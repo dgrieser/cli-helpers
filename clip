@@ -1,7 +1,9 @@
 #!/bin/bash
 CLIPBOARD_PRIVATE_FILE="${HOME}/.cache/clipboard-private"
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
-if [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
     . "${SCRIPT_DIR}/lib-desktop"
 else
     . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"

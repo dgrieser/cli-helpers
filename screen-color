@@ -15,6 +15,9 @@ def is_wayland():
     return os.environ.get("XDG_SESSION_TYPE") == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 
 def helper_path(name):
+    local_helper = os.path.join(SCRIPT_DIR, "lib", "cli-helpers", name)
+    if os.path.exists(local_helper):
+        return local_helper
     local_helper = os.path.join(SCRIPT_DIR, name)
     if os.path.exists(local_helper):
         return local_helper

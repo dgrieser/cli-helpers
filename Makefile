@@ -7,8 +7,9 @@ GNOME_EXTENSIONS_DIR ?= $(PREFIX)/share/gnome-shell/extensions
 ENABLE_GNOME_EXTENSION ?= 1
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
+SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-display-config gnome-window-bridge
-SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 ! -name 'lib-desktop' ! -name 'gnome-display-config' ! -name 'gnome-window-bridge' -printf '%f\n' | sort)
+SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 .PHONY: install uninstall list-install
@@ -20,7 +21,7 @@ install:
 		sed -i 's#/usr/local/lib/cli-helpers#$(LIBDIR)#g' "$(DESTDIR)$(BINDIR)/$$script"; \
 	done
 	for shared in $(SHARED); do \
-		install -m 0755 "$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+		install -m 0755 "$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
 	sed -i 's#/usr/local/share/gnome-shell/extensions#$(GNOME_EXTENSIONS_DIR)#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
 	cp -a "gnome-shell-extension/$(EXTENSION_UUID)/." "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)/"
@@ -53,5 +54,5 @@ list-install:
 	@printf 'Scripts -> %s\n' "$(DESTDIR)$(BINDIR)"
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 	@printf 'Shared -> %s\n' "$(DESTDIR)$(LIBDIR)"
-	@printf '%s\n' $(SHARED) | sed 's/^/  /'
+	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
 	@printf 'GNOME extension -> %s\n' "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)"
