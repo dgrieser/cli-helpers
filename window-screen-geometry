@@ -1,6 +1,10 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
-. "${SCRIPT_DIR}/lib-desktop"
+if [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
 
 usage() {
     echo "usage: $(basename "${0}") [-h|--help] [--ignore-scale] [-r|--raw] <display>" 1>&2
@@ -50,7 +54,7 @@ done
 [ -z "${display}" ] && usage
 
 if cli_helpers_is_wayland; then
-    line="$("${SCRIPT_DIR}/gnome-display-config" list --geometry --display "${display}")"
+    line="$(cli_helpers_gnome_display_config list --geometry --display "${display}")"
     [ -z "${line}" ] && fail "Display '${display}' not found"
     read -r _name x y width height scale <<< "${line}"
     if [ "${apply_scale}" -eq 0 ]; then

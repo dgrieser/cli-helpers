@@ -6,6 +6,7 @@ BUS_NAME="de.dgrieser.CliHelpers.WindowBridge"
 OBJECT_PATH="/de/dgrieser/CliHelpers/WindowBridge"
 INTERFACE="de.dgrieser.CliHelpers.WindowBridge"
 EXTENSION_UUID="cli-helpers-window-bridge@dgrieser.de"
+EXTENSION_DIR="${CLI_HELPERS_EXTENSION_DIR:-/usr/local/share/gnome-shell/extensions/${EXTENSION_UUID}}"
 
 usage() {
     echo "usage: $(basename "${0}") <list|active|focus|pointer-monitor|active-monitor> [argument]" 1>&2
@@ -15,7 +16,7 @@ usage() {
 fail_bridge() {
     cat 1>&2 <<EOF
 ERROR: GNOME Wayland window control requires the ${EXTENSION_UUID} GNOME Shell extension.
-Install the extension from ./gnome-shell-extension/${EXTENSION_UUID}, then enable it with:
+Install the extension from ${EXTENSION_DIR}, then enable it with:
   gnome-extensions enable ${EXTENSION_UUID}
 EOF
     exit 1

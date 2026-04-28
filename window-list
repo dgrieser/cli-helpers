@@ -1,6 +1,10 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
-. "${SCRIPT_DIR}/lib-desktop"
+if [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
 
 if cli_helpers_is_wayland; then
     cli_helpers_require_command gdbus gdbus || exit 1

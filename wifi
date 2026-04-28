@@ -10,7 +10,7 @@ names_to_ssids["work"]="Mittwald"
 names_to_ssids["home"]="Dave"
 
 names="${!names_to_ssids[@]}"
-ssid=$(iwgetid -r)
+ssid=$(iw dev | awk '/Interface/ { iface=$2 } /ssid/ { print $2; exit }')
 force=0
 
 

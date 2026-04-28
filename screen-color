@@ -14,8 +14,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def is_wayland():
     return os.environ.get("XDG_SESSION_TYPE") == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 
+def helper_path(name):
+    local_helper = os.path.join(SCRIPT_DIR, name)
+    if os.path.exists(local_helper):
+        return local_helper
+    return os.path.join(os.environ.get("CLI_HELPERS_LIBDIR", "/usr/local/lib/cli-helpers"), name)
+
 def gnome_display_config(*args):
-    helper = os.path.join(SCRIPT_DIR, "gnome-display-config")
+    helper = helper_path("gnome-display-config")
     result = subprocess.run([helper, *args], capture_output=True, text=True)
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "gnome-display-config failed"
