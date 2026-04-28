@@ -3,28 +3,33 @@ DESTDIR ?=
 
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/cli-helpers
-GNOME_EXTENSIONS_DIR ?= $(HOME)/.local/share/gnome-shell/extensions
 ENABLE_GNOME_EXTENSION ?= 1
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
+EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
+EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-display-config gnome-window-bridge
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
-.PHONY: list install uninstall list-install
+.PHONY: list install extension-zip install-gnome-extension uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
 	@printf '  make list          Show this help and available commands\n'
 	@printf '  make list-install  Show install destinations and installed files\n'
+	@printf '  make extension-zip  Package the GNOME extension\n'
+	@printf '  make install-gnome-extension  Install the packaged GNOME extension\n'
 	@printf '  sudo make install  Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make uninstall  Remove installed files\n'
 	@printf '\nAvailable commands:\n'
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 
 install:
-	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)"
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"; do \
+		[ -d "$$dir" ] || mkdir -p "$$dir"; \
+	done
 	for script in $(SCRIPTS); do \
 		install -m 0755 "$$script" "$(DESTDIR)$(BINDIR)/$$script"; \
 		sed -i 's#/usr/local/lib/cli-helpers#$(LIBDIR)#g' "$(DESTDIR)$(BINDIR)/$$script"; \
@@ -32,8 +37,8 @@ install:
 	for shared in $(SHARED); do \
 		install -m 0755 "$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
-	sed -i 's#/usr/local/share/gnome-shell/extensions#$(GNOME_EXTENSIONS_DIR)#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
-	cp -a "gnome-shell-extension/$(EXTENSION_UUID)/." "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)/"
+	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
+	$(MAKE) install-gnome-extension
 	for link in $(LINKS); do \
 		target="$$(readlink "$$link")"; \
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
@@ -49,6 +54,13 @@ install:
 		echo "Skipping GNOME extension enable step."; \
 	fi
 
+extension-zip:
+	rm -f "$(EXTENSION_ZIP)"
+	cd "$(EXTENSION_DIR)" && zip -r "$(EXTENSION_ZIP)" .
+
+install-gnome-extension: extension-zip
+	gnome-extensions install --force "$(EXTENSION_ZIP)"
+
 uninstall:
 	for script in $(SCRIPTS) $(LINKS); do \
 		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
@@ -57,11 +69,11 @@ uninstall:
 		rm -f "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
 	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
-	rm -rf "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)"
+	gnome-extensions uninstall "$(EXTENSION_UUID)" || true
 
 list-install:
 	@printf 'Scripts -> %s\n' "$(DESTDIR)$(BINDIR)"
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 	@printf 'Shared -> %s\n' "$(DESTDIR)$(LIBDIR)"
 	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
-	@printf 'GNOME extension -> %s\n' "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)"
+	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
