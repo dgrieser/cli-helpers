@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# Function to display usage information
+usage() {
+    echo "Usage: $(basename "${0}") <source_directory> <destination_directory>"
+    exit 1
+}
+
+# Check if correct number of arguments are provided
+if [ "${#}" -ne 2 ]; then
+    usage
+fi
+
+SOURCE_DIR="${1}"
+DEST_DIR="${2}"
+
+# make sure we don't have any trailing slash
+if [ "${SOURCE_DIR}" != "/" ]; then
+    SOURCE_DIR="${SOURCE_DIR%/}"
+fi
+if [ "${DEST_DIR}" != "/" ]; then
+    DEST_DIR="${DEST_DIR%/}"
+fi
+
+# Check if source directory exists
+if [ ! -d "${SOURCE_DIR}" ]; then
+    echo "ERROR: Source directory does not exist"
+    exit 1
+fi
+
+create_editable_diff() {
+    local src="${1}"
+    local dest="${2}"
+    local tmp_file=$(mktemp)
+    
+    meld "${src}" "${dest}" -o "${tmp_file}" &>/dev/null
+    echo "${tmp_file}"
+}
+
+copy_file() {
+    local src="${1}"
+    local dest="${2}"
+    mkdir -p "$(dirname "${dest}")"
+    cp "${src}" "${dest}"
+}
+
+exec 7<<<"$(find "${SOURCE_DIR}" \( -type f -o -type l \) 2>/dev/null)"
+
+while read -r -u 7 src_file; do
+    prompt_for_continue=0
+    rel_path="${src_file#${SOURCE_DIR}/}"
+    dest_file="${DEST_DIR}/${rel_path}"
+    if [ -L "${src_file}" ]; then
+        # Handle symbolic link
+        if [ -e "${dest_file}" ]; then
+            src_file_link="$(readlink "${src_file}")"
+            dest_file_link="$(readlink "${dest_file}")"
+
+            if [ "${src_file_link}" != "${dest_file_link}" ]; then
+                prompt_for_continue=1
+                echo "${src_file} -> ${dest_file}:"
+                echo
+                echo "${src_file_link} != ${dest_file_link}"
+                echo
+                while true; do
+                    read -p "Symbolic link files differ. (u)pdate or (s)kip? " link_choice
+                    case ${link_choice} in
+                        u|U)
+                            ln -sf "$(readlink "${src_file}")" "${dest_file}"
+                            echo "Updated symbolic link: ${dest_file}"
+                            break
+                            ;;
+                        s|S)
+                            echo "Skipped: ${src_file}"
+                            break
+                            ;;
+                        *)
+                            echo "Invalid choice. Please enter 'u' or 's'."
+                            ;;
+                    esac
+                done
+            fi
+        else
+            mkdir -p "$(dirname "${dest_file}")"
+            ln -sf "$(readlink "${src_file}")" "${dest_file}"
+            echo "Created symbolic link: ${dest_file}"
+        fi
+    elif [ -f "${dest_file}" ]; then
+        if ! diff "${src_file}" "${dest_file}" > /dev/null; then
+            prompt_for_continue=1
+            echo
+            diff -u --color=always "${dest_file}" "${src_file}"
+	        echo
+	        echo "${src_file} -> ${dest_file}:"
+            
+            while true; do
+                read -p "Files differ. (o)verwrite, (s)kip, or (e)dit? " choice
+                case ${choice} in
+                    o|O)
+                        copy_file "${src_file}" "${dest_file}"
+                        break
+                        ;;
+                    s|S)
+                        echo "Skipped: ${src_file}"
+                        break
+                        ;;
+                    e|E)
+                        tmp_file=$(create_editable_diff "${src_file}" "${dest_file}")
+                        if [ ! -s "${tmp_file}" ]; then
+                            echo "Edit was aborted."
+                        elif diff "${tmp_file}" "${dest_file}" > /dev/null; then
+                            echo "Files identical after editing. Skipped: ${src_file}"
+                            break
+                        else
+                            read -p "Apply changes? [Y/n] " choice
+                            if [ "${choice,,}" != "n" ]; then
+                                cat "{tmp_file}" > "${dest_file}"
+                                echo "Edited and saved: ${dest_file}"
+                                break
+                            else
+                                echo "Edit was aborted."
+                            fi
+                        fi
+                        rm "${tmp_file}"
+                        ;;
+                    *)
+                        echo "Invalid choice. Please enter 'o', 's', or 'e'."
+                        ;;
+                esac
+            done
+        fi
+    else
+        copy_file "${src_file}" "${dest_file}"
+    fi
+
+    if [ ${prompt_for_continue} -eq 1 ]; then
+        read -p "Continue? [Y/n] " choice
+        if [ "${choice,,}" = "n" ]; then
+            echo "Aborted."
+            exit 1
+        fi
+    fi
+done 

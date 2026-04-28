@@ -1,0 +1,154 @@
+#!/bin/bash
+
+APP_PATH="${0}"
+APP_NAME="$(basename "${APP_PATH}")"
+DEFAULT_CLI="codex"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] COMMAND
+
+Edit or create a file or command using ai (sudo if needed).
+
+    COMMAND     The command or file to edit.
+                Commands are found via which or
+                are searched for in /usr/local/bin
+
+Options:
+    -h, --help  Show this message
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    local message="${1}"
+    [ -z "${message}" ] && message="Abort."
+    echo "${message}" 1>&2
+    exit 1
+}
+
+syntax-check() {
+    local file="${1}"
+    local shebang
+    local syntax_ok=1
+
+    shebang="$(head -n 1 "${file}")"
+    case "${shebang}" in
+        "#!/bin/bash"|"#!/usr/bin/bash"|"#!/usr/bin/env bash")
+            LC_ALL=C bash -n "${file}" || syntax_ok=0
+            ;;
+        "#!/usr/bin/python3"|"#!/usr/bin/env python3")
+            LC_ALL=C python3 -m py_compile "${file}" || syntax_ok=0
+            ;;
+    esac
+
+    if [ "${syntax_ok}" -eq 0 ]; then
+        error "Syntax check failed"
+        prompt-yes-no "Edit again?" && exec "${APP_PATH}" "${original_args[@]}"
+    fi
+}
+
+original_args=("${@}")
+file_or_cmd=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${file_or_cmd}" ]; then
+                file_or_cmd="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${file_or_cmd}" ] && usage
+file=""
+
+if [ "${file_or_cmd:0:1}" = "/" ] || [ "${file_or_cmd:0:2}" = "./" ]; then
+    file="${file_or_cmd}"
+else
+    file="$(which ${file_or_cmd})"
+    if [ -z "${file}" ]; then
+        file="/usr/local/bin/${file_or_cmd}"
+    fi
+fi
+
+# check if text based file
+[ -f "${file}" ] && [ "$(file -b -i "${file}" | grep -c "^text/")" -lt 0 ] && fail "${file} is not a text based file"
+
+echo "Editing ${file}"
+
+# check if parent folder is writable by user
+if [ -w "$(dirname ${file})" ]; then
+    sudo=""
+else
+    sudo="sudo "
+fi
+
+local_file="$(basename "${file}")"
+tmp_repo="$(mktemp -d "${TMPDIR:-/tmp}/${local_file}-git-$(date +%s)-XXXX")"
+local_file_path="${tmp_repo}/${local_file}"
+trap "rm -rf ${tmp_repo}" EXIT
+
+cd "${tmp_repo}"
+git init
+
+[ -f "${file}" ] && cp "${file}" "${local_file_path}" || touch "${local_file_path}"
+chmod +x "${local_file_path}"
+cp "${HOME}/Dokumente/instructions/bash-cli-instructions.md" "${tmp_repo}"/.
+git add .
+git commit -m "Initial commit of ${local_file}"
+
+echo; echo "Choose CLI to use:"
+cli=$(prompt-command -d "${DEFAULT_CLI}")
+
+# run cli tool
+${cli}
+
+# check if changes have been made, either uncommitted, staged, or committed
+untracked="$(git ls-files --others --exclude-standard)"
+unstaged="$(git diff --name-only)"
+staged="$(git --no-pager diff --cached --name-only)"
+[ -z "${untracked}" ] && [ -z "${unstaged}" ] && [ -z "${staged}" ] && echo && abort "No changes have been made."
+
+git-diff
+echo
+
+syntax-check "${local_file_path}"
+
+echo
+
+prompt-no-yes "Keep editing?"; exit_code=$?
+case "${exit_code}" in
+    130) abort ;;
+    0) exec "${APP_PATH}" "${original_args[@]}" ;;
+esac
+
+prompt-yes-no "Apply changes to ${file}?"; exit_code=$?
+case "${exit_code}" in
+    0) ;;
+    *) abort "Changes not applied." ;;
+esac
+
+${sudo}cp "${local_file_path}" "${file}"
+echo "Copied ${local_file} to ${file}"
+
+if [ ! -x "${file}" ]; then
+    ${sudo}chmod +x "${file}"
+    echo "Made ${file} executable"
+fi

@@ -1,0 +1,285 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage()
+{
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] PROMPT...
+
+    Chat using an AI CLI tool on your terminal.
+
+    - Automatically grounds all answers with web search
+    - Creates and resumes sessions per TTY instance
+    - History of sessions is stored in ~/.${APP_NAME}
+
+PROMPT
+    The prompt to send to AI CLI tool of your choice
+
+OPTIONS:
+    -h, --help          Display this help message
+
+    -c, --clip          Read part of the prompt from clipboard
+                        Can be used multiple times
+
+    -f, --file <file>   Read part of the prompt from file
+                        Can be used multiple times
+                        To read from stdin, use "-"
+
+    -r, --resume <id>   Resume a specific session ID
+                        Overrides the current TTY session
+
+    --print-last        Print last chat log
+    --print-current     Print current chat log
+    --print-history     Print history of chat logs
+
+EXAMPLES:
+
+    ${APP_NAME} What is the capital of France?
+
+    ${APP_NAME} I see this error message: -c What is wrong here? Maybe look at -f somefile or -f someotherfile
+
+    cat error.log | ${APP_NAME} Can you please analyze this error log? -f -
+
+EOF
+    exit 1
+}
+
+error()
+{
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail()
+{
+    error "${1}"
+    exit 1
+}
+
+get_tty_pid () 
+{ 
+    local pid=$$
+    local cmd_file=""
+    local exe_file=""
+    local cmd_lines=""
+    local argc=0
+    local first_arg=""
+    local exe_path=""
+    while [ "${pid}" -gt 0 ] && [ -d "/proc/${pid}" ]; do
+        cmd_file="/proc/${pid}/cmdline"
+        exe_file="/proc/${pid}/exe"
+        if [ -r "${cmd_file}" ]; then
+            cmd_lines=$(tr '\0' '\n' < "${cmd_file}" | sed '/^$/d')
+            argc=$(printf '%s\n' "${cmd_lines}" | wc -l)
+            first_arg=$(printf '%s\n' "${cmd_lines}" | sed -n '1p')
+        else
+            argc=0
+            first_arg=""
+        fi;
+        exe_path=$(readlink -f "${exe_file}" 2> /dev/null || echo "")
+        if [ "${argc}" -eq 1 ] && [[ "${first_arg}" == *bash ]] && [[ "${exe_path}" == */bin/bash ]]; then
+            echo "${pid}"
+            return 0
+        fi;
+        pid="$(awk '{print $4}' "/proc/${pid}/stat" 2> /dev/null || echo 0)"
+    done
+    return 1
+}
+
+get_pid_start () 
+{ 
+    local pid="${1}"
+    shift
+    [[ ! "${pid}" =~ ^[0-9]+$ ]] && return 1
+    [ ! -e "/proc/${pid}/stat" ] && return 1
+    local boot_time=0
+    boot_time="$(awk '$1=="btime"{print $2}' /proc/stat)"
+    local clk_tck=0
+    clk_tck="$(getconf CLK_TCK)"
+    local start_ticks=0
+    start_ticks="$(awk '{print $22}' "/proc/$pid/stat")"
+    local start_time_since_boot=0
+    start_time_since_boot="$((start_ticks / clk_tck))"
+    echo "$((start_time_since_boot + boot_time))"
+    return 0
+}
+
+get_session_file_path()
+{
+    local tty_pid
+    tty_pid="$(get_tty_pid)"
+    local start_time
+    start_time="$(get_pid_start "${tty_pid}")"
+    local session
+    if [ -n "${tty_pid}" ] && [ -n "${start_time}" ]; then
+        session="${tty_pid}_${start_time}"
+    else
+        session="$(uuidgen)"
+    fi
+    echo "/tmp/${APP_NAME}-session.${session}"
+}
+
+read_clipboard()
+{
+    if command -v clip-paste >/dev/null 2>&1; then
+        clip-paste
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard -o
+    elif command -v pbpaste >/dev/null 2>&1; then
+        pbpaste
+    else
+        fail "xclip or pbpaste not found"
+    fi
+}
+
+tail_log()
+{
+    local logfile="${1}"
+    #tail -f "${logfile}" 2>/dev/null
+    tail -f "${logfile}" 2>/dev/null | sed -u -n '/^mcp startup:/,/^codex$/{/^mcp startup:/b;/^codex$/b;p}' | glow --stream
+}
+
+[ -z "${WORKSPACE}" ] && WORKSPACE="${HOME}/workspace"
+
+NL=$'\n'
+
+SESSION_FILE_PATH="$(get_session_file_path)"
+RESUME_SESSION=""
+if [ -z "${CLI_TOOL_SESSION}" ] && [ -f "${SESSION_FILE_PATH}" ]; then
+    CLI_TOOL_SESSION="$(cat "${SESSION_FILE_PATH}" 2>/dev/null)"
+fi
+
+GENERAL_INSTRUCTION_PROMPT="
+
+DO NOT execute commands, only explain to the user.
+"
+
+
+SEARCH_INSTRUCTION_PROMPT="
+
+IMPORTANT:
+1. Make sure to ground your response with web searches on topics relevant to the prompt above.
+2. Please ONLY mention the sources AT THE START of your response, NEVER in the body of your response.
+3. DO NOT mention the sources, nor the title, nor the URL, nor a reference, in the body of your response.
+4. YOU MUST list the source in the following format:
+**Sources**
+1. <description>  
+<raw URL>
+2. <description or title>  
+<raw URL>
+3. <description or title>  
+<raw URL>
+[...]
+"
+
+SEARCH_INSTRUCTION_REMINDER_PROMPT="
+IMPORTANT:
+Please remember the instructions from the first prompt.
+"
+
+chat_log_folder="${HOME}/.${APP_NAME}"
+session_file_ext="log"
+workdir="${WORKSPACE}/${APP_NAME}-tmp"
+prompt=""
+
+export CODEX_HOME="${chat_log_folder}"
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+        ;;
+        -r|--resume)
+            shift
+            [ -z "${1}" ] && usage
+            RESUME_SESSION="${1}"
+        ;;
+        -c|--clip)
+            [ -n "${prompt}" ] && prompt+="${NL}"
+            prompt+="$(read_clipboard)"
+            prompt+="${NL}"
+        ;;
+        -f|--file)
+            shift
+            [ -z "${1}" ] && usage
+            [ "${1}" != "-" ] && [ ! -f "${1}" ] && fail "${1} is not a file"
+            [ -n "${prompt}" ] && prompt+="${NL}"
+            [ "${1}" != "-" ] && prompt+="File content of ${1}:${NL}"
+            prompt+="\`\`\`${NL}"
+            prompt+="$(cat "${1}")"
+            prompt+="${NL}\`\`\`${NL}"
+        ;;
+        --print-last)
+            last_file="$(ls -1t "${chat_log_folder}/"*".${session_file_ext}" 2>/dev/null | head -n 1)"
+            [ -z "${last_file}" ] && fail "No chat log found"
+            cat "${last_file}" 2>/dev/null
+            exit 0
+        ;;
+        --print-current)
+            [ -z "${CLI_TOOL_SESSION}" ] && fail "No session started"
+            session_file="${chat_log_folder}/${CLI_TOOL_SESSION}.${session_file_ext}"
+            [ ! -f "${session_file}" ] && fail "Current session log '${session_file}' not found"
+            cat "${session_file}" 2>/dev/null
+            exit 0 
+        ;;
+        --print-history)
+            (
+                session_files="$(ls -1tr "${chat_log_folder}/"*".${session_file_ext}" 2>/dev/null)"
+                echo -e "ID\tPROMPT"
+                for session_file in ${session_files}; do
+                    user_prompt="$(cat "${session_file}" 2>/dev/null \
+                                       | sed -n '/^user$/,/^mcp startup:/{/^user$/b;/^mcp startup:/b;p}' \
+                                       | tr $'\n' ' ' | tr -s ' ')"
+                    [ ${#user_prompt} -gt 100 ] && user_prompt="${user_prompt:0:97}..."
+                    session_id="$(basename "${session_file}" ".${session_file_ext}")"
+                    echo -e "${session_id}\t${user_prompt}"
+                done
+            ) | column -t -s $'\t'
+            exit 0
+        ;;
+        *)
+            [ -n "${prompt}" ] && prompt+=" "
+            prompt+="${1}"
+        ;;
+    esac
+    shift
+done
+
+[ -n "${RESUME_SESSION}" ] && CLI_TOOL_SESSION="${RESUME_SESSION}"
+[ -z "${prompt}" ] && usage
+stderr_file="$(mktemp "/tmp/${APP_NAME}-stderr.XXXXXX")"
+stdout_file="$(mktemp "/tmp/${APP_NAME}-stdout.XXXXXX")"
+
+first=1
+(
+    [ ! -d "${workdir}" ] && mkdir -p "${workdir}"
+    cd "${workdir}"
+    [ ! -d "${workdir}/.git" ] && git init "${workdir}"
+    codex_args=()
+    #codex_args+=("--profile" "mini")
+    codex_args+=("--full-auto" "exec")
+    [ -n "${CLI_TOOL_SESSION}" ] && first=0 && codex_args+=("resume" "${CLI_TOOL_SESSION}") && print-text-muted "Resuming session ${CLI_TOOL_SESSION}" 1>&2
+    [ ${first} -eq 1 ] && prompt="${prompt}${GENERAL_INSTRUCTION_PROMPT}${SEARCH_INSTRUCTION_PROMPT}" || prompt="${prompt}${SEARCH_INSTRUCTION_REMINDER_PROMPT}"
+    echo "${prompt}" | codex "${codex_args[@]}" 1>"${stdout_file}" 2>"${stderr_file}" &
+    codex_pid=$!
+    tail_log "${stderr_file}" &
+    tail_pid=$!
+    wait "${codex_pid}"
+    kill "${tail_pid}"
+    session_id="$(cat "${stderr_file}" | color-clear | grep -m 1 "^session id:" | sed -e 's/^session id: //g')"
+    [ -n "${session_id}" ] && echo "${session_id}" > "${SESSION_FILE_PATH}" || uuidgen > "${SESSION_FILE_PATH}"
+)
+
+session_id="$(cat "${SESSION_FILE_PATH}" 2>/dev/null)"
+mkdir -p "${chat_log_folder}"
+chat_log_file="${chat_log_folder}/${session_id}.${session_file_ext}"
+
+#echo "Prompt:${NL}${prompt}${NL}" >> "${chat_log_file}"
+cat "${stderr_file}" >> "${chat_log_file}" && echo >> "${chat_log_file}"
+#cat "${stdout_file}" >> "${chat_log_file}" && echo >> "${chat_log_file}"
+echo; cat "${stdout_file}" | glow --width 0
+
+rm -f "${stderr_file}" "${stdout_file}"
+
+
+exit 0

@@ -1,0 +1,4 @@
+#!/bin/bash
+pid=$(pgrep -f "busybox httpd") && kill ${pid}
+clip-clear
+busybox httpd -p 9090 -h /home/grieser/Dokumente/html/ && pgrep -f "busybox httpd"

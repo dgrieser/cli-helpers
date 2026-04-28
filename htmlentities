@@ -1,0 +1,39 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") [--decode|-d] [--encode|-e]"
+    echo "         --decode, -d: Decode HTML entities from stdin"
+    echo "         --encode, -e: Encode HTML entities from stdin"
+    exit 1
+}
+
+mode="encode"
+mode_set=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --decode|-d)
+            [ ${mode_set} -eq 1 ] && usage
+            mode="decode"
+            mode_set=1
+            ;;
+        --encode|-e)
+            [ ${mode_set} -eq 1 ] && usage
+            mode="encode"
+            mode_set=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+case "${mode}" in
+    decode)
+        perl -CS -MHTML::Entities -pe 'decode_entities($_); s/\x{00A0}/ /g;' # use regular spaces
+        ;;
+    encode)
+        perl -CS -MHTML::Entities -pe 'encode_entities($_);'
+        ;;
+esac

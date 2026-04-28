@@ -1,0 +1,67 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-h|--help] [--id] [--id-name] [--home]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+name=1
+id=0
+home=0
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --id)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            id=1
+            name=0
+            ;;
+        --id-name)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            id=1
+            name=1
+            ;;
+        --home)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            home=1
+            name=0
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+! command -v w >/dev/null 2>&1 && fail "w command not found"
+
+user="$(w -hu | grep -m 1 'session' | awk '{print $1}')"
+[ -z "${user}" ] && fail "no user logged in"
+home_dir="$(awk -F: -v user="${user}" '$1 == user { print $6; exit }' /etc/passwd)"
+[ ${home} -eq 1 ] && [ -z "${home_dir}" ] && fail "no home directory found for user ${user}"
+
+output=()
+[ ${id} -eq 1 ] && output+=( "$(id -u "${user}")" )
+[ ${name} -eq 1 ] && output+=( "${user}" )
+[ ${home} -eq 1 ] && output+=( "${home_dir}" )
+
+echo "${output[@]}" | tr ' ' ':'
+
+exit 0

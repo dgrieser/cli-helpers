@@ -1,0 +1,68 @@
+#!/bin/bash
+CLIPBOARD_PRIVATE_FILE="${HOME}/.cache/clipboard-private"
+
+usage() {
+    echo "usage: $(basename "${0}") [--print] [<file, or stdin>]" 2>&1
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 2>&1
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+PRINT=0
+FILE=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --print)
+            PRINT=1
+            ;;
+        *)
+            if [ -z "${FILE}" ]; then
+                FILE="${1}"
+            else
+                error "Unexpected argument '${1}'"
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ "${FILE}" = "-" ] && FILE=""
+[ -n "${FILE}" ] && [ ! -f "${FILE}" ] && fail "File '${FILE}' does not exist"
+
+# read from file
+if [ -n "${FILE}" ]; then
+    touch "${CLIPBOARD_PRIVATE_FILE}"
+    if [ "${PRINT}" -eq 1 ]; then
+        cat "${FILE}" | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p -f 2>/dev/null
+    else
+        cat "${FILE}" | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p &>/dev/null
+    fi
+    rm "${CLIPBOARD_PRIVATE_FILE}"
+    exit 0
+fi
+
+# read from stdin if available
+if [ -p /dev/stdin ]; then
+    touch "${CLIPBOARD_PRIVATE_FILE}"
+    if [ "${PRINT}" -eq 1 ]; then
+        cat - | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p -f 2>/dev/null
+    else
+        cat - | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p &>/dev/null
+    fi
+    rm "${CLIPBOARD_PRIVATE_FILE}"
+    exit 0
+fi
+
+usage

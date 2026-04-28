@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import argparse
+import getpass
+
+def input_with_default(default=''):
+    result = input()
+    if not result:
+        result = default
+    return result
+
+def is_interactive():
+    return sys.__stdin__.isatty() and sys.__stdout__.isatty()
+
+def main():
+    bin_name = os.path.basename(sys.argv[0])
+    exit_code_binaries = {
+        'prompt-continue',
+        'prompt-continue-yes',
+        'prompt-yes-no',
+        'prompt-no-yes',
+    }
+    if bin_name in exit_code_binaries:
+        description = 'Prompt for confirmation and return the result as an exit code'
+        epilog = 'Exit status: 0 for "yes", 1 otherwise. Ctrl-C exits with 130.'
+    else:
+        description = 'Read multiple lines from stdin'
+        epilog = (
+            'Special invocations prompt-continue, prompt-continue-yes, '
+            'prompt-yes-no, and prompt-no-yes return status 0 for "yes" '
+            'and 1 otherwise instead of printing the answer.'
+        )
+
+    parser = argparse.ArgumentParser(description=description, epilog=epilog)
+    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode and "Enter input:" for a single line mode')
+    parser.add_argument('--prompt-char', '-c', type=str, help='Custom prompt character, defaults to "> " for multiple line mode and "" for a single line mode')
+    parser.add_argument('--single-line', '-s', action='store_true', help='Read a single line from stdin, without the prompt char')
+    parser.add_argument('--protected', '-P', action='store_true', help='Prompt for a secret')
+    parser.add_argument('--default', '-d', type=str, default='', help='Default value')
+    parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    #alias prompt-continue='prompt -s -p '\''Continue [y/N]:'\'' | grep -q '\''^[yY]$'\'''
+    #alias prompt-input='prompt --single-line '
+    #alias prompt-multiline='prompt --prompt '
+    #alias prompt-password='prompt --single-line --protected --prompt "Password: "'
+
+    prompt = args.prompt
+    prompt_char = args.prompt_char
+    prompt_single_line = args.single_line
+    prompt_protected = args.protected
+    prompt_default = args.default
+    prompt_exit_code_pattern = None
+    
+    # check the name of the binary
+    if bin_name == 'prompt-continue':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        else:
+            prompt = 'Continue [y/N]:'
+        prompt_exit_code_pattern = r'^[yY]$'
+    if bin_name == 'prompt-continue-yes':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        else:
+            prompt = 'Continue [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+    elif bin_name == 'prompt-yes-no':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+            prompt = prompt + ' [Y/n]:'
+        else:
+            prompt = 'Do it? [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+    elif bin_name == 'prompt-no-yes':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+            prompt = prompt + ' [y/N]:'
+        else:
+            prompt = 'Do it? [y/N]:'
+        prompt_exit_code_pattern = r'^[yY]$'
+    elif bin_name == 'prompt-input':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+    elif bin_name == 'prompt-multiline':
+        prompt_single_line = False
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+    elif bin_name == 'prompt-password':
+        prompt_single_line = True
+        prompt_protected = True
+        prompt = 'Password:'
+
+    if prompt_default and (prompt_protected or not prompt_single_line):
+        print('ERROR: --default can only be used in non-protected, single line mode.', file=sys.stderr)
+        exit(1)
+
+    if not prompt:
+        prompt = 'Enter input:' if prompt_single_line else '(Press Ctrl-D when done)'
+    if not prompt_char:
+        prompt_char = '' if prompt_single_line else '> '
+
+    end = ' ' if prompt_single_line else '\n'
+
+    if prompt_default:
+        if prompt[-1] == ':': prompt = prompt[:-1]
+        prompt = prompt + ' (' + prompt_default + '):'
+
+    if not (prompt_protected and prompt_single_line):
+        print(prompt, end=end, file=sys.stderr)
+
+    if prompt_single_line:
+        try:
+            print(prompt_char, end='', file=sys.stderr)
+            if prompt_protected:
+                line = getpass.getpass(prompt=prompt + end)
+            else:
+                line = input_with_default(prompt_default)
+        except KeyboardInterrupt:
+            print('')
+            exit(130)
+        if prompt_exit_code_pattern:
+            if not line:
+                line = ''
+            if re.match(prompt_exit_code_pattern, line): exit(0)
+            else: exit(1)
+        print(line, end='')
+    else:
+        lines = []
+        while True:
+            try:
+                if not prompt_protected: print(prompt_char, end='', file=sys.stderr)
+                if prompt_protected:
+                    line = getpass.getpass(prompt=prompt_char)
+                else:
+                    line = input_with_default(prompt_default)
+                    # use default only once
+                    prompt_default = None
+            except KeyboardInterrupt:
+                print('')
+                exit(130)
+            except EOFError:
+                break
+            lines.append(line)
+
+        print('\r' + ' ' * len(prompt_char) + '\r', end='', file=sys.stderr)
+        print('\n'.join(lines))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,144 @@
+#!/bin/bash
+
+function usage() {
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    exit 1
+}
+
+color_settings='bg+:'"${COLOR_SELECTION_BACKGROUND:-238}"',header:'"${COLOR_TABLE_HEADER:-238}"':italic'
+color_style="${COLOR_MODE}"
+
+cmd=""
+key_cmd=""
+args=""
+query=""
+delimiter='  +'
+watch_seconds=0
+reverse=1
+print_query=0
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --columns)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${args}" ] && args="${args} "
+            args="${args}--with-nth=${1}"
+            ;;
+        --filter-columns)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${args}" ] && args="${args} "
+            args="${args}--nth=${1}"
+            ;;
+        --command)
+            shift
+            [ -z "${1}" ] && usage
+            cmd="${1}"
+            print_query=1
+            ;;
+        --key-command)
+            shift
+            [ -z "${1}" ] && usage
+            key_cmd="${1}"
+            print_query=1
+            ;;
+        --watch)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            watch_seconds="${1}"
+            ;;
+        --delimiter)
+            shift
+            [ -z "${1}" ] && usage
+            delimiter="${1}"
+            ;;
+        --help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            if [[ "${1}" == -* ]]; then
+                break
+            else
+                [ -n "${query}" ] && query="${query} "
+                query="${query}${1}"
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ ${print_query} -eq 1 ]; then
+    [ -n "${args}" ] && args="${args} "
+    args="${args}--print-query"
+fi
+
+[ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
+
+if [ ${reverse} -eq 1 ]; then
+    [ -n "${args}" ] && args="${args} "    
+    args="${args}--layout=default"
+fi
+
+update_fzf() {
+    local cmd="${1}"
+    local port="${2}"
+    local seconds="${3}"
+    sleep 2
+    while true; do
+        reload_fzf "${cmd}" "${port}" || break
+        sleep "${seconds}"
+    done
+}
+
+reload_fzf() {
+    local cmd="${1}"
+    local port="${2}"
+    curl -XPOST 127.0.0.1:${port} -d "reload(${cmd})" &> /dev/null
+    return ${?}
+}
+
+while true; do
+    if [ -n "${cmd}" ]; then
+        if [ ${watch_seconds} -gt 0 ]; then
+            port=$((39000+RANDOM%1000))
+            while lsof -nP -i:${port} &> /dev/null; do
+                port=$((port+1))
+            done
+            [ -n "${args}" ] && args="${args} "
+            args="${args}--listen=127.0.0.1:${port}"
+            update_fzf "${cmd}" "${port}" "${watch_seconds}" &
+        fi
+        cmd_result="$(${cmd})"
+        header="$(echo "${cmd_result}" | head -n 1)"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --no-hscroll --color="${color_settings}" --query="${query}" ${args} "$@")"
+        if [ ${print_query} -eq 1 ]; then
+            query="$(echo "${result}" | head -n 1)"
+            result="$(echo "${result}" | sed '1d')"
+        fi
+    else
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --no-hscroll --color="${color_settings}" --query="${query}" ${args} "$@")"
+    fi
+
+    if [ -n "${key_cmd}" ]; then
+        # TODO actually store last command exec and pipe back into fzf
+        # TODO OR at least add saved header as argument, maybe split key, result and header as individual arguments
+        ${key_cmd} "${result}"
+        exit_code=$?
+        case "${exit_code}" in
+            1)
+                exit 0
+                ;;
+           255)
+                exit 1
+                ;;
+        esac
+    else
+        echo "${result}"
+        exit 0
+    fi
+done

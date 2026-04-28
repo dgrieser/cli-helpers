@@ -1,0 +1,67 @@
+#!/bin/bash
+name="Launcher"
+bin_path="${0}"
+bin_name="$(basename "${bin_path}")"
+config_path="${HOME}/.config/terminator/config_${bin_name}"
+max_seconds=3
+dock_height=10
+window_width=900
+window_height=200
+window_x=300
+window_y=${dock_height}
+screen_scale=1
+
+
+pid=$(pidof -x "${bin_path}")
+if [ "${pid}" != "$$" ]; then
+    window-focus-by-class "${bin_name}"
+    echo "Focus on ${bin_name}"
+    exit 0
+fi
+
+terminator_args=("-g" "${config_path}" "--no-dbus" "--title=${name}")
+terminator_args+=("--geometry=${window_width}x${window_height}+${window_x}+${window_y}")
+
+echo "+ terminator ${terminator_args[*]}" >&2
+TERM_SIMPLE="▶ " terminator "${terminator_args[@]}" &
+pid=$!
+
+EXIT_FILE="/tmp/launcher-${pid}.exit"
+rm -rf "${EXIT_FILE}"
+
+attempts=1
+while ! xprop -name "${name}" -f WM_CLASS 8s -set WM_CLASS "${bin_name}" 2>/dev/null; do
+    ((attempts++))
+    sleep 0.5
+    [ "${attempts}" -gt 10 ] && break
+done
+
+counter=0
+interval=0.5
+ignore_active=0
+max_seconds_after_kill=${interval}
+while true; do
+    kill -0 ${pid} 2>/dev/null || exit 0
+
+    # kill file exists, wait only for process
+    # and already exit immediately
+    if [ -f "${EXIT_FILE}" ]; then
+        rm -rf "${EXIT_FILE}"
+        counter=0
+        max_seconds=${max_seconds_after_kill}
+        ignore_active=1
+    fi
+
+    counter=$(echo "${counter}+${interval}" | bc)
+
+    # launcher in focus resets the counter
+    [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "$(window-by-class ${bin_name})" ]] && counter=0
+
+    # running process in launcher resets the counter
+    [ $(pstree -AT ${pid} | tr -s '-' | tr '-' $'\n' | wc -l) -gt 2 ] && counter=0
+
+    # otherwise exit launcher after max_seconds
+    (( $(echo "${counter} >= ${max_seconds}" | bc -l) )) && kill ${pid} && exit 0
+
+    sleep ${interval}
+done

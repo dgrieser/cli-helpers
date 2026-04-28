@@ -1,0 +1,56 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: "$(basename ${0})" <command-source> <command-target>" 1>&2
+    exit 1
+}
+
+parse_command() {
+    local cmd="${1}"
+    if [ "${cmd:0:1}" = "/" ] || [ "${cmd:0:2}" = "./" ]; then
+        echo "${cmd}"
+        return 0
+    fi
+    whichcmd="$(which "${cmd}")"
+    if [ -z "${whichcmd}" ]; then
+        cmd="/usr/local/bin/${cmd}"
+    else
+        cmd="${whichcmd}"
+    fi
+    echo "${cmd}"
+    return 0
+}
+
+
+command_source=""
+command_target=""
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${command_source}" ]; then
+                command_source="${1}"
+            elif [ -z "${command_target}" ]; then
+                command_target="${1}"
+            else
+                usage
+            fi
+    esac
+    shift
+done
+
+[ -z "${command_source}" ] && usage
+[ -z "${command_target}" ] && usage
+
+command_source="$(parse_command "${command_source}")"
+command_target="$(parse_command "${command_target}")"
+
+if [ ! -f "${command_source}" ]; then
+    echo "ERROR: File not found: ${command_source}" 1>&2
+    exit 1
+fi
+
+LC_ALL=C sudo mv -v "${command_source}" "${command_target}"

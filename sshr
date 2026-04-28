@@ -1,0 +1,50 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "$0") [--prompt] [<ssh arguments>]" 1>&2
+    exit 1
+}
+
+KNOWN_HOSTS="${HOME}/.ssh/known_hosts"
+HISTORY_FILE="${HISTFILE:-${HOME}/.bash_history}"
+PROMPT=0
+
+if [ "${1}" = "--prompt" ]; then
+    shift
+    PROMPT=1
+fi
+
+ssh_command=""
+
+if [ "$#" -lt 1 ]; then
+    ssh_command="$(tail -n 50 "${HISTORY_FILE}" | tac | grep -E -m 1 "^ssh .+")"
+    if [ -z "${ssh_command}" ]; then
+        echo "ERROR: No ssh command found in recent bash history." 1>&2
+        exit 1
+        usage
+    fi
+    echo "Found command:"
+    echo "${ssh_command}"
+else
+    ssh_command="${@}"
+    if [[ ! "${ssh_command}" =~ ^"ssh " ]]; then
+        ssh_command="ssh ${ssh_command}"
+    fi
+fi
+
+host="$(echo "${ssh_command}" | sed -E "s/^ssh(\s-[^ ]+)*\s+([^-][^ ]+).*$/\2/" | cut -d @ -f 2- | sed 's|^ssh://||')"
+[ -z "${host}" ] && echo "ERROR: No host found in command." 1>&2 && usage
+
+if [ "${PROMPT}" -eq 1 ]; then
+    read -p "Re-add host ${host} to known hosts? [Y/n] " -r
+    [[ $REPLY =~ ^[nN]$ ]] && exit 0
+fi
+
+actual_host="$(ssh -G "${host}" | awk '/^hostname / { print $2 }')"
+echo
+echo "Re-adding ${actual_host}..."
+ssh-keygen -f "${KNOWN_HOSTS}" -R "${actual_host}" 2>/dev/null
+ssh-keyscan -H "${actual_host}" >> "${KNOWN_HOSTS}"
+echo
+
+${ssh_command}

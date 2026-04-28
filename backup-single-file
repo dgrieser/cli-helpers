@@ -1,0 +1,55 @@
+#!/bin/bash
+
+
+usage() {
+    echo "usage: $(basename "${0}") [--days <days>] file" 1>&2
+    exit 1
+}
+
+days=7
+file=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --days)
+            shift
+            if [ -z "${1}" ] || ! [[ "${1}" =~ ^[0-9]+$ ]] || [ "${1}" -lt 1 ]; then
+                echo "ERROR: --days requires a positive integer" 1>&2
+                usage
+            fi
+            days="${1}"
+            ;;
+        --help)
+            usage
+            ;;
+        -*)
+            echo "ERROR: Unknown option ${1}" 1>&2
+            usage
+            ;;
+        *)
+            if [ -n "${file}" ]; then
+                usage
+            fi
+            file="${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${file}" ] && usage
+[ ! -f "${file}" ] && echo "ERROR: '${file}' is not a valid file" 1>&2 && exit 1
+
+absolute_filepath="$(cd "$(dirname "${file}")" && pwd)/$(basename "${file}")"
+timestamp="$(date +%Y%m%d%H%M%S)"
+backup_path="${absolute_filepath}_${timestamp}"
+echo "Creating backup: $backup_path"
+cp -p -- "${file}" "${backup_path}"
+
+relative_filename="$(basename "${absolute_filepath}")"
+backup_pattern="${relative_filepath}_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
+
+echo "Deleting backups older than ${days} days..."
+directory="$(dirname "${absolute_filepath}")"
+
+find "${directory}" -maxdepth 1 -type f -name "${relative_filename}${backup_pattern}" -mtime +"$((days - 1))" -exec rm -v {} \;
+
+echo "Backup complete"

@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+import tesserocr
+import argparse
+import argcomplete
+
+def extract_text_from_image(image_path, language='eng'):
+    text = tesserocr.file_to_text(image_path, lang=language)
+    return text
+
+def get_languages():
+    languages = []
+    for l in tesserocr.get_languages():
+        if isinstance(l, list):
+            for name in l:
+                languages.append(name)
+    return languages
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('image_path', metavar='image-path', type=str, help='Path to the image file')
+    parser.add_argument('-l', '--language', type=str, default='eng', choices=get_languages(), help='Language to use for OCR').complete = argcomplete.autocomplete
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+    text = extract_text_from_image(args.image_path, args.language)
+    print(text)
+
+if __name__ == "__main__":
+    main()

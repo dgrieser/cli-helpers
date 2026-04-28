@@ -1,0 +1,147 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] COMMAND
+
+Print information about a command, bash function, or alias.
+
+    COMMAND          The command, function, or alias to print information about.
+
+Options:
+    -h, --help       Print this help.
+    -l, --lines <#>  Specify the number of lines to print, default is 10.
+    -L, --all-lines  Print all lines.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+function print_content() {
+    local max_lines="${1}"; shift
+    local content="${1}"; shift
+    [ -z "${content}" ] && return
+    [ "${max_lines}" -eq 0 ] && return
+    local line_count=0
+    line_count="$(echo "${content}" | wc -l)"
+    [ "${line_count}" -eq 0 ] && return
+
+    if [ "${max_lines}" -gt 0 ] && [ "${line_count}" -gt "${max_lines}" ]; then
+        echo
+        echo "${cmd_content}" | head -n "${lines}"
+        echo "[...]"
+    else
+        echo
+        echo "${cmd_content}"
+    fi
+}
+
+cmd=""
+lines=10
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -l|--lines)
+            shift
+            [[ ! "${1}" =~ ^([0-9]+|-1)$ ]] && fail "Invalid number of lines '${1}'."
+            lines="${1}"
+            ;;
+        -L|--all-lines)
+            lines=-1
+            ;;
+        *)
+            if [ -z "${cmd}" ]; then
+                cmd="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${cmd}" ] && usage
+
+shopt -s expand_aliases
+
+[ -f /etc/profile ] && source /etc/profile &>/dev/null
+[ -f ~/.profile ] && source ~/.profile &>/dev/null
+[ -f ~/.bash_aliases ] && source ~/.bash_aliases &>/dev/null
+
+cmd_line=""
+cmd_content=""
+cmd_type_desc=""
+cmd_mime_type=""
+cmd_source=""
+
+cmd_type="$(type -t "${cmd}" 2>/dev/null)"
+case "${cmd_type}" in
+    file)
+        cmd_path="$(which "${cmd}" 2> /dev/null)" || fail "Command '${cmd}' not found."
+        cmd_links=()
+        current_path="${cmd_path}"
+        while [ -L "${current_path}" ]; do
+            [ "${#cmd_links[@]}" -eq 0 ] && cmd_links+=("${current_path}")
+            last_path="${current_path}"
+            current_path="$(readlink "${current_path}")"
+            # if relative path, make absolute
+            [ ! -e "${current_path}" ] && current_path="$(realpath "$(dirname "${last_path}")/${current_path}")"
+            cmd_links+=("${current_path}")
+        done
+        cmd_full_path="${current_path}"
+        cmd_type_desc="$(LC_ALL=C file -b "${cmd_full_path}" | sed -E 's/, /\n    /g')"
+        cmd_mime_type="$(LC_ALL=C file -b --mime-type "${cmd_full_path}")"
+        if [ "${#cmd_links[@]}" -gt 0 ]; then
+            first=1
+            for link in "${cmd_links[@]}"; do
+                [ "${first}" -eq 1 ] && first=0 || cmd_line="${cmd_line} -> "
+                cmd_line="${cmd_line}${link}"
+            done
+        else
+            cmd_line="${cmd_path}"
+        fi
+        cmd_source="$(LC_ALL=C dpkg -S "${cmd_full_path}" 2>/dev/null | cut -d: -f1)"
+        [ -n "${cmd_source}" ] && cmd_source="$(LC_ALL=C apt list --installed 2>/dev/null | grep "${cmd_source}")"
+        [[ "${cmd_mime_type}" =~ ^text ]] && cmd_content="$(cat "${cmd_full_path}")"
+        ;;
+    function)
+        cmd_line="function ${cmd}"
+        cmd_mime_type="text/x-bashfunction"
+        cmd_type_desc="Bourne-Again shell function"
+        cmd_content="$(LC_ALL=C type "${cmd}" | sed '1d')"
+        cmd_source="$(shopt -s extdebug &>/dev/null; declare -F "${cmd}" 2>/dev/null | awk '{print $3}'; shopt -u extdebug &>/dev/null)"
+        ;;
+    alias)
+        cmd_line="alias ${cmd}"
+        cmd_mime_type="text/x-bashalias"
+        cmd_type_desc="Bourne-Again shell alias"
+        cmd_content="$(LC_ALL=C alias "${cmd}")"
+        cmd_source="<alias definition>"
+        ;;
+    *)
+        fail "Command '${cmd}' not found."
+        ;;
+esac
+
+echo "${cmd_line}"
+echo "${cmd_mime_type}"
+echo "${cmd_type_desc}"
+echo "${cmd_source:-<unknown>}"
+print_content "${lines}" "${cmd_content}"

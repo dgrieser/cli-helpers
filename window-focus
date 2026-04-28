@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $(basename "${0}") <id>"
+    exit 1
+fi
+
+wmctrl -ia ${1}

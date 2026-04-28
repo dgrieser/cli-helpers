@@ -1,0 +1,97 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    echo "usage: ${APP_NAME} [-h|--help] [--verbose] [-r|--clear] [-c|--clipboard|-p|--primary] [FILE]" 1>&2
+    echo
+    echo "${APP_NAME} collects the contents of the clipboard and writes it to FILE or stdout."
+    echo " 1. Read the contents of the current clipboard"
+    echo " 2. Write it to FILE (or stdout)"
+    echo " 3. Clear the clipboard"
+    echo " 4. Wait for the clipboard to change"
+    echo " 5. Repeat"
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+print_verbose() {
+    if [ "${verbose}" -eq 1 ]; then
+        echo "+ ${1}" 1>&2
+    fi
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+file=""
+verbose=0
+clean=0
+clip_args=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --verbose)
+            verbose=1
+            ;;
+        -r|--clear)
+            clean=1
+            ;;
+        -c|--clipboard)
+            clip_args+=("${1}")
+            ;;
+        -p|--primary)
+            clip_args+=("${1}")
+            ;;
+        *)
+            if [ -z "${file}" ]; then
+                file="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${file}" ]; then
+    print_verbose "No file specified, writing to stdout."
+    file="/dev/stdout"
+else
+    parent="$(dirname "${file}")"
+    print_verbose "mkdir -p '${parent}'"
+    mkdir -p "${parent}" || fail "Failed to create directory '${parent}'."
+    print_verbose "touch '${file}'"
+    touch "${file}" || fail "Failed to create file '${file}'."
+fi
+
+if [ "${clean}" -eq 1 ]; then
+    print_verbose "clip-clear ${clip_args[*]}"
+    clip-clear "${clip_args[@]}"
+fi
+
+while true; do
+    print_verbose "clip-paste-wait ${clip_args[*]}"
+    if [ "${verbose}" -eq 1 ]; then
+        clip-paste-wait "${clip_args[@]}" | sed 's/$/\n/' | tee -a "${file}" | sed 's/^/>> /'
+    else
+        clip-paste-wait "${clip_args[@]}" | sed 's/$/\n/' >> "${file}"
+    fi
+    sleep 0.1
+    print_verbose "clip-clear ${clip_args[*]}"
+    clip-clear "${clip_args[@]}"
+done
+
+exit 0

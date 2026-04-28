@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+import sys
+import argparse
+
+
+import argcomplete
+import re
+import yaml
+
+def load_items(data):
+    if isinstance(data, dict):
+        if 'items' in data:  # Kubernetes-style List
+            return data['items']
+        else:  # Single resource
+            return [data]
+    elif isinstance(data, list):
+        return data
+    else:
+        raise ValueError("Unsupported YAML structure")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Find patterns in YAML resources',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('pattern', help='Regex pattern to search for')
+    parser.add_argument('-i', '--ignore-case', action='store_true', 
+                        help='Case-insensitive search')
+    parser.add_argument('-f', '--fields', action='append',
+                        help='YAML fields to print (defaults to name or metadata.namespace and metadata.name, if available)')
+    parser.add_argument('-m', '--max-count', type=int, default=-1,
+                        help='Maximum number of matches to print')
+    parser.add_argument('-C', '--context', type=int, default=0,
+                        help='Number of lines of context to print before and after each match')
+    parser.add_argument('-B', '--before-context', type=int, default=0,
+                        help='Number of lines of context to print before each match')
+    parser.add_argument('-A', '--after-context', type=int, default=0,
+                        help='Number of lines of context to print after each match')
+    parser.add_argument('-L', '--fields-without-matches', action='store_true',
+                        help='Only print the fields without matches')
+    parser.add_argument('-l', '--fields-with-matches', action='store_true',
+                        help='Only print the fields with matches')
+
+    args = parser.parse_args()
+    argcomplete.autocomplete(parser)
+
+    before_context = args.before_context
+    after_context = args.after_context
+    if args.context > 0:
+        before_context = args.context
+        after_context = args.context
+
+    try:
+        pattern = re.compile(args.pattern, re.IGNORECASE if args.ignore_case else 0)
+    except re.error as e:
+        print(f"ERROR: Invalid regex pattern: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.fields_with_matches and args.fields_without_matches:
+        print("ERROR: Only one of --fields-with-matches or --fields-without-matches can be specified", file=sys.stderr)
+        sys.exit(1)
+
+    if (args.fields_with_matches or args.fields_without_matches) and (args.context > 0 or args.before_context > 0 or args.after_context > 0 or args.max_count > 0):
+        print("ERROR: Context or --max-count arguments cannot be used with --fields-with-matches or --fields-without-matches", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        try:
+            data = yaml.safe_load(sys.stdin)
+        except yaml.YAMLError as e:
+            print(f"ERROR: Failed to parse YAML: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            items = load_items(data)
+        except ValueError as e:
+            print(f"ERROR: Failed to parse YAML: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        fields = []
+        if args.fields:
+            fields.extend(args.fields)
+        else:
+            for item in items:
+                if isinstance(item, dict):
+                    if 'name' in item:
+                        fields.append('name')
+                    if 'metadata' in item and (m := item.get('metadata', {})) and isinstance(m, dict):
+                        if 'namespace' in m:
+                            fields.append('metadata.namespace')
+                        if 'name' in m:
+                            fields.append('metadata.name')
+                break
+
+        if not fields:
+            print("ERROR: No fields specified", file=sys.stderr)
+            sys.exit(1)
+
+        for item_index, item in enumerate(items):
+            field_values = []
+            for field in fields:
+                field_parts = field.split('.')
+                value = item
+                for part in field_parts:
+                    value = value.get(part, {})
+                if value:
+                    field_values.append(str(value))
+                else:
+                    field_values.append('')
+
+            stop = False
+            match_count = 0
+            item_yaml = yaml.dump(item)
+            lines = item_yaml.splitlines()
+            lines_to_print = set()
+            line_matches = dict()
+            for line_index, line in enumerate(lines):
+                match = pattern.search(line)
+                if match:
+                    line_matches[line_index] = match.span()
+                    match_count += 1
+                    if before_context > 0:
+                        range_start = max(0, line_index - before_context)
+                        range_stop = max(0, line_index)
+                        for range_index in range(range_start, range_stop):
+                            if range_index in lines_to_print:
+                                continue
+                            lines_to_print.add(range_index)
+                    lines_to_print.add(line_index)
+                    if after_context > 0:
+                        range_start = min(len(lines) - 1, line_index + 1)
+                        range_stop = min(len(lines), line_index + 1 + after_context)
+                        for range_index in range(range_start, range_stop):
+                            if range_index in lines_to_print:
+                                continue
+                            lines_to_print.add(range_index)
+                    if args.max_count > 0 and match_count == args.max_count:
+                        break
+
+            if args.fields_without_matches:
+                if len(lines_to_print) == 0: print(f'{"\t".join(field_values)}')
+                continue
+            if args.fields_with_matches:
+                if len(lines_to_print) > 0: print(f'{"\t".join(field_values)}')
+                continue
+
+            if (before_context > 0 or after_context > 0) and len(lines_to_print) > 0 and item_index > 0:
+                print('--')
+
+            last_index = -1
+            for line_index in sorted(lines_to_print):
+                if (before_context > 0 or after_context > 0) and last_index > -1 and last_index < line_index - 1:
+                    print('--')
+                last_index = line_index
+                line = lines[line_index]
+                if (span := line_matches.get(line_index, None)) and len(span) == 2:
+                    # make match bold
+                    print(f'{"\t".join(field_values)}: {line[:span[0]]}\x1b[1m{line[span[0]:span[1]]}\x1b[0m{line[span[1]:]}')
+                else:
+                    print(f'{"\t".join(field_values)}- {line}')
+
+    except KeyboardInterrupt:
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

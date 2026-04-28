@@ -1,0 +1,53 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename ${0}) [-p|--prompt <prompt>] [-n|--newlines] <list of choices>" 1>&2
+    exit 1
+}
+
+NL=$'\n'
+prompt="Choose from list"
+items=""
+newlines=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--prompt)
+            shift
+            [ -z "${1}" ] && usage
+            prompt="${1}"
+            ;;
+        -n|--newlines)
+            newlines=1
+            ;;
+        *)
+            if [ -z "${items}" ]; then
+                items="${1}"
+            else
+                items="${items}${NL}${1}"
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${items}" ] && usage
+item_count=$(echo "${items}" | wc -l)
+
+[ "${newlines}" -eq 1 ] && echo 1>&2
+echo "${prompt}" 1>&2
+for i in $(seq 1 ${item_count}); do
+    echo "${i}) $(echo "${items}" | sed -n ${i}p)" 1>&2
+done
+read -p "Choose number: " -r REPLY
+[ -z "${REPLY}" ] && echo "Abort." 1>&2 && exit 1
+if [[ ! "${REPLY}" =~ ^[0-9]+$ ]] || [ "${REPLY}" -gt "${item_count}" ] || [ "${REPLY}" -lt 1 ]; then
+    echo "ERROR: Invalid choice: ${REPLY}" 1>&2 && exit 1
+fi
+choice="$(echo "${items}" | sed -n ${REPLY}p)"
+echo "Chose '${choice}'" 1>&2
+[ "${newlines}" -eq 1 ] && echo 1>&2
+echo "${choice}"

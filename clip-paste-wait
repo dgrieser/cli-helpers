@@ -1,0 +1,35 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    echo "usage: ${APP_NAME} [-h|--help] [-p|--primary|-c|--clipboard]" 1>&2
+    exit 1
+}
+
+clipboard="clipboard"
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--primary)
+            clipboard="primary"
+            shift
+            ;;
+        -c|--clipboard)
+            clipboard="clipboard"
+            shift
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+while true; do
+    content=$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")
+    [ -n "${content}" ] && break
+    sleep 1
+done
+echo -n "${content}"

@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+def device_added(path):
+    print("Device seen: " + path)
+    #device = bus.get_object('org.bluez', path)
+    #properties = device.GetAll('org.bluez.Device1', dbus_interface='org.freedesktop.DBus.Properties')
+    #print("Device seen: " + properties['Address'])
+    #if properties['Address'] == 'XX:XX:XX:XX:XX:XX':  # Replace with your device's MAC address
+    #    print("Specific device detected!")
+    #    # Add your script execution here
+
+def device_removed(path):
+    print("Device removed: " + path)
+    #device = bus.get_object('org.bluez', path)
+    #properties = device.GetAll('org.bluez.Device1', dbus_interface='org.freedesktop.DBus.Properties')
+    #print("Device removed: " + properties['Address'])
+    #if properties['Address'] == 'XX:XX:XX:XX:XX:XX':  # Replace with your device's MAC address
+    #    print("Specific device removed!")
+    #    # Add your script execution here
+
+def interfaces_added(path, interfaces):
+    if 'org.bluez.Device1' in interfaces:
+        device_added(path)
+
+def interfaces_removed(path, interfaces):
+    if 'org.bluez.Device1' in interfaces:
+        device_removed(path)
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SystemBus()
+bus.add_signal_receiver(interfaces_added, dbus_interface='org.freedesktop.DBus.ObjectManager', signal_name='InterfacesAdded')
+bus.add_signal_receiver(interfaces_removed, dbus_interface='org.freedesktop.DBus.ObjectManager', signal_name='InterfacesRemoved')
+
+mainloop = GLib.MainLoop()
+mainloop.run()

@@ -1,0 +1,156 @@
+#!/usr/bin/python3 -u
+from pydbus import SystemBus
+from gi.repository import GLib
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER=600 #1800
+SECONDS_DELAY_BETWEEN_SUSPENDS=60
+
+def get_cifs_mountpoints():
+    mounts = []
+    with open("/proc/self/mounts", encoding="utf-8") as f:  # like /proc/mounts
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == "cifs":  # fs type
+                mounts.append(Path(parts[1]))
+    # sort reverse so deeper mountpoints are unmounted first
+    mounts.sort(key=lambda p: len(p.as_posix()), reverse=True)
+    return mounts  # list[Path]
+
+def umount_cifs(force=False, lazy=False):
+    opts = []
+    if force:
+        opts.append("-f")
+    if lazy:
+        opts.append("-l")
+
+    for mp in get_cifs_mountpoints():
+        cmd = ["umount", *opts, str(mp)]
+        subprocess.run(cmd, check=False)
+
+def on_lid_opened_event(on_battery):
+    global is_lid_open
+    is_lid_open=True
+    print(f'Detected lid open')
+
+def on_lid_closed_event(on_battery):
+    global is_lid_open
+    is_lid_open=False
+    print(f'Detected lid close')
+    lock_screen()
+
+def on_lid_closed_for_a_while_event(on_battery):
+    print(f'Detected lid closed for {SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER} seconds while on {"battery" if on_battery else "AC"}')
+    if on_battery:
+        suspend_laptop()
+
+def on_battery_event(on_battery):
+    print(f'Detected change to {"battery" if on_battery else "AC"} power')
+    if on_battery and not is_lid_open:
+        print('Now on battery and lid closed, starting lid closed timer')
+        start_lid_closed_timer()
+
+def on_prepare_for_sleep(suspending):
+    if suspending:
+        on_suspend()
+    else:
+        on_resume()
+
+def on_suspend():
+    print(f'Detected system suspend')
+
+def on_resume():
+    print(f'Detected system resume with lid {"open" if is_lid_open else "closed"}')
+    if not is_lid_open and is_on_battery:
+        print('Lid still closed and on battery, suspending again')
+        suspend_laptop()
+
+def lock_screen():
+    print('Locking screen')
+    subprocess.run(['loginctl', 'lock-session'])
+
+def suspend_laptop():
+    global last_suspend_timestamp
+    now = time.time()
+    if now - last_suspend_timestamp < SECONDS_DELAY_BETWEEN_SUSPENDS:
+        print(f'Last suspend call was less than {SECONDS_DELAY_BETWEEN_SUSPENDS} seconds ago, starting lid closed timer instead')
+        start_lid_closed_timer()
+        return
+    last_suspend_timestamp = now
+    print('Unmounting cifs')
+    umount_cifs(force=True)
+    print('Suspending laptop')
+    subprocess.run(['systemctl', 'suspend'])
+
+def on_lid_closed_timer_trigger():
+    cancel_lid_closed_timer()
+    on_lid_closed_for_a_while_event(is_on_battery)
+
+def start_lid_closed_timer():
+    cancel_lid_closed_timer()
+    global lid_closed_timer
+    if SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER > 0:
+        lid_closed_timer = threading.Timer(SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER, on_lid_closed_timer_trigger)
+        lid_closed_timer.start()
+
+def cancel_lid_closed_timer():
+    global lid_closed_timer
+    if lid_closed_timer is not None:
+        lid_closed_timer.cancel()
+        lid_closed_timer = None
+
+def on_battery(on_battery):
+    global is_on_battery
+    is_on_battery = on_battery
+    on_battery_event(is_on_battery)
+
+def on_upower_properties_changed(*args):
+    properties = args[1]
+    
+    if 'LidIsClosed' in properties:
+        if properties['LidIsClosed']:
+            on_lid_closed_event(is_on_battery)
+            start_lid_closed_timer()
+        else:
+            on_lid_opened_event(is_on_battery)
+            cancel_lid_closed_timer()
+    
+    if 'OnBattery' in properties:
+        on_battery(properties['OnBattery'])
+
+def get_on_battery():
+    power_supply_dir = "/sys/class/power_supply"
+    for supply in os.listdir(power_supply_dir):
+        path = os.path.join(power_supply_dir, supply)
+        if os.path.exists(os.path.join(path, "type")):
+            with open(os.path.join(path, "type")) as f:
+                if f.read().strip() == "Mains":
+                    with open(os.path.join(path, "online")) as f:
+                        if f.read().strip() == "1":
+                            return False
+    return True
+
+is_lid_open = True
+is_on_battery = get_on_battery()
+last_suspend_timestamp = 0
+lid_closed_timer = None
+bus = SystemBus()
+
+upower = bus.get('org.freedesktop.UPower', '/org/freedesktop/UPower')
+upower.PropertiesChanged.connect(on_upower_properties_changed)
+bus.subscribe(
+    iface='org.freedesktop.login1.Manager',
+    signal='PrepareForSleep',
+    object='/org/freedesktop/login1',
+    signal_fired=lambda sender, object, iface, signal, params: on_prepare_for_sleep(params[0])
+)
+
+
+print('Starting power trigger...')
+print(f'Currently running on {"battery" if is_on_battery else "AC"} power')
+loop = GLib.MainLoop()
+loop.run()

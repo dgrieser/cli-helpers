@@ -1,0 +1,70 @@
+#!/bin/bash
+
+
+usage() {
+    echo "usage: $(basename "${0}") [--jpg]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+jpg=0
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --jpg)
+            jpg=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+tmpfile=""
+ext=""
+image_mime_type="$(xclip -selection clipboard -t TARGETS -o | egrep -m 1 '^image/')"
+if [ -z "${image_mime_type}" ]; then
+    # no image in clipboard, try downloading if it is a URL
+    text="$(DISPLAY=$(xdisplay) xclip -o -sel c)"
+    if [[ "${text}" =~ ^https?:// ]]; then
+        tmpfile=$(mktemp "/tmp/clip-paste-image.XXXXXX")
+        if ! curl -sS -L -o "${tmpfile}" "${text}"; then
+            rm -f "${tmpfile}" 2> /dev/null
+            fail "Failed to download ${text}"
+        fi
+        image_mime_type="$(mimetype --output-format %m "${tmpfile}" 2> /dev/null)"
+    fi
+else
+    tmpfile=$(mktemp "/tmp/clip-paste-image.XXXXXX")
+    xclip -selection clipboard -t "${image_mime_type}" -o > "${tmpfile}"
+fi
+
+if [ -z "${image_mime_type}" ]; then
+    # nothing usable found
+    [ -n "${tmpfile}" ] && rm -f "${tmpfile}" 2> /dev/null
+    fail "No image found in clipboard"
+    exit 1
+fi
+
+ext=$(mime-to-ext "${image_mime_type}" 2> /dev/null)
+[ -n "${ext}" ] && mv "${tmpfile}" "${tmpfile}.${ext}" && tmpfile="${tmpfile}.${ext}"
+
+if [ ${jpg} -eq 1 ]; then
+    ext="jpg"
+    convert "${tmpfile}" "${tmpfile}.${ext}"
+    rm -f "${tmpfile}" 2> /dev/null
+    tmpfile="${tmpfile}.${ext}"
+fi
+
+echo "${tmpfile}"

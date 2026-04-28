@@ -1,0 +1,51 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") <url> <ttl-seconds>" 1>&2
+    exit 1
+}
+
+url=""
+ttl=""
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${url}" ]; then
+                url="${1}"
+            elif [ -z "${ttl}" ] && [[ "${1}" =~ ^[0-9]+$ ]]; then
+                ttl="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${url}" ] || [ -z "${ttl}" ]; then
+    usage
+fi
+
+sanitize_filename() {
+  local filename="${1}"
+  filename="${filename// /_}"
+  filename=$(echo "$filename" | tr -cd '[:alnum:]_-')
+  filename=$(echo "$filename" | sed 's/^[-_]*//' | sed 's/[-_]*$//')
+  filename="${filename:0:255}"
+  echo "$filename"
+}
+
+cache_file="/tmp/$(sanitize_filename "${url}").cache"
+
+[ -f "${cache_file}" ] && [ $(($(date +%s) - $(stat -c %Y "${cache_file}"))) -lt ${ttl} ] && cat "${cache_file}" && exit 0
+
+content="$(curl -sS "${url}")"
+if [ -n "${content}" ]; then
+    echo "${content}" > "${cache_file}"
+fi
+
+echo "${content}"

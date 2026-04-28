@@ -1,0 +1,14 @@
+#!/bin/bash
+
+function usage() {
+    echo "Usage: $(basename "${0}") <header (comma separated)>" 1>&2
+    exit 1
+}
+
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+header="${1}"
+
+column -t -s $'\t' -N "${header}" --output-separator $'\t'

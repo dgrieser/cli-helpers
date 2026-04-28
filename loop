@@ -1,0 +1,35 @@
+#!/bin/bash
+
+usage() {
+    echo "$(basename "${0}") [-d \"<delimiter>\"] '<commands>'"
+    exit 1
+}
+
+delimiter=""
+if [ "${1}" == "-d" ]; then
+    [ -z "${2}" ] && usage
+    [ ${#2} -gt 1 ] && usage
+    delimiter="${2}"
+fi
+
+line_index=0
+
+while IFS= read -u 9 -r line
+do
+    cmd="$@"
+    if [ -n "${delimiter}" ]; then
+        cmd="${@:3}"
+        count=$(echo "${line}" | tr -s "${delimiter}" | awk -F"${delimiter}" '{print NF}')
+        cmd="${cmd//\{n\}/${count}}"
+        for i in {0..9}
+        do
+            index=$((i+1))
+            part=$(echo "${line}" | tr -s "${delimiter}" | cut -d "${delimiter}" -f ${index})
+            cmd="${cmd//\{${i}\}/${part}}"
+        done
+    fi
+    cmd="${cmd//\{\}/${line}}"
+    cmd="${cmd//\{i\}/${line_index}}"
+    bash -c "${cmd}"
+    ((line_index+=1))
+done 9< /dev/stdin

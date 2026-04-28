@@ -1,0 +1,158 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} OPTIONS COMMAND [ARGUMENTS]
+
+Simple pagination tool, to automate reading multiple pages from a command.
+
+COMMAND              The command to run
+
+Options:
+    -h, --help       Show this help message
+    -S, --page-size  Number of items per page, defaults to 50
+    -p, --page-index-argument <name>
+                     Page index argument, defaults to auto-detected via --help
+    -s, --page-size-argument <name>
+                     Page size argument, defaults to auto-detected via --help
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" >&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+warning() {
+    echo "WARNING: ${1}" >&2
+}
+
+verbose() {
+    [ "${verbose}" -eq 0 ] && return
+    echo "+ ${1}" >&2
+}
+
+abort() {
+    echo "Abort." >&2
+    exit 130
+}
+
+cmd=""
+args=()
+page_size=50
+page_index_arg=""
+page_size_arg=""
+verbose=0
+marker_found=0
+while [ "${#}" -gt 0 ]; do
+    if [ "${marker_found}" -eq 0 ]; then
+        case "${1}" in
+            -h|--help)
+                usage
+                ;;
+            -S|--page-size)
+                shift
+                [[ ! "${1}" =~ ^[0-9]+$ ]] && error "Page size must be a number" && usage
+                page_size="${1}"
+                ;;
+            -p|--page-index-argument)
+                shift
+                [ -z "${1}" ] && error "Page index argument must not be empty" && usage
+                page_index_arg="${1}"
+                ;;
+            -s|--page-size-argument)
+                shift
+                [ -z "${1}" ] && error "Page size argument must not be empty" && usage
+                page_size_arg="${1}"
+                ;;
+            --verbose)
+                verbose=1
+                ;;
+            --)
+                marker_found=1
+                ;;
+            *)
+                if [ -z "${cmd}" ]; then
+                    [[ "${1}" ==  --* ]] && error "Invalid command name: ${1}" && usage
+                    cmd="${1}"
+                    marker_found=1
+                else
+                    usage
+                fi
+                ;;
+        esac
+    else
+        if [ -z "${cmd}" ]; then
+            [[ "${1}" ==  --* ]] && error "Invalid command name: ${1}" && usage
+            cmd="${1}"
+        else
+            args+=("${1}")
+        fi
+    fi
+    shift
+done
+
+[ -z "${cmd}" ] && usage
+
+if [ -z "${page_index_arg}" ] || [ -z "${page_size_arg}" ]; then
+    detected=0
+    case "${cmd}" in
+        glab)
+            detected=1
+            page_index_arg="--page"
+            page_size_arg="--per-page"
+            ;;
+        nexus-cli)
+            detected=1
+            page_index_arg="--page"
+            page_size_arg="--limit"
+            ;;
+    esac
+
+    if [ "${detected}" -eq 0 ]; then
+        verbose "timeout 3 ${cmd} ${args[*]} --help"
+        help_output="$(timeout 3 "${cmd}" "${args[@]}" --help 2>&1)"; exit_code="${?}"
+        # on timeout fail
+        [ "${exit_code}" -eq 124 ] && fail "Failed to detect page index and page size arguments, timed out"
+        [ -z "${help_output}" ] && fail "Failed to detect page index and page size arguments, no help output"
+        page_arguments="$(echo "${help_output}" | grep -iE "(page|limit)")" || fail "Failed to detect page index and page size arguments, argument not found"
+        page_arguments="$(echo "${page_arguments}" | grep -iE "\--[a-z_-]+" -o)" || fail "Failed to detect page index and page size arguments, argument parse error"
+        page_arguments="$(echo "${page_arguments}" | grep -E "(page|limit)")" || fail "Failed to detect page index and page size arguments, argument parse error"
+        page_arguments="$(echo "${page_arguments}" | awk '!seen[$0]++')"
+        page_size_arg="$(echo "${page_arguments}" | grep -iE "(limit|per|size)" | head -n 1)"
+        page_index_arg="$(echo "${page_arguments}" | grep -vF -- "${page_size_arg}" | head -n 1)"
+        [ -z "${page_index_arg}" ] && fail "Failed to detect page index and page size arguments, page index argument not found"
+        [ -z "${page_size_arg}" ] && fail "Failed to detect page index and page size arguments, page size argument not found"
+        detected=1
+    fi
+
+    if [ "${detected}" -eq 1 ]; then
+        verbose "Detected page index argument: ${page_index_arg}"
+        verbose "Detected page size argument: ${page_size_arg}"
+    fi
+fi
+
+
+current_page=1
+while true; do
+    verbose "${cmd} ${args[*]} ${page_index_arg} ${current_page} ${page_size_arg} ${page_size}"
+    result="$("${cmd}" "${args[@]}" "${page_index_arg}" "${current_page}" "${page_size_arg}" "${page_size}")"; exit_code="${?}"
+    [ "${exit_code}" -ne 0 ] && fail "Command failed with exit code ${exit_code}"
+    result_cleaned="$(echo "${result}" | grep -v "^$")"
+    [ -z "${result_cleaned}" ] && break
+    case "${result_cleaned}" in
+        '[]' | '{}' | '""' | null)
+            verbose "Result was ${result_cleaned}, assuming last page"
+            break
+            ;;
+    esac
+    echo "${result}"
+    current_page=$((current_page + 1))
+done

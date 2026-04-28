@@ -1,0 +1,30 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") <desktop> <title> [<arguments...>]"
+    exit 1
+}
+
+desktop_file=""
+title=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        *)
+            if [ -z "${desktop_file}" ]; then
+                desktop_file="${1}"
+            elif [ -z "${title}" ]; then
+                title="${1}"
+            else
+                # all other arguments
+                break
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${desktop_file}" ] && usage
+[ -z "${title}" ] && usage
+
+window-focus-by-title "${title}" || gtk-launch "${desktop_file}" ${@}

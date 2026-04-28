@@ -1,0 +1,399 @@
+#!/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import termios
+import tty
+import select
+import re
+
+# Function to get connected outputs using xrandr
+def get_connected_outputs():
+    result = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True)
+    outputs = []
+    order_index = 0
+    for line in result.stdout.splitlines():
+        if line.startswith(" "):
+            parsed = parse_monitor_line(line)
+            if parsed:
+                output_name, x_position = parsed
+                outputs.append((x_position, order_index, output_name))
+                order_index += 1
+    outputs.sort(key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0, item[1]))
+    return [output_name for _, _, output_name in outputs]
+
+def parse_monitor_line(line):
+    parts = line.split()
+    if len(parts) < 2:
+        return None
+    output_name = parts[-1]
+    geometry = None
+    for part in parts:
+        if "x" in part and "+" in part and "/" in part:
+            geometry = part
+            break
+    if not geometry:
+        return output_name, None
+    match = re.search(r"\+(-?\d+)\+(-?\d+)$", geometry)
+    if not match:
+        return output_name, None
+    x_position = int(match.group(1))
+    return output_name, x_position
+
+# Configuration utility functions
+CONFIG_DIR = os.path.expanduser("~/.config/screen-color")
+
+def ensure_config_dir():
+    """Create config directory if it doesn't exist"""
+    if not os.path.exists(CONFIG_DIR):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+
+def get_config_path(alias):
+    """Get the full path for a config alias"""
+    ensure_config_dir()
+    return os.path.join(CONFIG_DIR, f"{alias}.config")
+
+def save_config(alias, config_data):
+    """Save configuration to JSON file"""
+    config_path = get_config_path(alias)
+    
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+    return config_path
+
+def load_config(alias):
+    """Load configuration from JSON file"""
+    config_path = get_config_path(alias)
+    
+    if not os.path.exists(config_path):
+        return None
+    
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"ERROR: Failed to load preset '{alias}': {e}", file=sys.stderr)
+        return None
+
+def list_configs():
+    ensure_config_dir()
+    return [f.split(".config")[0] for f in os.listdir(CONFIG_DIR) if f.endswith(".config")]
+
+def resolve_preset_outputs(config_outputs, ordered_outputs):
+    resolved = {}
+    errors = []
+    for output_name, gamma_str in config_outputs.items():
+        target_name = output_name
+        if output_name.startswith("$") and output_name[1:].isdigit():
+            idx = int(output_name[1:])
+            if idx < 1 or idx > len(ordered_outputs):
+                errors.append(f"{output_name} out of range (only {len(ordered_outputs)} outputs)")
+                continue
+            target_name = ordered_outputs[idx - 1]
+        if target_name in resolved:
+            errors.append(f"duplicate target '{target_name}' from '{output_name}'")
+            continue
+        resolved[target_name] = gamma_str
+    if errors:
+        return None, "Invalid preset outputs: " + "; ".join(errors)
+    return resolved, None
+
+def validate_config_outputs(config_data, current_outputs):
+    """Validate that config outputs match current system outputs"""
+    if not isinstance(config_data, dict) or 'outputs' not in config_data:
+        return False, "Invalid preset format"
+
+    resolved_outputs, error = resolve_preset_outputs(config_data['outputs'], current_outputs)
+    if error:
+        return False, error
+
+    config_outputs = set(resolved_outputs.keys())
+    current_outputs_set = set(current_outputs)
+    
+    matching_outputs = config_outputs.intersection(current_outputs_set)
+    non_matching_outputs = config_outputs.difference(current_outputs_set)
+    
+    if not matching_outputs:
+        error_msg = f"No matching outputs found. Preset has: {list(config_outputs)}, Current system has: {list(current_outputs_set)}"
+        return False, error_msg
+    
+    return True, {"matching": list(matching_outputs), "non_matching": list(non_matching_outputs), "resolved": resolved_outputs}
+
+# Function to get current gamma settings
+def get_current_gamma(output):
+    result = subprocess.run(["xrandr", "--verbose"], capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+
+    in_correct_segment = False
+    for line in lines:
+        if not line.startswith(" ") and not line.startswith("\t"):  # New segment starts
+            in_correct_segment = line.split()[0] == output
+        if in_correct_segment and "Gamma" in line:
+            gamma_values = line.split()[1]
+            gamma = list(map(float, gamma_values.split(':')))
+            return gamma
+
+    return [1.0, 1.0, 1.0]  # Default gamma if not found
+
+# Function to set gamma
+def set_gamma(output, r, g, b):
+    # inverse and round to 2 decimal places
+    r = round(1.0 / r, 2)
+    g = round(1.0 / g, 2)
+    b = round(1.0 / b, 2)
+    subprocess.run(["xrandr", "--output", output, "--gamma", f"{r}:{g}:{b}"])
+
+# Function to display the current state in the terminal
+def display_state(last_action, output, r, g, b):
+    # move up four lines
+    sys.stdout.write("\033[4A")
+    sys.stdout.write("\r" + " " * 100)
+    sys.stdout.write(f"\rOutput:  {output}\nGamma:   {r:.1f}:{g:.1f}:{b:.1f}\n\n")
+    sys.stdout.write("\r" + " " * 100)
+    if last_action:
+        sys.stdout.write(f"\rAction:  {last_action}\n")
+    else:
+        sys.stdout.write("\r" + " " * 100 + "\n")
+    sys.stdout.flush()
+
+# Function to handle key inputs
+def get_key():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        key = sys.stdin.read(1)
+        if key == "\x1b":
+            while select.select([sys.stdin], [], [], 0.2)[0]:
+                next_key = sys.stdin.read(1)
+                print(f"\n\n{next_key}")
+                key = key + next_key
+        return key
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def interactive_mode(output=None, load_alias=None):
+    outputs = get_connected_outputs()
+    if not outputs:
+        print("No outputs found.")
+        return
+
+    # If load_alias is provided, load and apply config
+    if load_alias:
+        config_data = load_config(load_alias)
+        if not config_data:
+            print(f"ERROR: Preset '{load_alias}' not found or invalid.", file=sys.stderr)
+            return
+        
+        valid, validation_result = validate_config_outputs(config_data, outputs)
+        if not valid:
+            print(f"ERROR: Preset validation failed: {validation_result}", file=sys.stderr)
+            return
+        
+        # Apply configuration
+        for output_name, gamma_str in validation_result['resolved'].items():
+            if output_name in outputs:
+                gamma = list(map(float, gamma_str.split(':'))) 
+                set_gamma(output_name, *gamma)
+        print(f"Preset '{load_alias}' loaded and applied successfully.")
+        return
+
+    # Determine which output to use
+    if output:
+        if output not in outputs:
+            print(f"ERROR: Output '{output}' not found. Available outputs:", file=sys.stderr)
+            for o in outputs:
+                print(f"  {o}", file=sys.stderr)
+            return
+        current_output = output
+    else:
+        current_output = outputs[0]
+
+    current_gamma = get_current_gamma(current_output)
+
+    last_action = ""
+
+    print("Output controls:")
+    print("  q/a - Red +/-  |  w/s - Green +/-  |  e/d - Blue +/-   |  r - Reset to 1.0")
+    print("  TAB - Outputs  |  p - Load preset  |  P - Save preset  |  ESC - Exit")
+    print("\n\n\n\n")
+
+    try:
+        while True:
+            display_state(last_action, current_output, *current_gamma)
+
+            key = get_key()
+            if key == "\t":  # Tab key to cycle outputs
+                if len(outputs) > 1:
+                    last_action = "Cycled output"
+                    current_idx = outputs.index(current_output)
+                    current_output = outputs[(current_idx + 1) % len(outputs)]
+                    current_gamma = get_current_gamma(current_output)
+            elif key == "q":
+                # make sure it is rounded to one decimal
+                old_gamma = current_gamma[0]
+                current_gamma[0] = round(min(10.0, current_gamma[0] + 0.1), 1)  # Increase red
+                last_action = f"Increased red from {old_gamma} to {current_gamma[0]}"
+            elif key == "a":
+                old_gamma = current_gamma[0]
+                current_gamma[0] = round(max(0.1, current_gamma[0] - 0.1), 1)  # Decrease red
+                last_action = f"Decreased red from {old_gamma} to {current_gamma[0]}"
+            elif key == "w":
+                old_gamma = current_gamma[1]
+                current_gamma[1] = round(min(10.0, current_gamma[1] + 0.1), 1)  # Increase green
+                last_action = f"Increased green from {old_gamma} to {current_gamma[1]}"
+            elif key == "s":
+                old_gamma = current_gamma[1]
+                current_gamma[1] = round(max(0.1, current_gamma[1] - 0.1), 1)  # Decrease green
+                last_action = f"Decreased green from {old_gamma} to {current_gamma[1]}"
+            elif key == "e":
+                old_gamma = current_gamma[2]
+                current_gamma[2] = round(min(10.0, current_gamma[2] + 0.1), 1)  # Increase blue
+                last_action = f"Increased blue from {old_gamma} to {current_gamma[2]}"
+            elif key == "d":
+                old_gamma = current_gamma[2]
+                current_gamma[2] = round(max(0.1, current_gamma[2] - 0.1), 1)  # Decrease blue
+                last_action = f"Decreased blue from {old_gamma} to {current_gamma[2]}"
+            elif key == "r":
+                current_gamma = [1.0, 1.0, 1.0]  # Reset gamma
+                last_action = "Reset gamma to 1.0"
+            elif key == "p":
+                # Load preset
+                lines = 0
+                presets = list_configs()
+                if presets:
+                    lines += 1
+                    sys.stdout.write(f"Presets: {', '.join(presets)}\n")
+                lines += 1
+                sys.stdout.write("Load:    ")
+                sys.stdout.flush()
+                preset_name = input().strip()
+                if preset_name:
+                    config_data = load_config(preset_name)
+                    if config_data:
+                        valid, validation_result = validate_config_outputs(config_data, outputs)
+                        if valid:
+                            matching_outputs = validation_result['matching']
+                            for output_name in matching_outputs:
+                                if output_name in outputs:
+                                    gamma_str = validation_result['resolved'][output_name]
+                                    gamma = list(map(float, gamma_str.split(':')))
+                                    set_gamma(output_name, *gamma)
+                                    if output_name == current_output:
+                                        current_gamma = gamma
+                            last_action = f"Loaded preset '{preset_name}'"
+                        else:
+                            last_action = f"ERROR: Failed to load preset '{preset_name}', validation failed: {validation_result}"
+                    else:
+                        last_action = f"ERROR: Preset '{preset_name}' not found or invalid."
+                # Redraw display
+                for _ in range(lines):
+                    sys.stdout.write(f"\033[1A")
+                    sys.stdout.write("\r" + " " * 100)
+            elif key == "P":
+                # Save preset
+                lines = 0
+                presets = list_configs()
+                if presets:
+                    lines += 1
+                    sys.stdout.write(f"Presets: {', '.join(presets)}\n")
+                lines += 1
+                sys.stdout.write("Save:    ")
+                sys.stdout.flush()
+                preset_name = input().strip()
+                if preset_name:
+                    # Save all output configurations
+                    all_outputs_data = {}
+                    for output_name in outputs:
+                        gamma = get_current_gamma(output_name)
+                        gamma_str = ":".join(map(lambda x: f"{x:.1f}", gamma))
+                        all_outputs_data[output_name] = gamma_str
+                    
+                    config_data = {'outputs': all_outputs_data}
+                    save_config(preset_name, config_data)
+                    last_action = f"Saved preset '{preset_name}'"
+                # Redraw display
+                for _ in range(lines):
+                    sys.stdout.write(f"\033[1A")
+                    sys.stdout.write("\r" + " " * 100)
+            elif key in ["\x1b", "\x03"]:
+                break
+
+            # Apply the gamma settings
+            set_gamma(current_output, *current_gamma)
+    except KeyboardInterrupt:
+        pass
+
+def list_outputs():
+    outputs = get_connected_outputs()
+    if not outputs:
+        print("No outputs found.", file=sys.stderr)
+        return
+    
+    for output in outputs:
+        print(f"{output}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Interactive screen color adjustment tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Controls:
+  q/a - Red +/-      w/s - Green +/-    e/d - Blue +/-
+  TAB - Cycle between outputs           r   - Reset to 1.0
+  p   - Load preset  P - Save preset    ESC - Exit
+        '''
+    )
+    parser.add_argument('--list', action='store_true',
+                      help='List available outputs and exit')
+    parser.add_argument('--load', metavar='ALIAS',
+                      help='Load preset by alias')
+    parser.add_argument('output', nargs='?', default=None,
+                      help='Output to use (default: first available)')
+    
+    args = parser.parse_args()
+    
+    if args.list:
+        list_outputs()
+        return
+    
+    if args.load:
+        # Load config in non-interactive mode
+        config_data = load_config(args.load)
+        if not config_data:
+            print(f"ERROR: Preset '{args.load}' not found or invalid.", file=sys.stderr)
+            return 1
+        
+        outputs = get_connected_outputs()
+        if not outputs:
+            print("ERROR: No outputs found.", file=sys.stderr)
+            return 1
+        
+        valid, validation_result = validate_config_outputs(config_data, outputs)
+        if not valid:
+            print(f"ERROR: Preset validation failed: {validation_result}", file=sys.stderr)
+            return 1
+        
+        # Apply configuration
+        matching_outputs = validation_result['matching']
+        non_matching_outputs = validation_result['non_matching']
+        resolved_outputs = validation_result['resolved']
+        
+        if non_matching_outputs:
+            print(f"WARNING: Preset contains outputs not present: {non_matching_outputs}")
+            print(f"Only applying to matching outputs: {matching_outputs}")
+        
+        for output_name in matching_outputs:
+            gamma_str = resolved_outputs[output_name]
+            gamma = list(map(float, gamma_str.split(':'))) 
+            set_gamma(output_name, *gamma)
+        
+        print(f"Preset '{args.load}' loaded and applied successfully.")
+        return 0
+    
+    interactive_mode(args.output)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if [ $# -eq 0 ]; then
+    echo "usage: $(basename "${0}") <classes ...>" 1>&2
+    exit 1
+fi
+
+for wmclass in "$@"; do
+    wmctrl -xl | awk -v wmclass="$wmclass" '$3 == wmclass {print $1}'
+done

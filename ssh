@@ -1,0 +1,8 @@
+#!/bin/bash
+full_command="ssh ${@}"
+if [[ "${@}" != *"git@"* ]] \
+&& [[ "${@}" != *"js01"* ]] \
+&& [[ "${full_command}" != *" -G "* ]]; then
+    echo "${full_command}" | history_append
+fi
+exec /usr/bin/ssh ${@}

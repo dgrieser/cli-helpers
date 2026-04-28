@@ -1,0 +1,30 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") <kml-file>" 1>&2
+    exit 1
+}
+
+kmlpath=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${kmlpath}" ]; then
+                kmlpath="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${kmlpath}" ] && usage
+
+cat "${kmlpath}" \
+| xmlstarlet format - \
+| sed -E 's|^(.+)(<coordinates>)(.+)(</coordinates>)$|\1\2\n  \1\3\n\1\4|g' \
+| sed -E 's/([0-9,.]) ([0-9,.])/\1\n            \2/g'

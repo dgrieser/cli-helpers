@@ -1,0 +1,47 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-n|--new-line] [-c|--clipboard|-p|--primary] [-f|--file <file>]" 1>&2
+    exit 1
+}
+
+clipboard="primary"
+new_line=0
+file=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -n|--new-line)
+            new_line=1
+            ;;
+        -p|--primary)
+            clipboard="primary"
+            ;;
+        -c|--clipboard)
+            clipboard="clipboard"
+            ;;
+        -f|--file)
+            shift
+            [ -z "${1}" ] && usage
+            file="${1}"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+
+content="$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")"
+if [ $new_line -eq 1 ] && [ "${content: -1}" != $'\n' ]; then
+    content="${content}"$'\n'
+fi
+
+if [ -n "${file}" ]; then
+    echo -n "${content}" > "${file}"
+else
+    echo -n "${content}"
+fi

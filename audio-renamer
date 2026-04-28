@@ -1,0 +1,20 @@
+#!/bin/bash
+
+for f in *.mp3; do
+    title=$(ffprobe -v error -show_entries format_tags=title -of default=noprint_wrappers=1:nokey=1 "${f}")
+    clean_title="$(echo "${title}" | sed 's/[^a-zA-Z0-9]/_/g' | tr -s '_')"
+    clean_title="${clean_title##_}"
+    clean_title="${clean_title%%_}"
+    [ -z "${clean_title}" ] && clean_title="ole"
+    echo "${f} -> ${clean_title}.mp3"
+    index=0
+    clean_title_base="${clean_title}"
+    while [ -f "${clean_title}.mp3" ]; do
+        index=$((index + 1))
+        # with two leading zeros
+        index_str="$(printf "%02d" "${index}")"
+        clean_title="${clean_title_base}_${index_str}"
+    done
+    newname="${clean_title}.mp3"
+    mv -v -- "${f}" "${newname}"
+done

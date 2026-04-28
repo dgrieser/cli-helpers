@@ -1,0 +1,7 @@
+#!/bin/bash
+id=$(xdotool getwindowfocus)
+if [ -n "${id}" ]; then
+    printf "0x%08x\n" ${id}
+else
+    exit 1
+fi

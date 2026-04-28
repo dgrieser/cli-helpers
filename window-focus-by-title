@@ -1,0 +1,46 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") [--wait <seconds>] <title>"
+    exit 1
+}
+
+wait_seconds=0
+title=""
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        --wait)
+            shift
+            [[ "${1}" =~ ^[0-9]+$ ]] || usage
+            wait_seconds="${1}"
+            ;;
+        *)
+            if [ -z "${title}" ]; then
+                title="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+# get all windows by title name
+windows=""
+while true; do
+    windows=$(window-by-title "${title}")
+    [ -n "${windows}" ] && break
+    [ "${wait_seconds}" -gt 0 ] && sleep 1 && ((wait_seconds--)) || exit 1
+done
+active=$(window-active)
+if [ -z "${active}" ]; then
+    # no active window, use the first one
+    window-focus $(echo "${windows}" | head -n 1)
+else
+    next=$(echo "${windows}" | grep -A 1 "${active}" | grep -v "${active}" | tail -n 1)
+    if [ -z "${next}" ]; then
+        next=$(echo "${windows}" | head -n 1)
+    fi
+    window-focus "${next}"
+fi

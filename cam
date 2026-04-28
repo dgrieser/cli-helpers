@@ -1,0 +1,150 @@
+#!/bin/bash
+
+presets="$(cam-settings preset list)"
+has_default="$(echo "${presets}" | grep -qFx "default" && echo 1 || echo 0)"
+other_presets="$(echo "${presets}" | grep -vFx "default" | tr $'\n' ' ')"
+other_preset_1=""; other_preset_2=""; other_preset_3=""; other_preset_4=""
+for preset in ${other_presets}; do
+    if [ -z "${other_preset_1}" ]; then
+        other_preset_1="${preset}"
+    elif [ -z "${other_preset_2}" ]; then
+        other_preset_2="${preset}"
+    elif [ -z "${other_preset_3}" ]; then
+        other_preset_3="${preset}"
+    elif [ -z "${other_preset_4}" ]; then
+        other_preset_4="${preset}"
+    fi
+done
+
+read_keys() {
+    local key
+    IFS= read -rsn1 key 2>/dev/null >&2
+    if [[ $key == $'\x1b' ]]; then
+        read -rsn2 key 2>/dev/null >&2
+        case $key in
+            '[A') cam-settings increase brightness;;
+            '[B') cam-settings decrease brightness;;
+            '[C') cam-settings increase contrast;;
+            '[D') cam-settings decrease contrast;;
+            '[5') cam-settings increase saturation;;
+            '[6') cam-settings decrease saturation;;
+        esac
+    elif [[ $key == '+' ]]; then
+        cam-settings increase hue
+    elif [[ $key == '-' ]]; then
+        cam-settings increase backlight-compensation
+    elif [[ $key == "_" ]]; then
+        cam-settings decrease backlight-compensation
+    elif [[ $key == "#" ]]; then
+        cam-settings decrease hue
+    elif [[ $key == 'ü' ]]; then
+        cam-settings set white_balance_automatic 0 &>/dev/null
+        cam-settings increase white_balance_temperature
+    elif [[ $key == 'ä' ]]; then
+        cam-settings set white_balance_automatic 0 &>/dev/null
+        cam-settings decrease white_balance_temperature
+    elif [[ $key == 'ö' ]]; then
+        cur="$(cam-settings get --raw white_balance_automatic)"
+        if [[ "$cur" == "1" ]]; then
+            cam-settings set white_balance_automatic 0
+        else
+            cam-settings set white_balance_automatic 1
+        fi
+    elif [[ $key == 'r' ]]; then
+        cam-settings reset brightness
+        cam-settings reset contrast
+        cam-settings reset saturation
+        cam-settings reset hue
+        cam-settings reset gamma
+        cam-settings set white_balance_automatic 0 &>/dev/null
+        cam-settings reset white_balance_temperature
+        cam-settings reset white_balance_automatic
+        echo "Applied camera defaults"
+    elif [[ $key == 'd' ]]; then
+        if [ "${has_default}" -eq 1 ]; then
+            cam-settings preset apply default
+        else
+            echo "No default preset found"
+        fi
+    elif [[ $key == 'b' ]]; then
+        if [ -n "${other_preset_1}" ]; then
+            cam-settings preset apply "${other_preset_1}"
+        else
+            echo "No other preset found"
+        fi
+    elif [[ $key == 'B' ]]; then
+        if [ -n "${other_preset_2}" ]; then
+            cam-settings preset apply "${other_preset_2}"
+        else
+            echo "No other preset found"
+        fi
+    elif [[ $key == 'n' ]]; then
+        if [ -n "${other_preset_3}" ]; then
+            cam-settings preset apply "${other_preset_3}"
+        else
+            echo "No other preset found"
+        fi
+    elif [[ $key == 'N' ]]; then
+        if [ -n "${other_preset_4}" ]; then
+            cam-settings preset apply "${other_preset_4}"
+        else
+            echo "No other preset found"
+        fi
+    elif [[ $key == 'p' ]]; then
+        echo; echo -n "Presets: "
+        preset_list="$(cam-settings preset list | tr $'\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+        echo "${preset_list}"; echo
+        preset_name="$(prompt-input "Apply preset:")"
+        [ -n "${preset_name}" ] && cam-settings preset apply "${preset_name}"
+    elif [[ $key == 'P' ]]; then
+        echo
+        preset_name="$(prompt-input "Store preset:")"
+        [ -n "${preset_name}" ] && cam-settings preset store "${preset_name}"
+    elif [[ $key == '.' ]]; then
+        cam-settings increase gamma
+    elif [[ $key == ',' ]]; then
+        cam-settings decrease gamma
+    elif [[ $key == 'h' ]]; then
+        print_key_bindings
+    fi
+}
+
+print_key_bindings() {
+    bindings="r"
+    binding_presets="reset"
+    if [ "${has_default}" -eq 1 ]; then
+        bindings="${bindings}/d"
+        binding_presets="${binding_presets}, default"
+    fi
+    if [ -n "${other_preset_1}" ]; then
+        bindings="${bindings}/b"
+        binding_presets="${binding_presets}, ${other_preset_1}"
+    fi
+    if [ -n "${other_preset_2}" ]; then
+        bindings="${bindings}/B"
+        binding_presets="${binding_presets}, ${other_preset_2}"
+    fi
+    if [ -n "${other_preset_3}" ]; then
+        bindings="${bindings}/n"
+        binding_presets="${binding_presets}, ${other_preset_3}"
+    fi
+    if [ -n "${other_preset_4}" ]; then
+        bindings="${bindings}/N"
+        binding_presets="${binding_presets}, ${other_preset_4}"
+    fi
+    while [ "${#bindings}" -lt 11 ]; do
+        bindings="${bindings} "
+    done
+    echo "Arrow left/right  contrast        ü/ä/ö        white balance temperature"
+    echo "Arrow up/down     brightness      +/#          hue"
+    echo "Page up/down      saturation      ${bindings}  reset settings (${binding_presets})"
+    echo ",/.               gamma           p            apply preset"
+    echo "h                 help            P            store preset"
+    echo
+}
+
+print_key_bindings
+
+while true; do
+    read_keys
+done

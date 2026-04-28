@@ -1,0 +1,104 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $(basename "${0}") [FLAG]
+
+List all monitors
+
+Flags:
+  -d, --display   Select display by name
+  -g, --geometry  Print monitor geometry
+  -p, --primary   Print primary monitor
+  -h, --help      Display this help message and exit.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    local message="${1}"
+    if [ -n "${message}" ]; then
+        error "${message}"
+    else
+        echo "Abort." 1>&2
+    fi
+    exit 1
+}
+
+get_primary_monitor() {
+    xrandr --query | grep " primary" | awk '{print $1}'
+}
+
+print_primary=0
+print_geometry=0
+selected_monitor=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --help)
+            usage
+            ;;
+        -p|--primary)
+            print_primary=1
+            ;;
+        -g|--geometry)
+            print_geometry=1
+            ;;
+        -d|--display)
+            shift
+            selected_monitor="${1}"
+            ;;
+        *)
+            error "Unknown option '${1}'"
+            usage
+            ;;
+    esac
+    shift
+done
+
+# Regex to parse the geometry string, e.g., "1920/520x1080/290+1920+0"
+geo_regex="([0-9]+)/[0-9]+x([0-9]+)/[0-9]+\+([0-9]+)\+([0-9]+)"
+
+if [ "${print_primary}" -eq 1 ]; then
+    [ -n "${selected_monitor}" ] && fail "Cannot specify both --primary and --display."
+    selected_monitor="$(get_primary_monitor)"
+fi
+
+monitors=()
+while read -r line; do
+    name=$(echo "${line}" | awk '{print $NF}')
+
+    if [ "${print_geometry}" -eq 1 ]; then
+        geo=$(echo "${line}" | awk '{print $3}')
+        if [[ ${geo} =~ ${geo_regex} ]]; then
+            w="${BASH_REMATCH[1]}"
+            h="${BASH_REMATCH[2]}"
+            x="${BASH_REMATCH[3]}"
+            y="${BASH_REMATCH[4]}"
+            if [ -z "${selected_monitor}" ] || [ "${name}" == "${selected_monitor}" ]; then
+                monitors+=("${name} ${x} ${y} ${w} ${h}")
+            fi
+        fi
+    else
+        if [ -z "${selected_monitor}" ] || [ "${name}" == "${selected_monitor}" ]; then
+            monitors+=("${name}")
+        fi
+    fi
+done < <(xrandr --listmonitors | tail -n +2)
+
+if [ "${#monitors[@]}" -eq 0 ]; then
+    fail "Could not parse monitor information from xrandr."
+fi
+
+for monitor in "${monitors[@]}"; do
+    echo "${monitor}"
+done

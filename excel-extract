@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+import openpyxl
+import zipfile
+import xml.etree.ElementTree as ET
+import argparse
+import os
+import tempfile
+import warnings
+from oletools.olevba import VBA_Parser, VBA_Scanner
+
+def extract_code(vba_file):
+    vba_parser = VBA_Parser(vba_file)
+    result = []
+    for (filename, stream_path, vba_filename, vba_code) in vba_parser.extract_all_macros():
+        result.append(vba_code)
+    vba_parser.close()
+    return result
+
+def extract_xlsm_content(xlsm_file):
+    # Load the workbook
+    workbook = openpyxl.load_workbook(xlsm_file, keep_vba=True)
+    
+    # Extract formulas and cell values
+    formulas_and_values = []
+    for sheet in workbook.sheetnames:
+        worksheet = workbook[sheet]
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if cell.data_type == 'f':
+                    formulas_and_values.append(f"Sheet: {sheet}, Cell: {cell.coordinate}, Formula: {cell.value}")
+                elif cell.value is not None:
+                    formulas_and_values.append(f"Sheet: {sheet}, Cell: {cell.coordinate}, Value: {cell.value}")
+
+    # Extract VBA macros
+    vba_code = []
+    if workbook.vba_archive:
+        for name in workbook.vba_archive.namelist():
+            if name.startswith('xl/vba'):
+                vba_file_code = []
+                with tempfile.NamedTemporaryFile() as tmp_file:
+                    tmp_file.write(workbook.vba_archive.read(name))
+                    vba_file_code = extract_code(tmp_file.name)
+                if vba_file_code:
+                    vba_code.extend(vba_file_code)
+
+    # Extract custom functions and other logic from the workbook XML
+    custom_functions = []
+    with zipfile.ZipFile(xlsm_file, 'r') as zip_ref:
+        workbook_xml = zip_ref.read('xl/workbook.xml')
+        root = ET.fromstring(workbook_xml)
+        ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        for definedName in root.findall('.//ns:definedName', ns):
+            custom_functions.append(f"Name: {definedName.attrib['name']}, Formula: {definedName.text}")
+
+    return formulas_and_values, vba_code, custom_functions
+
+def main():
+    warnings.simplefilter(action='ignore', category=UserWarning)
+
+    parser = argparse.ArgumentParser(description='Extract formulas, cell values and macros from an Excel file')
+    parser.add_argument('xlsm_file', type=str, help='Path to the Excel file')
+    args = parser.parse_args()
+
+    formulas_and_values, vba_code, custom_functions = extract_xlsm_content(args.xlsm_file)
+    print("Formulas and Cell Values:")
+    for item in formulas_and_values:
+        print(item)
+
+    print("\nVBA Code:")
+    for code in vba_code:
+        print(code)
+
+    print("\nCustom Functions and Defined Names:")
+    for func in custom_functions:
+        print(func)
+
+if __name__ == '__main__':
+    main()

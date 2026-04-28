@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+
+ARRAY_PREFIXES = ("[", "@as", "@aas")
+KEYBINDING_HINTS = ("<", "XF86", "KP_", "Print", "Pause", "Scroll_Lock")
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+COLUMN_COLORS = [
+    "\033[38;5;11m",
+    "\033[38;5;33m",
+    "\033[38;5;46m",
+    "\033[38;5;51m",
+]
+BINDING_256_COLORS = [46, 207, 226, 208]
+
+
+def run(cmd: list[str]) -> str:
+    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "command failed: " + " ".join(cmd))
+    return proc.stdout
+
+
+def list_recursively() -> list[tuple[str, str, str]]:
+    out = run(["gsettings", "list-recursively"])
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^(\S+)\s+(\S+)\s+(.*)$", line)
+        if not match:
+            continue
+        schema, key, value = match.groups()
+        rows.append((schema, key, value))
+    return rows
+
+
+def looks_like_array(value: str) -> bool:
+    return value.startswith(ARRAY_PREFIXES) or value.startswith("['") or value.startswith('["')
+
+
+def looks_like_string_array(value: str) -> bool:
+    if not looks_like_array(value):
+        return False
+    if "{" in value or "<{" in value:
+        return False
+    return True
+
+
+def looks_like_keybinding(value: str) -> bool:
+    if not looks_like_string_array(value):
+        return False
+    if value == "[]" or value == "@as []" or value == "@aas []":
+        return True
+    return any(hint in value for hint in KEYBINDING_HINTS)
+
+
+def parse_gsettings_string_array(value: str) -> list[str]:
+    if value in ("[]", "@as []", "@aas []"):
+        return []
+    items = re.findall(r"'([^']*)'", value)
+    if not items:
+        items = re.findall(r'"([^"]*)"', value)
+    return [item for item in items if item]
+
+
+def parse_gsettings_string(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def format_keybinding(binding: str) -> str:
+    modifiers = re.findall(r"<([^>]+)>", binding)
+    key = re.sub(r"<[^>]+>", "", binding)
+
+    mod_map = {
+        "Control": "Ctrl",
+        "Primary": "Ctrl",
+    }
+    modifiers = [mod_map.get(mod, mod) for mod in modifiers]
+
+    key_map = {
+        "Page_Up": "PageUp",
+        "Page_Down": "PageDown",
+        "Escape": "Esc",
+        "semicolon": ";",
+        "period": ".",
+        "space": "Space",
+    }
+    key = key_map.get(key, key)
+    if len(key) == 1 and key.isalpha():
+        key = key.upper()
+
+    parts = [part for part in modifiers + [key] if part]
+    return "+".join(parts)
+
+
+def load_schema_descriptions() -> dict[tuple[str, str], str]:
+    schema_dirs = [
+        "/usr/share/glib-2.0/schemas",
+        os.path.expanduser("~/.local/share/glib-2.0/schemas"),
+    ]
+    descriptions: dict[tuple[str, str], str] = {}
+    for schema_dir in schema_dirs:
+        if not os.path.isdir(schema_dir):
+            continue
+        for path in glob.glob(os.path.join(schema_dir, "*.gschema.xml")):
+            try:
+                tree = ET.parse(path)
+            except ET.ParseError:
+                continue
+            root = tree.getroot()
+            for schema in root.findall(".//schema"):
+                schema_id = schema.get("id")
+                if not schema_id:
+                    continue
+                for key in schema.findall("./key"):
+                    key_name = key.get("name")
+                    if not key_name:
+                        continue
+                    description = key.findtext("./description", default="").strip()
+                    if description:
+                        descriptions[(schema_id, key_name)] = description
+    return descriptions
+
+
+def synthesize_description(key: str) -> str:
+    parts = re.split(r"[-_]+", key)
+    parts = [part for part in parts if part]
+    if not parts:
+        return "Keybinding."
+    return "Keybinding to " + " ".join(parts) + "."
+
+
+def iter_keybindings(
+    description_map: dict[tuple[str, str], str],
+) -> list[tuple[str, str, list[str], str]]:
+    rows = []
+    for schema, key, value in list_recursively():
+        value = value.replace("\n", " ").strip()
+        if not looks_like_keybinding(value):
+            continue
+        if value in ("[]", "@as []", "@aas []"):
+            continue
+        bindings = [format_keybinding(b) for b in parse_gsettings_string_array(value)]
+        description = description_map.get((schema, key), "")
+        if not description:
+            description = synthesize_description(key)
+        rows.append((schema, key, bindings, description))
+    return rows
+
+
+def get_gsettings_value(schema: str, key: str) -> str:
+    return run(["gsettings", "get", schema, key]).strip()
+
+
+def iter_custom_keybindings() -> list[tuple[str, str, list[str], str]]:
+    schema = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
+    parent_schema = "org.gnome.settings-daemon.plugins.media-keys"
+
+    try:
+        paths = parse_gsettings_string_array(get_gsettings_value(parent_schema, "custom-keybindings"))
+    except RuntimeError:
+        return []
+
+    rows = []
+    for path in paths:
+        relocatable_schema = f"{schema}:{path}"
+        try:
+            binding = parse_gsettings_string(get_gsettings_value(relocatable_schema, "binding"))
+            name = parse_gsettings_string(get_gsettings_value(relocatable_schema, "name"))
+            command = parse_gsettings_string(get_gsettings_value(relocatable_schema, "command"))
+        except RuntimeError:
+            continue
+        if not binding:
+            continue
+
+        key = name or path.rstrip("/").rsplit("/", 1)[-1]
+        description = command or "Custom shortcut."
+        rows.append((schema, key, [format_keybinding(binding)], description))
+    return rows
+
+
+def color_enabled(color_mode: str) -> bool:
+    if color_mode == "always":
+        return True
+    if color_mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def pad_cell(text: str, width: int) -> str:
+    return text + " " * max(0, width - len(text))
+
+
+def format_bindings(bindings: list[str], enable_color: bool) -> str:
+    if not enable_color:
+        return " ".join(bindings)
+    colored = []
+    for idx, binding in enumerate(bindings):
+        color_idx = BINDING_256_COLORS[min(idx, len(BINDING_256_COLORS) - 1)]
+        color = f"\033[38;5;{color_idx}m"
+        colored.append(f"{color}{binding}{RESET}")
+    return " ".join(colored)
+
+
+def apply_bold(text: str, enable: bool) -> str:
+    if not enable:
+        return text
+    return f"{BOLD}{text}{RESET}"
+
+
+def print_table(rows: list[tuple[str, str, list[str], str]], include_schema: bool, color_mode: str) -> None:
+    headers = ("SCHEMA", "KEY", "BINDINGS", "DESCRIPTION")
+    widths = [len(h) for h in headers]
+    for schema, key, bindings, description in rows:
+        widths[0] = max(widths[0], len(schema))
+        widths[1] = max(widths[1], len(key))
+        widths[2] = max(widths[2], len(" ".join(bindings)))
+        widths[3] = max(widths[3], len(description))
+
+    enable_color = color_enabled(color_mode)
+    if include_schema:
+        print(
+            apply_bold(pad_cell(headers[0], widths[0]), enable_color)
+            + "  "
+            + apply_bold(pad_cell(headers[1], widths[1]), enable_color)
+            + "  "
+            + apply_bold(pad_cell(headers[2], widths[2]), enable_color)
+            + "  "
+            + apply_bold(headers[3], enable_color)
+        )
+        schema_color, key_color, _bindings_color, desc_color = COLUMN_COLORS
+        for schema, key, bindings, description in rows:
+            schema_cell = pad_cell(schema, widths[0])
+            key_cell = pad_cell(key, widths[1])
+            plain_bindings = " ".join(bindings)
+            bindings_cell = format_bindings(bindings, enable_color) + " " * max(
+                0, widths[2] - len(plain_bindings)
+            )
+            desc_cell = description
+            if enable_color:
+                schema_cell = f"{schema_color}{schema_cell}{RESET}"
+                key_cell = f"{key_color}{key_cell}{RESET}"
+                desc_cell = f"{desc_color}{desc_cell}{RESET}"
+            print(f"{schema_cell}  {key_cell}  {bindings_cell}  {desc_cell}")
+    else:
+        print(
+            apply_bold(pad_cell(headers[1], widths[1]), enable_color)
+            + "  "
+            + apply_bold(pad_cell(headers[2], widths[2]), enable_color)
+            + "  "
+            + apply_bold(headers[3], enable_color)
+        )
+        _schema_color, key_color, _bindings_color, desc_color = COLUMN_COLORS
+        for _schema, key, bindings, description in rows:
+            key_cell = pad_cell(key, widths[1])
+            plain_bindings = " ".join(bindings)
+            bindings_cell = format_bindings(bindings, enable_color) + " " * max(
+                0, widths[2] - len(plain_bindings)
+            )
+            desc_cell = description
+            if enable_color:
+                key_cell = f"{key_color}{key_cell}{RESET}"
+                desc_cell = f"{desc_color}{desc_cell}{RESET}"
+            print(f"{key_cell}  {bindings_cell}  {desc_cell}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="List GNOME keyboard shortcuts as a space-separated table with uppercase headers."
+    )
+    parser.add_argument(
+        "--schema-regex",
+        default=".*",
+        help="Regex to filter schemas (default: include all).",
+    )
+    parser.add_argument(
+        "--color",
+        nargs="?",
+        const="auto",
+        default="auto",
+        choices=("auto", "always", "never"),
+        help="Colorize the output (auto, always, never).",
+    )
+    parser.add_argument(
+        "--include-schema",
+        action="store_true",
+        help="Include the SCHEMA column.",
+    )
+    args = parser.parse_args()
+
+    description_map = load_schema_descriptions()
+    rows = iter_keybindings(description_map)
+    rows.extend(iter_custom_keybindings())
+    if args.schema_regex != ".*":
+        rx = re.compile(args.schema_regex)
+        rows = [row for row in rows if rx.search(row[0])]
+
+    rows.sort()
+    print_table(rows, args.include_schema, args.color)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

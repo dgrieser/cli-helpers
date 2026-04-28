@@ -1,0 +1,20 @@
+#!/bin/bash
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+if [ -p /dev/stdin ]; then
+    file_path="$(cat -)"
+    [ ! -f "$file_path" ] && fail "Failed to find file denoted by stdin"
+    mime_type="$(mimetype --output-format "%m" "${file_path}")"
+    [ -z "$mime_type" ] && fail "Failed to determine mime type of file"
+    DISPLAY=$(xdisplay) xclip -sel c -t "${mime_type}" -i "${file_path}"
+else
+    fail "No input provided"
+fi

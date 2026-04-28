@@ -1,0 +1,53 @@
+#!/bin/bash
+
+usage()
+{
+    echo "Usage: vpn-up <vpn-name> [-d|--down]"
+    exit 1
+}
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+ok=0
+name=""
+mode="up"
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --down|-d)
+            mode="down"
+            ok=1
+            ;;
+        *)
+            if [ -z "${name}" ] && [ -n "${1}" ]; then
+                name="${1}"
+                ok=1
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ ${ok} -eq 0 ] && usage
+
+uuid_list="$(nmcli -t -f TYPE,NAME,UUID c | grep "^vpn:")"
+[ -n "${name}" ] && uuid_list="$(echo "${uuid_list}" | grep "^vpn:${name}")"
+uuid_list="$(echo "${uuid_list}" | cut -d ':' -f 3)"
+if [ -z "${uuid_list}" ]; then
+    echo "ERROR: No VPN found"
+    exit 1
+fi
+
+if [ -t 0 ]; then # no stdin
+    for uuid in ${uuid_list}; do
+        nmcli c ${mode} uuid "${uuid}" &>/dev/null
+    done
+else
+    for uuid in ${uuid_list}; do
+        nmcli c ${mode} uuid "${uuid}" passwd-file <(echo -n "vpn.secrets.password:"; cat) &>/dev/null
+    done
+fi

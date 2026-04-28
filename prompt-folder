@@ -1,0 +1,20 @@
+#!/bin/bash
+
+read_dir() {
+    local initial_dir="${PWD}"
+    read -e -i "${initial_dir}" -p "Enter directory: " dir
+    echo "${dir}"
+}
+
+_complete_dirs() {
+    local cur
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    COMPREPLY=()
+    while IFS= read -r d; do
+        [[ -d "${d}" ]] && COMPREPLY+=("${d}")
+    done < <(compgen -d -- "${cur}")
+}
+
+
+complete -F _complete_dirs read_dir
+read_dir

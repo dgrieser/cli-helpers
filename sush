@@ -1,0 +1,59 @@
+#!/bin/bash
+
+if [ $# -lt 1 ]; then
+    echo "Usage: "$(basename ${0})" <file|command>"
+    exit 1
+fi
+
+if [ -f "${1}" ]; then
+    file="$(readlink -f "${1}")"
+else
+    file="$(which ${1})"
+fi
+
+if [ ! -f "${file}" ]; then
+    usage
+fi
+
+new_file="/usr/local/bin/$(basename "${file}")"
+
+# check if parent folder is writable by user
+if [ -w "$(dirname ${new_file})" ]; then
+    sudo=""
+else
+    sudo="sudo "
+fi
+
+if [ -f "${new_file}" ]; then
+    # show unified colored diff
+    ${sudo}diff -u --color=always "${new_file}" "${file}"
+    # prompt whether to overwrite the new file with y/N
+    echo
+    read -p "Overwrite existing executable ${new_file}? [y/N] " -r
+    if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
+        echo "Aborting"
+        exit 0
+    fi
+fi
+
+if [ "${file}" != "${new_file}" ]; then
+    ${sudo}cp "${file}" "${new_file}"
+    echo "Copied ${file} to ${new_file}"
+fi
+if [ ! -x "${new_file}" ]; then
+    ${sudo}chmod +x "${new_file}"
+    echo "Made ${new_file} executable"
+fi
+if [ "$(stat -c %U "${new_file}")" != "root" ]; then
+    ${sudo}chown root:root "${new_file}"
+    echo "Changed owner of ${new_file} to root"
+fi
+
+if [ "${file}" != "${new_file}" ]; then
+    # prompt whether to delete the old file with y/N
+    read -p "Delete old file ${file}? [y/N] " -r
+    if [[ ${REPLY} =~ ^[Yy]$ ]]; then
+        ${sudo}rm "${file}"
+        echo "Deleted ${file}"
+    fi 
+fi 

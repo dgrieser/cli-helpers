@@ -1,0 +1,92 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+session_folder="${HOME}/.codex/sessions"
+session_prefix="rollout-"
+session_ext="jsonl"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} OPTIONS SESSION
+
+Prints sessions of codex CLI
+
+SESSION   the ID of the session to print
+
+Options:
+    -h, --help      Show this message
+    -r, --raw       Raw output
+    --verbose       Verbose output
+}
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+verbose() {
+    [ "${verbose}" -eq 0 ] && return
+    echo "${1}" | sed 's/^/+ /g' 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+session_id=""
+raw=0
+verbose=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h | --help)
+            usage
+            ;;
+        -r | --raw)
+            raw=1
+            ;;
+        --verbose)
+            verbose=1
+            ;;
+        *)
+            if [ -z "${session_id}" ]; then
+                session_id="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -n "${session_id}" ]; then
+    verbose "Finding session with session_id=${session_id}..."
+    find_args=( "${session_folder}" '-name' "${session_prefix}*${session_id}.${session_ext}" )
+    filepath="$(find "${find_args[@]}")"
+    verbose "${filepath}"
+    [ -z "${filepath}" ] && fail "No such session: ${session_id}"
+    [ $(echo "${filepath}" | wc -l) -gt 1 ] && fail "Multiple matches for session: ${session_id}"
+    jq_args=( '-rs' '[.[] | .payload | select(.role == "assistant") | .content[]?.text] | join("\n\n---\n\n")' )
+    verbose "Extracting session messages from ${filepath}..."
+    verbose "cat ${filepath} | jq ${jq_args[*]}"
+    session_content="$(cat "${filepath}" | jq "${jq_args[@]}")"
+    [ "${raw}" -eq 0 ] && echo "${session_content}" | glow || echo "${session_content}"
+else
+    verbose "Listing sessions..."
+    find_args=( "${session_folder}" '-name' "${session_prefix}*.${session_ext}" '-printf' '%f\n' )
+    sed_session_args=( '-E' 's/^'"${session_prefix}"'([^.]+)\.'"${session_ext}"'/\1/' )
+    tail_args=( '-n' '10' )
+    sed_split_args=( '-E' 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})-(.+)$/\5  \1T\2:\3:\4/' )
+    verbose "find ${find_args[*]} | sed ${sed_session_args[*]} | sort | tail ${tail_args[*]} | sed ${sed_split_args[*]}"
+    sessions="$(find "${find_args[@]}" | sed "${sed_session_args[@]}" | sort | tail "${tail_args[@]}" | sed "${sed_split_args[@]}")"
+    verbose "${sessions}"
+    echo_args=( '-e' )
+    verbose "echo ${echo_args[*]} 'SESSION  AGE\n\${sessions}' | k-format"
+    echo "${echo_args[@]}" "SESSION  AGE\n${sessions}" | k-format
+fi
+
+exit 0

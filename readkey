@@ -1,0 +1,46 @@
+#!/bin/bash
+
+read_keys() {
+    local key char hex
+    IFS= read -rsn1 char 2>/dev/null >&2
+    hex="$(echo -n "${char}" | hexdump -ve '/1 "%02X"')"
+    key="${hex}"
+    echo "${key}"
+    if [ "${key}" == "20" ]; then
+        echo "space" && return 0
+    elif [[ "${key}" == "1B" ]]; then
+        for i in {1..5}; do
+            IFS= read -rsn1 -t 0.001 char 2>/dev/null >&2
+            hex="$(echo -n "${char}" | hexdump -ve '/1 "%02X"')"
+            [ -z "${hex}" ] && break
+            echo "READ ###${hex}###"
+            key="${key}${hex}"
+        done
+        case "${key}" in
+            '1B') echo "esc"; return 0;;
+            '1B5B41') echo "up"; return 0;;
+            '1B5B42') echo "down"; return 0;;
+            '1B5B43') echo "right"; return 0;;
+            '1B5B44') echo "left"; return 0;;
+            '1B5B46') echo "end"; return 0;;
+            '1B5B48') echo "home"; return 0;;
+            '1B5B327E') echo "insert"; return 0;;
+            '1B5B337E') echo "delete"; return 0;;
+            '1B5B357E') echo "pageup"; return 0;;
+            '1B5B367E') echo "pagedown"; return 0;;
+        esac
+        echo "${key}"; return 0
+    elif [[ "${key}" == "7F" ]]; then
+        echo "backspace"; return 0
+    elif [ -z "${key}" ]; then
+        echo "enter"; return 0
+    else
+        echo "${key}"; return 0
+    fi
+    return 1
+}
+
+while ! read_keys; do
+    :
+done
+

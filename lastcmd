@@ -1,0 +1,3 @@
+#!/bin/bash
+lastcmd="$(history_read -l 1 --no-timestamp --exclude "^(lastcmd|lcmd)")"
+echo -n "${lastcmd}"

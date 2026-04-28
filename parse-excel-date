@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+from datetime import datetime
+import locale
+import argparse
+import sys
+
+def parse_german_excel_date(date_str):
+    locale.setlocale(locale.LC_TIME, 'de_DE.UTF-8')
+    date_str = date_str.replace('.', '')
+    date_str = date_str.replace('Mrz', 'Mär')
+    parsed_date = None
+    try:
+        parsed_date = datetime.strptime(date_str, "%b %y")
+    except Exception:
+        pass
+    return parsed_date
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("date", type=str, nargs='+', help="Excel date string")
+    args = parser.parse_args()
+    input_date = ' '.join(args.date)
+    parsed_date = parse_german_excel_date(input_date)
+    if parsed_date is None:
+        print(f"Invalid date: '{input_date}'", file=sys.stderr)
+        exit(1)
+    print(f"{parsed_date.strftime('%Y-%m-%d')}")
+
+if __name__ == "__main__":
+    main()

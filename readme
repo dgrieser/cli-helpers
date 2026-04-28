@@ -1,0 +1,132 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") [--tts <11labs|openai>] [-r|--repeat] [-v|--voice <voice name>] [--bash-completion <command>]"
+    exit 1
+}
+
+completion() {
+    case "${1}" in
+        --tts)
+            echo "11labs openai"
+            ;;
+        -v|--voice)
+            11-voices --list-names
+            ;;
+        *)
+            echo "--tts --r --repeat -v --voice --bash-completion"
+            ;;
+    esac
+    exit 0
+}
+
+export output="/tmp/readme_tts.mp3"
+export tts_engine="openai"
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            shift
+            command="${1}"
+            completion "${command}"
+            exit 0
+            ;;
+        -r|--repeat)
+            echo "Playing..."
+            play-track "${output}"
+            exit 0
+            ;;
+        --tts)
+            shift
+            export tts_engine="${1}"
+            if [ "${tts_engine}" != "11labs" ] && [ "${tts_engine}" != "openai" ]; then
+                usage
+            fi
+            ;;
+        -v|--voice)
+            shift
+            export tts_voice="${1}"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${tts_voice}" ]; then
+    case "${tts_engine}" in
+        11labs)
+            export tts_voice="Dorothy"
+            ;;
+        openai)
+            export tts_voice="nova"
+            ;;
+    esac
+fi
+
+function abort() {
+    echo "Aborting."
+    exit 1
+}
+
+function ctrl_c() {
+    echo -ne "\r"
+    [ -z "${lines}" ] && abort
+
+    text="${lines}"
+    export lines=""
+
+    echo && read -p "Convert and play? [Y/n] " answer
+    [ "${answer,,}" == "n" ] && abort
+
+    run_tts "${text}"
+}
+
+function post_process() {
+    text="${1}"
+    # replace links
+    text="$(echo "${text}" | sed 's/https*:[^ ]\+/(siehe Link im Text)/g')"
+    # replace emojis
+    text="$(echo "${text}" | sed 's/:\([^ ]\+\):/ \1 (Emoji) /g')"
+    echo "${text}"
+}
+
+function run_tts()
+{
+    text="$(post_process "${1}")"
+    rm -rf "${output}"
+    echo "Converting..." 
+    case "${tts_engine}" in
+        11labs)
+            tts-11 -v "${tts_voice}" -f "${output}" "$(echo -e "${text}")" >/dev/null
+            ;;
+        openai) 
+            tts -v "${tts_voice}" -s 0.95 -f "${output}" "$(echo -e "${text}")" >/dev/null
+            ;;
+    esac
+
+    if [ $? -ne 0 ]; then
+        echo "Conversion failed"
+        exit 1
+    fi
+
+    echo "Playing..."
+    play-track "${output}"
+}
+
+trap ctrl_c INT
+
+echo "Enter text to read (press CTRL+C when done):"
+echo
+
+# collect text, until user presses CTRL+C
+export lines=""
+while true
+do
+    read -r line
+    if [ -n "${line}" ]; then
+        [ -n "${lines}" ] && export lines="${lines}\n"
+        export lines="${lines}$(echo ${line} | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')"
+    fi
+done

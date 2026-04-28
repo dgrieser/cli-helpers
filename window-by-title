@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $(basename "${0}") <title>"
+    exit 1
+fi
+
+wmctrl -xl | awk '$5 == "'"${1}"'"' | awk '{print $1}'

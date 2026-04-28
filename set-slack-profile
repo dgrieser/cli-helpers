@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+import os
+import sys
+import argparse
+import argcomplete
+import requests
+import subprocess
+import collections
+import NetworkManager
+import dbus.mainloop.glib
+import json
+from datetime import datetime, timedelta, timezone
+
+SlackStatus = collections.namedtuple('SlackStatus', ['status', 'url', 'persist'])
+NetworkStatusMapping = collections.namedtuple('NetworkStatusMapping', ['network_name', 'slack_status'])
+
+SLACK_STATUS = {
+    "InTransit": SlackStatus("InTransit", "https://api.statushook.cool/v1/prod/webhook/fire?id=fe235c94-f0f3-11ed-a612-1275f7efb6cd", False),
+    "OnVacation": SlackStatus("OnVacation", "https://api.statushook.cool/v1/prod/webhook/fire?id=d9709344-d1b1-11ef-980d-9e6722e35e40", True),
+    "HomeOffice": SlackStatus("HomeOffice", "https://api.statushook.cool/v1/prod/webhook/fire?id=55ec4af4-f0f3-11ed-a612-1275f7efb6cd", False),
+    "AtWork": SlackStatus("AtWork", "https://api.statushook.cool/v1/prod/webhook/fire?id=8ce9d850-f0f3-11ed-a612-1275f7efb6cd", False),
+}
+
+NETWORK_STATUS_MAPPING = {
+    "Dave": NetworkStatusMapping("Dave", SLACK_STATUS["HomeOffice"]),
+    "Mittwald": NetworkStatusMapping("Mittwald", SLACK_STATUS["AtWork"]),
+    "mw-ks.local": NetworkStatusMapping("mw-ks.local", SLACK_STATUS["AtWork"]),
+}
+
+STATUS_FILE = ".slack-status"
+STATUS_PATH = os.path.expanduser("~")
+
+def _now_utc():
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+def _read_persisted_status():
+    """Returns tuple (status_str, expires_at_dt_or_None) or (None, None) if none/expired/invalid."""
+    status_file = os.path.join(STATUS_PATH, STATUS_FILE)
+    if not os.path.exists(status_file):
+        return None, None
+
+    try:
+        with open(status_file, "r") as f:
+            content = f.read().strip()
+        if not content:
+            os.remove(status_file)
+            return None, None
+
+        # New format: JSON with keys 'status' and optional 'expires_at'
+        if content.startswith("{"):
+            data = json.loads(content)
+            status = data.get("status")
+            expires_at_str = data.get("expires_at")
+            expires_at = None
+            if expires_at_str:
+                # Handle trailing Z
+                if expires_at_str.endswith("Z"):
+                    expires_at_str = expires_at_str[:-1] + "+00:00"
+                expires_at = datetime.fromisoformat(expires_at_str)
+            # If expired, remove file and ignore
+            if expires_at and _now_utc() >= expires_at:
+                os.remove(status_file)
+                return None, None
+            return status, expires_at
+
+        # Old format: just the status string
+        return content, None
+
+    except Exception:
+        # Any parse error -> delete to avoid permanent lock-in
+        try:
+            os.remove(status_file)
+        except Exception:
+            pass
+        return None, None
+
+def _write_persisted_status(status_str, expires_at=None):
+    """Writes JSON with 'status' and optional 'expires_at' (UTC ISO 8601 with Z)."""
+    status_file = os.path.join(STATUS_PATH, STATUS_FILE)
+    data = {"status": status_str}
+    if expires_at is not None:
+        iso = expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        data["expires_at"] = iso
+    with open(status_file, "w") as f:
+        json.dump(data, f)
+
+def main():
+    try:
+        process = subprocess.run(["/usr/local/bin/loggedin", "--home"], stdout=subprocess.PIPE, check=True)
+        home_dir = process.stdout.decode('utf-8').strip()
+        global STATUS_PATH
+        STATUS_PATH = home_dir
+    except:
+        print("ERROR: Failed to determine home directory", file=sys.stderr)
+        home_dir = None
+    
+    parser = argparse.ArgumentParser("Set slack status based on network connection")
+    parser.add_argument(
+        "-s", "--status",
+        nargs="+",
+        metavar=("STATUS", "DAYS"),
+        help=(
+            "Status to set (overrides auto). Optional DAYS to auto-reset the override after N days. "
+            "Note: DAYS is allowed only for persistable statuses."
+        ),
+        required=False
+    )
+    parser.add_argument("-l", "--list", action="store_true", help="List available statuses", required=False)
+    parser.add_argument("-r", "--reset", action="store_true", help="Reset persisted manual override", required=False)
+    args = parser.parse_args()
+    argcomplete.autocomplete(parser)
+
+    if args.list:
+        for status in SLACK_STATUS.values():
+            print(f"{status.status}")
+        exit(0)
+
+    status_file = os.path.join(STATUS_PATH, STATUS_FILE)
+
+    if args.reset:
+        if os.path.exists(status_file):
+            os.remove(status_file)
+            print("Reset persisted status")
+        else:
+            print("ERROR: No persisted status to reset", file=sys.stderr)
+            exit(1)
+        exit(0)
+
+    # Check for an existing persisted (possibly expiring) override
+    persisted_status, persisted_expires_at = _read_persisted_status()
+    if persisted_status:
+        if persisted_expires_at:
+            until = persisted_expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            print(f"Slack status already persistently set to '{persisted_status}' until {until}.")
+        else:
+            print(f"Slack status already persistently set to '{persisted_status}'.")
+        exit(0)
+
+    slack_status = None
+    manual_days = None
+    manually = False
+
+    if args.status:
+        if len(args.status) not in (1, 2):
+            print("ERROR: --status accepts 1 or 2 arguments: STATUS [DAYS]", file=sys.stderr)
+            exit(1)
+
+        status_arg = args.status[0]
+        days_arg = args.status[1] if len(args.status) == 2 else None
+
+        # Validate status
+        for status in SLACK_STATUS.values():
+            if status.status.lower() == status_arg.lower():
+                slack_status = status
+                manually = True
+                break
+        else:
+            print("ERROR: Unknown status:", status_arg, file=sys.stderr)
+            exit(1)
+
+        # Validate/parse days if provided
+        if days_arg is not None:
+            # NEW: reject timed overrides for non-persistable statuses
+            if not slack_status.persist:
+                print(
+                    f"ERROR: '{slack_status.status}' is not persistable; timed overrides are not allowed. "
+                    f"Use without DAYS for a one-off change, or choose a persistable status.",
+                    file=sys.stderr
+                )
+                exit(1)
+            try:
+                manual_days = int(days_arg)
+                if manual_days <= 0:
+                    raise ValueError
+            except ValueError:
+                print("ERROR: DAYS must be a positive integer.", file=sys.stderr)
+                exit(1)
+
+    if slack_status is None:
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        connection_match = None
+        for connection in NetworkManager.NetworkManager.ActiveConnections:
+            if connection.Type == "802-11-wireless":
+                settings = connection.Connection.GetSettings()
+                # use wifi ssid
+                connection_match = settings["802-11-wireless"]["ssid"]
+            elif connection.Type == "802-3-ethernet":
+                settings = connection.Connection.GetSettings()
+                if "802-1x" in settings:
+                    # use domain suffix on ethernet
+                    connection_match = settings["802-1x"]["domain-suffix-match"]
+
+        if connection_match is not None and connection_match in NETWORK_STATUS_MAPPING:
+            slack_status = NETWORK_STATUS_MAPPING[connection_match].slack_status
+        else:
+            slack_status = SLACK_STATUS["InTransit"]
+
+    # If manually setting, remove any stale persisted file (shouldn't exist because we checked above, but be safe)
+    if manually and os.path.exists(status_file):
+        os.remove(status_file)
+
+    # set status via webhook
+    try:
+        response = requests.post(slack_status.url)
+        if response.status_code == 200:
+            print(f"Slack status set to '{slack_status.status}'.")
+        else:
+            try:
+                err = response.json().get("error", "Unknown error")
+            except Exception:
+                err = f"HTTP {response.status_code}"
+            print("Failed to update Slack status:", err, file=sys.stderr)
+            exit(1)
+    except requests.RequestException as e:
+        print("Failed to update Slack status:", str(e), file=sys.stderr)
+        exit(1)
+
+    # Decide whether/how to persist
+    # - Manual with DAYS: persist with expiry (already verified status is persistable)
+    # - Manual without DAYS: persist only if status.persist is True
+    # - Automatic: persist only if status.persist is True
+    should_persist = False
+    expires_at = None
+
+    if manually:
+        if manual_days is not None:
+            should_persist = True
+            expires_at = _now_utc() + timedelta(days=manual_days)
+        else:
+            should_persist = slack_status.persist
+    else:
+        should_persist = slack_status.persist
+
+    if should_persist:
+        _write_persisted_status(slack_status.status, expires_at)
+
+if __name__ == "__main__":
+    main()
+

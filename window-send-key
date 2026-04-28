@@ -1,0 +1,31 @@
+#!/bin/bash
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $(basename "${0}") [--type] <key> ..."
+    exit 1
+fi
+
+type_mode=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --type)
+            type_mode=1
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
+# send all arguments as keys
+while [ "${#}" -gt 0 ]; do
+    if [ "${type_mode}" -eq 1 ]; then
+        xdotool type --clearmodifiers "${1}"
+    else
+        xdotool key --clearmodifiers "${1}"
+    fi
+    #sleep 0.1
+    shift
+done

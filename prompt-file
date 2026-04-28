@@ -1,0 +1,10 @@
+#!/bin/bash
+
+read_file() {
+    local initial_dir="${PWD}"
+    read -e -i "${initial_dir}" -p "Enter file: " file
+    echo "${file}"
+}
+
+complete -o default read_file
+read_file

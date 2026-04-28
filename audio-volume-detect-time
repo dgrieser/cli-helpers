@@ -1,0 +1,14 @@
+#!/bin/bash
+
+function usage {
+    echo "usage: $(basename "${0}") <file>"
+    exit 1
+}
+
+if [ -z "${1}" ]; then
+    usage
+fi
+
+file="${1}"
+
+sox "${file}" -n trim 0 0.1 stats : newfile : restart 2>&1 | grep 'RMS lev dB' | awk '{ print $4 }' | awk 'BEGIN {c=0} {c+=100; hour = int(c/3600000); min = int(c/60000); sec = int((c%60000)/1000); ms = int(c)%1000/10; printf "%02d:%02d:%02d.%02d %s\n", hour, min, sec, ms, $0}'

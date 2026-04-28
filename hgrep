@@ -1,0 +1,58 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename $0) [options] <pattern ...>" 1>&2
+    echo 1>&2
+    echo "A tool to grep from history (case-insensitive)." 1>&2
+    echo 1>&2
+    echo "Options:" 1>&2
+    echo "  -h, --help  show this help message and exit" 1>&2
+    echo "  -B <number>, --before-context=<number>" 1>&2
+    echo "  -A <number>, --after-context=<number>" 1>&2
+    echo "  -C <number>, --context=<number>" 1>&2
+    exit 1
+}
+
+args=()
+pattern=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -B|--before-context)
+            shift
+            [ -z "${1}" ] && usage
+            args+=("--before-context=${1}")
+            ;;
+        --before-context=*)
+            args+=("${1}")
+            ;;
+        -A|--after-context)
+            shift
+            [ -z "${1}" ] && usage
+            args+=("--after-context=${1}")
+            ;;
+        --after-context=*)
+            args+=("${1}")
+            ;;
+        -C|--context)
+            shift
+            [ -z "${1}" ] && usage
+            args+=("--context=${1}")
+            ;;
+        --context=*)
+            args+=("${1}")
+            ;;
+        *)
+            [ -n "${pattern}" ] && pattern="${pattern} "
+            pattern="${pattern}${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${pattern}" ] && usage
+
+history_read | sort -k2 | sort -k1,1 | sed -E "s/^2[0-9]{3}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+[0-9]{4} //" | grep -v "^hgrep" | grep --color=always -i -E ${args[@]} -- "${pattern}"

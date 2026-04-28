@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ ! -e "${1}" ]; then
+    echo "File not found ${1}" 1>&2
+    exit 1
+fi
+
+date -d "$(stat -c %y "${1}")" +"%y%m%d%H%M%S"

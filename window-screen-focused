@@ -1,0 +1,140 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $(basename "${0}") [FLAG]
+
+Finds the name of a monitor based on the specified mode.
+
+Flags:
+  --mouse    Find the monitor where the mouse cursor is located.
+  --primary  Get the name of the primary monitor.
+  --window   Find the monitor containing the currently active window.
+  --help     Display this help message and exit.
+
+If no flag is provided, the script attempts to find the monitor in the
+following order: active window -> mouse cursor -> primary monitor.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}   
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}   
+
+fail() {
+    local message="${1}"
+    if [ -n "${message}" ]; then
+        error "${message}"
+    else
+        echo "Abort." 1>&2
+    fi
+    exit 1  
+}
+
+find_monitor_at_coords() {
+    local target_x="${1}"
+    local target_y="${2}"
+
+    for mon_data in "${monitors[@]}"; do
+        # Read the pre-parsed data: "name x y w h"
+        read -r name x y w h <<< "${mon_data}"
+
+        # Use bash arithmetic evaluation for integer comparison
+        if (( target_x >= x && target_x < x + w && target_y >= y && target_y < y + h )); then
+            echo "${name}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_monitor_from_window() {
+    # Get the active window ID, return 1 on failure
+    local win_id
+    win_id=$(xdotool getactivewindow 2>/dev/null) || return 1
+
+    # Check for a valid window ID
+    if [ -z "${win_id}" ] || [ "${win_id}" -le "0" ]; then
+        return 1
+    fi
+
+    # Get the window's top-left corner coordinates using the --shell flag
+    local win_x win_y
+    eval "$(xdotool getwindowgeometry --shell "${win_id}")"
+    win_x="${X}"
+    win_y="${Y}"
+
+    find_monitor_at_coords "${win_x}" "${win_y}"
+}
+
+get_monitor_from_mouse() {
+    local mouse_x mouse_y
+    eval "$(xdotool getmouselocation --shell)"
+    mouse_x="${X}"
+    mouse_y="${Y}"
+
+    find_monitor_at_coords "${mouse_x}" "${mouse_y}"
+}
+
+get_primary_monitor() {
+    window-screen-list --primary
+}
+
+
+declare -a monitors
+
+while IFS=$'\n' read -r line; do
+    monitors+=("${line}")
+done < <(window-screen-list --geometry)
+
+MODE=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --mouse|--primary|--window)
+            if [ -n "${MODE}" ]; then
+                error "Only one mode can be specified at a time."
+                usage
+            fi
+            MODE="${1#--}"
+            ;;
+        --help)
+            usage
+            ;;
+        *)
+            error "Unknown option '${1}'"
+            usage
+            ;;
+    esac
+    shift
+done
+
+case "${MODE}" in
+    mouse)
+        get_monitor_from_mouse || fail "Could not find monitor for the mouse cursor."
+        ;;
+    primary)
+        get_primary_monitor
+        ;;
+    window)
+        get_monitor_from_window || fail "Could not find monitor for the active window."
+        ;;
+    *)
+        result=""
+        result=$(get_monitor_from_window)
+        if [ -z "${result}" ]; then
+            result=$(get_monitor_from_mouse)
+        fi
+        if [ -z "${result}" ]; then
+            result=$(get_primary_monitor)
+        fi
+        echo "${result}"
+        ;;
+esac

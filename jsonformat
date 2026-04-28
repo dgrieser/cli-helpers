@@ -1,0 +1,191 @@
+#!/bin/bash
+
+APP_NAME="$(basename "$0")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] JSON_FILE
+
+Format JSON file in place using jq.
+
+Options:
+    -h, --help              Show this message
+    --sort-all-keys         Sort object keys recursively at all levels
+    --sort-keys PATH        Sort object keys recursively under PATH
+                            Repeatable. PATH uses dot notation, e.g. '.', '.models',
+                            '.models[].scores', or '.models[0].scores'
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: $1" 1>&2
+}
+
+fail() {
+    error "$1"
+    exit 1
+}
+
+json_path_to_jq() {
+    local json_path="$1"
+    local jq_path="."
+    local escaped_segment
+    local segments
+    local segment
+    local segment_name
+    local segment_suffix
+
+    if [ "${json_path}" = "." ]; then
+        printf '.'
+        return 0
+    fi
+
+    if ! [[ "${json_path}" =~ ^\. ]]; then
+        error "Invalid --sort-keys path: ${json_path}"
+        return 1
+    fi
+
+    IFS='.' read -r -a segments <<< "${json_path#.}"
+    for segment in "${segments[@]}"; do
+        if [[ -z "${segment}" || ! "${segment}" =~ ^([^.\[]+)(\[\]|\[([0-9]+)\])?$ ]]; then
+            error "Invalid --sort-keys path: ${json_path}"
+            return 1
+        fi
+
+        segment_name="${BASH_REMATCH[1]}"
+        segment_suffix="${BASH_REMATCH[2]}"
+
+        escaped_segment="${segment_name//\\/\\\\}"
+        escaped_segment="${escaped_segment//\"/\\\"}"
+        jq_path="${jq_path}[\"${escaped_segment}\"]"
+
+        if [ -n "${segment_suffix}" ]; then
+            jq_path="${jq_path}${segment_suffix}"
+        fi
+    done
+
+    printf '%s' "${jq_path}"
+}
+
+json_path_to_jq_matcher() {
+    local json_path="$1"
+    local escaped_segment
+    local segments
+    local segment
+    local segment_name
+    local segment_suffix
+    local segment_index
+    local depth=0
+    local conditions=()
+    local condition
+    local matcher
+
+    if [ "${json_path}" = "." ]; then
+        printf 'length == 0'
+        return 0
+    fi
+
+    if ! [[ "${json_path}" =~ ^\. ]]; then
+        error "Invalid --sort-keys path: ${json_path}"
+        return 1
+    fi
+
+    IFS='.' read -r -a segments <<< "${json_path#.}"
+    for segment in "${segments[@]}"; do
+        if [[ -z "${segment}" || ! "${segment}" =~ ^([^.\[]+)(\[\]|\[([0-9]+)\])?$ ]]; then
+            error "Invalid --sort-keys path: ${json_path}"
+            return 1
+        fi
+
+        segment_name="${BASH_REMATCH[1]}"
+        segment_suffix="${BASH_REMATCH[2]}"
+        segment_index="${BASH_REMATCH[3]}"
+
+        escaped_segment="${segment_name//\\/\\\\}"
+        escaped_segment="${escaped_segment//\"/\\\"}"
+        conditions+=(".[${depth}] == \"${escaped_segment}\"")
+        depth=$((depth + 1))
+
+        if [ "${segment_suffix}" = "[]" ]; then
+            conditions+=("(.[${depth}] | type) == \"number\"")
+            depth=$((depth + 1))
+        elif [ -n "${segment_index}" ]; then
+            conditions+=(".[${depth}] == ${segment_index}")
+            depth=$((depth + 1))
+        fi
+    done
+
+    matcher="length == ${depth}"
+    for condition in "${conditions[@]}"; do
+        matcher="${matcher} and ${condition}"
+    done
+
+    printf '%s' "${matcher}"
+}
+
+json_path=""
+sort_all_keys=0
+sort_keys_paths=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        --sort-all-keys)
+            sort_all_keys=1
+            ;;
+        --sort-keys)
+            shift
+            [ "$#" -gt 0 ] || fail "Missing value for --sort-keys"
+            sort_keys_paths+=("$1")
+            ;;
+        -*)
+            fail "Unknown option: $1"
+            ;;
+        *)
+            if [ -z "${json_path}" ]; then
+                json_path="$1"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${json_path}" ] && usage
+[ -f "${json_path}" ] || fail "File not found: ${json_path}"
+[ -r "${json_path}" ] || fail "File is not readable: ${json_path}"
+[ -w "${json_path}" ] || fail "File is not writable: ${json_path}"
+command -v jq >/dev/null 2>&1 || fail "jq is not installed or not in PATH"
+
+jq_filter='def sort_object_keys_recursively:
+  walk(if type == "object" then to_entries | sort_by(.key) | from_entries else . end);
+.'
+
+if [ "${sort_all_keys}" -eq 1 ]; then
+    jq_filter="${jq_filter}
+| sort_object_keys_recursively"
+fi
+
+for sort_keys_path in "${sort_keys_paths[@]}"; do
+    jq_path="$(json_path_to_jq "${sort_keys_path}")" || exit 1
+    jq_matcher="$(json_path_to_jq_matcher "${sort_keys_path}")" || exit 1
+
+    if [ "${jq_path}" = "." ]; then
+        jq_filter="${jq_filter}
+| sort_object_keys_recursively"
+        continue
+    fi
+
+    jq_filter="${jq_filter}
+| reduce (paths | select(${jq_matcher})) as \$p (.;
+    setpath(\$p; (getpath(\$p) | sort_object_keys_recursively)))"
+done
+
+tmp_file="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX")"
+trap 'rm -f "${tmp_file}"' EXIT
+
+jq "${jq_filter}" "${json_path}" > "${tmp_file}" || fail "Invalid JSON: ${json_path}"
+mv "${tmp_file}" "${json_path}"

@@ -1,0 +1,81 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}"): [-h|--help] [-v|--verbose] [-s|--segment-seconds <seconds, defaults to 600>] <input file> [<output file basename, defaults to <input file>_seg_<index>.<ext>]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+verbose() {
+    [ "${verbose}" -eq 1 ] && echo "+ ${1}" 1>&2
+}
+
+input_file=""
+output_file_base=""
+segment_seconds=600
+verbose=0
+
+while [[ $# -gt 0 ]]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -v|--verbose)
+            verbose=1
+            ;;
+        -s|--segment-seconds)
+            shift
+            [ -z "${1}" ] && usage
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            segment_seconds="${1}"
+            ;;
+        *)
+            if [ -z "${input_file}" ]; then
+                input_file="${1}"
+            elif [ -z "${output_file_base}" ]; then
+                output_file_base="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${input_file}" ] && usage
+
+extension="${input_file##*.}"
+
+if [ -z "${output_file_base}" ]; then
+    name_without_ext="${input_file%.${extension}}"
+    output_file_base="${name_without_ext}_seg"
+fi
+
+ffmpeg_args=()
+ffmpeg_args+=("-i" "${input_file}")
+ffmpeg_args+=("-f" "segment")
+ffmpeg_args+=("-segment_time" "${segment_seconds}")
+ffmpeg_args+=("-c" "copy")
+
+if [ "${verbose}" -eq 1 ]; then
+    ffmpeg_args+=("-loglevel" "verbose")
+else
+    ffmpeg_args+=("-loglevel" "error")
+    ffmpeg_args+=("-hide_banner")
+fi
+
+ffmpeg_args+=("${output_file_base}_%d.${extension}")
+verbose "ffmpeg ${ffmpeg_args[*]}"
+ffmpeg "${ffmpeg_args[@]}"
+
+for i in $(seq 0 1000); do
+    [ -f "${output_file_base}_${i}.${extension}" ] && echo "${output_file_base}_${i}.${extension}" || break
+done

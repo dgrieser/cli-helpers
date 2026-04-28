@@ -1,0 +1,29 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Format a space separated table to a tab separated table.
+
+Options:
+    -h, --help          display this help and exit
+EOF
+exit 1
+}
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+color-clear | sed 's/ \{2,\}/\t/g'

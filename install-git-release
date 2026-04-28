@@ -1,0 +1,641 @@
+#!/bin/bash
+
+APP_NAME="$(basename ${0})"
+
+
+function usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] PROJECT
+
+    PROJECT
+        Name or URL of the project to install
+
+    Options:
+        -h, --help          Display this help and exit
+
+        -p, --pattern       Pattern of the artifact to install
+                            Default: *linux*64*
+
+        -b, --binary        Pattern of the binary to install
+
+        -i, --install-path  Path to install the binary
+                            Default: /usr/local/bin
+
+        -y, --yes           Answer yes to all prompts
+
+        -d, --dry-run       Perform a trial run with no changes made
+EOF
+    exit 1
+}
+
+function error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+function fail() {
+    error "${1}"
+    cleanup
+    exit 1
+}
+
+function abort() {
+    echo "Abort." 1>&2
+    cleanup
+    exit 1
+}
+
+function success() {
+    echo "Done" 1>&2
+    cleanup
+    exit 0
+}
+
+function manual_download() {
+    echo 1>&2
+    read -p "Please provide download URL: " download_url 1>&2
+    [ -z "${download_url}" ] && abort
+    (cd "${tmpfolder}" && curl -L -O "${download_url}")
+    return $?
+}
+
+function cleanup() {
+    [ -n "${TMP_DIR}" ] && rm -rf "${TMP_DIR}"
+    [ -d "${tmpfolder}" ] && rm -rf "${tmpfolder}"
+}
+
+function contains_version() {
+    local version_output="${1}"
+    # check if anything looks like a version
+    echo -e "${version_output}" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' && echo -e "${version_output}" && return 0
+    return 1
+}
+
+function binary_version() {
+    local binary_path="${1}"
+    prefix_commands=()
+    command -v unbuffer >/dev/null 2>&1 && prefix_commands+=(unbuffer)
+    command -v timeout >/dev/null 2>&1 && prefix_commands+=(timeout 5)
+    contains_version "$("${prefix_commands[@]}" "${binary_path}" --version 2>&1)" && return 0
+    contains_version "$("${prefix_commands[@]}" "${binary_path}" version 2>&1)" && return 0
+    echo "<unknown>"
+    return 1
+}
+
+function print_version_table() {
+	local name="${1}"; shift
+	local current="${1}"; shift
+	local update="${1}"; shift
+	if [ "${current}" == "${update}" ]; then
+		echo "${name} is up to date" 1>&2
+	else
+		echo -e "NAME\tCURRENT\tUPDATE\n${name}\t${current}\t${update}" | column -t -s $'\t'
+	fi
+}
+
+function list_files() {
+    local file_list="${1}"
+    if [ -z "${file_list}" ]; then
+        echo " └─ (empty)"
+    else
+        echo " │"
+        echo "${file_list}" | sed 's/^/ └─ /'
+    fi
+}
+
+function find_readme() {
+    local files="${1}"
+    echo "${files}" | grep -i 'readme' | awk '{ print length(), $0 }' | sort -n | cut -d' ' -f2- | head -n 1
+}
+
+function filter_excluded_artifacts() {
+    local artifacts="${1}"
+    local filtered=""
+    local excluded_name
+    while IFS= read -r artifact; do
+        [ -z "${artifact}" ] && continue
+        excluded_name="$(basename "${artifact}")"
+        case "${excluded_name}" in
+            README.md|RELEASE.md|CONTRIBUTING.md|LICENSE|SECURITY.md)
+                continue
+                ;;
+        esac
+        if [ -z "${filtered}" ]; then
+            filtered="${artifact}"
+        else
+            filtered="${filtered}"$'\n'"${artifact}"
+        fi
+    done <<< "${artifacts}"
+    echo "${filtered}"
+}
+
+function print_archive_file() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local file="${3}"
+    case "${archive_type}" in
+        zip)
+            unzip -cq "${artifact}" "${file}"
+            ;;
+        tar)
+            tar -xOf "${artifact}" "${file}"
+            ;;
+        *)
+            fail "Unsupported archive type: ${archive_type} for '${artifact}'"
+            ;;
+    esac
+}
+
+function reduce_artifacts() {
+    local list="${1}"
+    local reduced="${list}"
+    local deb_list=""
+    local tar_list=""
+    local zip_list=""
+    local noext_list=""
+
+    deb_list="$(echo "${reduced}" | grep -E '\.deb$' || true)"
+    if [ -n "${deb_list}" ]; then
+        echo "${deb_list}"
+        return 0
+    fi
+
+    tar_list="$(echo "${reduced}" | grep -E '\.(tar\.gz|tar\.xz|tar\.bz2|tar|tgz)$' || true)"
+    if [ -n "${tar_list}" ]; then
+        echo "${tar_list}"
+        return 0
+    fi
+
+    zip_list="$(echo "${reduced}" | grep -E '\.zip$' || true)"
+    if [ -n "${zip_list}" ]; then
+        echo "${zip_list}"
+        return 0
+    fi
+
+    noext_list="$(echo "${reduced}" | awk -F/ '{ b=$NF; if (b !~ /\./) print $0 }')"
+    if [ -n "${noext_list}" ]; then
+        echo "${noext_list}"
+        return 0
+    fi
+
+    echo "${reduced}"
+    return 0
+}
+
+function prefer_gnu_over_musl() {
+    local list="${1}"; shift
+    prefer_a_over_b "gnu" "musl" "${list}"
+    return $?
+}
+
+function prefer_linux_over_darwin() {
+    local list="${1}"; shift
+    prefer_a_over_b "linux" "darwin" "${list}"
+    return $?
+}
+
+function prefer_a_over_b() {
+    local a="${1}"; shift
+    local b="${1}"; shift
+    local list="${1}"; shift
+    local has_a=0
+    local has_b=0
+
+    echo "${list}" | grep -q "${a}" && has_a=1
+    echo "${list}" | grep -q "${b}" && has_b=1
+    if [ ${has_a} -eq 1 ] && [ ${has_b} -eq 1 ]; then
+        echo "${list}" | grep -i "${a}"
+        return 0
+    fi
+
+    echo "${list}"
+    return 0
+}
+
+function archive_ls() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    case "${archive_type}" in
+        zip)
+            zipinfo -1 "${artifact}"
+            ;;
+        tar)
+            tar -tf "${artifact}"
+            ;;
+        *)
+            fail "Unsupported archive type: ${archive_type} for '${artifact}'"
+            ;;
+    esac
+}
+
+function retrieve_binary_from_archive() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    echo "Unpacking archive '${artifact}'..." 1>&2
+    files="$(archive_ls "${artifact}" "${archive_type}")"
+    output="$(list_files "${files}")"
+    echo "${output}" 1>&2
+    count=$(echo "${files}" | wc -l)
+    readme_file="$(find_readme "${files}")"
+    if [ -n "${readme_file}" ]; then
+        if prompt_readme "${readme_file}"; then
+            echo 1>&2
+            echo "Content of '${readme_file}':" 1>&2
+            readme_content="$(print_archive_file "${artifact}" "${archive_type}" "${readme_file}")"
+			if command -v glow &>/dev/null; then
+	            glow <(echo "${readme_content}") 1>&2
+			else
+				echo "${readme_content}" 1>&2
+				echo 1>&2
+			fi
+        fi
+    fi
+    files="$(filter_excluded_artifacts "${files}")"
+    count=$(echo "${files}" | wc -l)
+    binary_path=""
+    if [ -n "${BINARY_PATTERN}" ]; then
+        matching_files=""
+        while IFS= read -r file; do
+            if [[ "${file}" == ${BINARY_PATTERN} ]]; then
+                if [ -z "${matching_files}" ]; then
+                    matching_files="${file}"
+                else
+                    matching_files="${matching_files}\n${file}"
+                fi
+            fi
+        done <<< "${files}"
+        files="${matching_files}"
+        count=$(echo "${files}" | wc -l)
+    fi
+
+    if [ ${count} -eq 1 ]; then
+        binary_path="${files}"
+    elif [ ${count} -gt 1 ]; then
+        [ ${YES} -eq 1 ] && echo 1>&2 && echo "${files}" 1>&2 && error "Found ${count} files in '${artifact}' archive" && return 1
+        binary_path="$(choose -n -p "Binary to install:" "${files}")"
+    else
+        echo "No files found in '${artifact}'" 1>&2
+        return 1
+    fi
+    echo "${binary_path}"
+    return 0
+}
+
+function prompt_readme() {
+    local readme="${1}"
+    [ ${YES} -eq 1 ] && return 1
+    [ ${DRY_RUN} -eq 1 ] && return 1
+    echo 1>&2
+    read -p "Show readme '${readme}'? [y/N] " -r REPLY 1>&2
+    [[ "${REPLY}" =~ ^[Yy]$ ]] && return 0
+    return 1
+}
+
+function prompt_install() {
+    local binary="${1}"
+    local target_path="${2}"
+    [ ${YES} -eq 1 ] && return 0
+    [ ${DRY_RUN} -eq 1 ] && return 0
+    read -p "Install binary '${binary}' to '${target_path}/${binary}'? [Y/n] " -r REPLY 1>&2
+    [[ "${REPLY}" =~ ^[Nn]$ ]] && abort
+    return 0
+}
+
+function extract_binary_from_archive() {
+    local artifact="${1}"; shift
+    local archive_type="${1}"; shift
+    local binary_path="${1}"; shift
+    local binary="${1}"; shift
+    local target_path="${1}"; shift
+    local archive_binary
+    archive_binary="$(basename "${binary_path}")"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "${tmpdir}"' RETURN
+
+    extract_binary_to_dir "${artifact}" "${archive_type}" "${binary_path}" "${tmpdir}"
+
+    SUDO=""
+    [ ! -w "${target_path}" ] && SUDO="sudo"
+    LC_ALL=C ${SUDO} mv -vf "${tmpdir}/${archive_binary}" "${target_path}/${binary}"
+}
+
+function extract_binary_to_dir() {
+    local artifact="${1}"; shift
+    local archive_type="${1}"; shift
+    local binary_path="${1}"; shift
+    local target_dir="${1}"; shift
+    case "${archive_type}" in
+        zip)
+            # -j strips directories so the file lands directly in ${target_dir}
+            unzip -o -j "${artifact}" "${binary_path}" -d "${target_dir}" 1>&2
+            ;;
+        tar)
+            # count path components to strip so the file lands in ${target_dir}
+            local component_count
+            component_count=$(echo "${binary_path}" | tr -cd '/' | wc -c)
+            tar -xvf "${artifact}" -C "${target_dir}" --strip-components="${component_count}" "${binary_path}" 1>&2
+            ;;
+        *)
+            fail "Unsupported archive type: ${archive_type} for '${artifact}'"
+            ;;
+    esac
+}
+
+function install_from_archive() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local target_path="${3}"
+    binary_path="$(retrieve_binary_from_archive "${artifact}" "${archive_type}")"
+    [ $? -ne 0 ] && return 1
+    if [ -n "${binary_path}" ]; then
+        # setting global variable
+        BINARY="$(basename "${binary_path}")"
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            local tmpdir
+            tmpdir="$(mktemp -d)"
+            trap 'rm -rf "${tmpdir}"' RETURN
+            extract_binary_to_dir "${artifact}" "${archive_type}" "${binary_path}" "${tmpdir}" || return 1
+            local new_version
+            local current_version
+            new_version="$(binary_version "${tmpdir}/${BINARY}" | head -n 1)"
+            if [ -x "${INSTALL_PATH}/${BINARY}" ]; then
+                current_version="$(binary_version "${INSTALL_PATH}/${BINARY}" | head -n 1)"
+            else
+                current_version="(not installed)"
+            fi
+            print_version_table "${BINARY}" "${current_version}" "${new_version}"
+        else
+            prompt_install "${BINARY}" "${target_path}"
+            extract_binary_from_archive "${artifact}" "${archive_type}" "${binary_path}" "${BINARY}" "${target_path}"
+        fi
+        return $?
+    fi
+}
+
+function install_binary() {
+    local binary_path="${1}"
+    local target_path="${2}"
+    local binary
+    binary="$(basename "${binary_path}")"
+
+    if [ -n "${BINARY_PATTERN}" ]; then
+        if [[ "${binary}" != ${BINARY_PATTERN} ]]; then
+            error "Binary '${binary}' doesn't match pattern '${BINARY_PATTERN}'"
+            return 1
+        fi
+    fi
+
+    echo "Detected binary '${binary_path}'..." 1>&2
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        local new_version
+        local current_version
+        new_version="$(binary_version "${binary_path}" | head -n 1)"
+        if [ -x "${target_path}/${binary}" ]; then
+            current_version="$(binary_version "${target_path}/${binary}" | head -n 1)"
+        else
+            current_version="(not installed)"
+        fi
+        print_version_table "${binary}" "${current_version}" "${new_version}"
+    else
+        prompt_install "${binary}" "${target_path}"
+        SUDO=""
+        [ ! -w "${target_path}" ] && SUDO="sudo"
+        ${SUDO} cp -v "${binary_path}" "${target_path}/${binary}" || return 1
+        ${SUDO} chmod +x "${target_path}/${binary}" || return 1
+        # setting global variable
+        BINARY="${binary}"
+    fi
+    return 0
+}
+
+function install_deb() {
+    local artifact="${1}"
+    local package_name=""
+    local version=""
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        package_name="$(dpkg-deb -f "${artifact}" Package)"
+        new_version="$(dpkg-deb -f "${artifact}" Version)"
+		current_version="$(LC_ALL=C apt list "${package_name}" --installed 2>/dev/null | tail -1 | head -1 | awk '{print $2}')"
+		print_version_table "${package_name}" "${current_version}" "${new_version}"
+        return 0
+    else
+        echo "Installing '${artifact}' using apt..." 1>&2
+        sudo apt install "${artifact}" 1>&2 || return 1
+    fi
+    return 0
+}
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+NL=$'\n'
+YES=0
+DRY_RUN=0
+PATTERNS=()
+INSTALL_PATH="/usr/local/bin"
+BINARY_PATTERN=""
+TMP_DIR=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -d|--dry-run)
+            DRY_RUN=1
+            ;;
+        -p|--pattern)
+            shift
+            [ -z "${1}" ] && usage
+            PATTERNS+=("${1}")
+            ;;
+        -i|--install-path)
+            shift
+            [ -z "${1}" ] && usage
+            INSTALL_PATH="${1}"
+            ;;
+        -b|--binary)
+            shift
+            [ -z "${1}" ] && usage
+            BINARY_PATTERN="${1}"
+            ;;
+        -y|--yes)
+            YES=1
+            ;;
+        *)
+            if [ -z "${project}" ]; then
+                project="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${project}" ] && usage
+[ ${#PATTERNS[@]} -eq 0 ] && PATTERNS=( "*linux*64*" "*amd64*" "*x86_64*linux*" "*x64*linux*" )
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "Running in dry-run mode..." 1>&2
+    TMP_DIR="$(mktemp -d)"
+fi
+target_path="${INSTALL_PATH}"
+[ "${DRY_RUN}" -eq 1 ] && target_path="${TMP_DIR}"
+
+GITLAB=0
+GITHUB=0
+
+if [[ "${APP_NAME}" == *gitlab* ]]; then
+    GITLAB=1
+elif [[ "${APP_NAME}" == *github* ]]; then
+    GITHUB=1
+fi
+
+tmpfolder=$(mktemp -d)
+trap cleanup EXIT
+
+
+echo "Retrieving artifact from '${project}' with patterns ${PATTERNS[*]}..." 1>&2
+
+if [[ ! "${project}" =~ ^(https?)://.* ]] then
+    echo 1>&2
+    echo "Looking for repository: ${project}" 1>&2
+    git_search_args=()
+    git_search_args+=("${project}")
+    [ ${GITLAB} -eq 1 ] && git_search_args+=("--gitlab")
+    [ ${GITHUB} -eq 1 ] && git_search_args+=("--github")
+    repo="$(git-search "${git_search_args[@]}")"
+    if [ -z "${repo}" ]; then
+        fail "No such repository: ${project}"
+    fi
+    count=$(echo "${repo}" | wc -l)
+    if [ ${count} -gt 1 ]; then
+        [ ${YES} -eq 1 ] && fail "Found multiple repositories: ${repo}"
+        repo="$(choose -n -p "Found multiple repositories:" "${repo}")"
+    fi
+    if [ -n "${repo}" ]; then
+        project="${repo}"
+        echo "${project}" 1>&2
+        echo 1>&2
+    fi
+fi
+
+if [[ "${project}" == "https://github.com"* ]]; then
+    gh_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
+    for pattern in "${PATTERNS[@]}"; do
+        gh_args+=( "-p" "${pattern}" )
+    done
+    if ! gh "${gh_args[@]}" 1>&2; then
+        error "Failed to retrieve artifact from '${project}'"
+        manual_download
+    fi
+else
+    if [[ "${project}" == "https://"* ]]; then
+        if [ -n "${GITLAB_HOST}" ] && [[ "${project}" != "${GITLAB_HOST}"* ]]; then
+            GITLAB_HOST="$(echo "${project}" | cut -d/ -f1-3)"
+            unset GITLAB_TOKEN
+        fi
+    fi
+
+    glab_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
+    for pattern in "${PATTERNS[@]}"; do
+        glab_args+=( "-n" "${pattern}" )
+    done
+    if ! glab "${glab_args[@]}" 1>&2; then
+        error "Failed to retrieve artifact from '${project}'"
+        manual_download
+    fi
+fi
+
+artifact=""
+for pattern in "${PATTERNS[@]}"; do
+    [ -n "${artifact}" ] && artifact+=$'\n'
+    artifact="${artifact}$(ls -1 "${tmpfolder}/"${pattern} 2> /dev/null)"
+done
+[ -z "${artifact}" ] && error "Artifact not found" && manual_download
+
+# sort reverse and make unique
+artifact="$(echo "${artifact}" | sort -ur)"
+
+if [ $(echo "${artifact}" | wc -l) -gt 1 ]; then
+    artifact_list="${artifact}"
+    best=""
+    echo 1>&2
+    echo "Found multiple artifacts matching ${PATTERNS[*]}:" 1>&2
+    while IFS= read -r item; do
+        echo "$(basename "${item}")" 1>&2
+    done <<< "${artifact_list}"
+
+    # try filtering by architecture
+    filtered="$(echo "${artifact_list}" | grep -E "($(uname -p)|$(dpkg --print-architecture))")"
+    count=$(echo "${filtered}" | wc -l)
+
+    if [ ${count} -eq 1 ]; then
+        # reduced to one, use it
+        best="${filtered}"
+    elif [ ${count} -gt 1 ]; then
+        # continue with filtered list
+        echo 1>&2
+        echo "Filtered artifacts:" 1>&2
+        while IFS= read -r item; do
+            echo "$(basename "${item}")" 1>&2
+        done <<< "${filtered}"
+        artifact_list="${filtered}"
+    fi
+
+    if [ -z "${best}" ]; then
+        reduced_list="$(reduce_artifacts "${artifact_list}")"
+        reduced_list="$(prefer_gnu_over_musl "${reduced_list}")"
+        reduced_list="$(prefer_linux_over_darwin "${reduced_list}")"
+        if [ "$(echo "${reduced_list}" | wc -l)" -eq 1 ]; then
+            best="${reduced_list}"
+        else
+            artifact_list="${reduced_list}"
+        fi
+    fi
+
+    if [ -z "${best}" ]; then
+        [ ${YES} -eq 1 ] && fail "Multiple artifacts found"
+        best="$(choose -n -p "Please select the artifact to install:" "${artifact_list}")"
+    fi
+    echo "Chose '$(basename "${best}")' as best candidate" 1>&2
+    artifact="${best}"
+fi
+
+BINARY=""
+artifact_tmp_path="/tmp/$(basename "${artifact}" | tr '.' '_')"
+manual_install=0
+
+echo 1>&2; echo "Installing from '${artifact}'..." 1>&2
+if [[ "${artifact}" == *.deb ]]; then
+    install_deb "${artifact}" || manual_install=1
+elif tar -tf "${artifact}" &> /dev/null; then
+    install_from_archive "${artifact}" "tar" "${target_path}" || manual_install=1
+elif zipinfo -1 "${artifact}" &> /dev/null; then
+    install_from_archive "${artifact}" "zip" "${target_path}" || manual_install=1
+elif file "${artifact}" | grep -q "ELF"; then
+    install_binary "${artifact}" "${target_path}" || manual_install=1
+else
+    error "Unknown artifact type: '${artifact}'"
+    manual_install=1
+fi
+
+if [ ${manual_install} -eq 1 ]; then
+    LC_ALL=C mv -vf "${artifact}" "${artifact_tmp_path}"
+    echo 1>&2
+    echo "Please install manually from:" 1>&2
+    echo 1>&2
+    echo "${artifact_tmp_path}" 1>&2
+    ls -al "${artifact_tmp_path}" 1>&2
+    abort 
+fi
+
+if [ "${DRY_RUN}" -eq 0 ] && [ -n "${BINARY}" ]; then
+    echo 1>&2
+    echo "Printing version of '${target_path}/${BINARY}':" 1>&2
+    binary_version "${target_path}/${BINARY}" 1>&2
+fi
+
+success

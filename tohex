@@ -1,0 +1,33 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") [--width|-w <width, devisable by 2, default: 8>]" 1>&2
+    exit 1
+}
+
+set_width() {
+    local w="${1}"
+    [ ${width_set} -eq 1 ] && usage
+    [[ ! "${w}" =~ ^[0-9]+$ ]] && usage
+    [ $(( ${w} % 2 )) -ne 0 ] && echo "ERROR: width must be devisable by 2" 1>&2 && exit 1
+    width="${w}"
+    width_set=1
+    return 0
+}
+
+width=8
+width_set=0
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --width|-w)
+            shift
+            set_width "${1}" || usage
+            ;;
+        *)
+            set_width "${1}" || usage
+            ;;
+    esac
+    shift
+done
+
+cat - | xxd -u -g1 -c${width} -R always -d | sed -E 's/^[0-9]+: //g' | nl -n rn -s '  ' -w4 -i${width} -v0

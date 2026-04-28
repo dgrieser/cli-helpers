@@ -1,0 +1,38 @@
+#!/bin/bash
+
+APP="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP} [OPTIONS]
+
+Print log entries from power-trigger service.
+
+Options:
+    -h, --help   Print this help and exit.
+    -a, --all    Print all log entries, not just opening and closing the lid.
+EOF
+    exit 1
+}
+
+all=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -a|--all)
+            all=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+match='Detected lid (open|close)$'
+[ "${all}" -eq 1 ] && match='.'
+
+journalctl --user -u power-trigger.service --no-hostname --since -72h | grep -E "${match}" | sed -E 's/^(.+)power-trigger[^:]+: (.+)$/\1\2/g' | less +G

@@ -1,0 +1,143 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: $(basename ${0}) [OPTIONS] COMMAND
+
+Edit or create a file or command using vim (sudo if needed).
+
+    COMMAND     The command or file to edit.
+                Commands are found via which or
+                are searched for in /usr/local/bin
+
+Options:
+    -h, --help  Show this message
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+file_or_cmd=""
+original_args=("${@}")
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${file_or_cmd}" ]; then
+                file_or_cmd="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${file_or_cmd}" ] && usage
+file=""
+
+if [ "${file_or_cmd:0:1}" = "/" ] || [ "${file_or_cmd:0:2}" = "./" ]; then
+    file="${file_or_cmd}"
+else
+    file="$(which ${file_or_cmd})"
+    if [ -z "${file}" ]; then
+        file="/usr/local/bin/${file_or_cmd}"
+    fi
+fi
+
+is_text_file=1
+if [ -f "${file}" ] && [[ "$(file -L "${file}" --mime-type -b)" != text/* ]]; then
+    is_text_file=0
+    warning "${file} does not appear to be a text file."
+    prompt-no-yes "Edit anyway?" || exit 1
+fi
+
+echo "Editing ${file}"
+
+parent_folder="$(dirname "${file}")"
+base_name=$(basename "${file}")
+swp_file="${parent_folder}/.${base_name}.swp"
+remove_swp_file=0
+
+# check if parent folder is writable by user
+if [ -w "${parent_folder}" ]; then
+    sudo=""
+else
+    sudo="sudo "
+fi
+
+vim_args=()
+new_content=""
+if [ ! -f "${file}" ]; then
+    ${sudo}bash -c 'echo -e "#!/bin/bash\n" > '"${file}"''
+    new_content="$(< "${file}")"
+    vim_args+=("-c" "normal G")
+fi
+if [ ! -x "${file}" ]; then
+    ${sudo}chmod +x "${file}"
+fi
+vim_args+=("-c" "startinsert")
+
+# check for swap file
+if [ -f "${swp_file}" ]; then
+    # Recover using swap, then delete swap after successful write
+    prompt-yes-no "Swap file found. Recover?"; exit_code=$?
+    case "${exit_code}" in
+        0)
+            vim_args+=("-c" "silent! recover" "-c" "set nobackup nowritebackup")
+            remove_swp_file=1
+            ;;
+        1)
+            prompt-yes-no "Delete swap file?"; exit_code=$?
+            [ "${exit_code}" -eq 0 ] && ${sudo}rm "${swp_file}"
+            [ "${exit_code}" -gt 1 ] && exit "${exit_code}"
+            ;;
+        *)
+            exit "${exit_code}"
+            ;;
+    esac
+fi
+
+${sudo}vim "${vim_args[@]}" "${file}"
+[ $? -eq 0 ] && [ "${remove_swp_file}" -eq 1 ] && [ -f "${swp_file}" ] && ${sudo}rm "${swp_file}"
+
+if [ "${is_text_file}" -eq 1 ]; then
+    changed_content="$(< "${file}")"
+    if [ -n "${new_content}" ] && [ "${new_content}" = "${changed_content}" ]; then
+        # remove file, since editing seems to be aborted
+        echo "Abort. Removing ${file}"
+        ${sudo}rm "${file}"
+    else
+        shebang="$(head -n 1 "${file}")"
+        syntax_ok=1
+        case "${shebang}" in
+            "#!/bin/bash"|"#!/usr/bin/bash"|"#!/usr/bin/env bash")
+                LC_ALL=C bash -n "${file}" || syntax_ok=0
+                ;;
+            "#!/usr/bin/python3"|"#!/usr/bin/env python3")
+                LC_ALL=C python3 -m py_compile "${file}" || syntax_ok=0
+                ;;
+        esac
+
+        if [ "${syntax_ok}" -eq 0 ]; then
+            error "Syntax check failed"
+            prompt-yes-no "Edit again?" && exec vish "${original_args[@]}"
+        fi
+    fi
+fi

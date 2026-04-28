@@ -1,0 +1,10 @@
+#!/bin/bash
+gofile="$(mktemp /tmp/XXXXXX.go)"
+cat "${HOME}/.config/go/main-template.go" > "${gofile}"
+while true; do
+    vi "${gofile}"
+    go run "${gofile}"
+    echo
+    prompt-continue-yes || break
+done
+rm "${gofile}"
