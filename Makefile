@@ -12,7 +12,16 @@ SHARED := lib-desktop gnome-display-config gnome-window-bridge
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
-.PHONY: install uninstall list-install
+.PHONY: list install uninstall list-install
+
+list:
+	@printf 'Available targets:\n'
+	@printf '  make list          Show this help and available commands\n'
+	@printf '  make list-install  Show install destinations and installed files\n'
+	@printf '  sudo make install  Install commands, shared helpers, and GNOME extension\n'
+	@printf '  sudo make uninstall  Remove installed files\n'
+	@printf '\nAvailable commands:\n'
+	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 
 install:
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(GNOME_EXTENSIONS_DIR)/$(EXTENSION_UUID)"
