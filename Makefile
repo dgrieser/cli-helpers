@@ -3,7 +3,7 @@ DESTDIR ?=
 
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/cli-helpers
-GNOME_EXTENSIONS_DIR ?= $(PREFIX)/share/gnome-shell/extensions
+GNOME_EXTENSIONS_DIR ?= $(HOME)/.local/share/gnome-shell/extensions
 ENABLE_GNOME_EXTENSION ?= 1
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
