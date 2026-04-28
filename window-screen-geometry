@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 usage() {
     echo "usage: $(basename "${0}") [-h|--help] [--ignore-scale] [-r|--raw] <display>" 1>&2
@@ -47,11 +49,31 @@ done
 
 [ -z "${display}" ] && usage
 
+if cli_helpers_is_wayland; then
+    line="$("${SCRIPT_DIR}/gnome-display-config" list --geometry --display "${display}")"
+    [ -z "${line}" ] && fail "Display '${display}' not found"
+    read -r _name x y width height scale <<< "${line}"
+    if [ "${apply_scale}" -eq 0 ]; then
+        scale=1
+    fi
+    geometry="${width}x${height}+${x}+${y}"
+    if [ "${raw}" -eq 1 ]; then
+        echo "${geometry}"
+    else
+        echo "${width}"
+        echo "${height}"
+        echo "${x}"
+        echo "${y}"
+        [ "${apply_scale}" -eq 1 ] && echo "${scale}"
+    fi
+    exit 0
+fi
+
 if [ "${apply_scale}" -eq 1 ]; then
     scale="$(xmllint --xpath "string(//monitor/monitorspec[connector='${display}']/../../scale)" ${HOME}/.config/monitors.xml 2>/dev/null | head -n 1)"
     [ -z "${scale}" ] && warning "Unable to determine scale for display '${display}', defaulting to 1" && scale=1
 fi
-geometry=$(xrandr --listmonitors | tail -n +2 | grep "${display_name}$" | awk '{print $3}')
+geometry=$(xrandr --listmonitors | tail -n +2 | grep "${display}$" | awk '{print $3}')
 [ -z "${geometry}" ] && fail "Display '${display}' not found"
 width=0
 height=0

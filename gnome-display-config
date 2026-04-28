@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except (ImportError, ValueError) as exc:
+    print(f"ERROR: python3-gi is required for GNOME Wayland display configuration: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
+INTERFACE = "org.gnome.Mutter.DisplayConfig"
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def call_display_config(method, params=None):
+    if params is None:
+        params = GLib.Variant("()", ())
+    proxy = Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SESSION,
+        Gio.DBusProxyFlags.NONE,
+        None,
+        BUS_NAME,
+        OBJECT_PATH,
+        INTERFACE,
+        None,
+    )
+    try:
+        return proxy.call_sync(method, params, Gio.DBusCallFlags.NONE, -1, None).unpack()
+    except GLib.Error as exc:
+        fail(f"Failed to call Mutter DisplayConfig.{method}: {exc.message}")
+
+
+def current_state():
+    serial, monitors, logical_monitors, properties = call_display_config("GetCurrentState")
+    mode_sizes = {}
+    for monitor in monitors:
+        spec, modes, monitor_props = monitor
+        connector, vendor, product, serial_number = spec
+        selected_mode = None
+        for mode in modes:
+            mode_id, width, height, refresh_rate, preferred_scale, supported_scales, mode_props = mode
+            if mode_props.get("is-current") or selected_mode is None:
+                selected_mode = (int(width), int(height))
+            if mode_props.get("is-current"):
+                break
+        if selected_mode:
+            mode_sizes[connector] = selected_mode
+
+    result = []
+    for logical in logical_monitors:
+        x, y, scale, transform, primary, logical_outputs, props = logical
+        names = [connector for connector, vendor, product, serial_number in logical_outputs]
+        width = int(props.get("logical-width", 0))
+        height = int(props.get("logical-height", 0))
+        if (width == 0 or height == 0) and names:
+            physical_width, physical_height = mode_sizes.get(names[0], (0, 0))
+            if scale:
+                width = int(round(physical_width / scale))
+                height = int(round(physical_height / scale))
+        for name in names:
+            result.append({
+                "name": name,
+                "x": int(x),
+                "y": int(y),
+                "width": width,
+                "height": height,
+                "scale": float(scale),
+                "primary": bool(primary),
+                "group": names,
+            })
+
+    if not result:
+        fail("No logical monitors returned by Mutter DisplayConfig.")
+    return result
+
+
+def list_monitors(args):
+    monitors = current_state()
+    if args.primary:
+        monitors = [monitor for monitor in monitors if monitor["primary"]]
+    if args.display:
+        monitors = [monitor for monitor in monitors if monitor["name"] == args.display]
+
+    if not monitors:
+        fail("No matching monitor found.")
+
+    for monitor in monitors:
+        if args.json:
+            print(json.dumps(monitor, sort_keys=True))
+        elif args.geometry:
+            print("{name} {x} {y} {width} {height} {scale:g}".format(**monitor))
+        else:
+            print(monitor["name"])
+
+
+def gamma_resources():
+    # GetResources returns serial, CRTCs, outputs, modes, max_screen_width, max_screen_height.
+    serial, crtcs, outputs, modes, max_width, max_height = call_display_config("GetResources")
+    output_to_crtc = {}
+    for output in outputs:
+        output_id = output[0]
+        crtc_id = output[2]
+        connector = output[4]
+        output_to_crtc[connector] = crtc_id
+    return serial, output_to_crtc
+
+
+def gamma_to_float(values):
+    if not values:
+        return 1.0
+    midpoint = values[len(values) // 2]
+    if midpoint == 0:
+        return 0.0
+    normalized = midpoint / 65535.0
+    return round(0.5 / normalized, 2)
+
+
+def gamma_to_ramp(value, length):
+    if length <= 1:
+        length = 256
+    value = max(0.1, float(value))
+    return [min(65535, int(round((i / (length - 1)) * 65535 / value))) for i in range(length)]
+
+
+def get_gamma(output):
+    serial, output_to_crtc = gamma_resources()
+    crtc_id = output_to_crtc.get(output)
+    if crtc_id is None:
+        fail(f"Output '{output}' not found.")
+    red, green, blue = call_display_config("GetCrtcGamma", GLib.Variant("(uu)", (serial, crtc_id)))
+    return [gamma_to_float(red), gamma_to_float(green), gamma_to_float(blue)]
+
+
+def set_gamma(output, red, green, blue):
+    serial, output_to_crtc = gamma_resources()
+    crtc_id = output_to_crtc.get(output)
+    if crtc_id is None:
+        fail(f"Output '{output}' not found.")
+    current_red, current_green, current_blue = call_display_config("GetCrtcGamma", GLib.Variant("(uu)", (serial, crtc_id)))
+    length = max(len(current_red), len(current_green), len(current_blue), 256)
+    params = GLib.Variant(
+        "(uuaqaqaq)",
+        (
+            serial,
+            crtc_id,
+            gamma_to_ramp(red, length),
+            gamma_to_ramp(green, length),
+            gamma_to_ramp(blue, length),
+        ),
+    )
+    call_display_config("SetCrtcGamma", params)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("--display")
+    list_parser.add_argument("--geometry", action="store_true")
+    list_parser.add_argument("--primary", action="store_true")
+    list_parser.add_argument("--json", action="store_true")
+
+    gamma_parser = subparsers.add_parser("gamma")
+    gamma_parser.add_argument("output")
+
+    set_gamma_parser = subparsers.add_parser("set-gamma")
+    set_gamma_parser.add_argument("output")
+    set_gamma_parser.add_argument("red", type=float)
+    set_gamma_parser.add_argument("green", type=float)
+    set_gamma_parser.add_argument("blue", type=float)
+
+    args = parser.parse_args()
+    if args.command == "list":
+        list_monitors(args)
+    elif args.command == "gamma":
+        print(":".join(f"{value:.1f}" for value in get_gamma(args.output)))
+    elif args.command == "set-gamma":
+        set_gamma(args.output, args.red, args.green, args.blue)
+
+
+if __name__ == "__main__":
+    main()

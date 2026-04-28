@@ -1,7 +1,14 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 if [ "$#" -ne 1 ]; then
     echo "Usage: $(basename "${0}") <id> <class>"
+    exit 1
+fi
+
+if cli_helpers_is_wayland; then
+    echo "ERROR: window-set-class is X11-only. Wayland clients/classes cannot be reassigned from outside the compositor." 1>&2
     exit 1
 fi
 

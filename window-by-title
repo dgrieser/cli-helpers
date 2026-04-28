@@ -1,8 +1,23 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 if [ $# -ne 1 ]; then
     echo "Usage: $(basename "${0}") <title>"
     exit 1
 fi
 
-wmctrl -xl | awk '$5 == "'"${1}"'"' | awk '{print $1}'
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import sys
+
+needle = sys.argv[1]
+for window in json.load(sys.stdin):
+    if window.get("title", "") == needle:
+        print(window.get("id", ""))
+' "${1}"
+else
+    wmctrl -xl | awk '$5 == "'"${1}"'"' | awk '{print $1}'
+fi

@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 name="Launcher"
 bin_path="${0}"
 bin_name="$(basename "${bin_path}")"
@@ -14,7 +16,11 @@ screen_scale=1
 
 pid=$(pidof -x "${bin_path}")
 if [ "${pid}" != "$$" ]; then
-    window-focus-by-class "${bin_name}"
+    if cli_helpers_is_wayland; then
+        window-focus-by-title "${name}"
+    else
+        window-focus-by-class "${bin_name}"
+    fi
     echo "Focus on ${bin_name}"
     exit 0
 fi
@@ -29,12 +35,14 @@ pid=$!
 EXIT_FILE="/tmp/launcher-${pid}.exit"
 rm -rf "${EXIT_FILE}"
 
-attempts=1
-while ! xprop -name "${name}" -f WM_CLASS 8s -set WM_CLASS "${bin_name}" 2>/dev/null; do
-    ((attempts++))
-    sleep 0.5
-    [ "${attempts}" -gt 10 ] && break
-done
+if ! cli_helpers_is_wayland; then
+    attempts=1
+    while ! xprop -name "${name}" -f WM_CLASS 8s -set WM_CLASS "${bin_name}" 2>/dev/null; do
+        ((attempts++))
+        sleep 0.5
+        [ "${attempts}" -gt 10 ] && break
+    done
+fi
 
 counter=0
 interval=0.5
@@ -55,7 +63,12 @@ while true; do
     counter=$(echo "${counter}+${interval}" | bc)
 
     # launcher in focus resets the counter
-    [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "$(window-by-class ${bin_name})" ]] && counter=0
+    if cli_helpers_is_wayland; then
+        launcher_window="$(window-by-title "${name}")"
+    else
+        launcher_window="$(window-by-class ${bin_name})"
+    fi
+    [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "${launcher_window}" ]] && counter=0
 
     # running process in launcher resets the counter
     [ $(pstree -AT ${pid} | tr -s '-' | tr '-' $'\n' | wc -l) -gt 2 ] && counter=0

@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 usage() {
     echo "usage: $(basename "${0}") [-n|--new-line] [-c|--clipboard|-p|--primary] [-f|--file <file>]" 1>&2
@@ -35,7 +37,16 @@ while [ $# -gt 0 ]; do
 done
 
 
-content="$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")"
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command wl-paste wl-clipboard || exit 1
+    if [ "${clipboard}" = "primary" ]; then
+        content="$(wl-paste --primary 2>/dev/null)"
+    else
+        content="$(wl-paste 2>/dev/null)"
+    fi
+else
+    content="$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")"
+fi
 if [ $new_line -eq 1 ] && [ "${content: -1}" != $'\n' ]; then
     content="${content}"$'\n'
 fi

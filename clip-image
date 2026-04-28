@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 error() {
     echo "ERROR: ${1}" 1>&2
@@ -14,7 +16,12 @@ if [ -p /dev/stdin ]; then
     [ ! -f "$file_path" ] && fail "Failed to find file denoted by stdin"
     mime_type="$(mimetype --output-format "%m" "${file_path}")"
     [ -z "$mime_type" ] && fail "Failed to determine mime type of file"
-    DISPLAY=$(xdisplay) xclip -sel c -t "${mime_type}" -i "${file_path}"
+    if cli_helpers_is_wayland; then
+        cli_helpers_require_command wl-copy wl-clipboard || exit 1
+        wl-copy --type "${mime_type}" < "${file_path}"
+    else
+        DISPLAY=$(xdisplay) xclip -sel c -t "${mime_type}" -i "${file_path}"
+    fi
 else
     fail "No input provided"
 fi

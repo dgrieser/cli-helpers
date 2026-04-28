@@ -1,0 +1,31 @@
+#!/bin/bash
+
+cli_helpers_session_type() {
+    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        echo "wayland"
+    else
+        echo "x11"
+    fi
+}
+
+cli_helpers_is_wayland() {
+    [ "$(cli_helpers_session_type)" = "wayland" ]
+}
+
+cli_helpers_require_command() {
+    local command_name="${1}"
+    local package_name="${2:-${command_name}}"
+
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        echo "ERROR: '${command_name}' is required. Install '${package_name}' and retry." 1>&2
+        return 1
+    fi
+}
+
+cli_helpers_repo_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
+}
+
+cli_helpers_gnome_window_bridge() {
+    "$(cli_helpers_repo_dir)/gnome-window-bridge" "$@"
+}

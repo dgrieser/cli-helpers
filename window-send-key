@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $(basename "${0}") [--type] <key> ..."
@@ -21,10 +23,25 @@ done
 
 # send all arguments as keys
 while [ "${#}" -gt 0 ]; do
-    if [ "${type_mode}" -eq 1 ]; then
-        xdotool type --clearmodifiers "${1}"
+    if cli_helpers_is_wayland; then
+        cli_helpers_require_command ydotool ydotool || exit 1
+        if [ "${type_mode}" -eq 1 ]; then
+            ydotool type "${1}" || {
+                echo "ERROR: ydotool failed. Ensure the ydotool daemon/service is running and accessible." 1>&2
+                exit 1
+            }
+        else
+            ydotool key "${1}" || {
+                echo "ERROR: ydotool failed. Ensure the ydotool daemon/service is running and accessible." 1>&2
+                exit 1
+            }
+        fi
     else
-        xdotool key --clearmodifiers "${1}"
+        if [ "${type_mode}" -eq 1 ]; then
+            xdotool type --clearmodifiers "${1}"
+        else
+            xdotool key --clearmodifiers "${1}"
+        fi
     fi
     #sleep 0.1
     shift

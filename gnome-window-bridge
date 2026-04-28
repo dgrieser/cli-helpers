@@ -1,0 +1,58 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BUS_NAME="de.dgrieser.CliHelpers.WindowBridge"
+OBJECT_PATH="/de/dgrieser/CliHelpers/WindowBridge"
+INTERFACE="de.dgrieser.CliHelpers.WindowBridge"
+EXTENSION_UUID="cli-helpers-window-bridge@dgrieser.de"
+
+usage() {
+    echo "usage: $(basename "${0}") <list|active|focus|pointer-monitor|active-monitor> [argument]" 1>&2
+    exit 1
+}
+
+fail_bridge() {
+    cat 1>&2 <<EOF
+ERROR: GNOME Wayland window control requires the ${EXTENSION_UUID} GNOME Shell extension.
+Install the extension from ./gnome-shell-extension/${EXTENSION_UUID}, then enable it with:
+  gnome-extensions enable ${EXTENSION_UUID}
+EOF
+    exit 1
+}
+
+call_bridge() {
+    gdbus call --session \
+        --dest "${BUS_NAME}" \
+        --object-path "${OBJECT_PATH}" \
+        --method "${INTERFACE}.${1}" \
+        "${@:2}" 2>/dev/null || fail_bridge
+}
+
+unquote_gvariant_string() {
+    sed -E "s/^\\('(.*)',\\)$/\\1/; s/^\\((.*),\\)$/\\1/"
+}
+
+[ "$#" -ge 1 ] || usage
+
+case "${1}" in
+    list)
+        call_bridge ListWindows | unquote_gvariant_string
+        ;;
+    active)
+        call_bridge GetActiveWindow | unquote_gvariant_string
+        ;;
+    focus)
+        [ "$#" -eq 2 ] || usage
+        call_bridge FocusWindow "${2}" >/dev/null
+        ;;
+    pointer-monitor)
+        call_bridge GetPointerMonitor | unquote_gvariant_string
+        ;;
+    active-monitor)
+        call_bridge GetActiveWindowMonitor | unquote_gvariant_string
+        ;;
+    *)
+        usage
+        ;;
+esac

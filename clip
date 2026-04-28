@@ -1,8 +1,10 @@
 #!/bin/bash
 CLIPBOARD_PRIVATE_FILE="${HOME}/.cache/clipboard-private"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 usage() {
-    echo "usage: $(basename "${0}") [--print] [<file, or stdin>]" 2>&1
+    echo "usage: $(basename "${0}") [--print] [-c|--clipboard|-p|--primary] [<file, or stdin>]" 2>&1
     exit 1
 }
 
@@ -17,6 +19,7 @@ fail() {
 
 PRINT=0
 FILE=""
+CLIPBOARD="both"
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -25,6 +28,12 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --print)
             PRINT=1
+            ;;
+        -c|--clipboard)
+            CLIPBOARD="clipboard"
+            ;;
+        -p|--primary)
+            CLIPBOARD="primary"
             ;;
         *)
             if [ -z "${FILE}" ]; then
@@ -41,28 +50,47 @@ done
 [ "${FILE}" = "-" ] && FILE=""
 [ -n "${FILE}" ] && [ ! -f "${FILE}" ] && fail "File '${FILE}' does not exist"
 
+copy_file() {
+    local input_file="${1}"
+    touch "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_require_command wl-copy wl-clipboard || return 1
+        if [ "${CLIPBOARD}" = "clipboard" ] || [ "${CLIPBOARD}" = "both" ]; then
+            wl-copy < "${input_file}"
+        fi
+        if [ "${CLIPBOARD}" = "primary" ] || [ "${CLIPBOARD}" = "both" ]; then
+            wl-copy --primary < "${input_file}"
+        fi
+    else
+        if [ "${CLIPBOARD}" = "clipboard" ]; then
+            DISPLAY=$(xdisplay) xclip -i -sel c < "${input_file}" &>/dev/null
+        elif [ "${CLIPBOARD}" = "primary" ]; then
+            DISPLAY=$(xdisplay) xclip -i -sel p < "${input_file}" &>/dev/null
+        else
+            DISPLAY=$(xdisplay) xclip -i -sel c < "${input_file}" &>/dev/null
+            DISPLAY=$(xdisplay) xclip -i -sel p < "${input_file}" &>/dev/null
+        fi
+    fi
+
+    [ "${PRINT}" -eq 1 ] && cat "${input_file}"
+    rm -f "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
+}
+
 # read from file
 if [ -n "${FILE}" ]; then
-    touch "${CLIPBOARD_PRIVATE_FILE}"
-    if [ "${PRINT}" -eq 1 ]; then
-        cat "${FILE}" | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p -f 2>/dev/null
-    else
-        cat "${FILE}" | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p &>/dev/null
-    fi
-    rm "${CLIPBOARD_PRIVATE_FILE}"
+    copy_file "${FILE}" || exit 1
     exit 0
 fi
 
 # read from stdin if available
 if [ -p /dev/stdin ]; then
-    touch "${CLIPBOARD_PRIVATE_FILE}"
-    if [ "${PRINT}" -eq 1 ]; then
-        cat - | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p -f 2>/dev/null
-    else
-        cat - | DISPLAY=$(xdisplay) xclip -i -sel c -f 2>/dev/null | DISPLAY=$(xdisplay) xclip -i -sel p &>/dev/null
-    fi
-    rm "${CLIPBOARD_PRIVATE_FILE}"
-    exit 0
+    tmpfile="$(mktemp "/tmp/clip.XXXXXX")"
+    cat - > "${tmpfile}"
+    copy_file "${tmpfile}"
+    status=$?
+    rm -f "${tmpfile}"
+    exit "${status}"
 fi
 
 usage

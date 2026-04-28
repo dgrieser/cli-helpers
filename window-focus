@@ -1,8 +1,15 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 if [ $# -ne 1 ]; then
     echo "Usage: $(basename "${0}") <id>"
     exit 1
 fi
 
-wmctrl -ia ${1}
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    cli_helpers_gnome_window_bridge focus "${1}"
+else
+    wmctrl -ia ${1}
+fi

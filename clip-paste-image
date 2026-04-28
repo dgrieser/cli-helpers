@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 
 usage() {
@@ -33,10 +35,19 @@ done
 
 tmpfile=""
 ext=""
-image_mime_type="$(xclip -selection clipboard -t TARGETS -o | egrep -m 1 '^image/')"
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command wl-paste wl-clipboard || exit 1
+    image_mime_type="$(wl-paste --list-types | egrep -m 1 '^image/')"
+else
+    image_mime_type="$(xclip -selection clipboard -t TARGETS -o | egrep -m 1 '^image/')"
+fi
 if [ -z "${image_mime_type}" ]; then
     # no image in clipboard, try downloading if it is a URL
-    text="$(DISPLAY=$(xdisplay) xclip -o -sel c)"
+    if cli_helpers_is_wayland; then
+        text="$(wl-paste 2>/dev/null)"
+    else
+        text="$(DISPLAY=$(xdisplay) xclip -o -sel c)"
+    fi
     if [[ "${text}" =~ ^https?:// ]]; then
         tmpfile=$(mktemp "/tmp/clip-paste-image.XXXXXX")
         if ! curl -sS -L -o "${tmpfile}" "${text}"; then
@@ -47,7 +58,11 @@ if [ -z "${image_mime_type}" ]; then
     fi
 else
     tmpfile=$(mktemp "/tmp/clip-paste-image.XXXXXX")
-    xclip -selection clipboard -t "${image_mime_type}" -o > "${tmpfile}"
+    if cli_helpers_is_wayland; then
+        wl-paste --type "${image_mime_type}" > "${tmpfile}"
+    else
+        xclip -selection clipboard -t "${image_mime_type}" -o > "${tmpfile}"
+    fi
 fi
 
 if [ -z "${image_mime_type}" ]; then

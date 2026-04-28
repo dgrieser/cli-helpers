@@ -1,2 +1,19 @@
 #!/bin/bash
-wmctrl -xl
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
+
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import socket
+import sys
+
+host = socket.gethostname()
+for window in json.load(sys.stdin):
+    app_class = window.get("wm_class") or window.get("sandboxed_app_id") or ""
+    print(f"{window.get('id', '')} {window.get('workspace', -1)} {host} {app_class} {window.get('title', '')}")
+'
+else
+    wmctrl -xl
+fi

@@ -1,10 +1,26 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 if [ $# -eq 0 ]; then
     echo "usage: $(basename "${0}") <classes ...>" 1>&2
     exit 1
 fi
 
-for wmclass in "$@"; do
-    wmctrl -xl | awk -v wmclass="$wmclass" '$3 == wmclass {print $1}'
-done
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import sys
+
+classes = set(sys.argv[1:])
+for window in json.load(sys.stdin):
+    names = {window.get("wm_class", ""), window.get("sandboxed_app_id", "")}
+    if classes.intersection(names):
+        print(window.get("id", ""))
+' "$@"
+else
+    for wmclass in "$@"; do
+        wmctrl -xl | awk -v wmclass="$wmclass" '$3 == wmclass {print $1}'
+    done
+fi

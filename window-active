@@ -1,7 +1,16 @@
 #!/bin/bash
-id=$(xdotool getwindowfocus)
-if [ -n "${id}" ]; then
-    printf "0x%08x\n" ${id}
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
+
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    id="$(cli_helpers_gnome_window_bridge active)"
+    [ -n "${id}" ] && echo "${id}" || exit 1
 else
-    exit 1
+    id=$(xdotool getwindowfocus)
+    if [ -n "${id}" ]; then
+        printf "0x%08x\n" ${id}
+    else
+        exit 1
+    fi
 fi

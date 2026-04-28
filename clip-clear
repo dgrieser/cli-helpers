@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 usage() {
     echo "usage: $(basename "${0}") [-c|--clipboard|-p|--primary]" 1>&2
@@ -25,4 +27,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-echo | DISPLAY=$(xdisplay) xclip -r -selection "${clipboard}"
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command wl-copy wl-clipboard || exit 1
+    if [ "${clipboard}" = "primary" ]; then
+        wl-copy --primary --clear
+    else
+        wl-copy --clear
+    fi
+else
+    echo | DISPLAY=$(xdisplay) xclip -r -selection "${clipboard}"
+fi

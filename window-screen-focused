@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${SCRIPT_DIR}/lib-desktop"
 
 usage() {
     cat <<EOF
@@ -90,9 +92,11 @@ get_primary_monitor() {
 
 declare -a monitors
 
-while IFS=$'\n' read -r line; do
-    monitors+=("${line}")
-done < <(window-screen-list --geometry)
+if ! cli_helpers_is_wayland; then
+    while IFS=$'\n' read -r line; do
+        monitors+=("${line}")
+    done < <(window-screen-list --geometry)
+fi
 
 MODE=""
 
@@ -118,23 +122,41 @@ done
 
 case "${MODE}" in
     mouse)
-        get_monitor_from_mouse || fail "Could not find monitor for the mouse cursor."
+        if cli_helpers_is_wayland; then
+            cli_helpers_require_command gdbus gdbus || exit 1
+            cli_helpers_gnome_window_bridge pointer-monitor
+        else
+            get_monitor_from_mouse || fail "Could not find monitor for the mouse cursor."
+        fi
         ;;
     primary)
         get_primary_monitor
         ;;
     window)
-        get_monitor_from_window || fail "Could not find monitor for the active window."
+        if cli_helpers_is_wayland; then
+            cli_helpers_require_command gdbus gdbus || exit 1
+            cli_helpers_gnome_window_bridge active-monitor
+        else
+            get_monitor_from_window || fail "Could not find monitor for the active window."
+        fi
         ;;
     *)
-        result=""
-        result=$(get_monitor_from_window)
-        if [ -z "${result}" ]; then
-            result=$(get_monitor_from_mouse)
+        if cli_helpers_is_wayland; then
+            cli_helpers_require_command gdbus gdbus || exit 1
+            result=$(cli_helpers_gnome_window_bridge active-monitor)
+            [ -z "${result}" ] && result=$(cli_helpers_gnome_window_bridge pointer-monitor)
+            [ -z "${result}" ] && result=$(get_primary_monitor)
+            echo "${result}"
+        else
+            result=""
+            result=$(get_monitor_from_window)
+            if [ -z "${result}" ]; then
+                result=$(get_monitor_from_mouse)
+            fi
+            if [ -z "${result}" ]; then
+                result=$(get_primary_monitor)
+            fi
+            echo "${result}"
         fi
-        if [ -z "${result}" ]; then
-            result=$(get_primary_monitor)
-        fi
-        echo "${result}"
         ;;
 esac
