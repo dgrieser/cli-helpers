@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except (ImportError, ValueError) as exc:
+    print(f"ERROR: python3-gi is required for GNOME clipboard bridge: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+BUS_NAME = "de.david.grieser.CliHelpers.WindowBridge"
+OBJECT_PATH = "/de/david/grieser/CliHelpers/WindowBridge"
+INTERFACE = "de.david.grieser.CliHelpers.WindowBridge"
+TIMEOUT_MS = 3000
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def call_bridge(method, params):
+    try:
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE,
+            None,
+        )
+        return proxy.call_sync(method, params, Gio.DBusCallFlags.NONE, TIMEOUT_MS, None).unpack()
+    except GLib.Error as exc:
+        fail(f"Failed to call {INTERFACE}.{method}: {exc.message}")
+
+
+def read_text(path):
+    if path == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"Clipboard extension path only supports UTF-8 text: {exc}")
+    if "\0" in text:
+        fail("Clipboard extension path only supports text without NUL bytes.")
+    return text
+
+
+def set_text(args):
+    copied, = call_bridge(
+        "SetClipboardText",
+        GLib.Variant("(ss)", (args.selection, read_text(args.file))),
+    )
+    return 0 if copied else 1
+
+
+def get_text(args):
+    text, = call_bridge("GetClipboardText", GLib.Variant("(s)", (args.selection,)))
+    sys.stdout.write(text)
+    return 0
+
+
+def clear_text(args):
+    cleared, = call_bridge("ClearClipboard", GLib.Variant("(s)", (args.selection,)))
+    return 0 if cleared else 1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    set_parser = subparsers.add_parser("set")
+    set_parser.add_argument("selection", choices=("clipboard", "primary"))
+    set_parser.add_argument("file", nargs="?", default="-")
+    set_parser.set_defaults(func=set_text)
+
+    get_parser = subparsers.add_parser("get")
+    get_parser.add_argument("selection", choices=("clipboard", "primary"))
+    get_parser.set_defaults(func=get_text)
+
+    clear_parser = subparsers.add_parser("clear")
+    clear_parser.add_argument("selection", choices=("clipboard", "primary"))
+    clear_parser.set_defaults(func=clear_text)
+
+    args = parser.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

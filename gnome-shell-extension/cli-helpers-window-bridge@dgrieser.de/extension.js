@@ -1,15 +1,17 @@
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const BUS_NAME = 'de.dgrieser.CliHelpers.WindowBridge';
-const OBJECT_PATH = '/de/dgrieser/CliHelpers/WindowBridge';
+const BUS_NAME = 'de.david.grieser.CliHelpers.WindowBridge';
+const OBJECT_PATH = '/de/david/grieser/CliHelpers/WindowBridge';
 
 const IFACE_XML = `
 <node>
-  <interface name="de.dgrieser.CliHelpers.WindowBridge">
+  <interface name="de.david.grieser.CliHelpers.WindowBridge">
     <method name="ListWindows">
       <arg type="s" direction="out" name="windows_json"/>
     </method>
@@ -25,6 +27,19 @@ const IFACE_XML = `
     </method>
     <method name="GetActiveWindowMonitor">
       <arg type="s" direction="out" name="monitor"/>
+    </method>
+    <method name="SetClipboardText">
+      <arg type="s" direction="in" name="selection"/>
+      <arg type="s" direction="in" name="text"/>
+      <arg type="b" direction="out" name="copied"/>
+    </method>
+    <method name="GetClipboardText">
+      <arg type="s" direction="in" name="selection"/>
+      <arg type="s" direction="out" name="text"/>
+    </method>
+    <method name="ClearClipboard">
+      <arg type="s" direction="in" name="selection"/>
+      <arg type="b" direction="out" name="cleared"/>
     </method>
   </interface>
 </node>`;
@@ -59,6 +74,14 @@ function serializeWindow(window) {
         width: frame.width,
         height: frame.height,
     };
+}
+
+function clipboardType(selection) {
+    if (selection === 'clipboard')
+        return St.ClipboardType.CLIPBOARD;
+    if (selection === 'primary')
+        return St.ClipboardType.PRIMARY;
+    throw new Error(`Invalid clipboard selection: ${selection}`);
 }
 
 export default class CliHelpersWindowBridgeExtension extends Extension {
@@ -125,5 +148,31 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
     GetActiveWindowMonitor() {
         const window = global.display.get_focus_window();
         return window ? monitorName(window.get_monitor()) : '';
+    }
+
+    SetClipboardText(selection, text) {
+        St.Clipboard.get_default().set_text(clipboardType(selection), text);
+        return true;
+    }
+
+    GetClipboardTextAsync([selection], invocation) {
+        try {
+            St.Clipboard.get_default().get_text(
+                clipboardType(selection),
+                (_clipboard, text) => {
+                    invocation.return_value(GLib.Variant.new('(s)', [text || '']));
+                }
+            );
+        } catch (error) {
+            invocation.return_dbus_error(
+                'de.david.grieser.CliHelpers.WindowBridge.Error',
+                error.message
+            );
+        }
+    }
+
+    ClearClipboard(selection) {
+        St.Clipboard.get_default().set_text(clipboardType(selection), '');
+        return true;
     }
 }

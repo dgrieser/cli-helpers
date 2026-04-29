@@ -37,11 +37,13 @@ done
 
 while true; do
     if cli_helpers_is_wayland; then
-        cli_helpers_require_command wl-paste wl-clipboard || exit 1
-        if [ "${clipboard}" = "primary" ]; then
-            content=$(wl-paste --primary 2>/dev/null)
-        else
-            content=$(wl-paste 2>/dev/null)
+        if ! content="$(cli_helpers_clipboard_get_text "${clipboard}")"; then
+            cli_helpers_require_command wl-paste wl-clipboard || exit 1
+            if [ "${clipboard}" = "primary" ]; then
+                content=$(wl-paste --primary 2>/dev/null)
+            else
+                content=$(wl-paste 2>/dev/null)
+            fi
         fi
     else
         content=$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")

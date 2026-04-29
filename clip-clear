@@ -34,11 +34,13 @@ while [ $# -gt 0 ]; do
 done
 
 if cli_helpers_is_wayland; then
-    cli_helpers_require_command wl-copy wl-clipboard || exit 1
-    if [ "${clipboard}" = "primary" ]; then
-        wl-copy --primary --clear
-    else
-        wl-copy --clear
+    if ! cli_helpers_clipboard_clear_text "${clipboard}"; then
+        cli_helpers_require_command wl-copy wl-clipboard || exit 1
+        if [ "${clipboard}" = "primary" ]; then
+            wl-copy --primary --clear
+        else
+            wl-copy --clear
+        fi
     fi
 else
     echo | DISPLAY=$(xdisplay) xclip -r -selection "${clipboard}"

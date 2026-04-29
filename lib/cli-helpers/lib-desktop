@@ -30,6 +30,37 @@ cli_helpers_gnome_window_bridge() {
     "$(cli_helpers_repo_dir)/gnome-window-bridge" "$@"
 }
 
+cli_helpers_gnome_clipboard_bridge() {
+    "$(cli_helpers_repo_dir)/gnome-clipboard-bridge" "$@"
+}
+
 cli_helpers_gnome_display_config() {
     "$(cli_helpers_repo_dir)/gnome-display-config" "$@"
+}
+
+cli_helpers_clipboard_set_text_file() {
+    local selection="${1}"
+    local input_file="${2}"
+
+    cli_helpers_is_wayland || return 1
+    if [ "${selection}" = "both" ]; then
+        cli_helpers_gnome_clipboard_bridge set clipboard "${input_file}" >/dev/null 2>&1 &&
+            cli_helpers_gnome_clipboard_bridge set primary "${input_file}" >/dev/null 2>&1
+    else
+        cli_helpers_gnome_clipboard_bridge set "${selection}" "${input_file}" >/dev/null 2>&1
+    fi
+}
+
+cli_helpers_clipboard_get_text() {
+    local selection="${1}"
+
+    cli_helpers_is_wayland || return 1
+    cli_helpers_gnome_clipboard_bridge get "${selection}" 2>/dev/null
+}
+
+cli_helpers_clipboard_clear_text() {
+    local selection="${1}"
+
+    cli_helpers_is_wayland || return 1
+    cli_helpers_gnome_clipboard_bridge clear "${selection}" >/dev/null 2>&1
 }

@@ -1,6 +1,6 @@
 {
   "uuid": "cli-helpers-window-bridge@dgrieser.de",
   "name": "CLI Helpers Window Bridge",
-  "description": "D-Bus bridge used by cli-helpers for GNOME Wayland window operations.",
+  "description": "D-Bus bridge used by cli-helpers for GNOME Wayland window and clipboard operations.",
   "shell-version": ["45", "46", "47", "48", "49"]
 }

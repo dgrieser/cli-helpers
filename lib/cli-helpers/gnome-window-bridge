@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-BUS_NAME="de.dgrieser.CliHelpers.WindowBridge"
-OBJECT_PATH="/de/dgrieser/CliHelpers/WindowBridge"
-INTERFACE="de.dgrieser.CliHelpers.WindowBridge"
+BUS_NAME="de.david.grieser.CliHelpers.WindowBridge"
+OBJECT_PATH="/de/david/grieser/CliHelpers/WindowBridge"
+INTERFACE="de.david.grieser.CliHelpers.WindowBridge"
 EXTENSION_UUID="cli-helpers-window-bridge@dgrieser.de"
 EXTENSION_DIR="${CLI_HELPERS_EXTENSION_DIR:-/usr/local/share/gnome-shell/extensions/${EXTENSION_UUID}}"
 

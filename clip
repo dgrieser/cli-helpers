@@ -73,12 +73,14 @@ copy_file() {
     touch "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
 
     if cli_helpers_is_wayland; then
-        cli_helpers_require_command wl-copy wl-clipboard || return 1
-        if [ "${CLIPBOARD}" = "clipboard" ] || [ "${CLIPBOARD}" = "both" ]; then
-            wl-copy < "${input_file}"
-        fi
-        if [ "${CLIPBOARD}" = "primary" ] || [ "${CLIPBOARD}" = "both" ]; then
-            wl-copy --primary < "${input_file}"
+        if ! cli_helpers_clipboard_set_text_file "${CLIPBOARD}" "${input_file}"; then
+            cli_helpers_require_command wl-copy wl-clipboard || return 1
+            if [ "${CLIPBOARD}" = "clipboard" ] || [ "${CLIPBOARD}" = "both" ]; then
+                wl-copy < "${input_file}"
+            fi
+            if [ "${CLIPBOARD}" = "primary" ] || [ "${CLIPBOARD}" = "both" ]; then
+                wl-copy --primary < "${input_file}"
+            fi
         fi
     else
         if [ "${CLIPBOARD}" = "clipboard" ]; then
