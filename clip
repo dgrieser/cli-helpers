@@ -10,7 +10,7 @@ else
 fi
 
 usage() {
-    echo "usage: $(basename "${0}") [--print] [-c|--clipboard|-p|--primary] [<file, or stdin>]" 2>&1
+    echo "usage: $(basename "${0}") [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [<file, or stdin>]" 2>&1
     exit 1
 }
 
@@ -26,6 +26,7 @@ fail() {
 PRINT=0
 FILE=""
 CLIPBOARD="both"
+SKIP_NEWLINE=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -40,6 +41,9 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -p|--primary)
             CLIPBOARD="primary"
+            ;;
+        -n|--no-newline)
+            SKIP_NEWLINE=1
             ;;
         *)
             if [ -z "${FILE}" ]; then
@@ -58,6 +62,14 @@ done
 
 copy_file() {
     local input_file="${1}"
+    local tmp_file=""
+    
+    if [ "${SKIP_NEWLINE}" -eq 1 ]; then
+        tmp_file="$(mktemp "/tmp/clip.XXXXXX")"
+        trap "rm -f '${tmp_file}'" EXIT
+        cat "${input_file}" | tr -d '\n' | tr -d '\r' > "${tmp_file}"
+        input_file="${tmp_file}"
+    fi
     touch "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
 
     if cli_helpers_is_wayland; then
