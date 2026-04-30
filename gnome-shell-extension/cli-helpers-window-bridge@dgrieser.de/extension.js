@@ -93,6 +93,7 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
             BUS_NAME,
             Gio.BusNameOwnerFlags.REPLACE,
             null,
+            null,
             null
         );
     }
