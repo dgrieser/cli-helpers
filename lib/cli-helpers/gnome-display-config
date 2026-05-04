@@ -43,9 +43,11 @@ def call_display_config(method, params=None):
 def current_state():
     serial, monitors, logical_monitors, properties = call_display_config("GetCurrentState")
     mode_sizes = {}
+    display_names = {}
     for monitor in monitors:
         spec, modes, monitor_props = monitor
         connector, vendor, product, serial_number = spec
+        display_names[connector] = monitor_props.get("display-name", "")
         selected_mode = None
         for mode in modes:
             mode_id, width, height, refresh_rate, preferred_scale, supported_scales, mode_props = mode
@@ -70,6 +72,7 @@ def current_state():
         for name in names:
             result.append({
                 "name": name,
+                "display-name": display_names.get(name, ""),
                 "x": int(x),
                 "y": int(y),
                 "width": width,

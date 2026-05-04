@@ -11,7 +11,11 @@ import re
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+_force_x11 = False
+
 def is_wayland():
+    if _force_x11:
+        return False
     return os.environ.get("XDG_SESSION_TYPE") == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 
 def helper_path(name):
@@ -32,13 +36,67 @@ def gnome_display_config(*args):
     return result.stdout
 
 # Function to get connected outputs using the active display backend
-def get_connected_outputs():
+def parse_edid_name(edid_bytes):
+    if len(edid_bytes) < 128:
+        return None
+    fallback = None
+    for offset in [54, 72, 90, 108]:
+        block = edid_bytes[offset:offset + 18]
+        if block[0] != 0 or block[1] != 0 or block[2] != 0:
+            continue
+        text = block[5:18].decode("ascii", errors="replace").split("\n")[0].strip()
+        if block[3] == 0xFC:
+            return text
+        if block[3] == 0xFE and not fallback:
+            fallback = text
+    return fallback
+
+def get_x11_display_names(connector_names):
+    drm_base = "/sys/class/drm"
+    display_names = {}
+    try:
+        entries = os.listdir(drm_base)
+    except OSError:
+        return display_names
+    for entry in entries:
+        if "-" not in entry:
+            continue
+        edid_path = os.path.join(drm_base, entry, "edid")
+        if not os.path.exists(edid_path):
+            continue
+        drm_connector = entry.split("-", 1)[1]
+        xrandr_name = None
+        if drm_connector in connector_names:
+            xrandr_name = drm_connector
+        else:
+            simplified = re.sub(r"-A-(\d+)$", r"-\1", drm_connector)
+            if simplified in connector_names:
+                xrandr_name = simplified
+        if xrandr_name is None:
+            continue
+        try:
+            with open(edid_path, "rb") as f:
+                name = parse_edid_name(f.read())
+            if name:
+                display_names[xrandr_name] = name
+        except OSError:
+            pass
+    return display_names
+
+def get_outputs_info():
+    """Returns (ordered_names, display_names_dict)"""
     if is_wayland():
         try:
-            return [line.strip() for line in gnome_display_config("list").splitlines() if line.strip()]
-        except RuntimeError as e:
+            output = gnome_display_config("list", "--json")
+            monitors = [json.loads(line) for line in output.splitlines() if line.strip()]
+            names = [m["name"] for m in monitors]
+            dbus_names = {m["name"]: m["display-name"] for m in monitors if m.get("display-name")}
+            edid_names = get_x11_display_names(set(names))
+            display_names = {**dbus_names, **edid_names}
+            return names, display_names
+        except (RuntimeError, json.JSONDecodeError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
-            return []
+            return [], {}
 
     result = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True)
     outputs = []
@@ -51,7 +109,11 @@ def get_connected_outputs():
                 outputs.append((x_position, order_index, output_name))
                 order_index += 1
     outputs.sort(key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0, item[1]))
-    return [output_name for _, _, output_name in outputs]
+    names = [output_name for _, _, output_name in outputs]
+    return names, get_x11_display_names(set(names))
+
+def get_connected_outputs():
+    return get_outputs_info()[0]
 
 def parse_monitor_line(line):
     parts = line.split()
@@ -110,7 +172,8 @@ def list_configs():
     ensure_config_dir()
     return [f.split(".config")[0] for f in os.listdir(CONFIG_DIR) if f.endswith(".config")]
 
-def resolve_preset_outputs(config_outputs, ordered_outputs):
+def resolve_preset_outputs(config_outputs, ordered_outputs, display_names=None):
+    name_to_connector = {v: k for k, v in (display_names or {}).items() if v}
     resolved = {}
     errors = []
     for output_name, gamma_str in config_outputs.items():
@@ -121,6 +184,8 @@ def resolve_preset_outputs(config_outputs, ordered_outputs):
                 errors.append(f"{output_name} out of range (only {len(ordered_outputs)} outputs)")
                 continue
             target_name = ordered_outputs[idx - 1]
+        elif output_name not in ordered_outputs and output_name in name_to_connector:
+            target_name = name_to_connector[output_name]
         if target_name in resolved:
             errors.append(f"duplicate target '{target_name}' from '{output_name}'")
             continue
@@ -129,12 +194,12 @@ def resolve_preset_outputs(config_outputs, ordered_outputs):
         return None, "Invalid preset outputs: " + "; ".join(errors)
     return resolved, None
 
-def validate_config_outputs(config_data, current_outputs):
+def validate_config_outputs(config_data, current_outputs, display_names=None):
     """Validate that config outputs match current system outputs"""
     if not isinstance(config_data, dict) or 'outputs' not in config_data:
         return False, "Invalid preset format"
 
-    resolved_outputs, error = resolve_preset_outputs(config_data['outputs'], current_outputs)
+    resolved_outputs, error = resolve_preset_outputs(config_data['outputs'], current_outputs, display_names)
     if error:
         return False, error
 
@@ -189,11 +254,12 @@ def set_gamma(output, r, g, b):
     subprocess.run(["xrandr", "--output", output, "--gamma", f"{r}:{g}:{b}"])
 
 # Function to display the current state in the terminal
-def display_state(last_action, output, r, g, b):
+def display_state(last_action, output, r, g, b, display_name=None):
     # move up four lines
     sys.stdout.write("\033[4A")
     sys.stdout.write("\r" + " " * 100)
-    sys.stdout.write(f"\rOutput:  {output}\nGamma:   {r:.1f}:{g:.1f}:{b:.1f}\n\n")
+    label = f"{output}  ({display_name})" if display_name else output
+    sys.stdout.write(f"\rOutput:  {label}\nGamma:   {r:.1f}:{g:.1f}:{b:.1f}\n\n")
     sys.stdout.write("\r" + " " * 100)
     if last_action:
         sys.stdout.write(f"\rAction:  {last_action}\n")
@@ -218,7 +284,7 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def interactive_mode(output=None, load_alias=None):
-    outputs = get_connected_outputs()
+    outputs, display_names = get_outputs_info()
     if not outputs:
         print("No outputs found.")
         return
@@ -229,16 +295,16 @@ def interactive_mode(output=None, load_alias=None):
         if not config_data:
             print(f"ERROR: Preset '{load_alias}' not found or invalid.", file=sys.stderr)
             return
-        
-        valid, validation_result = validate_config_outputs(config_data, outputs)
+
+        valid, validation_result = validate_config_outputs(config_data, outputs, display_names)
         if not valid:
             print(f"ERROR: Preset validation failed: {validation_result}", file=sys.stderr)
             return
-        
+
         # Apply configuration
         for output_name, gamma_str in validation_result['resolved'].items():
             if output_name in outputs:
-                gamma = list(map(float, gamma_str.split(':'))) 
+                gamma = list(map(float, gamma_str.split(':')))
                 set_gamma(output_name, *gamma)
         print(f"Preset '{load_alias}' loaded and applied successfully.")
         return
@@ -265,7 +331,7 @@ def interactive_mode(output=None, load_alias=None):
 
     try:
         while True:
-            display_state(last_action, current_output, *current_gamma)
+            display_state(last_action, current_output, *current_gamma, display_name=display_names.get(current_output))
 
             key = get_key()
             if key == "\t":  # Tab key to cycle outputs
@@ -316,7 +382,7 @@ def interactive_mode(output=None, load_alias=None):
                 if preset_name:
                     config_data = load_config(preset_name)
                     if config_data:
-                        valid, validation_result = validate_config_outputs(config_data, outputs)
+                        valid, validation_result = validate_config_outputs(config_data, outputs, display_names)
                         if valid:
                             matching_outputs = validation_result['matching']
                             for output_name in matching_outputs:
@@ -393,10 +459,16 @@ Controls:
                       help='List available outputs and exit')
     parser.add_argument('--load', metavar='ALIAS',
                       help='Load preset by alias')
+    parser.add_argument('--x11', action='store_true',
+                      help='Force X11 mode (use xrandr instead of Wayland DBus)')
     parser.add_argument('output', nargs='?', default=None,
                       help='Output to use (default: first available)')
-    
+
     args = parser.parse_args()
+
+    if args.x11:
+        global _force_x11
+        _force_x11 = True
     
     if args.list:
         list_outputs()
@@ -409,12 +481,12 @@ Controls:
             print(f"ERROR: Preset '{args.load}' not found or invalid.", file=sys.stderr)
             return 1
         
-        outputs = get_connected_outputs()
+        outputs, display_names = get_outputs_info()
         if not outputs:
             print("ERROR: No outputs found.", file=sys.stderr)
             return 1
-        
-        valid, validation_result = validate_config_outputs(config_data, outputs)
+
+        valid, validation_result = validate_config_outputs(config_data, outputs, display_names)
         if not valid:
             print(f"ERROR: Preset validation failed: {validation_result}", file=sys.stderr)
             return 1
