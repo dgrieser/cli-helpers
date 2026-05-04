@@ -13,16 +13,19 @@ SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-b
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
-.PHONY: list install extension-zip install-gnome-extension uninstall list-install
+REPO_DIR := $(CURDIR)
+
+.PHONY: list install install-links extension-zip install-gnome-extension uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
-	@printf '  make list          Show this help and available commands\n'
-	@printf '  make list-install  Show install destinations and installed files\n'
-	@printf '  make extension-zip  Package the GNOME extension\n'
+	@printf '  make list                     Show this help and available commands\n'
+	@printf '  make list-install             Show install destinations and installed files\n'
+	@printf '  make extension-zip            Package the GNOME extension\n'
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension\n'
-	@printf '  sudo make install  Install commands, shared helpers, and GNOME extension\n'
-	@printf '  sudo make uninstall  Remove installed files\n'
+	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
+	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
+	@printf '  sudo make uninstall           Remove installed files\n'
 	@printf '\nAvailable commands:\n'
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 
@@ -42,6 +45,31 @@ install:
 	for link in $(LINKS); do \
 		target="$$(readlink "$$link")"; \
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
+	done
+	if [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+		if command -v gnome-extensions >/dev/null 2>&1; then \
+			gnome-extensions enable "$(EXTENSION_UUID)" || \
+				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
+		else \
+			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUID) manually after install." 1>&2; \
+		fi; \
+	else \
+		echo "Skipping GNOME extension enable step."; \
+	fi
+
+install-links:
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"; do \
+		[ -d "$$dir" ] || mkdir -p "$$dir"; \
+	done
+	for script in $(SCRIPTS); do \
+		ln -sfn "$(REPO_DIR)/$$script" "$(DESTDIR)$(BINDIR)/$$script"; \
+	done
+	for shared in $(SHARED); do \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	$(MAKE) install-gnome-extension
+	for link in $(LINKS); do \
+		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
 	if [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
 		if command -v gnome-extensions >/dev/null 2>&1; then \
