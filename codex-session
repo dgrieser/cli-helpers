@@ -5,6 +5,7 @@ APP_NAME="$(basename "${0}")"
 session_folder="${HOME}/.codex/sessions"
 session_prefix="rollout-"
 session_ext="jsonl"
+directory_max_length=35
 
 usage() {
     cat <<EOF 1>&2
@@ -30,6 +31,73 @@ error() {
 verbose() {
     [ "${verbose}" -eq 0 ] && return
     echo "${1}" | sed 's/^/+ /g' 1>&2
+}
+
+truncate_middle() {
+    local value="${1}"
+    local max_length="${2}"
+    local marker="..."
+    local start_length
+    local end_length
+
+    [ "${#value}" -le "${max_length}" ] && echo "${value}" && return
+
+    start_length=$(( (max_length - ${#marker}) / 2 ))
+    end_length=$(( max_length - ${#marker} - start_length ))
+    echo "${value:0:${start_length}}${marker}${value: -${end_length}}"
+}
+
+shorten_path() {
+    local path="${1}"
+    local max_length="${2}"
+    local parts
+    local part_count
+    local prefix
+    local collapse_start
+    local collapse_end
+    local shortened
+    local index
+
+    [ "${#path}" -le "${max_length}" ] && echo "${path}" && return
+
+    IFS='/' read -r -a parts <<< "${path}"
+    part_count="${#parts[@]}"
+
+    if [[ "${path}" == /* ]]; then
+        [ "${part_count}" -le 3 ] && truncate_middle "${path}" "${max_length}" && return
+        prefix="/${parts[1]}"
+        collapse_start=2
+    else
+        [ "${part_count}" -le 3 ] && truncate_middle "${path}" "${max_length}" && return
+        prefix="${parts[0]}/${parts[1]}"
+        collapse_start=2
+    fi
+
+    for (( collapse_end=collapse_start; collapse_end<part_count-1; collapse_end++ )); do
+        shortened="${prefix}/..."
+        for (( index=collapse_end+1; index<part_count; index++ )); do
+            shortened+="/${parts[index]}"
+        done
+        [ "${#shortened}" -le "${max_length}" ] && echo "${shortened}" && return
+    done
+
+    truncate_middle "${shortened}" "${max_length}"
+}
+
+shorten_text() {
+    local text="${1}"
+    local max_length="${2}"
+
+    [ "${#text}" -le "${max_length}" ] && echo "${text}" && return
+    echo "${text:0:$((max_length - 3))}..."
+}
+
+format_cwd() {
+    local cwd="${1}"
+
+    [ "${cwd}" = "${HOME}" ] && cwd="~"
+    [[ "${cwd}" == "${HOME}/"* ]] && cwd="~/${cwd#"${HOME}/"}"
+    shorten_path "${cwd}" "${directory_max_length}"
 }
 
 fail() {
@@ -77,16 +145,20 @@ if [ -n "${session_id}" ]; then
     [ "${raw}" -eq 0 ] && echo "${session_content}" | glow || echo "${session_content}"
 else
     verbose "Listing sessions..."
-    find_args=( "${session_folder}" '-name' "${session_prefix}*.${session_ext}" '-printf' '%f\n' )
-    sed_session_args=( '-E' 's/^'"${session_prefix}"'([^.]+)\.'"${session_ext}"'/\1/' )
-    tail_args=( '-n' '10' )
-    sed_split_args=( '-E' 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})-(.+)$/\5  \1T\2:\3:\4/' )
-    verbose "find ${find_args[*]} | sed ${sed_session_args[*]} | sort | tail ${tail_args[*]} | sed ${sed_split_args[*]}"
-    sessions="$(find "${find_args[@]}" | sed "${sed_session_args[@]}" | sort | tail "${tail_args[@]}" | sed "${sed_split_args[@]}")"
-    verbose "${sessions}"
-    echo_args=( '-e' )
-    verbose "echo ${echo_args[*]} 'SESSION  AGE\n\${sessions}' | k-format"
-    echo "${echo_args[@]}" "SESSION  AGE\n${sessions}" | k-format
+    rows=""
+    while IFS= read -r filepath; do
+        filename="$(basename "${filepath}")"
+        session_id="$(echo "${filename}" | sed -E 's/^'"${session_prefix}"'([^.]+)\.'"${session_ext}"'/\1/')"
+        uuid="$(echo "${session_id}" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-(.+)$/\1/')"
+        datetime="$(echo "${session_id}" | sed -E 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})-.+$/\1T\2:\3:\4/')"
+        cwd="$(jq -r -s 'map(select(.type == "session_meta"))[0].payload.cwd // ""' "${filepath}")"
+        cwd="$(format_cwd "${cwd}")"
+        summary="$(jq -rs 'map(select(.type == "event_msg" and .payload.type == "user_message"))[0].payload.message // ""' "${filepath}" | head -1 | tr -s ' \t\n' ' ')"
+        summary="$(shorten_text "${summary}" 60)"
+        rows+="${uuid}  ${datetime}  ${cwd}  ${summary}\n"
+    done < <(find "${session_folder}" -name "${session_prefix}*.${session_ext}" | sort | tail -n 50)
+    verbose "echo -e 'SESSION  DATETIME  DIRECTORY  SUMMARY\n\${rows}' | k-format"
+    echo -e "SESSION  DATETIME  DIRECTORY  SUMMARY\n${rows}" | k-format
 fi
 
 exit 0
