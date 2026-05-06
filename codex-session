@@ -16,10 +16,10 @@ Prints sessions of codex CLI
 SESSION   the ID of the session to print
 
 Options:
-    -h, --help      Show this message
-    -r, --raw       Raw output
-    --verbose       Verbose output
-}
+    -h, --help          Show this message
+    -l, --limit LIMIT   Limit number of sessions to list (default: 50)
+    -r, --raw           Raw output
+    --verbose           Verbose output
 EOF
     exit 1
 }
@@ -106,6 +106,7 @@ fail() {
 }
 
 session_id=""
+limit=50
 raw=0
 verbose=0
 
@@ -116,6 +117,13 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -r | --raw)
             raw=1
+            ;;
+        -l | --limit)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --limit"
+            limit="${1}"
+            [[ "${limit}" =~ ^[0-9]+$ ]] || fail "Invalid limit: ${limit}"
+            [ "${limit}" -gt 0 ] || fail "Invalid limit: ${limit}"
             ;;
         --verbose)
             verbose=1
@@ -156,7 +164,7 @@ else
         summary="$(jq -rs 'map(select(.type == "event_msg" and .payload.type == "user_message"))[0].payload.message // ""' "${filepath}" | head -1 | tr -s ' \t\n' ' ')"
         summary="$(shorten_text "${summary}" 60)"
         rows+="${uuid}  ${datetime}  ${cwd}  ${summary}\n"
-    done < <(find "${session_folder}" -name "${session_prefix}*.${session_ext}" | sort | tail -n 50)
+    done < <(find "${session_folder}" -name "${session_prefix}*.${session_ext}" | sort | tail -n "${limit}")
     verbose "echo -e 'SESSION  DATETIME  DIRECTORY  SUMMARY\n\${rows}' | k-format"
     echo -e "SESSION  DATETIME  DIRECTORY  SUMMARY\n${rows}" | k-format
 fi
