@@ -187,11 +187,12 @@ function reduce_artifacts() {
     return 0
 }
 
-function reduce_arm_artifacts() {
+function reduce_unsupported_artifacts() {
     local list="${1}"
-    local reduced="${list}"
+    local reduced=""
+    reduced="$(echo "${list}" | grep -vEi 'AppImage$' || true)"
     if [[ "${ARCH_UNAME}" != "arm"* ]] && [[ "${ARCH_DPKG}" != "arm"* ]]; then
-        reduced="$(echo "${list}" | grep -vE 'arm64|aarch64|armhf|armel|armv7|armv6' || true)"
+        reduced="$(echo "${reduced}" | grep -vE 'arm64|aarch64|armhf|armel|armv7|armv6' || true)"
     fi
     echo "${reduced}"
 }
@@ -829,7 +830,8 @@ done
 artifact="$(echo "${artifact}" | sort -ur)"
 
 if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
-    artifact_list="${artifact}"
+    # remove unsupported artifacts early
+    artifact_list="$(reduce_unsupported_artifacts "${artifact}")"
     best=""
     echo 1>&2
     echo "Found multiple artifacts matching ${PATTERNS[*]}:" 1>&2
@@ -837,7 +839,8 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
         basename "${item}" 1>&2
     done <<< "${artifact_list}"
 
-    # try filtering by architecture
+
+    # try filtering by architecture, original list stays intact
     filtered="$(echo "${artifact_list}" | grep -E "(${ARCH_UNAME}|${ARCH_DPKG})")"
     count=$(echo "${filtered}" | wc -l)
 
@@ -856,7 +859,6 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
 
     if [ -z "${best}" ]; then
         reduced_list="$(reduce_artifacts "${artifact_list}")"
-        reduced_list="$(reduce_arm_artifacts "${reduced_list}")"
         reduced_list="$(prefer_gnu_over_musl "${reduced_list}")"
         reduced_list="$(prefer_linux_over_darwin "${reduced_list}")"
         if [ "$(echo "${reduced_list}" | wc -l)" -eq 1 ]; then
