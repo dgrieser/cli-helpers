@@ -1,6 +1,6 @@
 #!/bin/bash
 
-APP_NAME="$(basename ${0})"
+APP_NAME="$(basename "${0}")"
 
 
 function usage() {
@@ -20,6 +20,11 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
 
         -i, --install-path  Path to install the binary
                             Default: /usr/local/bin
+
+        --bundle            Install archive as bundled app
+
+        --bundle-path       Path to install bundled app contents
+                            Default: /usr/local/share
 
         -y, --yes           Answer yes to all prompts
 
@@ -52,7 +57,7 @@ function success() {
 
 function manual_download() {
     echo 1>&2
-    read -p "Please provide download URL: " download_url 1>&2
+    read -r -p "Please provide download URL: " download_url 1>&2
     [ -z "${download_url}" ] && abort
     (cd "${tmpfolder}" && curl -L -O "${download_url}")
     return $?
@@ -98,6 +103,7 @@ function list_files() {
         echo " └─ (empty)"
     else
         echo " │"
+        # shellcheck disable=SC2001
         echo "${file_list}" | sed 's/^/ └─ /'
     fi
 }
@@ -227,6 +233,112 @@ function archive_ls() {
     esac
 }
 
+function archive_files_for_install() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local files
+    files="$(archive_ls "${artifact}" "${archive_type}")"
+    filter_excluded_artifacts "${files}"
+}
+
+function is_safe_archive_path() {
+    local file="${1}"
+    [ -z "${file}" ] && return 1
+    [[ "${file}" == /* ]] && return 1
+    [[ "${file}" == *"/../"* ]] && return 1
+    [[ "${file}" == "../"* ]] && return 1
+    [[ "${file}" == *"/.." ]] && return 1
+    [ "${file}" == ".." ] && return 1
+    return 0
+}
+
+function validate_archive_paths() {
+    local files="${1}"
+    local file
+    while IFS= read -r file; do
+        [ -z "${file}" ] && continue
+        if ! is_safe_archive_path "${file}"; then
+            error "Unsafe archive path: '${file}'"
+            return 1
+        fi
+    done <<< "${files}"
+    return 0
+}
+
+function common_top_level_dir() {
+    local files="${1}"
+    local first=""
+    local top=""
+    local file
+    while IFS= read -r file; do
+        [ -z "${file}" ] && continue
+        [[ "${file}" != */* ]] && return 0
+        top="${file%%/*}"
+        [ -z "${top}" ] && return 0
+        if [ -z "${first}" ]; then
+            first="${top}"
+        elif [ "${first}" != "${top}" ]; then
+            return 0
+        fi
+    done <<< "${files}"
+    echo "${first}"
+}
+
+function strip_archive_prefix() {
+    local file="${1}"
+    local prefix="${2}"
+    if [ -n "${prefix}" ] && [[ "${file}" == "${prefix}/"* ]]; then
+        echo "${file#"${prefix}"/}"
+    else
+        echo "${file}"
+    fi
+}
+
+function matching_binary_files() {
+    local files="${1}"
+    local pattern="${2}"
+    local matching_files=""
+    local file
+    local basename_file
+    while IFS= read -r file; do
+        [ -z "${file}" ] && continue
+        basename_file="$(basename "${file}")"
+        # shellcheck disable=SC2053
+        if [ -z "${pattern}" ] || [[ "${file}" == ${pattern} ]] || [[ "${basename_file}" == ${pattern} ]]; then
+            if [ -z "${matching_files}" ]; then
+                matching_files="${file}"
+            else
+                matching_files="${matching_files}"$'\n'"${file}"
+            fi
+        fi
+    done <<< "${files}"
+    echo "${matching_files}"
+}
+
+function choose_binary_from_files() {
+    local files="${1}"
+    local artifact="${2}"
+    local binary_path=""
+    local count
+
+    if [ -n "${BINARY_PATTERN}" ]; then
+        files="$(matching_binary_files "${files}" "${BINARY_PATTERN}")"
+    fi
+
+    count=$(echo "${files}" | wc -l)
+    if [ "${count}" -eq 1 ] && [ -n "${files}" ]; then
+        binary_path="${files}"
+    elif [ "${count}" -gt 1 ]; then
+        [ ${YES} -eq 1 ] && echo 1>&2 && echo "${files}" 1>&2 && error "Found ${count} files in '${artifact}' archive" && return 1
+        binary_path="$(choose -n -p "Binary to install:" "${files}")"
+    else
+        echo "No files found in '${artifact}'" 1>&2
+        return 1
+    fi
+    echo "${binary_path}"
+    return 0
+}
+
 function retrieve_binary_from_archive() {
     local artifact="${1}"
     local archive_type="${2}"
@@ -250,34 +362,7 @@ function retrieve_binary_from_archive() {
         fi
     fi
     files="$(filter_excluded_artifacts "${files}")"
-    count=$(echo "${files}" | wc -l)
-    binary_path=""
-    if [ -n "${BINARY_PATTERN}" ]; then
-        matching_files=""
-        while IFS= read -r file; do
-            if [[ "${file}" == ${BINARY_PATTERN} ]]; then
-                if [ -z "${matching_files}" ]; then
-                    matching_files="${file}"
-                else
-                    matching_files="${matching_files}\n${file}"
-                fi
-            fi
-        done <<< "${files}"
-        files="${matching_files}"
-        count=$(echo "${files}" | wc -l)
-    fi
-
-    if [ ${count} -eq 1 ]; then
-        binary_path="${files}"
-    elif [ ${count} -gt 1 ]; then
-        [ ${YES} -eq 1 ] && echo 1>&2 && echo "${files}" 1>&2 && error "Found ${count} files in '${artifact}' archive" && return 1
-        binary_path="$(choose -n -p "Binary to install:" "${files}")"
-    else
-        echo "No files found in '${artifact}'" 1>&2
-        return 1
-    fi
-    echo "${binary_path}"
-    return 0
+    choose_binary_from_files "${files}" "${artifact}"
 }
 
 function prompt_readme() {
@@ -298,6 +383,27 @@ function prompt_install() {
     read -p "Install binary '${binary}' to '${target_path}/${binary}'? [Y/n] " -r REPLY 1>&2
     [[ "${REPLY}" =~ ^[Nn]$ ]] && abort
     return 0
+}
+
+function prompt_bundle_install() {
+    local package="${1}"
+    local bundle_path="${2}"
+    [ ${YES} -eq 1 ] && return 0
+    [ ${DRY_RUN} -eq 1 ] && return 0
+    read -p "Install archive as bundled app under '${bundle_path}/${package}'? [Y/n] " -r REPLY 1>&2
+    [[ "${REPLY}" =~ ^[Nn]$ ]] && return 1
+    return 0
+}
+
+function sudo_for_path() {
+    local path="${1}"
+    local parent
+    if [ -e "${path}" ]; then
+        [ -w "${path}" ] || echo "sudo"
+        return 0
+    fi
+    parent="$(dirname "${path}")"
+    [ -w "${parent}" ] || echo "sudo"
 }
 
 function extract_binary_from_archive() {
@@ -341,12 +447,154 @@ function extract_binary_to_dir() {
     esac
 }
 
+function extract_archive_to_dir() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local target_dir="${3}"
+    case "${archive_type}" in
+        zip)
+            unzip -q -o "${artifact}" -d "${target_dir}" 1>&2
+            ;;
+        tar)
+            tar -xf "${artifact}" -C "${target_dir}" 1>&2
+            ;;
+        *)
+            fail "Unsupported archive type: ${archive_type} for '${artifact}'"
+            ;;
+    esac
+}
+
+function stage_bundle_archive() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local files="${3}"
+    local stage_dir="${4}"
+    local prefix="${5}"
+    local extract_dir
+    extract_dir="$(mktemp -d)"
+
+    validate_archive_paths "${files}" || return 1
+    extract_archive_to_dir "${artifact}" "${archive_type}" "${extract_dir}" || { rm -rf "${extract_dir}"; return 1; }
+
+    if [ -n "${prefix}" ]; then
+        mv "${extract_dir}/${prefix}/"* "${stage_dir}/" 2>/dev/null || true
+        mv "${extract_dir}/${prefix}/".[!.]* "${stage_dir}/" 2>/dev/null || true
+        mv "${extract_dir}/${prefix}/"..?* "${stage_dir}/" 2>/dev/null || true
+    else
+        mv "${extract_dir}/"* "${stage_dir}/" 2>/dev/null || true
+        mv "${extract_dir}/".[!.]* "${stage_dir}/" 2>/dev/null || true
+        mv "${extract_dir}/"..?* "${stage_dir}/" 2>/dev/null || true
+    fi
+    rm -rf "${extract_dir}"
+}
+
+function install_bundle_from_archive() {
+    local artifact="${1}"
+    local archive_type="${2}"
+    local install_path="${3}"
+    local bundle_path="${4}"
+    local files
+    local binary_path
+    local binary
+    local package
+    local prefix
+    local staged_binary_path
+    local stage_parent
+    local stage_dir
+    local target_bundle_dir
+    local link_path
+    local tmp_link
+
+    files="$(archive_files_for_install "${artifact}" "${archive_type}")"
+    validate_archive_paths "${files}" || return 1
+    binary_path="$(choose_binary_from_files "${files}" "${artifact}")" || return 1
+    binary="$(basename "${binary_path}")"
+    package="${binary}"
+    prefix="$(common_top_level_dir "${files}")"
+    staged_binary_path="$(strip_archive_prefix "${binary_path}" "${prefix}")"
+
+    if ! prompt_bundle_install "${package}" "${bundle_path}"; then
+        return 2
+    fi
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        stage_parent="$(mktemp -d)"
+        stage_dir="${stage_parent}/${package}"
+        mkdir -p "${stage_dir}"
+        stage_bundle_archive "${artifact}" "${archive_type}" "${files}" "${stage_dir}" "${prefix}" || { rm -rf "${stage_parent}"; return 1; }
+        if [ ! -x "${stage_dir}/${staged_binary_path}" ]; then
+            error "Selected binary is not executable after extraction: '${staged_binary_path}'"
+            rm -rf "${stage_parent}"
+            return 1
+        fi
+        local new_version
+        local current_version
+        new_version="$(binary_version "${stage_dir}/${staged_binary_path}" | head -n 1)"
+        if [ -x "${install_path}/${package}" ]; then
+            current_version="$(binary_version "${install_path}/${package}" | head -n 1)"
+        else
+            current_version="(not installed)"
+        fi
+        print_version_table "${package}" "${current_version}" "${new_version}"
+        echo "Bundle path: ${bundle_path}/${package}" 1>&2
+        echo "Binary link: ${install_path}/${package} -> ${bundle_path}/${package}/${staged_binary_path}" 1>&2
+        rm -rf "${stage_parent}"
+        return 0
+    fi
+
+    prompt_install "${package}" "${install_path}"
+    stage_parent="$(mktemp -d)"
+    stage_dir="${stage_parent}/${package}"
+    mkdir -p "${stage_dir}"
+    stage_bundle_archive "${artifact}" "${archive_type}" "${files}" "${stage_dir}" "${prefix}" || { rm -rf "${stage_parent}"; return 1; }
+    if [ ! -x "${stage_dir}/${staged_binary_path}" ]; then
+        error "Selected binary is not executable after extraction: '${staged_binary_path}'"
+        rm -rf "${stage_parent}"
+        return 1
+    fi
+
+    SUDO="$(sudo_for_path "${bundle_path}")"
+    target_bundle_dir="${bundle_path}/${package}"
+    ${SUDO} mkdir -p "${bundle_path}" || return 1
+    ${SUDO} rm -rf "${target_bundle_dir}.tmp" || return 1
+    LC_ALL=C ${SUDO} mv -vf "${stage_dir}" "${target_bundle_dir}.tmp" || return 1
+    rm -rf "${stage_parent}"
+    ${SUDO} rm -rf "${target_bundle_dir}" || return 1
+    LC_ALL=C ${SUDO} mv -vf "${target_bundle_dir}.tmp" "${target_bundle_dir}" || return 1
+
+    SUDO="$(sudo_for_path "${install_path}")"
+    ${SUDO} mkdir -p "${install_path}" || return 1
+    link_path="${install_path}/${package}"
+    tmp_link="${link_path}.tmp"
+    ${SUDO} rm -f "${tmp_link}" || return 1
+    ${SUDO} ln -s "${target_bundle_dir}/${staged_binary_path}" "${tmp_link}" || return 1
+    LC_ALL=C ${SUDO} mv -vf "${tmp_link}" "${link_path}" || return 1
+
+    BINARY="${package}"
+    return 0
+}
+
 function install_from_archive() {
     local artifact="${1}"
     local archive_type="${2}"
     local target_path="${3}"
-    binary_path="$(retrieve_binary_from_archive "${artifact}" "${archive_type}")"
-    [ $? -ne 0 ] && return 1
+    local bundle_result
+    if [ ${BUNDLE} -eq 1 ]; then
+        install_bundle_from_archive "${artifact}" "${archive_type}" "${target_path}" "${BUNDLE_PATH}"
+        return $?
+    fi
+    local files
+    local count
+    files="$(archive_files_for_install "${artifact}" "${archive_type}")"
+    count=$(echo "${files}" | wc -l)
+    if [ "${count}" -gt 1 ]; then
+        install_bundle_from_archive "${artifact}" "${archive_type}" "${target_path}" "${BUNDLE_PATH}"
+        bundle_result=$?
+        [ ${bundle_result} -ne 2 ] && return ${bundle_result}
+    fi
+    if ! binary_path="$(retrieve_binary_from_archive "${artifact}" "${archive_type}")"; then
+        return 1
+    fi
     if [ -n "${binary_path}" ]; then
         # setting global variable
         BINARY="$(basename "${binary_path}")"
@@ -379,6 +627,7 @@ function install_binary() {
     binary="$(basename "${binary_path}")"
 
     if [ -n "${BINARY_PATTERN}" ]; then
+        # shellcheck disable=SC2053
         if [[ "${binary}" != ${BINARY_PATTERN} ]]; then
             error "Binary '${binary}' doesn't match pattern '${BINARY_PATTERN}'"
             return 1
@@ -411,7 +660,6 @@ function install_binary() {
 function install_deb() {
     local artifact="${1}"
     local package_name=""
-    local version=""
     if [ "${DRY_RUN}" -eq 1 ]; then
         package_name="$(dpkg-deb -f "${artifact}" Package)"
         new_version="$(dpkg-deb -f "${artifact}" Version)"
@@ -429,11 +677,12 @@ if [ $# -lt 1 ]; then
     usage
 fi
 
-NL=$'\n'
 YES=0
 DRY_RUN=0
 PATTERNS=()
 INSTALL_PATH="/usr/local/bin"
+BUNDLE=0
+BUNDLE_PATH="/usr/local/share"
 BINARY_PATTERN=""
 TMP_DIR=""
 
@@ -454,6 +703,14 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             INSTALL_PATH="${1}"
+            ;;
+        --bundle)
+            BUNDLE=1
+            ;;
+        --bundle-path)
+            shift
+            [ -z "${1}" ] && usage
+            BUNDLE_PATH="${1}"
             ;;
         -b|--binary)
             shift
@@ -499,7 +756,7 @@ trap cleanup EXIT
 
 echo "Retrieving artifact from '${project}' with patterns ${PATTERNS[*]}..." 1>&2
 
-if [[ ! "${project}" =~ ^(https?)://.* ]] then
+if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     echo 1>&2
     echo "Looking for repository: ${project}" 1>&2
     git_search_args=()
@@ -511,7 +768,7 @@ if [[ ! "${project}" =~ ^(https?)://.* ]] then
         fail "No such repository: ${project}"
     fi
     count=$(echo "${repo}" | wc -l)
-    if [ ${count} -gt 1 ]; then
+    if [ "${count}" -gt 1 ]; then
         [ ${YES} -eq 1 ] && fail "Found multiple repositories: ${repo}"
         repo="$(choose -n -p "Found multiple repositories:" "${repo}")"
     fi
@@ -552,6 +809,7 @@ fi
 artifact=""
 for pattern in "${PATTERNS[@]}"; do
     [ -n "${artifact}" ] && artifact+=$'\n'
+    # shellcheck disable=SC2086
     artifact="${artifact}$(ls -1 "${tmpfolder}/"${pattern} 2> /dev/null)"
 done
 [ -z "${artifact}" ] && error "Artifact not found" && manual_download
@@ -559,28 +817,28 @@ done
 # sort reverse and make unique
 artifact="$(echo "${artifact}" | sort -ur)"
 
-if [ $(echo "${artifact}" | wc -l) -gt 1 ]; then
+if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
     artifact_list="${artifact}"
     best=""
     echo 1>&2
     echo "Found multiple artifacts matching ${PATTERNS[*]}:" 1>&2
     while IFS= read -r item; do
-        echo "$(basename "${item}")" 1>&2
+        basename "${item}" 1>&2
     done <<< "${artifact_list}"
 
     # try filtering by architecture
     filtered="$(echo "${artifact_list}" | grep -E "($(uname -p)|$(dpkg --print-architecture))")"
     count=$(echo "${filtered}" | wc -l)
 
-    if [ ${count} -eq 1 ]; then
+    if [ "${count}" -eq 1 ]; then
         # reduced to one, use it
         best="${filtered}"
-    elif [ ${count} -gt 1 ]; then
+    elif [ "${count}" -gt 1 ]; then
         # continue with filtered list
         echo 1>&2
         echo "Filtered artifacts:" 1>&2
         while IFS= read -r item; do
-            echo "$(basename "${item}")" 1>&2
+            basename "${item}" 1>&2
         done <<< "${filtered}"
         artifact_list="${filtered}"
     fi
