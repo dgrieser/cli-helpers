@@ -3,6 +3,7 @@
 APP_PATH="${0}"
 APP_NAME="$(basename "${APP_PATH}")"
 DEFAULT_CLI="codex"
+RM_CMD="$(command -v trash 2>/dev/null || command -v rm 2>/dev/null)"
 
 usage() {
     cat <<EOF 1>&2
@@ -103,7 +104,7 @@ fi
 local_file="$(basename "${file}")"
 tmp_repo="$(mktemp -d "${TMPDIR:-/tmp}/${local_file}-git-$(date +%s)-XXXX")"
 local_file_path="${tmp_repo}/${local_file}"
-trap "rm -rf ${tmp_repo}" EXIT
+trap "${RM_CMD} -rf ${tmp_repo}" EXIT
 
 cd "${tmp_repo}"
 git init

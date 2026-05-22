@@ -13,6 +13,8 @@ COMMAND              The command to run
 Options:
     -h, --help       Show this help message
     -S, --page-size  Number of items per page, defaults to 50
+    -M, --max-items  Stop after enough whole pages to cover this many items
+    -P, --max-pages  Maximum number of pages to read
     -p, --page-index-argument <name>
                      Page index argument, defaults to auto-detected via --help
     -s, --page-size-argument <name>
@@ -47,6 +49,8 @@ abort() {
 cmd=""
 args=()
 page_size=50
+max_items=""
+max_pages=""
 page_index_arg=""
 page_size_arg=""
 verbose=0
@@ -61,6 +65,16 @@ while [ "${#}" -gt 0 ]; do
                 shift
                 [[ ! "${1}" =~ ^[0-9]+$ ]] && error "Page size must be a number" && usage
                 page_size="${1}"
+                ;;
+            -M|--max-items)
+                shift
+                [[ ! "${1}" =~ ^[0-9]+$ ]] && error "Max items must be a number" && usage
+                max_items="${1}"
+                ;;
+            -P|--max-pages)
+                shift
+                [[ ! "${1}" =~ ^[0-9]+$ ]] && error "Max pages must be a number" && usage
+                max_pages="${1}"
                 ;;
             -p|--page-index-argument)
                 shift
@@ -100,6 +114,11 @@ while [ "${#}" -gt 0 ]; do
 done
 
 [ -z "${cmd}" ] && usage
+[ "${page_size}" -eq 0 ] && fail "Page size must be greater than zero"
+
+if [ -n "${max_items}" ] && [ "${max_items}" -gt 0 ] && [ "${max_items}" -lt "${page_size}" ]; then
+    page_size="${max_items}"
+fi
 
 if [ -z "${page_index_arg}" ] || [ -z "${page_size_arg}" ]; then
     detected=0
@@ -140,8 +159,21 @@ if [ -z "${page_index_arg}" ] || [ -z "${page_size_arg}" ]; then
 fi
 
 
+effective_max_pages="${max_pages}"
+if [ -n "${max_items}" ]; then
+    max_pages_for_items=$(((max_items + page_size - 1) / page_size))
+    if [ -z "${effective_max_pages}" ] || [ "${max_pages_for_items}" -lt "${effective_max_pages}" ]; then
+        effective_max_pages="${max_pages_for_items}"
+    fi
+fi
+
 current_page=1
 while true; do
+    if [ -n "${effective_max_pages}" ] && [ "${current_page}" -gt "${effective_max_pages}" ]; then
+        verbose "Reached page limit: ${effective_max_pages}"
+        break
+    fi
+
     verbose "${cmd} ${args[*]} ${page_index_arg} ${current_page} ${page_size_arg} ${page_size}"
     result="$("${cmd}" "${args[@]}" "${page_index_arg}" "${current_page}" "${page_size_arg}" "${page_size}")"; exit_code="${?}"
     [ "${exit_code}" -ne 0 ] && fail "Command failed with exit code ${exit_code}"
