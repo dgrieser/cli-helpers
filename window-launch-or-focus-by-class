@@ -5,8 +5,6 @@ usage() {
     exit 1
 }
 
-set -x
-
 desktop_file=""
 classes=""
 
