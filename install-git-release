@@ -121,7 +121,7 @@ function filter_excluded_artifacts() {
         [ -z "${artifact}" ] && continue
         excluded_name="$(basename "${artifact}")"
         case "${excluded_name}" in
-            README.md|RELEASE.md|CONTRIBUTING.md|LICENSE|SECURITY.md)
+            README|README.md|RELEASE|RELEASE.md|CONTRIBUTING|CONTRIBUTING.md|LICENSE|LICENSE.md|SECURITY|SECURITY.md|CHANGELOG|CHANGELOG.md)
                 continue
                 ;;
         esac
