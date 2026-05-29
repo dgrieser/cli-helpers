@@ -41,7 +41,19 @@ pid=$!
 EXIT_FILE="/tmp/launcher-${pid}.exit"
 rm -rf "${EXIT_FILE}"
 
-if ! cli_helpers_is_wayland; then
+if cli_helpers_is_wayland; then
+    attempts=1
+    while true; do
+        win_id="$(window-by-title "${name}" 2>/dev/null)"
+        if [ -n "${win_id}" ]; then
+            cli_helpers_gnome_window_bridge set-above "${win_id}"
+            break
+        fi
+        ((attempts++))
+        sleep 0.5
+        [ "${attempts}" -gt 10 ] && break
+    done
+else
     attempts=1
     while ! xprop -name "${name}" -f WM_CLASS 8s -set WM_CLASS "${bin_name}" 2>/dev/null; do
         ((attempts++))

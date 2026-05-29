@@ -41,6 +41,10 @@ const IFACE_XML = `
       <arg type="s" direction="in" name="selection"/>
       <arg type="b" direction="out" name="cleared"/>
     </method>
+    <method name="SetWindowAbove">
+      <arg type="s" direction="in" name="window_id"/>
+      <arg type="b" direction="out" name="set"/>
+    </method>
   </interface>
 </node>`;
 
@@ -175,6 +179,14 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
 
     ClearClipboard(selection) {
         St.Clipboard.get_default().set_text(clipboardType(selection), '');
+        return true;
+    }
+
+    SetWindowAbove(id) {
+        const window = this._findWindow(id);
+        if (!window)
+            return false;
+        window.make_above();
         return true;
     }
 }
