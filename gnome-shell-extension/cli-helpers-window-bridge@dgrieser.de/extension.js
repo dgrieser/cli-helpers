@@ -138,10 +138,11 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
 
     GetPointerMonitor() {
         const [x, y] = global.get_pointer();
-        for (const monitor of Main.layoutManager.monitors) {
+        for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+            const monitor = Main.layoutManager.monitors[i];
             if (x >= monitor.x && x < monitor.x + monitor.width &&
                 y >= monitor.y && y < monitor.y + monitor.height)
-                return monitor.connector || monitor.name || '';
+                return monitorName(i);
         }
         return '';
     }

@@ -10,16 +10,13 @@ fi
 
 if cli_helpers_is_wayland; then
     cli_helpers_require_command gdbus gdbus || exit 1
-    cli_helpers_gnome_window_bridge list | python3 -c '
-import json
-import socket
-import sys
-
+    cli_helpers_gnome_window_bridge list | python3 -c "
+import json, socket, sys
 host = socket.gethostname()
-for window in json.load(sys.stdin):
-    app_class = window.get("wm_class") or window.get("sandboxed_app_id") or ""
-    print(f"{window.get('id', '')} {window.get('workspace', -1)} {host} {app_class} {window.get('title', '')}")
-'
+for w in json.load(sys.stdin):
+    cls = w.get('wm_class') or w.get('sandboxed_app_id') or ''
+    print(w.get('id', ''), w.get('workspace', -1), host, cls, w.get('title', ''))
+"
 else
     wmctrl -xl
 fi
