@@ -26,7 +26,7 @@ done
 # get all windows by class name
 windows=""
 while true; do
-    windows="$(window-by-class ${classes})"
+    windows="$(window-by-class ${classes} | sort)"
     [ -n "${windows}" ] && break
     if [ "${wait_seconds}" -gt 0 ]; then
         sleep 1
@@ -41,7 +41,7 @@ if [ -z "${active}" ]; then
     # no active window, use the first one
     window-focus $(echo "${windows}" | head -n 1)
 else
-    next=$(echo "${windows}" | grep -A 1 "${active}" | grep -v "${active}" | tail -n 1)
+    next=$(echo "${windows}" | grep -A 1 -Fx "${active}" | grep -vFx "${active}" | tail -n 1)
     if [ -z "${next}" ]; then
         next=$(echo "${windows}" | head -n 1)
     fi
