@@ -18,6 +18,8 @@ Options:
     -h, --help          Show this message
     -l, --last          Print the latest session
     -n, --limit LIMIT   Limit number of sessions to list (default: 50)
+    -g, --grep GREP     Filter listed sessions by a regex match in session contents
+    -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
     -r, --raw           Raw output
     --verbose           Verbose output
 EOF
@@ -142,6 +144,8 @@ print_session_file() {
 }
 
 session_id=""
+grep_pattern=""
+igrep_pattern=""
 last=0
 limit=50
 raw=0
@@ -164,6 +168,18 @@ while [ "${#}" -gt 0 ]; do
             limit="${1}"
             [[ "${limit}" =~ ^[0-9]+$ ]] || fail "Invalid limit: ${limit}"
             [ "${limit}" -gt 0 ] || fail "Invalid limit: ${limit}"
+            ;;
+        -g | --grep)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --grep"
+            grep_pattern="${1}"
+            [ -n "${grep_pattern}" ] || fail "Missing argument for --grep"
+            ;;
+        -i | --igrep)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --igrep"
+            igrep_pattern="${1}"
+            [ -n "${igrep_pattern}" ] || fail "Missing argument for --igrep"
             ;;
         --verbose)
             verbose=1
@@ -188,6 +204,38 @@ if [ "${last}" -eq 1 ] && [ -n "${session_id}" ]; then
     fail "--last cannot be used with SESSION"
 fi
 
+if [ -n "${grep_pattern}" ] && [ -n "${session_id}" ]; then
+    fail "--grep cannot be used with SESSION"
+fi
+
+if [ -n "${igrep_pattern}" ] && [ -n "${session_id}" ]; then
+    fail "--igrep cannot be used with SESSION"
+fi
+
+if [ -n "${grep_pattern}" ] && [ "${last}" -eq 1 ]; then
+    fail "--grep cannot be used with --last"
+fi
+
+if [ -n "${igrep_pattern}" ] && [ "${last}" -eq 1 ]; then
+    fail "--igrep cannot be used with --last"
+fi
+
+if [ -n "${grep_pattern}" ] && [ -n "${igrep_pattern}" ]; then
+    fail "--grep and --igrep cannot be used together"
+fi
+
+if [ -n "${grep_pattern}" ]; then
+    grep -q -- "${grep_pattern}" /dev/null 2>/dev/null
+    grep_status="${?}"
+    [ "${grep_status}" -eq 1 ] || [ "${grep_status}" -eq 0 ] || fail "Invalid --grep pattern: ${grep_pattern}"
+fi
+
+if [ -n "${igrep_pattern}" ]; then
+    grep -qi -- "${igrep_pattern}" /dev/null 2>/dev/null
+    grep_status="${?}"
+    [ "${grep_status}" -eq 1 ] || [ "${grep_status}" -eq 0 ] || fail "Invalid --igrep pattern: ${igrep_pattern}"
+fi
+
 if [ "${last}" -eq 1 ]; then
     verbose "Finding latest session..."
     filepath="$(find "${session_folder}" -mindepth 2 -maxdepth 2 -name "*.${session_ext}" -printf '%T@ %p\n' | sort -n | tail -n 1 | sed 's/^[^ ]* //')"
@@ -204,8 +252,23 @@ elif [ -n "${session_id}" ]; then
 else
     verbose "Listing sessions..."
     rows=""
+    session_files=()
     while IFS= read -r filepath; do
         [ -n "${filepath}" ] || continue
+        if [ -n "${grep_pattern}" ]; then
+            grep -q -- "${grep_pattern}" "${filepath}" || continue
+        fi
+        if [ -n "${igrep_pattern}" ]; then
+            grep -qi -- "${igrep_pattern}" "${filepath}" || continue
+        fi
+        session_files+=("${filepath}")
+    done < <(find "${session_folder}" -mindepth 2 -maxdepth 2 -name "*.${session_ext}" -printf '%T@ %p\n' | sort -n | sed 's/^[^ ]* //')
+
+    session_count="${#session_files[@]}"
+    start_index=$(( session_count - limit ))
+    [ "${start_index}" -lt 0 ] && start_index=0
+
+    for filepath in "${session_files[@]:${start_index}}"; do
         filename="$(basename "${filepath}")"
         session_id="${filename%."${session_ext}"}"
         datetime="$(jq -r -s 'map(select(.timestamp))[0].timestamp // "" | sub("\\.[0-9]+Z$"; "Z") | sub("Z$"; "")' "${filepath}")"
@@ -225,7 +288,7 @@ else
         ' "${filepath}" | head -1 | tr -s ' \t\n' ' ')"
         summary="$(shorten_text "${summary}" 60)"
         rows+="${session_id}  ${datetime}  ${cwd}  ${summary}\n"
-    done < <(find "${session_folder}" -mindepth 2 -maxdepth 2 -name "*.${session_ext}" -printf '%T@ %p\n' | sort -n | tail -n "${limit}" | sed 's/^[^ ]* //')
+    done
     verbose "echo -e 'SESSION  DATETIME  DIRECTORY  SUMMARY\n\${rows}' | k-format"
     echo -e "SESSION  DATETIME  DIRECTORY  SUMMARY\n${rows}" | k-format
 fi
