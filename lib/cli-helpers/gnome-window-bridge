@@ -31,7 +31,16 @@ call_bridge() {
 }
 
 unquote_gvariant_string() {
-    sed -E "s/^\\('(.*)',\\)$/\\1/; s/^\\((.*),\\)$/\\1/"
+    python3 -c '
+import ast
+import sys
+
+value = ast.literal_eval(sys.stdin.read())
+if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], str):
+    print(value[0])
+else:
+    sys.exit("ERROR: unexpected GVariant string response")
+'
 }
 
 [ "$#" -ge 1 ] || usage
