@@ -10,13 +10,19 @@ fi
 
 if cli_helpers_is_wayland; then
     cli_helpers_require_command gdbus gdbus || exit 1
-    cli_helpers_gnome_window_bridge list | python3 -c "
+    windows_json="$(cli_helpers_gnome_window_bridge list)" || exit 1
+    python3 -c '
 import json, socket, sys
 host = socket.gethostname()
-for w in json.load(sys.stdin):
-    cls = w.get('wm_class') or w.get('sandboxed_app_id') or ''
-    print(w.get('id', ''), w.get('workspace', -1), host, cls, w.get('title', ''))
-"
+windows = json.load(sys.stdin)
+if not isinstance(windows, list):
+    sys.exit("ERROR: window bridge returned invalid window list")
+for w in windows:
+    if not isinstance(w, dict):
+        continue
+    cls = w.get("wm_class") or w.get("sandboxed_app_id") or ""
+    print(w.get("id", ""), w.get("workspace", -1), host, cls, w.get("title", ""))
+' <<<"${windows_json}"
 else
     wmctrl -xl
 fi

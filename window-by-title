@@ -15,15 +15,21 @@ fi
 
 if cli_helpers_is_wayland; then
     cli_helpers_require_command gdbus gdbus || exit 1
-    cli_helpers_gnome_window_bridge list | python3 -c '
+    windows_json="$(cli_helpers_gnome_window_bridge list)" || exit 1
+    python3 -c '
 import json
 import sys
 
 needle = sys.argv[1]
-for window in json.load(sys.stdin):
+windows = json.load(sys.stdin)
+if not isinstance(windows, list):
+    sys.exit("ERROR: window bridge returned invalid window list")
+for window in windows:
+    if not isinstance(window, dict):
+        continue
     if window.get("title", "") == needle:
         print(window.get("id", ""))
-' "${1}"
+' "${1}" <<<"${windows_json}"
 else
     wmctrl -xl | awk '$5 == "'"${1}"'"' | awk '{print $1}'
 fi

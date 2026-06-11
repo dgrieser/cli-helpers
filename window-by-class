@@ -15,16 +15,22 @@ fi
 
 if cli_helpers_is_wayland; then
     cli_helpers_require_command gdbus gdbus || exit 1
-    cli_helpers_gnome_window_bridge list | python3 -c '
+    windows_json="$(cli_helpers_gnome_window_bridge list)" || exit 1
+    python3 -c '
 import json
 import sys
 
 classes = set(sys.argv[1:])
-for window in json.load(sys.stdin):
+windows = json.load(sys.stdin)
+if not isinstance(windows, list):
+    sys.exit("ERROR: window bridge returned invalid window list")
+for window in windows:
+    if not isinstance(window, dict):
+        continue
     names = {window.get("wm_class", ""), window.get("sandboxed_app_id", "")}
     if classes.intersection(names):
         print(window.get("id", ""))
-' "$@"
+' "$@" <<<"${windows_json}"
 else
     for wmclass in "$@"; do
         wmctrl -xl | awk -v wmclass="$wmclass" '$3 == wmclass {print $1}'
