@@ -1,14 +1,52 @@
 #!/bin/bash
 
-function usage() {
-    echo "Usage: $(basename "${0}") <header (comma separated)>" 1>&2
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] HEADER
+
+Format tab-separated input into an aligned table. Reads from stdin.
+
+Arguments:
+  HEADER                Comma-separated column header names
+
+Options:
+  -h, --help            Show this help message and exit
+EOF
     exit 1
 }
 
-if [ $# -ne 1 ]; then
-    usage
-fi
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
 
-header="${1}"
+fail() {
+    error "${1}"
+    exit 1
+}
+
+header=""
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -n "${header}" ]; then
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            header="${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${header}" ] && usage
 
 column -t -s $'\t' -N "${header}" --output-separator $'\t'
