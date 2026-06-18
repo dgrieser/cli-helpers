@@ -1,3 +1,90 @@
 #!/bin/bash
-# either at least two spaces or one tab
-sed -E 's/(\t| {2,})/|/g; s/^/|/; s/$/|/' | awk 'NR==1{h=$0; gsub(/[^|]/,"-",h); print $0 RS h; next}1'
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Convert between a tab/space-separated table and a Markdown table. Reads from
+stdin.
+
+By default, a tab- or space-separated table is converted to a Markdown table.
+Columns are split on a tab or on two or more spaces, and the first row is
+treated as the header.
+
+The reverse options parse a Markdown table (leading/trailing pipes optional)
+and drop the header separator row.
+
+Options:
+  --to-tsv              Convert a Markdown table to tab-separated values
+  --to-csv              Convert a Markdown table to comma-separated values
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+mode="md"
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --to-tsv)
+            [ "${mode}" != "md" ] && fail "Only one of --to-tsv or --to-csv may be given"
+            mode="tsv"
+            ;;
+        --to-csv)
+            [ "${mode}" != "md" ] && fail "Only one of --to-tsv or --to-csv may be given"
+            mode="csv"
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+
+if [ "${mode}" = "md" ]; then
+    # either at least two spaces or one tab
+    sed -E 's/(\t| {2,})/|/g; s/^/|/; s/$/|/' | awk 'NR==1{h=$0; gsub(/[^|]/,"-",h); print $0 RS h; next}1'
+else
+    awk -v mode="${mode}" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function csvq(s) { if (s ~ /[",\n]/) { gsub(/"/, "\"\"", s); return "\"" s "\"" } return s }
+    {
+        line = $0
+        if (line ~ /^[[:space:]]*$/) next
+        sub(/^[[:space:]]*\|/, "", line)
+        sub(/\|[[:space:]]*$/, "", line)
+        n = split(line, cells, "|")
+        # skip the header separator row (e.g. |---|:--:|)
+        is_sep = 1
+        for (i = 1; i <= n; i++) {
+            if (trim(cells[i]) !~ /^:?-+:?$/) { is_sep = 0; break }
+        }
+        if (is_sep) next
+        sep = (mode == "csv") ? "," : "\t"
+        out = ""
+        for (i = 1; i <= n; i++) {
+            c = trim(cells[i])
+            if (mode == "csv") c = csvq(c)
+            out = (i == 1) ? c : out sep c
+        }
+        print out
+    }'
+fi
