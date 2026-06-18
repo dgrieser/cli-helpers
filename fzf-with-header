@@ -16,6 +16,7 @@ delimiter='  +'
 watch_seconds=0
 reverse=1
 print_query=0
+fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
 
 while [ $# -gt 0 ]; do
     case "${1}" in
@@ -84,6 +85,9 @@ if [ ${reverse} -eq 1 ]; then
     args="${args}--layout=default"
 fi
 
+[ -n "${args}" ] && args="${args} "
+args="${args}--bind=${fzf_bindings}"
+
 update_fzf() {
     local cmd="${1}"
     local port="${2}"
@@ -115,13 +119,13 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --no-hscroll --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --no-hscroll --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
