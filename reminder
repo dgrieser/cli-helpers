@@ -1,0 +1,337 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+REMINDER_DIR="${HOME}/.cache/reminder"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Manage and write Markdown reminders in ${REMINDER_DIR}.
+
+Active reminders are *.md files. Marking one "Done" renames it to
+<name>.md_<timestamp> so it drops out of every listing without being lost.
+
+With no options, runs interactive edit mode: navigate the reminder titles,
+toggle a Done checkbox, add new reminders, then save.
+
+Options:
+  --print               Render all reminders with glow and exit
+  --add                 Open an editor to write a new reminder and exit
+  -h, --help            Show this help message and exit
+
+Edit-mode keys:
+  up / down (or k / j)  Move between reminders
+  space                 Toggle the Done checkbox on the selected reminder
+  n                     Add a new reminder, then return to edit mode
+  enter                 Save: mark checked reminders Done and exit
+  esc                   Abort (prompts to discard if anything changed)
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# Collect active reminder files (*.md) into the named array variable.
+collect_reminders() {
+    local -n _out="${1}"
+    local f
+    _out=()
+    for f in "${REMINDER_DIR}"/*.md; do
+        [ -f "${f}" ] && _out+=("${f}")
+    done
+}
+
+# First non-empty line of a file, with any leading Markdown heading marks stripped.
+get_title() {
+    local t
+    t="$(grep -m1 -E '\S' "${1}" 2>/dev/null | sed -E 's/^#+[[:space:]]*//')"
+    [ -z "${t}" ] && t="$(basename "${1}")"
+    printf '%s' "${t}"
+}
+
+# Render every reminder with glow.
+print_reminders() {
+    local reminders=()
+    collect_reminders reminders
+    if [ "${#reminders[@]}" -eq 0 ]; then
+        echo "No reminders." 1>&2
+        return 0
+    fi
+    {
+        echo "# YOUR REMINDERS"
+        echo
+        local f
+        for f in "${reminders[@]}"; do
+            cat "${f}"
+            echo
+        done
+    } | glow
+}
+
+# Open an editor on a new reminder. On success (editor exit 0 and the template
+# was actually changed) save it and print the saved path to stdout. Otherwise
+# print nothing and return non-zero.
+add_reminder() {
+    local dir template tmp content header slug target ts
+    dir="$(basename "$(pwd)")"
+    template="### ${dir}"
+
+    tmp="$(mktemp --suffix=.md)" || return 1
+    printf '%s\n' "${template}" > "${tmp}"
+
+    if ! vim "${tmp}" </dev/tty >/dev/tty 2>&1; then
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    content="$(cat "${tmp}")"
+    header="$(grep -m1 -E '\S' "${tmp}" | sed -E 's/^#+[[:space:]]*//')"
+    if [ "${content}" = "${template}" ] || [ -z "${header}" ]; then
+        # Unchanged from the template, or empty: nothing worth saving.
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    slug="$(printf '%s' "${header}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+    [ -z "${slug}" ] && slug="reminder"
+
+    target="${REMINDER_DIR}/${slug}.md"
+    if [ -e "${target}" ]; then
+        ts="$(date +%Y-%m-%dT%H-%M-%S)"
+        target="${REMINDER_DIR}/${slug}-${ts}.md"
+    fi
+
+    mv "${tmp}" "${target}"
+    printf '%s\n' "${target}"
+}
+
+# --- interactive edit mode --------------------------------------------------
+
+# State shared across the edit-mode helpers.
+files=()
+titles=()
+done_flags=()
+created=()
+sel=0
+
+load_list() {
+    files=()
+    titles=()
+    done_flags=()
+    collect_reminders files
+    local f
+    for f in "${files[@]}"; do
+        titles+=("$(get_title "${f}")")
+        done_flags+=(0)
+    done
+}
+
+read_key() {
+    local char rest c
+    IFS= read -rsn1 char </dev/tty
+    if [ -z "${char}" ]; then
+        printf 'enter\n'
+        return
+    fi
+    if [ "${char}" = $'\e' ]; then
+        rest=""
+        while IFS= read -rsn1 -t 0.001 c </dev/tty; do
+            rest="${rest}${c}"
+        done
+        case "${rest}" in
+            "[A") printf 'up\n' ;;
+            "[B") printf 'down\n' ;;
+            "[C") printf 'right\n' ;;
+            "[D") printf 'left\n' ;;
+            "") printf 'esc\n' ;;
+            *) printf 'other\n' ;;
+        esac
+        return
+    fi
+    case "${char}" in
+        " ") printf 'space\n' ;;
+        $'\n'|$'\r') printf 'enter\n' ;;
+        *) printf '%s\n' "${char}" ;;
+    esac
+}
+
+render() {
+    tput clear
+    printf 'YOUR REMINDERS  —  up/down move · space Done · n new · enter save · esc abort\n\n'
+    if [ "${#files[@]}" -eq 0 ]; then
+        printf '  (no reminders — press n to add one, esc to quit)\n'
+        return
+    fi
+    local i box
+    for i in "${!files[@]}"; do
+        if [ "${done_flags[${i}]}" -eq 1 ]; then box="[x]"; else box="[ ]"; fi
+        if [ "${i}" -eq "${sel}" ]; then
+            tput smso
+            printf '> %s %s' "${box}" "${titles[${i}]}"
+            tput rmso
+            printf '\n'
+        else
+            printf '  %s %s\n' "${box}" "${titles[${i}]}"
+        fi
+    done
+}
+
+has_changes() {
+    [ "${#created[@]}" -gt 0 ] && return 0
+    local i
+    for i in "${!done_flags[@]}"; do
+        [ "${done_flags[${i}]}" -eq 1 ] && return 0
+    done
+    return 1
+}
+
+confirm_discard() {
+    tput cnorm
+    printf '\nDiscard changes'
+    [ "${#created[@]}" -gt 0 ] && printf ' and delete %d new reminder(s)' "${#created[@]}"
+    printf '? [y/N] '
+    local ans
+    IFS= read -rn1 ans </dev/tty
+    printf '\n'
+    tput civis
+    case "${ans}" in
+        y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+commit_done() {
+    local i ts count=0
+    for i in "${!files[@]}"; do
+        if [ "${done_flags[${i}]}" -eq 1 ]; then
+            ts="$(date +%Y-%m-%dT%H-%M-%S)"
+            mv "${files[${i}]}" "${files[${i}]}_${ts}"
+            count=$((count + 1))
+        fi
+    done
+    [ "${count}" -gt 0 ] && echo "Marked ${count} reminder(s) done." 1>&2
+    return 0
+}
+
+edit_mode() {
+    [ -t 1 ] || fail "Edit mode requires a terminal."
+
+    load_list
+    sel=0
+    created=()
+
+    trap 'tput cnorm 2>/dev/null' EXIT
+    tput civis
+
+    local key newpath
+    while true; do
+        render
+        key="$(read_key)"
+        case "${key}" in
+            up|k)
+                [ "${sel}" -gt 0 ] && sel=$((sel - 1))
+                ;;
+            down|j)
+                [ $((sel + 1)) -lt "${#files[@]}" ] && sel=$((sel + 1))
+                ;;
+            space)
+                [ "${#files[@]}" -gt 0 ] || continue
+                if [ "${done_flags[${sel}]}" -eq 0 ]; then
+                    done_flags[${sel}]=1
+                else
+                    done_flags[${sel}]=0
+                fi
+                ;;
+            n)
+                tput cnorm
+                newpath="$(add_reminder)"
+                tput civis
+                if [ -n "${newpath}" ] && [ -f "${newpath}" ]; then
+                    files+=("${newpath}")
+                    titles+=("$(get_title "${newpath}")")
+                    done_flags+=(0)
+                    created+=("${newpath}")
+                    sel=$(( ${#files[@]} - 1 ))
+                fi
+                ;;
+            enter)
+                commit_done
+                break
+                ;;
+            esc)
+                if has_changes; then
+                    if confirm_discard; then
+                        local p
+                        for p in "${created[@]}"; do
+                            rm -f "${p}"
+                        done
+                        break
+                    fi
+                else
+                    break
+                fi
+                ;;
+        esac
+    done
+
+    tput cnorm
+    tput clear
+    trap - EXIT
+}
+
+# --- argument parsing -------------------------------------------------------
+
+mode="edit"
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --print)
+            [ "${mode}" != "edit" ] && fail "Only one of --print or --add may be given"
+            mode="print"
+            ;;
+        --add)
+            [ "${mode}" != "edit" ] && fail "Only one of --print or --add may be given"
+            mode="add"
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+
+mkdir -p "${REMINDER_DIR}"
+
+case "${mode}" in
+    print)
+        print_reminders
+        ;;
+    add)
+        path="$(add_reminder)"
+        if [ -n "${path}" ]; then
+            echo "Saved: ${path}" 1>&2
+        else
+            echo "No reminder added." 1>&2
+        fi
+        ;;
+    edit)
+        edit_mode
+        ;;
+esac
