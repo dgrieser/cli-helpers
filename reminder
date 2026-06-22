@@ -3,6 +3,15 @@
 APP_NAME="$(basename "${0}")"
 REMINDER_DIR="${HOME}/.cache/reminder"
 
+# Edit-mode UI colours (SGR escapes). C_TITLE mirrors glow's dark-style H1
+# (bright-yellow bold on a bright-blue background) so the title matches --print.
+C_TITLE=$'\033[93;104;1m'
+C_HELP=$'\033[90m'      # grey help text
+C_SEP=$'\033[90m'       # grey vertical rule
+C_BOX_OFF=$'\033[36m'   # cyan unchecked checkbox
+C_BOX_ON=$'\033[32m'    # green checked checkbox
+C_RESET=$'\033[0m'
+
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [OPTIONS]
@@ -23,6 +32,7 @@ Options:
 Edit-mode keys:
   up / down (or k / j)  Move between reminders
   space                 Toggle the Done checkbox on the selected reminder
+  e                     Edit the selected reminder in vim, then return
   n                     Add a new reminder, then return to edit mode
   enter                 Save: mark checked reminders Done and exit
   esc                   Abort (prompts to discard if anything changed)
@@ -165,25 +175,143 @@ read_key() {
     esac
 }
 
-render() {
-    tput clear
-    printf 'YOUR REMINDERS  —  up/down move · space Done · n new · enter save · esc abort\n\n'
-    if [ "${#files[@]}" -eq 0 ]; then
-        printf '  (no reminders — press n to add one, esc to quit)\n'
+# Resolve the glow style to render previews with into the global GLOW_STYLE.
+# Honors $REMINDER_GLOW_STYLE, then the "style" key in glow.yml, else "dark".
+# (--print's glow writes to a tty so it already picks up glow.yml on its own;
+# the preview pipes glow into a substitution, which strips style + colour, so it
+# must pass the style explicitly.)
+resolve_glow_style() {
+    if [ -n "${REMINDER_GLOW_STYLE:-}" ]; then
+        GLOW_STYLE="${REMINDER_GLOW_STYLE}"
         return
     fi
-    local i box
-    for i in "${!files[@]}"; do
-        if [ "${done_flags[${i}]}" -eq 1 ]; then box="[x]"; else box="[ ]"; fi
-        if [ "${i}" -eq "${sel}" ]; then
-            tput smso
-            printf '> %s %s' "${box}" "${titles[${i}]}"
-            tput rmso
-            printf '\n'
+    local cfg style
+    cfg="${GLOW_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/glow/glow.yml}"
+    if [ -f "${cfg}" ]; then
+        style="$(sed -nE 's/^[[:space:]]*style:[[:space:]]*"?([^"#]+)"?[[:space:]]*$/\1/p' "${cfg}" | head -1)"
+        style="${style%"${style##*[![:space:]]}"}"
+    fi
+    GLOW_STYLE="${style:-dark}"
+    [ "${GLOW_STYLE}" = "auto" ] && GLOW_STYLE="dark"
+}
+
+# Derive the title bar colour from how glow renders an H1 under GLOW_STYLE, so
+# "YOUR REMINDERS" matches the heading produced by --print on this terminal.
+compute_title_style() {
+    local out sgr
+    out="$(printf '# YOUR REMINDERS\n' | CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w 30 2>/dev/null)"
+    sgr="$(printf '%s' "${out}" | grep -ao $'\033\\[[0-9;]*m[^Y]*YOUR' | head -1 | grep -ao $'\033\\[[0-9;]*m' | tail -1)"
+    [ -n "${sgr}" ] && C_TITLE="${sgr}"
+}
+
+# Render the selected reminder with glow into the global right_lines, wrapped to
+# the given width. Cached on (file, width) via preview_key so that toggling Done
+# (which leaves the selection unchanged) does not re-run glow.
+build_right_lines() {
+    local w="${1}" f key line
+    if [ "${#files[@]}" -eq 0 ]; then
+        right_lines=()
+        preview_key=""
+        return
+    fi
+    f="${files[${sel}]}"
+    key="${f}::${w}"
+    [ "${key}" = "${preview_key:-}" ] && return
+    preview_key="${key}"
+    right_lines=()
+    # glow writes to a pipe here, so it would normally drop colour ("not a
+    # terminal"); CLICOLOR_FORCE keeps the ANSI, and an explicit style is needed
+    # because background auto-detection also needs a tty.
+    while IFS= read -r line; do
+        right_lines+=("${line}")
+    done < <(CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" "${f}" 2>/dev/null)
+    # glow prepends a blank top-margin line; drop it.
+    if [ "${#right_lines[@]}" -gt 0 ]; then
+        local first
+        first="$(printf '%s' "${right_lines[0]}" | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')"
+        [ -z "${first//[[:space:]]/}" ] && right_lines=("${right_lines[@]:1}")
+    fi
+}
+
+# The whole frame is composed into a single string and written in one shot, and
+# the screen is repainted from the home position (rather than cleared) with each
+# line erased to its end — this avoids the blank-screen flash between frames.
+render() {
+    local cols lines avail sep left_w right_w tw
+    cols="$(tput cols 2>/dev/null || echo 80)"
+    lines="$(tput lines 2>/dev/null || echo 24)"
+    avail=$((lines - 3))
+    [ "${avail}" -lt 1 ] && avail=1
+    left_w=$((cols / 3))
+    [ "${left_w}" -lt 24 ] && left_w=24
+    [ "${left_w}" -gt 44 ] && left_w=44
+    right_w=$((cols - left_w - 3))
+    # Width left for the title after the "  " marker, the "[ ]" box and a space.
+    tw=$((left_w - 6))
+    [ "${tw}" -lt 1 ] && tw=1
+    # Grey vertical rule (3 visible columns: space, bar, space).
+    sep=" ${C_SEP}│${C_RESET} "
+
+    # eol = reset attributes, then erase to end of line (clears stale glyphs and
+    # any background colour glow may have left active).
+    local home=$'\033[H' eol=$'\033[0m\033[K' clrbelow=$'\033[J'
+    local smso rmso
+    smso="$(tput smso)"
+    rmso="$(tput rmso)"
+
+    # Scroll the list so the selection stays visible.
+    local count="${#files[@]}" start=0
+    if [ "${count}" -gt "${avail}" ] && [ "${sel}" -ge "${avail}" ]; then
+        start=$((sel - avail + 1))
+    fi
+
+    local out="${home}"
+    # "YOUR REMINDERS" styled like glow's H1, then grey help text.
+    out+="${C_TITLE} YOUR REMINDERS ${C_RESET}${C_HELP}  up/down move · space Done · e edit · n new · enter save · esc abort${eol}"$'\n'
+    out+="${eol}"$'\n'
+
+    local preview=1
+    [ "${right_w}" -lt 16 ] && preview=0
+    [ "${preview}" -eq 1 ] && build_right_lines "${right_w}"
+
+    local r li lcell box boxcol title plain rtext
+    for ((r = 0; r < avail; r++)); do
+        li=$((start + r))
+        if [ "${count}" -eq 0 ] && [ "${r}" -eq 0 ]; then
+            plain="(no reminders — n to add, esc to quit)"
+            lcell="${C_HELP}$(printf '%-*s' "${left_w}" "${plain:0:${left_w}}")${C_RESET}"
+        elif [ "${li}" -lt "${count}" ]; then
+            if [ "${done_flags[${li}]}" -eq 1 ]; then
+                box="[x]"; boxcol="${C_BOX_ON}"
+            else
+                box="[ ]"; boxcol="${C_BOX_OFF}"
+            fi
+            title="${titles[${li}]:0:${tw}}"
+            if [ "${li}" -eq "${sel}" ]; then
+                # Selected: reverse-video bar across the whole cell, plain text.
+                plain="$(printf '> %s %-*s' "${box}" "${tw}" "${title}")"
+                lcell="${smso}$(printf '%-*s' "${left_w}" "${plain:0:${left_w}}")${rmso}"
+            else
+                # Coloured checkbox, default-coloured title.
+                lcell="  ${boxcol}${box}${C_RESET} $(printf '%-*s' "${tw}" "${title}")"
+            fi
         else
-            printf '  %s %s\n' "${box}" "${titles[${i}]}"
+            lcell="$(printf '%-*s' "${left_w}" "")"
+        fi
+        if [ "${preview}" -eq 1 ]; then
+            # glow output carries its own ANSI; pass it through untruncated.
+            rtext="${right_lines[${r}]:-}"
+            out+="${lcell}${sep}${rtext}${eol}"$'\n'
+        else
+            out+="${lcell}${eol}"$'\n'
         fi
     done
+
+    # Drop the final newline so the cursor never lands past the last row (which
+    # would scroll the screen), then clear anything left below.
+    out="${out%$'\n'}"
+    out+="${clrbelow}"
+    printf '%s' "${out}"
 }
 
 has_changes() {
@@ -229,9 +357,13 @@ edit_mode() {
     load_list
     sel=0
     created=()
+    preview_key=""
+    resolve_glow_style
+    compute_title_style
 
     trap 'tput cnorm 2>/dev/null' EXIT
     tput civis
+    tput clear
 
     local key newpath
     while true; do
@@ -252,6 +384,15 @@ edit_mode() {
                     done_flags[${sel}]=0
                 fi
                 ;;
+            e)
+                [ "${#files[@]}" -gt 0 ] || continue
+                tput cnorm
+                vim "${files[${sel}]}" </dev/tty >/dev/tty 2>&1
+                tput civis
+                titles[${sel}]="$(get_title "${files[${sel}]}")"
+                preview_key=""
+                tput clear
+                ;;
             n)
                 tput cnorm
                 newpath="$(add_reminder)"
@@ -263,6 +404,8 @@ edit_mode() {
                     created+=("${newpath}")
                     sel=$(( ${#files[@]} - 1 ))
                 fi
+                preview_key=""
+                tput clear
                 ;;
             enter)
                 commit_done
@@ -277,6 +420,8 @@ edit_mode() {
                         done
                         break
                     fi
+                    # Declined: prompt text dirtied the screen, repaint clean.
+                    tput clear
                 else
                     break
                 fi
