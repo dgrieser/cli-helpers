@@ -3,9 +3,7 @@
 APP_NAME="$(basename "${0}")"
 REMINDER_DIR="${HOME}/.cache/reminder"
 
-# Edit-mode UI colours (SGR escapes). C_TITLE mirrors glow's dark-style H1
-# (bright-yellow bold on a bright-blue background) so the title matches --print.
-C_TITLE=$'\033[93;104;1m'
+C_TITLE=$'\033[38;5;228;48;5;63;1m'
 C_HELP=$'\033[90m'      # grey help text
 C_SEP=$'\033[90m'       # grey vertical rule
 C_BOX_OFF=$'\033[36m'   # cyan unchecked checkbox
@@ -85,6 +83,7 @@ print_reminders() {
         done
     } | glow
 }
+
 
 # Open an editor on a new reminder. On success (editor exit 0 and the template
 # was actually changed) save it and print the saved path to stdout. Otherwise
@@ -195,15 +194,6 @@ resolve_glow_style() {
     [ "${GLOW_STYLE}" = "auto" ] && GLOW_STYLE="dark"
 }
 
-# Derive the title bar colour from how glow renders an H1 under GLOW_STYLE, so
-# "YOUR REMINDERS" matches the heading produced by --print on this terminal.
-compute_title_style() {
-    local out sgr
-    out="$(printf '# YOUR REMINDERS\n' | CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w 30 2>/dev/null)"
-    sgr="$(printf '%s' "${out}" | grep -ao $'\033\\[[0-9;]*m[^Y]*YOUR' | head -1 | grep -ao $'\033\\[[0-9;]*m' | tail -1)"
-    [ -n "${sgr}" ] && C_TITLE="${sgr}"
-}
-
 # Render the selected reminder with glow into the global right_lines, wrapped to
 # the given width. Cached on (file, width) via preview_key so that toggling Done
 # (which leaves the selection unchanged) does not re-run glow.
@@ -211,7 +201,7 @@ build_right_lines() {
     local w="${1}" f key line
     if [ "${#files[@]}" -eq 0 ]; then
         right_lines=()
-        preview_key=""
+         preview_key=""
         return
     fi
     f="${files[${sel}]}"
@@ -224,7 +214,7 @@ build_right_lines() {
     # because background auto-detection also needs a tty.
     while IFS= read -r line; do
         right_lines+=("${line}")
-    done < <(CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" "${f}" 2>/dev/null)
+    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" "${f}" 2>/dev/null)
     # glow prepends a blank top-margin line; drop it.
     if [ "${#right_lines[@]}" -gt 0 ]; then
         local first
@@ -359,7 +349,6 @@ edit_mode() {
     created=()
     preview_key=""
     resolve_glow_style
-    compute_title_style
 
     trap 'tput cnorm 2>/dev/null' EXIT
     tput civis
