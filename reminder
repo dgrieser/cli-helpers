@@ -5,9 +5,14 @@ REMINDER_DIR="${HOME}/.cache/reminder"
 
 C_TITLE=$'\033[38;5;228;48;5;63;1m'
 C_HELP=$'\033[90m'      # grey help text
+C_KEY=$'\033[38;5;250m' # lighter grey for help keys
 C_SEP=$'\033[90m'       # grey vertical rule
 C_BOX_OFF=$'\033[36m'   # cyan unchecked checkbox
 C_BOX_ON=$'\033[32m'    # green checked checkbox
+C_OPEN=$'\033[92m'      # bright green "OPEN" view label
+C_DONE=$'\033[38;5;250m' # light grey "DONE" view label
+C_BOLD=$'\033[1m'       # bold reminder titles
+C_ITALIC=$'\033[3m'     # italic title: unsaved (new/edited) reminder
 C_RESET=$'\033[0m'
 
 usage() {
@@ -16,11 +21,12 @@ usage: ${APP_NAME} [OPTIONS]
 
 Manage and write Markdown reminders in ${REMINDER_DIR}.
 
-Active reminders are *.md files. Marking one "Done" renames it to
+Active reminders are *.md files. Marking one as done renames it to
 <name>.md_<timestamp> so it drops out of every listing without being lost.
 
 With no options, runs interactive edit mode: navigate the reminder titles,
-toggle a Done checkbox, add new reminders, then save.
+toggle a done checkbox, add new reminders, then save. Tab switches between the
+open (active) and done (completed) views; both list newest-modified first.
 
 Options:
   --print               Render all reminders with glow and exit
@@ -29,10 +35,12 @@ Options:
 
 Edit-mode keys:
   up / down (or k / j)  Move between reminders
-  space                 Toggle the Done checkbox on the selected reminder
-  e                     Edit the selected reminder in vim, then return
+  tab                   Switch between the open and done (completed) views
+  shift+up / shift+down Scroll the preview pane (for reminders taller than it)
+  space                 Toggle the checkbox (open: mark done; done: reopen)
+  e                     Edit the selected reminder in vim (revertable on abort)
   n                     Add a new reminder, then return to edit mode
-  enter                 Save: mark checked reminders Done and exit
+  enter                 Save: apply toggles (done / reopen) and exit
   esc                   Abort (prompts to discard if anything changed)
 EOF
     exit 1
@@ -47,14 +55,21 @@ fail() {
     exit 1
 }
 
-# Collect active reminder files (*.md) into the named array variable.
-collect_reminders() {
-    local -n _out="${1}"
-    local f
-    _out=()
-    for f in "${REMINDER_DIR}"/*.md; do
-        [ -f "${f}" ] && _out+=("${f}")
-    done
+# Emit reminder files for a view, newest-modified first, one path per line.
+# $1 = "open" (active *.md) | "done" (completed *.md_<timestamp>).
+list_files_by_mtime() {
+    local view="${1}" f
+    {
+        if [ "${view}" = "done" ]; then
+            for f in "${REMINDER_DIR}"/*.md_*; do
+                [ -f "${f}" ] && printf '%s\t%s\n' "$(stat -c %Y "${f}")" "${f}"
+            done
+        else
+            for f in "${REMINDER_DIR}"/*.md; do
+                [ -f "${f}" ] && printf '%s\t%s\n' "$(stat -c %Y "${f}")" "${f}"
+            done
+        fi
+    } | sort -rn -k1,1 | cut -f2-
 }
 
 # First non-empty line of a file, with any leading Markdown heading marks stripped.
@@ -65,10 +80,12 @@ get_title() {
     printf '%s' "${t}"
 }
 
-# Render every reminder with glow.
+# Render every active reminder with glow, newest first.
 print_reminders() {
-    local reminders=()
-    collect_reminders reminders
+    local reminders=() f
+    while IFS= read -r f; do
+        [ -n "${f}" ] && reminders+=("${f}")
+    done < <(list_files_by_mtime open)
     if [ "${#reminders[@]}" -eq 0 ]; then
         echo "No reminders." 1>&2
         return 0
@@ -76,7 +93,6 @@ print_reminders() {
     {
         echo "# YOUR REMINDERS"
         echo
-        local f
         for f in "${reminders[@]}"; do
             cat "${f}"
             echo
@@ -131,18 +147,27 @@ files=()
 titles=()
 done_flags=()
 created=()
+declare -A edited_backup=()   # file -> tmp holding its pre-edit content
 sel=0
+saved_stty=""                 # original tty settings, restored on exit
+view="open"                   # "open" (active) | "done" (completed)
+declare -A pending=()         # file -> 1 if flagged for its view's action on save
 
 load_list() {
     files=()
     titles=()
     done_flags=()
-    collect_reminders files
     local f
-    for f in "${files[@]}"; do
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        files+=("${f}")
         titles+=("$(get_title "${f}")")
-        done_flags+=(0)
-    done
+        if [ -n "${pending[${f}]:-}" ]; then
+            done_flags+=(1)
+        else
+            done_flags+=(0)
+        fi
+    done < <(list_files_by_mtime "${view}")
 }
 
 read_key() {
@@ -162,6 +187,8 @@ read_key() {
             "[B") printf 'down\n' ;;
             "[C") printf 'right\n' ;;
             "[D") printf 'left\n' ;;
+            "[1;2A") printf 'shift-up\n' ;;
+            "[1;2B") printf 'shift-down\n' ;;
             "") printf 'esc\n' ;;
             *) printf 'other\n' ;;
         esac
@@ -169,6 +196,7 @@ read_key() {
     fi
     case "${char}" in
         " ") printf 'space\n' ;;
+        $'\t') printf 'tab\n' ;;
         $'\n'|$'\r') printf 'enter\n' ;;
         *) printf '%s\n' "${char}" ;;
     esac
@@ -195,7 +223,7 @@ resolve_glow_style() {
 }
 
 # Render the selected reminder with glow into the global right_lines, wrapped to
-# the given width. Cached on (file, width) via preview_key so that toggling Done
+# the given width. Cached on (file, width) via preview_key so that toggling done
 # (which leaves the selection unchanged) does not re-run glow.
 build_right_lines() {
     local w="${1}" f key line
@@ -208,13 +236,17 @@ build_right_lines() {
     key="${f}::${w}"
     [ "${key}" = "${preview_key:-}" ] && return
     preview_key="${key}"
+    right_scroll=0          # new preview starts at the top
     right_lines=()
     # glow writes to a pipe here, so it would normally drop colour ("not a
     # terminal"); CLICOLOR_FORCE keeps the ANSI, and an explicit style is needed
-    # because background auto-detection also needs a tty.
+    # because background auto-detection also needs a tty. Feed the file on stdin
+    # rather than as a path: done reminders are named "<name>.md_<timestamp>", and
+    # glow only treats a path as Markdown by its extension (it hangs on .md_*),
+    # whereas stdin is always rendered as Markdown.
     while IFS= read -r line; do
         right_lines+=("${line}")
-    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" "${f}" 2>/dev/null)
+    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" 2>/dev/null < "${f}")
     # glow prepends a blank top-margin line; drop it.
     if [ "${#right_lines[@]}" -gt 0 ]; then
         local first
@@ -236,8 +268,9 @@ render() {
     [ "${left_w}" -lt 24 ] && left_w=24
     [ "${left_w}" -gt 44 ] && left_w=44
     right_w=$((cols - left_w - 3))
-    # Width left for the title after the "  " marker, the "[ ]" box and a space.
-    tw=$((left_w - 6))
+    # Width left for the title after "> " (arrow + space, 2), the ☐ box (1) and
+    # a two-space gap (2).
+    tw=$((left_w - 5))
     [ "${tw}" -lt 1 ] && tw=1
     # Grey vertical rule (3 visible columns: space, bar, space).
     sep=" ${C_SEP}│${C_RESET} "
@@ -255,42 +288,68 @@ render() {
         start=$((sel - avail + 1))
     fi
 
+    local vlabel="OPEN" vcol="${C_OPEN}"
+    if [ "${view}" = "done" ]; then vlabel="DONE"; vcol="${C_DONE}"; fi
+
     local out="${home}"
-    # "YOUR REMINDERS" styled like glow's H1, then grey help text.
-    out+="${C_TITLE} YOUR REMINDERS ${C_RESET}${C_HELP}  up/down move · space Done · e edit · n new · enter save · esc abort${eol}"$'\n'
+    # View label styled like glow's H1; the label word is tinted by view (green
+    # OPEN / white DONE), then C_TITLE restores the bar's fg for the trailing pad.
+    out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}tab${C_HELP} open/done · ${C_KEY}space${C_HELP} toggle · ${C_KEY}shift+up/down${C_HELP} scroll · ${C_KEY}e${C_HELP} edit · ${C_KEY}n${C_HELP} new · ${C_KEY}enter${C_HELP} save · ${C_KEY}esc${C_HELP} abort${eol}"$'\n'
     out+="${eol}"$'\n'
 
-    local preview=1
+    local preview=1 max_scroll=0
     [ "${right_w}" -lt 16 ] && preview=0
-    [ "${preview}" -eq 1 ] && build_right_lines "${right_w}"
+    if [ "${preview}" -eq 1 ]; then
+        build_right_lines "${right_w}"
+        # Clamp the preview scroll so it can't run past the last screenful.
+        max_scroll=$(( ${#right_lines[@]} - avail ))
+        [ "${max_scroll}" -lt 0 ] && max_scroll=0
+        [ "${right_scroll}" -gt "${max_scroll}" ] && right_scroll="${max_scroll}"
+        [ "${right_scroll}" -lt 0 ] && right_scroll=0
+    fi
 
-    local r li lcell box boxcol title plain rtext
+    local r li lcell box boxcol title plain rtext titalic checked
     for ((r = 0; r < avail; r++)); do
         li=$((start + r))
         if [ "${count}" -eq 0 ] && [ "${r}" -eq 0 ]; then
             plain="(no reminders — n to add, esc to quit)"
             lcell="${C_HELP}$(printf '%-*s' "${left_w}" "${plain:0:${left_w}}")${C_RESET}"
         elif [ "${li}" -lt "${count}" ]; then
-            if [ "${done_flags[${li}]}" -eq 1 ]; then
-                box="[x]"; boxcol="${C_BOX_ON}"
+            # A flag means "mark done" in the open view, "reopen" in the done
+            # view. A ticked box shows the done-state either way: flagged when
+            # open, unflagged when done.
+            if [ "${view}" = "done" ]; then
+                checked=$(( done_flags[li] == 1 ? 0 : 1 ))
             else
-                box="[ ]"; boxcol="${C_BOX_OFF}"
+                checked="${done_flags[li]}"
+            fi
+            if [ "${checked}" -eq 1 ]; then
+                box="☑"; boxcol="${C_BOX_ON}"
+            else
+                box="☐"; boxcol="${C_BOX_OFF}"
+            fi
+            # Italicise unsaved titles only: created this session, or edited
+            # (revertable). The italic spans just the title, not the box or ">".
+            if is_created "${files[${li}]}" || [ -n "${edited_backup[${files[${li}]}]:-}" ]; then
+                titalic="${C_ITALIC}"
+            else
+                titalic=""
             fi
             title="${titles[${li}]:0:${tw}}"
             if [ "${li}" -eq "${sel}" ]; then
-                # Selected: reverse-video bar across the whole cell, plain text.
-                plain="$(printf '> %s %-*s' "${box}" "${tw}" "${title}")"
-                lcell="${smso}$(printf '%-*s' "${left_w}" "${plain:0:${left_w}}")${rmso}"
+                # Selected: reverse-video bold bar; italic applied to the title only.
+                lcell="${smso}${C_BOLD}$(printf '> %s  ' "${box}")${titalic}$(printf '%-*s' "${tw}" "${title}")${C_RESET}${rmso}"
             else
-                # Coloured checkbox, default-coloured title.
-                lcell="  ${boxcol}${box}${C_RESET} $(printf '%-*s' "${tw}" "${title}")"
+                # Arrow gap, coloured checkbox, two spaces, bold (italic if unsaved) title.
+                lcell="  ${boxcol}${box}${C_RESET}  ${C_BOLD}${titalic}$(printf '%-*s' "${tw}" "${title}")${C_RESET}"
             fi
         else
             lcell="$(printf '%-*s' "${left_w}" "")"
         fi
         if [ "${preview}" -eq 1 ]; then
             # glow output carries its own ANSI; pass it through untruncated.
-            rtext="${right_lines[${r}]:-}"
+            # right_scroll offsets which preview line maps to this screen row.
+            rtext="${right_lines[$((r + right_scroll))]:-}"
             out+="${lcell}${sep}${rtext}${eol}"$'\n'
         else
             out+="${lcell}${eol}"$'\n'
@@ -304,23 +363,34 @@ render() {
     printf '%s' "${out}"
 }
 
+# True if the given path was created this session (via the "n" key).
+is_created() {
+    local p
+    for p in "${created[@]}"; do
+        [ "${p}" = "${1}" ] && return 0
+    done
+    return 1
+}
+
 has_changes() {
     [ "${#created[@]}" -gt 0 ] && return 0
-    local i
-    for i in "${!done_flags[@]}"; do
-        [ "${done_flags[${i}]}" -eq 1 ] && return 0
-    done
+    [ "${#edited_backup[@]}" -gt 0 ] && return 0
+    [ "${#pending[@]}" -gt 0 ] && return 0
     return 1
 }
 
 confirm_discard() {
     tput cnorm
+    stty echo </dev/tty 2>/dev/null   # show the y/N keystroke
     printf '\nDiscard changes'
-    [ "${#created[@]}" -gt 0 ] && printf ' and delete %d new reminder(s)' "${#created[@]}"
+    [ "${#created[@]}" -gt 0 ] && printf ', delete %d new reminder(s)' "${#created[@]}"
+    [ "${#edited_backup[@]}" -gt 0 ] && printf ', revert %d edit(s)' "${#edited_backup[@]}"
+    [ "${#pending[@]}" -gt 0 ] && printf ', drop %d pending toggle(s)' "${#pending[@]}"
     printf '? [y/N] '
     local ans
     IFS= read -rn1 ans </dev/tty
     printf '\n'
+    stty -echo </dev/tty 2>/dev/null  # back to the session's no-echo mode
     tput civis
     case "${ans}" in
         y|Y) return 0 ;;
@@ -328,29 +398,50 @@ confirm_discard() {
     esac
 }
 
-commit_done() {
-    local i ts count=0
-    for i in "${!files[@]}"; do
-        if [ "${done_flags[${i}]}" -eq 1 ]; then
-            ts="$(date +%Y-%m-%dT%H-%M-%S)"
-            mv "${files[${i}]}" "${files[${i}]}_${ts}"
-            count=$((count + 1))
-        fi
+# Apply pending toggles across both views: an open reminder flagged done gets a
+# _<timestamp> suffix; a done reminder flagged for reopen gets that suffix
+# stripped (back to <name>.md). Keyed by path, so the current view is irrelevant.
+commit_pending() {
+    local p ts target done_count=0 reopen_count=0
+    for p in "${!pending[@]}"; do
+        [ "${pending[${p}]}" = "1" ] || continue
+        [ -f "${p}" ] || continue
+        case "${p}" in
+            *.md_*)
+                target="${p%%.md_*}.md"
+                [ -e "${target}" ] && target="${p%%.md_*}-$(date +%Y-%m-%dT%H-%M-%S).md"
+                mv "${p}" "${target}" && reopen_count=$((reopen_count + 1))
+                ;;
+            *.md)
+                ts="$(date +%Y-%m-%dT%H-%M-%S)"
+                mv "${p}" "${p}_${ts}" && done_count=$((done_count + 1))
+                ;;
+        esac
     done
-    [ "${count}" -gt 0 ] && echo "Marked ${count} reminder(s) done." 1>&2
+    [ "${done_count}" -gt 0 ] && echo "Marked ${done_count} reminder(s) done." 1>&2
+    [ "${reopen_count}" -gt 0 ] && echo "Reopened ${reopen_count} reminder(s)." 1>&2
     return 0
 }
 
 edit_mode() {
     [ -t 1 ] || fail "Edit mode requires a terminal."
 
+    view="open"
+    pending=()
+    created=()
+    edited_backup=()
     load_list
     sel=0
-    created=()
     preview_key=""
+    right_scroll=0
     resolve_glow_style
 
-    trap 'tput cnorm 2>/dev/null' EXIT
+    # Disable echo for the whole session. render() runs between keystrokes, and a
+    # held-down arrow streams escape sequences during that window; with echo on
+    # the terminal would print and act on them, flashing stray glyphs at the edges.
+    saved_stty="$(stty -g </dev/tty 2>/dev/null)"
+    stty -echo </dev/tty 2>/dev/null
+    trap 'tput cnorm 2>/dev/null; [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null' EXIT
     tput civis
     tput clear
 
@@ -360,25 +451,61 @@ edit_mode() {
         key="$(read_key)"
         case "${key}" in
             up|k)
-                [ "${sel}" -gt 0 ] && sel=$((sel - 1))
+                # Wrap to the bottom when stepping off the top.
+                [ "${#files[@]}" -gt 0 ] && sel=$(( (sel - 1 + ${#files[@]}) % ${#files[@]} ))
                 ;;
             down|j)
-                [ $((sel + 1)) -lt "${#files[@]}" ] && sel=$((sel + 1))
+                # Wrap to the top when stepping off the bottom.
+                [ "${#files[@]}" -gt 0 ] && sel=$(( (sel + 1) % ${#files[@]} ))
+                ;;
+            shift-up)
+                # Scroll the preview pane up; render clamps the lower bound.
+                [ "${right_scroll}" -gt 0 ] && right_scroll=$((right_scroll - 1))
+                ;;
+            shift-down)
+                # Scroll the preview pane down; render clamps to the last screenful.
+                right_scroll=$((right_scroll + 1))
+                ;;
+            tab)
+                # Switch open <-> done view. Pending toggles are keyed by path, so
+                # they persist across the switch.
+                if [ "${view}" = "open" ]; then view="done"; else view="open"; fi
+                load_list
+                sel=0
+                preview_key=""
+                right_scroll=0
                 ;;
             space)
                 [ "${#files[@]}" -gt 0 ] || continue
+                local kf="${files[${sel}]}"
                 if [ "${done_flags[${sel}]}" -eq 0 ]; then
                     done_flags[${sel}]=1
+                    pending["${kf}"]=1
                 else
                     done_flags[${sel}]=0
+                    unset 'pending['"${kf}"']'
                 fi
                 ;;
             e)
                 [ "${#files[@]}" -gt 0 ] || continue
                 tput cnorm
-                vim "${files[${sel}]}" </dev/tty >/dev/tty 2>&1
+                local f bak
+                f="${files[${sel}]}"
+                bak="$(mktemp --suffix=.md)"
+                cp "${f}" "${bak}"
+                vim "${f}" </dev/tty >/dev/tty 2>&1
                 tput civis
-                titles[${sel}]="$(get_title "${files[${sel}]}")"
+                if cmp -s "${f}" "${bak}"; then
+                    # Unchanged: nothing to revert.
+                    rm -f "${bak}"
+                elif is_created "${f}" || [ -n "${edited_backup[${f}]:-}" ]; then
+                    # New this session (discard deletes it wholesale) or already
+                    # backed up from an earlier edit: keep the earliest backup.
+                    rm -f "${bak}"
+                else
+                    edited_backup[${f}]="${bak}"
+                fi
+                titles[${sel}]="$(get_title "${f}")"
                 preview_key=""
                 tput clear
                 ;;
@@ -387,17 +514,25 @@ edit_mode() {
                 newpath="$(add_reminder)"
                 tput civis
                 if [ -n "${newpath}" ] && [ -f "${newpath}" ]; then
-                    files+=("${newpath}")
-                    titles+=("$(get_title "${newpath}")")
-                    done_flags+=(0)
                     created+=("${newpath}")
-                    sel=$(( ${#files[@]} - 1 ))
+                    # New reminders are active: surface them in the open view.
+                    view="open"
+                    load_list
+                    sel=0
+                    local i
+                    for i in "${!files[@]}"; do
+                        [ "${files[${i}]}" = "${newpath}" ] && sel="${i}" && break
+                    done
                 fi
                 preview_key=""
                 tput clear
                 ;;
             enter)
-                commit_done
+                commit_pending
+                local p
+                for p in "${edited_backup[@]}"; do
+                    rm -f "${p}"
+                done
                 break
                 ;;
             esc)
@@ -406,6 +541,9 @@ edit_mode() {
                         local p
                         for p in "${created[@]}"; do
                             rm -f "${p}"
+                        done
+                        for p in "${!edited_backup[@]}"; do
+                            mv "${edited_backup[${p}]}" "${p}"
                         done
                         break
                     fi
@@ -419,6 +557,7 @@ edit_mode() {
     done
 
     tput cnorm
+    [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null
     tput clear
     trap - EXIT
 }
