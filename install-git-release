@@ -18,6 +18,9 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
 
         -b, --binary        Pattern of the binary to install
 
+        -n, --name          Name to install the final binary as
+                            Default: original binary name
+
         -i, --install-path  Path to install the binary
                             Default: /usr/local/bin
 
@@ -25,6 +28,13 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
 
         --bundle-path       Path to install bundled app contents
                             Default: /usr/local/share
+
+        -c, --post-install  Command to run after a successful install, with
+                            the working directory set to the unpacked archive
+                            contents (the downloaded file's directory for a
+                            plain binary). May be given multiple times.
+                            Env: INSTALL_PATH, BINARY_NAME, BINARY_PATH,
+                            ARTIFACT, UNPACK_DIR
 
         -y, --yes           Answer yes to all prompts
 
@@ -519,7 +529,7 @@ function install_bundle_from_archive() {
     validate_archive_paths "${files}" || return 1
     binary_path="$(choose_binary_from_files "${files}" "${artifact}")" || return 1
     binary="$(basename "${binary_path}")"
-    package="${binary}"
+    package="${BINARY_NAME:-${binary}}"
     prefix="$(common_top_level_dir "${files}")"
     staged_binary_path="$(strip_archive_prefix "${binary_path}" "${prefix}")"
 
@@ -596,6 +606,10 @@ function install_from_archive() {
     local files
     local count
     files="$(archive_files_for_install "${artifact}" "${archive_type}")"
+    # honour -b|--binary: if it narrows to a single file, skip the bundle heuristic
+    if [ -n "${BINARY_PATTERN}" ]; then
+        files="$(matching_binary_files "${files}" "${BINARY_PATTERN}")"
+    fi
     count=$(echo "${files}" | wc -l)
     if [ "${count}" -gt 1 ]; then
         install_bundle_from_archive "${artifact}" "${archive_type}" "${target_path}" "${BUNDLE_PATH}"
@@ -606,8 +620,10 @@ function install_from_archive() {
         return 1
     fi
     if [ -n "${binary_path}" ]; then
+        local archive_binary
+        archive_binary="$(basename "${binary_path}")"
         # setting global variable
-        BINARY="$(basename "${binary_path}")"
+        BINARY="${BINARY_NAME:-${archive_binary}}"
         if [ "${DRY_RUN}" -eq 1 ]; then
             local tmpdir
             tmpdir="$(mktemp -d)"
@@ -615,7 +631,7 @@ function install_from_archive() {
             extract_binary_to_dir "${artifact}" "${archive_type}" "${binary_path}" "${tmpdir}" || return 1
             local new_version
             local current_version
-            new_version="$(binary_version "${tmpdir}/${BINARY}" | head -n 1)"
+            new_version="$(binary_version "${tmpdir}/${archive_binary}" | head -n 1)"
             if [ -x "${INSTALL_PATH}/${BINARY}" ]; then
                 current_version="$(binary_version "${INSTALL_PATH}/${BINARY}" | head -n 1)"
             else
@@ -634,7 +650,9 @@ function install_binary() {
     local binary_path="${1}"
     local target_path="${2}"
     local binary
+    local install_name
     binary="$(basename "${binary_path}")"
+    install_name="${BINARY_NAME:-${binary}}"
 
     if [ -n "${BINARY_PATTERN}" ]; then
         # shellcheck disable=SC2053
@@ -649,20 +667,20 @@ function install_binary() {
         local new_version
         local current_version
         new_version="$(binary_version "${binary_path}" | head -n 1)"
-        if [ -x "${target_path}/${binary}" ]; then
-            current_version="$(binary_version "${target_path}/${binary}" | head -n 1)"
+        if [ -x "${target_path}/${install_name}" ]; then
+            current_version="$(binary_version "${target_path}/${install_name}" | head -n 1)"
         else
             current_version="(not installed)"
         fi
-        print_version_table "${binary}" "${current_version}" "${new_version}"
+        print_version_table "${install_name}" "${current_version}" "${new_version}"
     else
-        prompt_install "${binary}" "${target_path}"
+        prompt_install "${install_name}" "${target_path}"
         SUDO=""
         [ ! -w "${target_path}" ] && SUDO="sudo"
-        ${SUDO} cp -v "${binary_path}" "${target_path}/${binary}" || return 1
-        ${SUDO} chmod +x "${target_path}/${binary}" || return 1
+        ${SUDO} cp -v "${binary_path}" "${target_path}/${install_name}" || return 1
+        ${SUDO} chmod +x "${target_path}/${install_name}" || return 1
         # setting global variable
-        BINARY="${binary}"
+        BINARY="${install_name}"
     fi
     return 0
 }
@@ -683,6 +701,72 @@ function install_deb() {
     return 0
 }
 
+function run_post_install() {
+    local artifact="${1}"
+    local artifact_kind="${2}"
+    [ ${#POST_INSTALL_CMDS[@]} -eq 0 ] && return 0
+
+    local work_dir=""
+    local unpack_dir=""
+    case "${artifact_kind}" in
+        tar|zip)
+            unpack_dir="$(mktemp -d)"
+            if ! extract_archive_to_dir "${artifact}" "${artifact_kind}" "${unpack_dir}"; then
+                error "Failed to unpack archive for post-install command"
+                rm -rf "${unpack_dir}"
+                return 1
+            fi
+            work_dir="${unpack_dir}"
+            ;;
+        deb)
+            unpack_dir="$(mktemp -d)"
+            if ! dpkg-deb -x "${artifact}" "${unpack_dir}" 2>/dev/null; then
+                error "Failed to unpack deb for post-install command"
+                rm -rf "${unpack_dir}"
+                return 1
+            fi
+            work_dir="${unpack_dir}"
+            ;;
+        *)
+            # plain binary: nothing to unpack, use the downloaded file's directory
+            work_dir="$(dirname "${artifact}")"
+            ;;
+    esac
+
+    local binary_path=""
+    [ -n "${BINARY}" ] && binary_path="${INSTALL_PATH}/${BINARY}"
+
+    local rc=0
+    local cmd
+    for cmd in "${POST_INSTALL_CMDS[@]}"; do
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            echo 1>&2
+            echo "[dry-run] would run post-install command in '${work_dir}':" 1>&2
+            echo "  ${cmd}" 1>&2
+            continue
+        fi
+        echo 1>&2
+        echo "Running post-install command in '${work_dir}':" 1>&2
+        echo "  ${cmd}" 1>&2
+        if ! (
+            cd "${work_dir}" || exit 1
+            INSTALL_PATH="${INSTALL_PATH}" \
+            BINARY_NAME="${BINARY}" \
+            BINARY_PATH="${binary_path}" \
+            ARTIFACT="${artifact}" \
+            UNPACK_DIR="${work_dir}" \
+            bash -c "${cmd}" 1>&2
+        ); then
+            error "Post-install command failed: ${cmd}"
+            rc=1
+            break
+        fi
+    done
+
+    [ -n "${unpack_dir}" ] && rm -rf "${unpack_dir}"
+    return ${rc}
+}
+
 if [ $# -lt 1 ]; then
     usage
 fi
@@ -694,6 +778,9 @@ INSTALL_PATH="/usr/local/bin"
 BUNDLE=0
 BUNDLE_PATH="/usr/local/share"
 BINARY_PATTERN=""
+BINARY_NAME=""
+POST_INSTALL_CMDS=()
+ARTIFACT_KIND=""
 TMP_DIR=""
 ARCH_UNAME="$(uname -m 2>/dev/null || true)"
 ARCH_DPKG="$(dpkg --print-architecture 2>/dev/null || true)"
@@ -728,6 +815,16 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             BINARY_PATTERN="${1}"
+            ;;
+        -n|--name)
+            shift
+            [ -z "${1}" ] && usage
+            BINARY_NAME="${1}"
+            ;;
+        -c|--post-install)
+            shift
+            [ -z "${1}" ] && usage
+            POST_INSTALL_CMDS+=("${1}")
             ;;
         -y|--yes)
             YES=1
@@ -882,12 +979,16 @@ manual_install=0
 
 echo 1>&2; echo "Installing from '${artifact}'..." 1>&2
 if [[ "${artifact}" == *.deb ]]; then
+    ARTIFACT_KIND="deb"
     install_deb "${artifact}" || manual_install=1
 elif tar -tf "${artifact}" &> /dev/null; then
+    ARTIFACT_KIND="tar"
     install_from_archive "${artifact}" "tar" "${target_path}" || manual_install=1
 elif zipinfo -1 "${artifact}" &> /dev/null; then
+    ARTIFACT_KIND="zip"
     install_from_archive "${artifact}" "zip" "${target_path}" || manual_install=1
 elif file "${artifact}" | grep -q "ELF"; then
+    ARTIFACT_KIND="binary"
     install_binary "${artifact}" "${target_path}" || manual_install=1
 else
     error "Unknown artifact type: '${artifact}'"
@@ -909,5 +1010,7 @@ if [ "${DRY_RUN}" -eq 0 ] && [ -n "${BINARY}" ]; then
     echo "Printing version of '${target_path}/${BINARY}':" 1>&2
     binary_version "${target_path}/${BINARY}" 1>&2
 fi
+
+run_post_install "${artifact}" "${ARTIFACT_KIND}" || abort
 
 success
