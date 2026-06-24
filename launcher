@@ -20,16 +20,16 @@ window_y=${dock_height}
 screen_scale=1
 
 # center horizontally on the focused screen (fall back to primary)
-for screen in "$(window-screen-focused 2>/dev/null)" "$(window-screen-focused --primary 2>/dev/null)"; do
-    [ -z "${screen}" ] && continue
-    mapfile -t screen_geom < <(window-screen-geometry "${screen}" 2>/dev/null)
-    screen_width="${screen_geom[0]}"
-    screen_x="${screen_geom[2]}"
-    if [[ "${screen_width}" =~ ^[0-9]+$ ]] && [ "${screen_width}" -gt "${window_width}" ]; then
-        window_x=$(( ${screen_x:-0} + (screen_width - window_width) / 2 ))
-        break
-    fi
-done
+#for screen in "$(window-screen-focused 2>/dev/null)" "$(window-screen-focused --primary 2>/dev/null)"; do
+#    [ -z "${screen}" ] && continue
+#    mapfile -t screen_geom < <(window-screen-geometry "${screen}" 2>/dev/null)
+#    screen_width="${screen_geom[0]}"
+#    screen_x="${screen_geom[2]}"
+#    if [[ "${screen_width}" =~ ^[0-9]+$ ]] && [ "${screen_width}" -gt "${window_width}" ]; then
+#        window_x=$(( ${screen_x:-0} + (screen_width - window_width) / 2 ))
+#        break
+#    fi
+#done
 
 
 pid=$(pidof -x "${bin_path}")
@@ -44,7 +44,7 @@ if [ "${pid}" != "$$" ]; then
 fi
 
 terminator_args=("-g" "${config_path}" "--no-dbus" "--title=${name}")
-terminator_args+=("--geometry=${window_width}x${window_height}+${window_x}+${window_y}")
+#terminator_args+=("--geometry=${window_width}x${window_height}+${window_x}+${window_y}")
 
 echo "+ terminator ${terminator_args[*]}" >&2
 TERM_SIMPLE="▶ " terminator "${terminator_args[@]}" &
