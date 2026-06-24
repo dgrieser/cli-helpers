@@ -12,6 +12,7 @@ C_BOX_ON=$'\033[32m'    # green checked checkbox
 C_OPEN=$'\033[92m'      # bright green "OPEN" view label
 C_DONE=$'\033[38;5;250m' # light grey "DONE" view label
 C_BOLD=$'\033[1m'       # bold reminder titles
+C_NOBOLD=$'\033[22m'    # bold off only (keeps reverse video / other attrs)
 C_ITALIC=$'\033[3m'     # italic title: unsaved (new/edited) reminder
 C_RESET=$'\033[0m'
 
@@ -25,7 +26,9 @@ Active reminders are *.md files. Marking one as done renames it to
 <name>.md_<timestamp> so it drops out of every listing without being lost.
 
 With no options, runs interactive edit mode: navigate the reminder titles,
-toggle a done checkbox, add new reminders, then save. Tab switches between the
+toggle a done checkbox, edit and add reminders, then save. Every change is
+staged and nothing in ${REMINDER_DIR} is touched until you save with enter;
+esc or Ctrl+C exit with the real reminders untouched. Tab switches between the
 open (active) and done (completed) views; both list newest-modified first.
 
 Options:
@@ -38,10 +41,11 @@ Edit-mode keys:
   tab                   Switch between the open and done (completed) views
   shift+up / shift+down Scroll the preview pane (for reminders taller than it)
   space                 Toggle the checkbox (open: mark done; done: reopen)
-  e                     Edit the selected reminder in vim (revertable on abort)
+  e                     Edit the selected reminder in vim (staged until save)
   n                     Add a new reminder, then return to edit mode
-  enter                 Save: apply toggles (done / reopen) and exit
-  esc                   Abort (prompts to discard if anything changed)
+  enter                 Save: apply all staged changes and exit
+  esc                   Done view: back to open view; open view: abort
+                        (prompts to discard if anything is staged)
 EOF
     exit 1
 }
@@ -101,11 +105,12 @@ print_reminders() {
 }
 
 
-# Open an editor on a new reminder. On success (editor exit 0 and the template
-# was actually changed) save it and print the saved path to stdout. Otherwise
-# print nothing and return non-zero.
-add_reminder() {
-    local dir template tmp content header slug target ts
+# Open an editor on a new reminder *template* and stage it in a tmp file WITHOUT
+# touching REMINDER_DIR. On success (editor exit 0 and the template was actually
+# changed) print the tmp path to stdout; otherwise print nothing and return
+# non-zero. The caller decides when (if ever) to persist it via save_reminder.
+compose_reminder() {
+    local dir template tmp content header
     dir="$(basename "$(pwd)")"
     template="### ${dir}"
 
@@ -120,11 +125,20 @@ add_reminder() {
     content="$(cat "${tmp}")"
     header="$(grep -m1 -E '\S' "${tmp}" | sed -E 's/^#+[[:space:]]*//')"
     if [ "${content}" = "${template}" ] || [ -z "${header}" ]; then
-        # Unchanged from the template, or empty: nothing worth saving.
+        # Unchanged from the template, or empty: nothing worth keeping.
         rm -f "${tmp}"
         return 1
     fi
 
+    printf '%s\n' "${tmp}"
+}
+
+# Persist a composed reminder (the tmp from compose_reminder) into REMINDER_DIR
+# under a slug derived from its first heading. The tmp is copied, not moved, so
+# the caller still owns its cleanup. Prints the saved path.
+save_reminder() {
+    local tmp="${1}" header slug target ts
+    header="$(grep -m1 -E '\S' "${tmp}" | sed -E 's/^#+[[:space:]]*//')"
     slug="$(printf '%s' "${header}" \
         | tr '[:upper:]' '[:lower:]' \
         | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
@@ -136,7 +150,7 @@ add_reminder() {
         target="${REMINDER_DIR}/${slug}-${ts}.md"
     fi
 
-    mv "${tmp}" "${target}"
+    cp "${tmp}" "${target}"
     printf '%s\n' "${target}"
 }
 
@@ -146,23 +160,68 @@ add_reminder() {
 files=()
 titles=()
 done_flags=()
-created=()
-declare -A edited_backup=()   # file -> tmp holding its pre-edit content
+done_epoch=()                # parallel to files: completion epoch (done view) or 0
+# Nothing below touches REMINDER_DIR until save (enter). Every edit-mode action
+# is staged here and only applied on save; esc/Ctrl+C discard it all, leaving the
+# real reminders untouched.
+created=()                    # tmp paths of new reminders composed but not saved
+declare -A edited_work=()     # real file -> tmp holding its EDITED (new) content
+declare -A new_done=()        # created-tmp -> 1 if a staged new reminder is flagged done
 sel=0
 saved_stty=""                 # original tty settings, restored on exit
 view="open"                   # "open" (active) | "done" (completed)
-declare -A pending=()         # file -> 1 if flagged for its view's action on save
+declare -A pending=()         # real file -> 1 if flagged for its view's action on save
 change_log=()                 # coloured, one-per-line summary of changes applied on save
+term_cols=80                  # cached terminal size; recomputed only on SIGWINCH
+term_lines=24
+need_winch=1                  # 1 => refresh term size on next render
+smso_cap=""                   # standout on/off escapes, queried once (static)
+rmso_cap=""
+declare -A preview_cache=()   # "file::width" -> glow output, newline-joined
+
+# Parse the completion epoch out of a "<name>.md_<YYYY-MM-DDTHH-MM-SS>" path.
+# Done once per item at load time (not per frame), so the one date(1) fork here
+# stays off render's hot path. Prints the epoch, or 0 if it can't be parsed.
+done_path_epoch() {
+    local raw d t
+    raw="${1##*.md_}"
+    d="${raw%%T*}"
+    t="${raw#*T}"
+    t="${t//-/:}"
+    date -d "${d} ${t}" +%s 2>/dev/null || echo 0
+}
 
 load_list() {
     files=()
     titles=()
     done_flags=()
-    local f
+    done_epoch=()
+    local f n
+    # Staged new reminders are active and unsaved: show them at the top of the
+    # open view only (they have no place in the done view).
+    if [ "${view}" = "open" ]; then
+        for n in "${created[@]}"; do
+            files+=("${n}")
+            titles+=("$(get_title "${n}")")
+            done_epoch+=(0)
+            if [ -n "${new_done[${n}]:-}" ]; then
+                done_flags+=(1)
+            else
+                done_flags+=(0)
+            fi
+        done
+    fi
     while IFS= read -r f; do
         [ -n "${f}" ] || continue
         files+=("${f}")
-        titles+=("$(get_title "${f}")")
+        # Title reflects the staged edit when there is one.
+        titles+=("$(get_title "${edited_work[${f}]:-${f}}")")
+        # Completion epoch, parsed once here for the relative-time display.
+        if [ "${view}" = "done" ]; then
+            done_epoch+=("$(done_path_epoch "${f}")")
+        else
+            done_epoch+=(0)
+        fi
         if [ -n "${pending[${f}]:-}" ]; then
             done_flags+=(1)
         else
@@ -171,11 +230,25 @@ load_list() {
     done < <(list_files_by_mtime "${view}")
 }
 
+# True if a keystroke is already waiting, without consuming it. Used to coalesce
+# rapid scrolling: render skips the costly preview build while input is queued.
+input_pending() {
+    IFS= read -rsn1 -t 0 _ </dev/tty
+}
+
+# Read one logical key into the global KEY. Setting a variable rather than
+# echoing avoids a $()-subshell fork on every single keystroke.
 read_key() {
-    local char rest c
+    local char rest c rc
     IFS= read -rsn1 char </dev/tty
+    rc=$?
+    if [ "${rc}" -gt 128 ]; then
+        # A trapped signal (e.g. SIGWINCH) interrupted read: just repaint.
+        KEY='redraw'
+        return
+    fi
     if [ -z "${char}" ]; then
-        printf 'enter\n'
+        KEY='enter'
         return
     fi
     if [ "${char}" = $'\e' ]; then
@@ -184,22 +257,22 @@ read_key() {
             rest="${rest}${c}"
         done
         case "${rest}" in
-            "[A") printf 'up\n' ;;
-            "[B") printf 'down\n' ;;
-            "[C") printf 'right\n' ;;
-            "[D") printf 'left\n' ;;
-            "[1;2A") printf 'shift-up\n' ;;
-            "[1;2B") printf 'shift-down\n' ;;
-            "") printf 'esc\n' ;;
-            *) printf 'other\n' ;;
+            "[A") KEY='up' ;;
+            "[B") KEY='down' ;;
+            "[C") KEY='right' ;;
+            "[D") KEY='left' ;;
+            "[1;2A") KEY='shift-up' ;;
+            "[1;2B") KEY='shift-down' ;;
+            "") KEY='esc' ;;
+            *) KEY='other' ;;
         esac
         return
     fi
     case "${char}" in
-        " ") printf 'space\n' ;;
-        $'\t') printf 'tab\n' ;;
-        $'\n'|$'\r') printf 'enter\n' ;;
-        *) printf '%s\n' "${char}" ;;
+        " ") KEY='space' ;;
+        $'\t') KEY='tab' ;;
+        $'\n'|$'\r') KEY='enter' ;;
+        *) KEY="${char}" ;;
     esac
 }
 
@@ -238,6 +311,15 @@ build_right_lines() {
     [ "${key}" = "${preview_key:-}" ] && return
     preview_key="${key}"
     right_scroll=0          # new preview starts at the top
+    if [ -n "${preview_cache[${key}]+x}" ]; then
+        # Already rendered this (file, width): split the stored lines back out
+        # (builtin, no glow fork) so revisiting an item is instant.
+        mapfile -t right_lines <<< "${preview_cache[${key}]}"
+        return
+    fi
+    # Preview the staged content: a new reminder's tmp, or an edited file's
+    # working copy, falls back to the real file when neither applies.
+    local src="${edited_work[${f}]:-${f}}"
     right_lines=()
     # glow writes to a pipe here, so it would normally drop colour ("not a
     # terminal"); CLICOLOR_FORCE keeps the ANSI, and an explicit style is needed
@@ -247,22 +329,38 @@ build_right_lines() {
     # whereas stdin is always rendered as Markdown.
     while IFS= read -r line; do
         right_lines+=("${line}")
-    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" 2>/dev/null < "${f}")
+    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" 2>/dev/null < "${src}")
     # glow prepends a blank top-margin line; drop it.
     if [ "${#right_lines[@]}" -gt 0 ]; then
         local first
         first="$(printf '%s' "${right_lines[0]}" | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')"
         [ -z "${first//[[:space:]]/}" ] && right_lines=("${right_lines[@]:1}")
     fi
+    # Memoise the finished frame so later visits skip glow entirely.
+    local joined
+    printf -v joined '%s\n' "${right_lines[@]}"
+    preview_cache[${key}]="${joined%$'\n'}"
 }
 
 # The whole frame is composed into a single string and written in one shot, and
 # the screen is repainted from the home position (rather than cleared) with each
 # line erased to its end — this avoids the blank-screen flash between frames.
 render() {
-    local cols lines avail sep left_w right_w tw
-    cols="$(tput cols 2>/dev/null || echo 80)"
-    lines="$(tput lines 2>/dev/null || echo 24)"
+    local cols lines avail sep left_w right_w tw pad tpad now today yest
+    # Clock for the done view's relative-time labels. printf's %()T is a builtin
+    # (no fork); computed once per frame, reused for every row.
+    printf -v now '%(%s)T' -1
+    printf -v today '%(%Y-%m-%d)T' "${now}"
+    printf -v yest '%(%Y-%m-%d)T' "$((now - 86400))"
+    # Terminal size is forked from tput only when it actually changes (initial
+    # frame + SIGWINCH), not on every keystroke.
+    if [ "${need_winch}" -eq 1 ]; then
+        term_cols="$(tput cols 2>/dev/null || echo 80)"
+        term_lines="$(tput lines 2>/dev/null || echo 24)"
+        need_winch=0
+    fi
+    cols="${term_cols}"
+    lines="${term_lines}"
     avail=$((lines - 3))
     [ "${avail}" -lt 1 ] && avail=1
     left_w=$((cols / 3))
@@ -279,9 +377,8 @@ render() {
     # eol = reset attributes, then erase to end of line (clears stale glyphs and
     # any background colour glow may have left active).
     local home=$'\033[H' eol=$'\033[0m\033[K' clrbelow=$'\033[J'
-    local smso rmso
-    smso="$(tput smso)"
-    rmso="$(tput rmso)"
+    # Standout caps are static; queried once in edit_mode, not per frame.
+    local smso="${smso_cap}" rmso="${rmso_cap}"
 
     # Scroll the list so the selection stays visible.
     local count="${#files[@]}" start=0
@@ -301,7 +398,10 @@ render() {
     local preview=1 max_scroll=0
     [ "${right_w}" -lt 16 ] && preview=0
     if [ "${preview}" -eq 1 ]; then
-        build_right_lines "${right_w}"
+        # While more keystrokes are already queued (fast scrolling), reuse the
+        # last frame's preview instead of (re)building it; the preview settles
+        # the moment the user stops, keeping the list itself responsive.
+        input_pending || build_right_lines "${right_w}"
         # Clamp the preview scroll so it can't run past the last screenful.
         max_scroll=$(( ${#right_lines[@]} - avail ))
         [ "${max_scroll}" -lt 0 ] && max_scroll=0
@@ -309,12 +409,13 @@ render() {
         [ "${right_scroll}" -lt 0 ] && right_scroll=0
     fi
 
-    local r li lcell box boxcol title plain rtext titalic checked
+    local r li lcell box boxcol title plain rtext titalic checked datestr ttw
     for ((r = 0; r < avail; r++)); do
         li=$((start + r))
         if [ "${count}" -eq 0 ] && [ "${r}" -eq 0 ]; then
             plain="(no reminders — n to add, esc to quit)"
-            lcell="${C_HELP}$(printf '%-*s' "${left_w}" "${plain:0:${left_w}}")${C_RESET}"
+            printf -v pad '%-*s' "${left_w}" "${plain:0:${left_w}}"
+            lcell="${C_HELP}${pad}${C_RESET}"
         elif [ "${li}" -lt "${count}" ]; then
             # A flag means "mark done" in the open view, "reopen" in the done
             # view. A ticked box shows the done-state either way: flagged when
@@ -330,22 +431,60 @@ render() {
                 box="☐"; boxcol="${C_BOX_OFF}"
             fi
             # Italicise unsaved titles only: created this session, or edited
-            # (revertable). The italic spans just the title, not the box or ">".
-            if is_created "${files[${li}]}" || [ -n "${edited_backup[${files[${li}]}]:-}" ]; then
+            # (staged). The italic spans just the title, not the box or ">".
+            if is_created "${files[${li}]}" || [ -n "${edited_work[${files[${li}]}]:-}" ]; then
                 titalic="${C_ITALIC}"
             else
                 titalic=""
             fi
-            title="${titles[${li}]:0:${tw}}"
+            # In the done view, show when it was completed, right-aligned in
+            # light grey and not bold. Under 5h: relative ("4h 10m ago", or
+            # "just now" under a minute). Else today/yesterday by name, else the
+            # full date — all with the time. The title shrinks to make room.
+            datestr=""; ttw="${tw}"
+            if [ "${view}" = "done" ]; then
+                local dts ddate dtime ep diff dh dm
+                dts="${files[${li}]##*.md_}"   # YYYY-MM-DDTHH-MM-SS
+                ddate="${dts%%T*}"            # YYYY-MM-DD
+                dtime="${dts#*T}"; dtime="${dtime%-*}"; dtime="${dtime//-/:}"  # HH:MM
+                ep="${done_epoch[li]:-0}"
+                diff=$(( now - ep ))
+                if [ "${ep}" -gt 0 ] && [ "${diff}" -ge 0 ] && [ "${diff}" -lt 18000 ]; then
+                    if [ "${diff}" -lt 60 ]; then
+                        datestr="just now"
+                    else
+                        dh=$(( diff / 3600 )); dm=$(( (diff % 3600) / 60 ))
+                        datestr=""
+                        [ "${dh}" -gt 0 ] && datestr="${dh}h"
+                        [ "${dm}" -gt 0 ] && datestr="${datestr:+${datestr} }${dm}m"
+                        datestr="${datestr} ago"
+                    fi
+                elif [ "${ep}" -gt 0 ] && [ "${ddate}" = "${today}" ]; then
+                    datestr="Today ${dtime}"
+                elif [ "${ep}" -gt 0 ] && [ "${ddate}" = "${yest}" ]; then
+                    datestr="Yesterday ${dtime}"
+                else
+                    datestr="${ddate} ${dtime}"
+                fi
+                ttw=$(( tw - ${#datestr} - 1 ))
+                [ "${ttw}" -lt 1 ] && ttw=1
+            fi
+            title="${titles[${li}]:0:${ttw}}"
+            printf -v tpad '%-*s' "${ttw}" "${title}"
             if [ "${li}" -eq "${sel}" ]; then
-                # Selected: reverse-video bold bar; italic applied to the title only.
-                lcell="${smso}${C_BOLD}$(printf '> %s  ' "${box}")${titalic}$(printf '%-*s' "${tw}" "${title}")${C_RESET}${rmso}"
+                # Selected: reverse-video bold bar; italic on the title only. The
+                # date rides inside the bar (C_NOBOLD drops bold but keeps the
+                # reverse video, so it isn't bold like the title).
+                lcell="${smso}${C_BOLD}> ${box}  ${titalic}${tpad}"
+                [ -n "${datestr}" ] && lcell+="${C_NOBOLD} ${datestr}"
+                lcell+="${C_RESET}${rmso}"
             else
                 # Arrow gap, coloured checkbox, two spaces, bold (italic if unsaved) title.
-                lcell="  ${boxcol}${box}${C_RESET}  ${C_BOLD}${titalic}$(printf '%-*s' "${tw}" "${title}")${C_RESET}"
+                lcell="  ${boxcol}${box}${C_RESET}  ${C_BOLD}${titalic}${tpad}${C_RESET}"
+                [ -n "${datestr}" ] && lcell+=" ${C_HELP}${datestr}${C_RESET}"
             fi
         else
-            lcell="$(printf '%-*s' "${left_w}" "")"
+            printf -v lcell '%-*s' "${left_w}" ""
         fi
         if [ "${preview}" -eq 1 ]; then
             # glow output carries its own ANSI; pass it through untruncated.
@@ -375,17 +514,25 @@ is_created() {
 
 has_changes() {
     [ "${#created[@]}" -gt 0 ] && return 0
-    [ "${#edited_backup[@]}" -gt 0 ] && return 0
+    [ "${#edited_work[@]}" -gt 0 ] && return 0
     [ "${#pending[@]}" -gt 0 ] && return 0
     return 1
+}
+
+# Remove every staging tmp (composed new reminders + edit working copies). Safe
+# to call repeatedly and on any exit path; it never touches REMINDER_DIR.
+cleanup_staging() {
+    local p
+    for p in "${created[@]}"; do rm -f "${p}"; done
+    for p in "${edited_work[@]}"; do rm -f "${p}"; done
 }
 
 confirm_discard() {
     tput cnorm
     stty echo </dev/tty 2>/dev/null   # show the y/N keystroke
     printf '\nDiscard changes'
-    [ "${#created[@]}" -gt 0 ] && printf ', delete %d new reminder(s)' "${#created[@]}"
-    [ "${#edited_backup[@]}" -gt 0 ] && printf ', revert %d edit(s)' "${#edited_backup[@]}"
+    [ "${#created[@]}" -gt 0 ] && printf ', drop %d new reminder(s)' "${#created[@]}"
+    [ "${#edited_work[@]}" -gt 0 ] && printf ', discard %d edit(s)' "${#edited_work[@]}"
     [ "${#pending[@]}" -gt 0 ] && printf ', drop %d pending toggle(s)' "${#pending[@]}"
     printf '? [y/N] '
     local ans
@@ -430,27 +577,44 @@ edit_mode() {
     view="open"
     pending=()
     created=()
-    edited_backup=()
+    edited_work=()
+    new_done=()
     change_log=()
+    preview_cache=()
     load_list
     sel=0
     preview_key=""
     right_scroll=0
     resolve_glow_style
 
+    # Query the static standout caps once (used every frame by render).
+    smso_cap="$(tput smso 2>/dev/null)"
+    rmso_cap="$(tput rmso 2>/dev/null)"
+
     # Disable echo for the whole session. render() runs between keystrokes, and a
     # held-down arrow streams escape sequences during that window; with echo on
     # the terminal would print and act on them, flashing stray glyphs at the edges.
     saved_stty="$(stty -g </dev/tty 2>/dev/null)"
     stty -echo </dev/tty 2>/dev/null
-    trap 'tput cnorm 2>/dev/null; [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null' EXIT
+    # On any exit (including death by signal) restore the terminal and drop the
+    # staging tmps. Nothing in REMINDER_DIR is touched here, so an interrupted
+    # session — Ctrl+C included — leaves the real reminders exactly as they were.
+    trap 'tput cnorm 2>/dev/null; [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null; cleanup_staging' EXIT
+    # Ctrl+C / kill: exit, which fires the EXIT trap above (discard, no apply).
+    # Print a newline first so the shell prompt resumes on its own line.
+    trap 'printf "\n"; exit 130' INT
+    trap 'exit 143' TERM
+    # On resize, just flag a size refresh; render recomputes on the next frame.
+    trap 'need_winch=1' WINCH
+    need_winch=1
     tput civis
     tput clear
 
     local key newpath
     while true; do
         render
-        key="$(read_key)"
+        read_key
+        key="${KEY}"
         case "${key}" in
             up|k)
                 # Wrap to the bottom when stepping off the top.
@@ -480,42 +644,58 @@ edit_mode() {
             space)
                 [ "${#files[@]}" -gt 0 ] || continue
                 local kf="${files[${sel}]}"
+                # Staged new items carry their done flag in new_done; existing
+                # files in pending (which commit_pending applies on save).
                 if [ "${done_flags[${sel}]}" -eq 0 ]; then
                     done_flags[${sel}]=1
-                    pending["${kf}"]=1
+                    if is_created "${kf}"; then new_done["${kf}"]=1; else pending["${kf}"]=1; fi
                 else
                     done_flags[${sel}]=0
-                    unset 'pending['"${kf}"']'
+                    if is_created "${kf}"; then unset 'new_done['"${kf}"']'; else unset 'pending['"${kf}"']'; fi
                 fi
                 ;;
             e)
                 [ "${#files[@]}" -gt 0 ] || continue
                 tput cnorm
-                local f bak
+                local f work
                 f="${files[${sel}]}"
-                bak="$(mktemp --suffix=.md)"
-                cp "${f}" "${bak}"
-                vim "${f}" </dev/tty >/dev/tty 2>&1
-                tput civis
-                if cmp -s "${f}" "${bak}"; then
-                    # Unchanged: nothing to revert.
-                    rm -f "${bak}"
-                elif is_created "${f}" || [ -n "${edited_backup[${f}]:-}" ]; then
-                    # New this session (discard deletes it wholesale) or already
-                    # backed up from an earlier edit: keep the earliest backup.
-                    rm -f "${bak}"
+                if is_created "${f}"; then
+                    # Staged new reminder: its content already lives in a tmp
+                    # (f itself), so edit it in place — still nothing on disk.
+                    vim "${f}" </dev/tty >/dev/tty 2>&1
                 else
-                    edited_backup[${f}]="${bak}"
+                    # Existing reminder: edit a working copy and stage it; the
+                    # real file stays untouched until save.
+                    work="${edited_work[${f}]:-}"
+                    if [ -z "${work}" ]; then
+                        work="$(mktemp --suffix=.md)"
+                        cp "${f}" "${work}"
+                    fi
+                    vim "${work}" </dev/tty >/dev/tty 2>&1
+                    if cmp -s "${work}" "${f}"; then
+                        # Edited back to the original: drop the staged copy.
+                        rm -f "${work}"
+                        unset 'edited_work['"${f}"']'
+                    else
+                        edited_work[${f}]="${work}"
+                    fi
                 fi
-                titles[${sel}]="$(get_title "${f}")"
+                tput civis
+                titles[${sel}]="$(get_title "${edited_work[${f}]:-${f}}")"
+                # Content changed: drop this file's memoised previews (all widths).
+                local ck
+                for ck in "${!preview_cache[@]}"; do
+                    case "${ck}" in "${f}::"*) unset 'preview_cache['"${ck}"']' ;; esac
+                done
                 preview_key=""
                 tput clear
                 ;;
             n)
                 tput cnorm
-                newpath="$(add_reminder)"
+                newpath="$(compose_reminder)"
                 tput civis
                 if [ -n "${newpath}" ] && [ -f "${newpath}" ]; then
+                    # Stage only — written to REMINDER_DIR on save, not now.
                     created+=("${newpath}")
                     # New reminders are active: surface them in the open view.
                     view="open"
@@ -530,31 +710,42 @@ edit_mode() {
                 tput clear
                 ;;
             enter)
-                local p
-                # Record created/edited (already on disk) before commit_pending
-                # renames any toggled files out from under get_title.
+                # Save: this is the ONLY place REMINDER_DIR is mutated. Order:
+                # persist new reminders, apply edits, then done/reopen toggles.
+                local p saved ts title
                 for p in "${created[@]}"; do
-                    change_log+=("${C_OPEN}+ added    ${C_RESET}$(get_title "${p}")")
+                    title="$(get_title "${p}")"
+                    saved="$(save_reminder "${p}")"
+                    change_log+=("${C_OPEN}+ added    ${C_RESET}${title}")
+                    # A new reminder flagged done is saved, then marked done.
+                    if [ -n "${new_done[${p}]:-}" ] && [ -f "${saved}" ]; then
+                        ts="$(date +%Y-%m-%dT%H-%M-%S)"
+                        mv "${saved}" "${saved}_${ts}" \
+                            && change_log+=("${C_BOX_ON}✓ done     ${C_RESET}${title}")
+                    fi
                 done
-                for p in "${!edited_backup[@]}"; do
-                    change_log+=("${C_BOX_OFF}~ edited   ${C_RESET}$(get_title "${p}")")
+                for p in "${!edited_work[@]}"; do
+                    cp "${edited_work[${p}]}" "${p}" \
+                        && change_log+=("${C_BOX_OFF}~ edited   ${C_RESET}$(get_title "${p}")")
                 done
                 commit_pending
-                for p in "${edited_backup[@]}"; do
-                    rm -f "${p}"
-                done
                 break
                 ;;
             esc)
+                # From the done view, esc backs out to the open view first;
+                # only a second esc (from the open view) exits.
+                if [ "${view}" = "done" ]; then
+                    view="open"
+                    load_list
+                    sel=0
+                    preview_key=""
+                    right_scroll=0
+                    continue
+                fi
                 if has_changes; then
                     if confirm_discard; then
-                        local p
-                        for p in "${created[@]}"; do
-                            rm -f "${p}"
-                        done
-                        for p in "${!edited_backup[@]}"; do
-                            mv "${edited_backup[${p}]}" "${p}"
-                        done
+                        # Nothing was applied; the end-of-function cleanup drops
+                        # the staging tmps and the real reminders stay as-is.
                         break
                     fi
                     # Declined: prompt text dirtied the screen, repaint clean.
@@ -563,13 +754,17 @@ edit_mode() {
                     break
                 fi
                 ;;
+            redraw)
+                # Signal-interrupted read (e.g. SIGWINCH): loop repaints.
+                ;;
         esac
     done
 
+    cleanup_staging          # drop staging tmps (already applied on save, or discarded)
     tput cnorm
     [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null
     tput clear
-    trap - EXIT
+    trap - EXIT INT TERM WINCH
 
     # Report what the save applied, one coloured change per line. Printed after
     # the clear so it survives onto the cleared screen.
@@ -611,8 +806,10 @@ case "${mode}" in
         print_reminders
         ;;
     add)
-        path="$(add_reminder)"
-        if [ -n "${path}" ]; then
+        tmp="$(compose_reminder)"
+        if [ -n "${tmp}" ]; then
+            path="$(save_reminder "${tmp}")"
+            rm -f "${tmp}"
             echo "Saved: ${path}" 1>&2
         else
             echo "No reminder added." 1>&2
