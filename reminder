@@ -152,6 +152,7 @@ sel=0
 saved_stty=""                 # original tty settings, restored on exit
 view="open"                   # "open" (active) | "done" (completed)
 declare -A pending=()         # file -> 1 if flagged for its view's action on save
+change_log=()                 # coloured, one-per-line summary of changes applied on save
 
 load_list() {
     files=()
@@ -401,25 +402,25 @@ confirm_discard() {
 # Apply pending toggles across both views: an open reminder flagged done gets a
 # _<timestamp> suffix; a done reminder flagged for reopen gets that suffix
 # stripped (back to <name>.md). Keyed by path, so the current view is irrelevant.
+# Each applied move appends a coloured line to change_log (title read before mv).
 commit_pending() {
-    local p ts target done_count=0 reopen_count=0
+    local p ts target title
     for p in "${!pending[@]}"; do
         [ "${pending[${p}]}" = "1" ] || continue
         [ -f "${p}" ] || continue
+        title="$(get_title "${p}")"
         case "${p}" in
             *.md_*)
                 target="${p%%.md_*}.md"
                 [ -e "${target}" ] && target="${p%%.md_*}-$(date +%Y-%m-%dT%H-%M-%S).md"
-                mv "${p}" "${target}" && reopen_count=$((reopen_count + 1))
+                mv "${p}" "${target}" && change_log+=("${C_DONE}↺ reopened ${C_RESET}${title}")
                 ;;
             *.md)
                 ts="$(date +%Y-%m-%dT%H-%M-%S)"
-                mv "${p}" "${p}_${ts}" && done_count=$((done_count + 1))
+                mv "${p}" "${p}_${ts}" && change_log+=("${C_BOX_ON}✓ done     ${C_RESET}${title}")
                 ;;
         esac
     done
-    [ "${done_count}" -gt 0 ] && echo "Marked ${done_count} reminder(s) done." 1>&2
-    [ "${reopen_count}" -gt 0 ] && echo "Reopened ${reopen_count} reminder(s)." 1>&2
     return 0
 }
 
@@ -430,6 +431,7 @@ edit_mode() {
     pending=()
     created=()
     edited_backup=()
+    change_log=()
     load_list
     sel=0
     preview_key=""
@@ -528,8 +530,16 @@ edit_mode() {
                 tput clear
                 ;;
             enter)
-                commit_pending
                 local p
+                # Record created/edited (already on disk) before commit_pending
+                # renames any toggled files out from under get_title.
+                for p in "${created[@]}"; do
+                    change_log+=("${C_OPEN}+ added    ${C_RESET}$(get_title "${p}")")
+                done
+                for p in "${!edited_backup[@]}"; do
+                    change_log+=("${C_BOX_OFF}~ edited   ${C_RESET}$(get_title "${p}")")
+                done
+                commit_pending
                 for p in "${edited_backup[@]}"; do
                     rm -f "${p}"
                 done
@@ -560,6 +570,10 @@ edit_mode() {
     [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null
     tput clear
     trap - EXIT
+
+    # Report what the save applied, one coloured change per line. Printed after
+    # the clear so it survives onto the cleared screen.
+    [ "${#change_log[@]}" -gt 0 ] && printf '%s\n' "${change_log[@]}" 1>&2
 }
 
 # --- argument parsing -------------------------------------------------------
