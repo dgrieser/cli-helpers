@@ -2,6 +2,10 @@
 
 APP_NAME="$(basename "${0}")"
 REMINDER_DIR="${HOME}/.cache/reminder"
+# Persisted display order for active reminders: one basename per line. Read on
+# every print; rewritten whenever an edit/add is actually applied. Not matched
+# by the *.md / *.md_* globs, so it never shows up as a reminder.
+ORDER_FILE="${REMINDER_DIR}/.order"
 
 C_TITLE=$'\033[38;5;228;48;5;63;1m'
 C_HELP=$'\033[90m'      # grey help text
@@ -14,6 +18,7 @@ C_DONE=$'\033[38;5;250m' # light grey "DONE" view label
 C_BOLD=$'\033[1m'       # bold reminder titles
 C_NOBOLD=$'\033[22m'    # bold off only (keeps reverse video / other attrs)
 C_ITALIC=$'\033[3m'     # italic title: unsaved (new/edited) reminder
+C_MOVE=$'\033[38;5;232;48;5;214m' # selected row while reordering (dark on amber)
 C_RESET=$'\033[0m'
 
 usage() {
@@ -24,6 +29,11 @@ Manage and write Markdown reminders in ${REMINDER_DIR}.
 
 Active reminders are *.md files. Marking one as done renames it to
 <name>.md_<timestamp> so it drops out of every listing without being lost.
+
+The display order of active reminders is kept in ${ORDER_FILE} and applied to
+every listing (--print included). Reminders missing from that file (e.g. added
+from outside this tool) sort on top, newest-modified first. The order file is
+rewritten whenever a change is actually applied.
 
 With no options, runs interactive edit mode: navigate the reminder titles,
 toggle a done checkbox, edit and add reminders, then save. Every change is
@@ -41,6 +51,9 @@ Edit-mode keys:
   tab                   Switch between the open and done (completed) views
   shift+up / shift+down Scroll the preview pane (for reminders taller than it)
   space                 Toggle the checkbox (open: mark done; done: reopen)
+  o                     Reorder: grab the selected reminder (open view only),
+                        then up/down move it; enter keeps the new order, esc
+                        cancels. All other keys are disabled while reordering.
   e                     Edit the selected reminder in vim (staged until save)
   n                     Add a new reminder, then return to edit mode
   enter                 Save: apply all staged changes and exit
@@ -76,6 +89,44 @@ list_files_by_mtime() {
     } | sort -rn -k1,1 | cut -f2-
 }
 
+# Emit active reminder paths (*.md) in display order, one per line:
+#   1. files NOT listed in ORDER_FILE first, newest-modified first
+#   2. then files listed in ORDER_FILE, in that order, skipping any that no
+#      longer exist.
+# This is the single source of truth for ordering used by --print and edit mode.
+list_files_ordered() {
+    local f base line
+    declare -A in_order=()
+    if [ -f "${ORDER_FILE}" ]; then
+        while IFS= read -r line; do
+            [ -n "${line}" ] && in_order["${line}"]=1
+        done < "${ORDER_FILE}"
+    fi
+    # Untracked active reminders, newest first.
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        base="${f##*/}"
+        [ -n "${in_order[${base}]:-}" ] || printf '%s\n' "${f}"
+    done < <(list_files_by_mtime open)
+    # Tracked reminders, in the stored order (existing ones only).
+    if [ -f "${ORDER_FILE}" ]; then
+        while IFS= read -r line; do
+            [ -n "${line}" ] || continue
+            [ -f "${REMINDER_DIR}/${line}" ] && printf '%s\n' "${REMINDER_DIR}/${line}"
+        done < "${ORDER_FILE}"
+    fi
+}
+
+# Write ORDER_FILE from the given reminder paths (basenames, one per line). With
+# no paths the file is truncated, which is the correct state for "no reminders".
+persist_order() {
+    local p out=""
+    for p in "$@"; do
+        out+="${p##*/}"$'\n'
+    done
+    printf '%s' "${out}" > "${ORDER_FILE}"
+}
+
 # First non-empty line of a file, with any leading Markdown heading marks stripped.
 get_title() {
     local t
@@ -89,7 +140,7 @@ print_reminders() {
     local reminders=() f
     while IFS= read -r f; do
         [ -n "${f}" ] && reminders+=("${f}")
-    done < <(list_files_by_mtime open)
+    done < <(list_files_ordered)
     if [ "${#reminders[@]}" -eq 0 ]; then
         echo "No reminders." 1>&2
         return 0
@@ -178,6 +229,10 @@ need_winch=1                  # 1 => refresh term size on next render
 smso_cap=""                   # standout on/off escapes, queried once (static)
 rmso_cap=""
 declare -A preview_cache=()   # "file::width" -> glow output, newline-joined
+open_seq=()                   # canonical open-view order (created tmps + real paths)
+reorder=0                     # 1 while in reorder sub-mode (m); disables other keys
+reorder_backup=()             # open_seq snapshot, restored if reorder is cancelled
+order_changed=""              # non-empty once a reorder is kept (counts as a change)
 
 # Parse the completion epoch out of a "<name>.md_<YYYY-MM-DDTHH-MM-SS>" path.
 # Done once per item at load time (not per frame), so the one date(1) fork here
@@ -191,37 +246,47 @@ done_path_epoch() {
     date -d "${d} ${t}" +%s 2>/dev/null || echo 0
 }
 
+# Build open_seq, the canonical open-view order: staged new reminders first
+# (newest staged on top), then the active reminders in their stored order.
+# Called once at edit-mode start; thereafter open_seq is mutated in place (new
+# items prepended on "n", rows swapped while reordering) so a manual reorder and
+# the staged-new positions survive view switches.
+build_open_seq() {
+    open_seq=()
+    local n f
+    for n in "${created[@]}"; do open_seq+=("${n}"); done
+    while IFS= read -r f; do
+        [ -n "${f}" ] && open_seq+=("${f}")
+    done < <(list_files_ordered)
+}
+
 load_list() {
     files=()
     titles=()
     done_flags=()
     done_epoch=()
-    local f n
-    # Staged new reminders are active and unsaved: show them at the top of the
-    # open view only (they have no place in the done view).
+    local f
     if [ "${view}" = "open" ]; then
-        for n in "${created[@]}"; do
-            files+=("${n}")
-            titles+=("$(get_title "${n}")")
+        # Open view follows open_seq exactly (created tmps + real paths).
+        for f in "${open_seq[@]}"; do
+            files+=("${f}")
+            # Title reflects the staged edit when there is one.
+            titles+=("$(get_title "${edited_work[${f}]:-${f}}")")
             done_epoch+=(0)
-            if [ -n "${new_done[${n}]:-}" ]; then
-                done_flags+=(1)
+            if is_created "${f}"; then
+                if [ -n "${new_done[${f}]:-}" ]; then done_flags+=(1); else done_flags+=(0); fi
             else
-                done_flags+=(0)
+                if [ -n "${pending[${f}]:-}" ]; then done_flags+=(1); else done_flags+=(0); fi
             fi
         done
+        return
     fi
+    # Done view: completed reminders, newest-completed first (not reorderable).
     while IFS= read -r f; do
         [ -n "${f}" ] || continue
         files+=("${f}")
-        # Title reflects the staged edit when there is one.
         titles+=("$(get_title "${edited_work[${f}]:-${f}}")")
-        # Completion epoch, parsed once here for the relative-time display.
-        if [ "${view}" = "done" ]; then
-            done_epoch+=("$(done_path_epoch "${f}")")
-        else
-            done_epoch+=(0)
-        fi
+        done_epoch+=("$(done_path_epoch "${f}")")
         if [ -n "${pending[${f}]:-}" ]; then
             done_flags+=(1)
         else
@@ -392,7 +457,12 @@ render() {
     local out="${home}"
     # View label styled like glow's H1; the label word is tinted by view (green
     # OPEN / white DONE), then C_TITLE restores the bar's fg for the trailing pad.
-    out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}tab${C_HELP} open/done · ${C_KEY}space${C_HELP} toggle · ${C_KEY}shift+up/down${C_HELP} scroll · ${C_KEY}e${C_HELP} edit · ${C_KEY}n${C_HELP} new · ${C_KEY}enter${C_HELP} save · ${C_KEY}esc${C_HELP} abort${eol}"$'\n'
+    if [ "${reorder}" -eq 1 ]; then
+        # Reorder sub-mode: only the keys that do something here are advertised.
+        out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}  ${C_MOVE} REORDER ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}enter${C_HELP} save order · ${C_KEY}esc${C_HELP} cancel${eol}"$'\n'
+    else
+        out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}tab${C_HELP} open/done · ${C_KEY}space${C_HELP} toggle · ${C_KEY}shift+up/down${C_HELP} scroll · ${C_KEY}e${C_HELP} edit · ${C_KEY}n${C_HELP} new · ${C_KEY}o${C_HELP} reorder · ${C_KEY}enter${C_HELP} save · ${C_KEY}esc${C_HELP} abort${eol}"$'\n'
+    fi
     out+="${eol}"$'\n'
 
     local preview=1 max_scroll=0
@@ -471,7 +541,13 @@ render() {
             fi
             title="${titles[${li}]:0:${ttw}}"
             printf -v tpad '%-*s' "${ttw}" "${title}"
-            if [ "${li}" -eq "${sel}" ]; then
+            if [ "${li}" -eq "${sel}" ] && [ "${reorder}" -eq 1 ]; then
+                # Grabbed for reordering: amber background bar with a ↕ marker so
+                # it reads as "this row moves with up/down".
+                lcell="${C_MOVE}${C_BOLD}↕ ${box}  ${titalic}${tpad}"
+                [ -n "${datestr}" ] && lcell+="${C_NOBOLD} ${datestr}"
+                lcell+="${C_RESET}"
+            elif [ "${li}" -eq "${sel}" ]; then
                 # Selected: reverse-video bold bar; italic on the title only. The
                 # date rides inside the bar (C_NOBOLD drops bold but keeps the
                 # reverse video, so it isn't bold like the title).
@@ -516,6 +592,7 @@ has_changes() {
     [ "${#created[@]}" -gt 0 ] && return 0
     [ "${#edited_work[@]}" -gt 0 ] && return 0
     [ "${#pending[@]}" -gt 0 ] && return 0
+    [ -n "${order_changed}" ] && return 0
     return 1
 }
 
@@ -534,6 +611,7 @@ confirm_discard() {
     [ "${#created[@]}" -gt 0 ] && printf ', drop %d new reminder(s)' "${#created[@]}"
     [ "${#edited_work[@]}" -gt 0 ] && printf ', discard %d edit(s)' "${#edited_work[@]}"
     [ "${#pending[@]}" -gt 0 ] && printf ', drop %d pending toggle(s)' "${#pending[@]}"
+    [ -n "${order_changed}" ] && printf ', discard reordering'
     printf '? [y/N] '
     local ans
     IFS= read -rn1 ans </dev/tty
@@ -581,6 +659,10 @@ edit_mode() {
     new_done=()
     change_log=()
     preview_cache=()
+    reorder=0
+    reorder_backup=()
+    order_changed=""
+    build_open_seq
     load_list
     sel=0
     preview_key=""
@@ -615,6 +697,51 @@ edit_mode() {
         render
         read_key
         key="${KEY}"
+        # Reorder sub-mode owns the keyboard: up/down drag the grabbed row, enter
+        # keeps the new order, esc reverts to the pre-grab order, and every other
+        # key is ignored. (Ctrl+C still fires the global INT trap: exit, no save.)
+        if [ "${reorder}" -eq 1 ]; then
+            case "${key}" in
+                up|k)
+                    # No wrap: at the top, up does nothing. Otherwise swap with
+                    # the row above and follow the grabbed item up.
+                    if [ "${sel}" -gt 0 ]; then
+                        local tmp_seq="${open_seq[$((sel - 1))]}"
+                        open_seq[$((sel - 1))]="${open_seq[${sel}]}"
+                        open_seq[${sel}]="${tmp_seq}"
+                        sel=$((sel - 1))
+                        load_list
+                    fi
+                    ;;
+                down|j)
+                    # No wrap: at the bottom, down does nothing.
+                    if [ "${sel}" -lt $(( ${#open_seq[@]} - 1 )) ]; then
+                        local tmp_seq="${open_seq[$((sel + 1))]}"
+                        open_seq[$((sel + 1))]="${open_seq[${sel}]}"
+                        open_seq[${sel}]="${tmp_seq}"
+                        sel=$((sel + 1))
+                        load_list
+                    fi
+                    ;;
+                enter)
+                    # Keep the new order (staged; written to ORDER_FILE on save).
+                    order_changed=1
+                    reorder=0
+                    ;;
+                esc)
+                    # Abort: restore the order captured when reordering began.
+                    open_seq=("${reorder_backup[@]}")
+                    load_list
+                    [ "${sel}" -ge "${#files[@]}" ] && sel=$(( ${#files[@]} - 1 ))
+                    [ "${sel}" -lt 0 ] && sel=0
+                    reorder=0
+                    ;;
+                redraw|*)
+                    # All other keys are disabled while reordering.
+                    ;;
+            esac
+            continue
+        fi
         case "${key}" in
             up|k)
                 # Wrap to the bottom when stepping off the top.
@@ -653,6 +780,14 @@ edit_mode() {
                     done_flags[${sel}]=0
                     if is_created "${kf}"; then unset 'new_done['"${kf}"']'; else unset 'pending['"${kf}"']'; fi
                 fi
+                ;;
+            o)
+                # Grab the selected reminder for reordering. Open view only
+                # (the done view's order is fixed), and only with rows present.
+                [ "${view}" = "open" ] || continue
+                [ "${#files[@]}" -gt 0 ] || continue
+                reorder=1
+                reorder_backup=("${open_seq[@]}")
                 ;;
             e)
                 [ "${#files[@]}" -gt 0 ] || continue
@@ -697,14 +832,12 @@ edit_mode() {
                 if [ -n "${newpath}" ] && [ -f "${newpath}" ]; then
                     # Stage only — written to REMINDER_DIR on save, not now.
                     created+=("${newpath}")
-                    # New reminders are active: surface them in the open view.
+                    # New reminders are active and newest: put them on top of the
+                    # open view, ahead of any existing manual order.
+                    open_seq=("${newpath}" "${open_seq[@]}")
                     view="open"
                     load_list
                     sel=0
-                    local i
-                    for i in "${!files[@]}"; do
-                        [ "${files[${i}]}" = "${newpath}" ] && sel="${i}" && break
-                    done
                 fi
                 preview_key=""
                 tput clear
@@ -712,10 +845,13 @@ edit_mode() {
             enter)
                 # Save: this is the ONLY place REMINDER_DIR is mutated. Order:
                 # persist new reminders, apply edits, then done/reopen toggles.
-                local p saved ts title
+                local p saved ts title applied=0
+                has_changes && applied=1
+                declare -A saved_map=()
                 for p in "${created[@]}"; do
                     title="$(get_title "${p}")"
                     saved="$(save_reminder "${p}")"
+                    saved_map["${p}"]="${saved}"
                     change_log+=("${C_OPEN}+ added    ${C_RESET}${title}")
                     # A new reminder flagged done is saved, then marked done.
                     if [ -n "${new_done[${p}]:-}" ] && [ -f "${saved}" ]; then
@@ -729,6 +865,24 @@ edit_mode() {
                         && change_log+=("${C_BOX_OFF}~ edited   ${C_RESET}$(get_title "${p}")")
                 done
                 commit_pending
+                # Rewrite ORDER_FILE only when something was actually applied,
+                # capturing the open view's current order. Created items map to
+                # their saved paths; anything flagged done drops out (it left the
+                # open view), and resolves to its final active *.md path.
+                if [ "${applied}" -eq 1 ]; then
+                    local ordered=() q sp
+                    for q in "${open_seq[@]}"; do
+                        if is_created "${q}"; then
+                            [ -n "${new_done[${q}]:-}" ] && continue
+                            sp="${saved_map[${q}]:-}"
+                            [ -n "${sp}" ] && [ -f "${sp}" ] && ordered+=("${sp}")
+                        else
+                            [ -n "${pending[${q}]:-}" ] && continue
+                            [ -f "${q}" ] && ordered+=("${q}")
+                        fi
+                    done
+                    persist_order "${ordered[@]}"
+                fi
                 break
                 ;;
             esc)
@@ -811,6 +965,13 @@ case "${mode}" in
             path="$(save_reminder "${tmp}")"
             rm -f "${tmp}"
             echo "Saved: ${path}" 1>&2
+            # A new item was applied: rewrite the order file. The new reminder is
+            # untracked (newest), so it lands on top; existing order is preserved.
+            order_paths=()
+            while IFS= read -r f; do
+                [ -n "${f}" ] && order_paths+=("${f}")
+            done < <(list_files_ordered)
+            persist_order "${order_paths[@]}"
         else
             echo "No reminder added." 1>&2
         fi
