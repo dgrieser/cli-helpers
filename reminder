@@ -459,7 +459,7 @@ render() {
     # OPEN / white DONE), then C_TITLE restores the bar's fg for the trailing pad.
     if [ "${reorder}" -eq 1 ]; then
         # Reorder sub-mode: only the keys that do something here are advertised.
-        out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}  ${C_MOVE} REORDER ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}enter${C_HELP} save order · ${C_KEY}esc${C_HELP} cancel${eol}"$'\n'
+        out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}  ${C_MOVE} REORDER ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}o/enter${C_HELP} save order · ${C_KEY}esc${C_HELP} cancel${eol}"$'\n'
     else
         out+="${C_TITLE} REMINDERS · ${vcol}${vlabel}${C_TITLE} ${C_RESET}${C_HELP}  ${C_KEY}up/down${C_HELP} move · ${C_KEY}tab${C_HELP} open/done · ${C_KEY}space${C_HELP} toggle · ${C_KEY}shift+up/down${C_HELP} scroll · ${C_KEY}e${C_HELP} edit · ${C_KEY}n${C_HELP} new · ${C_KEY}o${C_HELP} reorder · ${C_KEY}enter${C_HELP} save · ${C_KEY}esc${C_HELP} abort${eol}"$'\n'
     fi
@@ -723,7 +723,7 @@ edit_mode() {
                         load_list
                     fi
                     ;;
-                enter)
+                o|enter)
                     # Keep the new order (staged; written to ORDER_FILE on save).
                     order_changed=1
                     reorder=0
