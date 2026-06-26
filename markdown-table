@@ -61,7 +61,7 @@ done
 
 if [ "${mode}" = "md" ]; then
     # either at least two spaces or one tab
-    sed -E 's/(\t| {2,})/|/g; s/^/|/; s/$/|/' | awk 'NR==1{h=$0; gsub(/[^|]/,"-",h); print $0 RS h; next}1'
+    sed -E 's/(\t| {2,})/|/g; s/^/|/; s/$/|/' | awk 'NR==1{t=$0; n=gsub(/\|/,"|",t); sep="|"; for(i=1;i<n;i++) sep=sep "---|"; print $0 RS sep; next}1'
 else
     awk -v mode="${mode}" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
