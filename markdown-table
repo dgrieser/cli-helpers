@@ -60,8 +60,26 @@ while [ "${#}" -gt 0 ]; do
 done
 
 if [ "${mode}" = "md" ]; then
-    # either at least two spaces or one tab
-    sed -E 's/(\t| {2,})/|/g; s/^/|/; s/$/|/' | awk 'NR==1{t=$0; n=gsub(/\|/,"|",t); sep="|"; for(i=1;i<n;i++) sep=sep "---|"; print $0 RS sep; next}1'
+    # Columns split on a tab or two or more spaces. Two or more blank lines end
+    # a table; the next non-blank row starts a new table with its own header.
+    awk '
+    function pipeify(s,   r) { r = s; gsub(/\t| {2,}/, "|", r); return "|" r "|" }
+    BEGIN { need_header = 1 }
+    /^[[:space:]]*$/ { blanks++; next }
+    {
+        if (blanks >= 2) need_header = 1
+        blanks = 0
+        line = pipeify($0)
+        if (need_header) {
+            if (printed) print ""
+            t = line; n = gsub(/\|/, "|", t)
+            sep = "|"; for (i = 1; i < n; i++) sep = sep "---|"
+            print line RS sep
+            need_header = 0; printed = 1
+            next
+        }
+        print line
+    }'
 else
     awk -v mode="${mode}" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }

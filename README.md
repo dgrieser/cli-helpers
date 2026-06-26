@@ -905,7 +905,7 @@ Converts a tab- or space-separated table from stdin into a Markdown table, or (w
 | `--to-csv` | Convert a Markdown table (stdin) to comma-separated values. |
 | `-h, --help` | Show the help message and exit. |
 
-With no option, input is treated as a tab/space-separated table (columns split on a tab or two-or-more spaces, first row is the header) and converted to a Markdown table. `--to-tsv` and `--to-csv` are mutually exclusive.
+With no option, input is treated as a tab/space-separated table (columns split on a tab or two-or-more spaces, first row is the header) and converted to a Markdown table. Empty/filler header cells still get a valid separator (`---`). Multiple tables are supported: two or more blank lines end a table, and the next non-blank row starts a new table with its own header. `--to-tsv` and `--to-csv` are mutually exclusive.
 
 **Examples:**
 ```bash
