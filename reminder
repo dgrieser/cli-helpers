@@ -681,7 +681,7 @@ edit_mode() {
     # On any exit (including death by signal) restore the terminal and drop the
     # staging tmps. Nothing in REMINDER_DIR is touched here, so an interrupted
     # session — Ctrl+C included — leaves the real reminders exactly as they were.
-    trap 'tput cnorm 2>/dev/null; [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null; cleanup_staging' EXIT
+    trap 'tput cnorm 2>/dev/null; tput rmcup 2>/dev/null; [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null; cleanup_staging' EXIT
     # Ctrl+C / kill: exit, which fires the EXIT trap above (discard, no apply).
     # Print a newline first so the shell prompt resumes on its own line.
     trap 'printf "\n"; exit 130' INT
@@ -689,6 +689,11 @@ edit_mode() {
     # On resize, just flag a size refresh; render recomputes on the next frame.
     trap 'need_winch=1' WINCH
     need_winch=1
+    # Draw the UI on the terminal's alternate screen (like vim/less/htop): on exit
+    # we switch back to the primary screen, leaving the user's scrollback — their
+    # previous commands and output — exactly as it was. Without this the tput clear
+    # calls below would wipe the scrollback (terminfo "clear" emits E3, \033[3J).
+    tput smcup
     tput civis
     tput clear
 
@@ -917,7 +922,9 @@ edit_mode() {
     cleanup_staging          # drop staging tmps (already applied on save, or discarded)
     tput cnorm
     [ -n "${saved_stty:-}" ] && stty "${saved_stty}" </dev/tty 2>/dev/null
-    tput clear
+    # Leave the alternate screen, restoring the primary screen (and its scrollback)
+    # untouched. The change_log below then prints at the user's normal prompt.
+    tput rmcup
     trap - EXIT INT TERM WINCH
 
     # Report what the save applied, one coloured change per line. Printed after
