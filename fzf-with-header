@@ -1,15 +1,20 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-description <key>:<description> ...] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
 color_settings='bg+:'"${COLOR_SELECTION_BACKGROUND:-238}"',header:'"${COLOR_TABLE_HEADER:-238}"':italic'
 color_style="${COLOR_MODE}"
 
+C_HELP=$'\033[90m'      # grey descriptions (matches reminder's help text)
+C_KEY=$'\033[38;5;250m' # lighter grey keys
+C_RESET=$'\033[0m'
+
 cmd=""
 key_cmd=""
+declare -A key_desc
 args=""
 query=""
 delimiter='  +'
@@ -43,6 +48,11 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             key_cmd="${1}"
             print_query=1
+            ;;
+        --key-description)
+            shift
+            [[ "${1}" != *:* ]] && usage
+            key_desc["${1%%:*}"]="${1#*:}"
             ;;
         --watch)
             shift
@@ -88,6 +98,73 @@ fi
 [ -n "${args}" ] && args="${args} "
 args="${args}--bind=${fzf_bindings}"
 
+split_key_spec() {
+    # split a bind/expect spec on commas outside parentheses
+    echo "${1}" | awk '{
+        depth = 0; buf = ""
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "(") depth++
+            else if (c == ")") depth--
+            if (c == "," && depth == 0) { if (buf != "") print buf; buf = "" } else buf = buf c
+        }
+        if (buf != "") print buf
+    }'
+}
+
+format_key_entry() {
+    local entry="${1}"
+    local key="${entry%%:*}"
+    if [ -n "${key_desc[${key}]+x}" ]; then
+        echo "${C_KEY}${key}${C_HELP} ${key_desc[${key}]}"
+    elif [[ "${entry}" != *:* ]]; then
+        echo "${C_KEY}${entry}"
+    else
+        local action="${entry#*:}"
+        case "${action}" in
+            execute\(*|execute-silent\(*|become\(*)
+                local body="${action#*\(}"
+                body="${body%)}"
+                echo "${C_KEY}${key}${C_HELP} ${body%% *}"
+                ;;
+            *)
+                echo "${C_KEY}${key}${C_HELP} $(echo "${action}" | sed 's/([^)]*)//g')"
+                ;;
+        esac
+    fi
+}
+
+collect_keys() {
+    local entry
+    while read -r entry; do
+        format_key_entry "${entry}"
+    done < <(split_key_spec "${1}")
+}
+
+mapped_keys="${C_KEY}shift-←/→${C_HELP} preview-wrap"
+prev=""
+for arg in "$@"; do
+    spec=""
+    case "${arg}" in
+        --bind=*)
+            spec="${arg#--bind=}"
+            ;;
+        --expect=*)
+            spec="${arg#--expect=}"
+            ;;
+        *)
+            case "${prev}" in
+                --bind|--expect)
+                    spec="${arg}"
+                    ;;
+            esac
+            ;;
+    esac
+    [ -n "${spec}" ] && mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
+    prev="${arg}"
+done
+keys_header="$(echo "${mapped_keys}" | awk '!seen[$0]++ { if (n++) printf " · "; printf "%s", $0 } END { print "" }')${C_RESET}"
+
 update_fzf() {
     local cmd="${1}"
     local port="${2}"
@@ -119,13 +196,13 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --border=top --border-label " ${keys_header} " --border-label-pos=3 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --border=top --border-label " ${keys_header} " --border-label-pos=3 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then

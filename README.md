@@ -1607,14 +1607,15 @@ key="$(readkey | tail -n1)"
 ```
 
 ### `fzf-with-header`
-A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command.
+A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed in the top border; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name.
 
-**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--watch <seconds>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
+**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-description <key>:<description> ...] [--watch <seconds>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
 
 | Argument / Flag | Description |
 |---|---|
 | `--command <command>` | Command whose output is piped into `fzf`; enables `--print-query` and is required for `--watch`. |
 | `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. |
+| `--key-description <key>:<description>` | Description shown for `<key>` in the top border instead of the inferred one; repeatable. Useful for `--expect` keys, whose effect lives in the `--key-command`. |
 | `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). |
 | `--columns <cols>` | Comma-separated columns to display (passed to `fzf --with-nth`). |
 | `--filter-columns <cols>` | Comma-separated columns to match against (passed to `fzf --nth`). |
@@ -1628,6 +1629,7 @@ A wrapper around `fzf` that treats the first input line as a fixed header, with 
 fzf-with-header --command "ps aux" --watch 5
 fzf-with-header --command "cat data.tsv" --columns 1,3 --delimiter $'\t'
 fzf-with-header docker -- --height=40%
+fzf-with-header --key-command handle-key --key-description "ctrl-x:delete entry" -- --expect=ctrl-x
 ```
 
 ---
