@@ -122,19 +122,19 @@ format_key_entry() {
     local entry="${1}"
     local key="${entry%%:*}"
     if [ -n "${key_desc[${key}]+x}" ]; then
-        echo "${C_KEY}${key}${C_HELP} ${key_desc[${key}]}"
+        printf '%s\t%s\n' "${key}" "${key_desc[${key}]}"
     elif [[ "${entry}" != *:* ]]; then
-        echo "${C_KEY}${entry}"
+        printf '%s\t\n' "${entry}"
     else
         local action="${entry#*:}"
         case "${action}" in
             execute\(*|execute-silent\(*|become\(*)
                 local body="${action#*\(}"
                 body="${body%)}"
-                echo "${C_KEY}${key}${C_HELP} ${body%% *}"
+                printf '%s\t%s\n' "${key}" "${body%% *}"
                 ;;
             *)
-                echo "${C_KEY}${key}${C_HELP} $(echo "${action}" | sed 's/([^)]*)//g')"
+                printf '%s\t%s\n' "${key}" "$(echo "${action}" | sed 's/([^)]*)//g')"
                 ;;
         esac
     fi
@@ -147,6 +147,30 @@ collect_keys() {
     done < <(split_key_spec "${1}")
 }
 
+# extract position and size from a --preview-window spec (other tokens ignored)
+preview_pos="right"
+preview_size="50"
+preview_size_pct=1
+parse_preview_window() {
+    local toks tok
+    IFS=',:' read -ra toks <<< "${1}"
+    for tok in "${toks[@]}"; do
+        case "${tok}" in
+            up|down|left|right)
+                preview_pos="${tok}"
+                ;;
+            [0-9]*%)
+                preview_size="${tok%\%}"
+                preview_size_pct=1
+                ;;
+            [0-9]*)
+                preview_size="${tok}"
+                preview_size_pct=0
+                ;;
+        esac
+    done
+}
+
 mapped_keys=""
 has_preview=0
 prev=""
@@ -155,8 +179,11 @@ for arg in "$@"; do
     case "${arg}" in
         --preview|--preview=*)
             # preview-wrap bindings only matter with a preview window
-            mapped_keys="${C_KEY}shift-←/→${C_HELP} preview-wrap"$'\n'"${mapped_keys}"
+            mapped_keys="shift-←/→"$'\t'"preview-wrap"$'\n'"${mapped_keys}"
             has_preview=1
+            ;;
+        --preview-window=*)
+            parse_preview_window "${arg#--preview-window=}"
             ;;
         --bind=*)
             spec="${arg#--bind=}"
@@ -169,6 +196,9 @@ for arg in "$@"; do
                 --bind|--expect)
                     spec="${arg}"
                     ;;
+                --preview-window)
+                    parse_preview_window "${arg}"
+                    ;;
             esac
             ;;
     esac
@@ -180,9 +210,17 @@ done
 if [ "${#key_desc_order[@]}" -gt 0 ]; then
     mapped_keys=""
     for desc_key in "${key_desc_order[@]}"; do
-        mapped_keys="${mapped_keys}${C_KEY}${desc_key}${C_HELP} ${key_desc[${desc_key}]}"$'\n'
+        mapped_keys="${mapped_keys}${desc_key}"$'\t'"${key_desc[${desc_key}]}"$'\n'
     done
 fi
+
+# merge keys sharing a description: "alt-+ stage" + "insert stage" -> "alt-+/insert stage"
+mapped_keys="$(echo "${mapped_keys}" | awk 'BEGIN { FS = OFS = "\t" }
+    $1 == "" { next }
+    seen[$0]++ { next }
+    $2 != "" && ($2 in slot) { keys[slot[$2]] = keys[slot[$2]] "/" $1; next }
+    { n++; keys[n] = $1; descs[n] = $2; if ($2 != "") slot[$2] = n }
+    END { for (i = 1; i <= n; i++) print keys[i], descs[i] }')"
 # wrap the key list to the terminal width (footer lines never soft-wrap);
 # widths are measured on the entry with its ANSI colors stripped, and fzf
 # indents the footer by 2 columns
@@ -190,25 +228,41 @@ term_cols="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
 [ -z "${term_cols}" ] && term_cols="$(tput cols 2>/dev/null)"
 [ -z "${term_cols}" ] && term_cols="${COLUMNS:-80}"
 max_line_width=$((term_cols - 4))
-# with a preview window the footer only spans the list half of the screen
-[ "${has_preview}" -eq 1 ] && max_line_width=$((term_cols / 2 - 4))
+# a left/right preview window shrinks the footer to the list pane; up/down
+# previews leave the full width
+if [ "${has_preview}" -eq 1 ]; then
+    case "${preview_pos}" in
+        left|right)
+            if [ "${preview_size_pct}" -eq 1 ]; then
+                list_cols=$(( term_cols * (100 - preview_size) / 100 ))
+            else
+                list_cols=$(( term_cols - preview_size ))
+            fi
+            max_line_width=$(( list_cols - 4 ))
+            ;;
+    esac
+fi
+[ "${max_line_width}" -lt 10 ] && max_line_width=10
 keys_header=""
 line_width=0
-declare -A seen_keys
-while IFS= read -r entry; do
-    [ -z "${entry}" ] && continue
-    [ -n "${seen_keys[${entry}]+x}" ] && continue
-    seen_keys["${entry}"]=1
-    plain="$(echo "${entry}" | sed $'s/\033\\[[0-9;]*m//g')"
+while IFS=$'\t' read -r entry_key entry_desc; do
+    [ -z "${entry_key}" ] && continue
+    if [ -n "${entry_desc}" ]; then
+        entry="${C_KEY}${entry_key}${C_HELP} ${entry_desc}"
+        entry_width=$(( ${#entry_key} + 1 + ${#entry_desc} ))
+    else
+        entry="${C_KEY}${entry_key}"
+        entry_width=${#entry_key}
+    fi
     if [ -z "${keys_header}" ]; then
         keys_header="${entry}"
-        line_width=${#plain}
-    elif [ $((line_width + 3 + ${#plain})) -le ${max_line_width} ]; then
+        line_width=${entry_width}
+    elif [ $((line_width + 3 + entry_width)) -le ${max_line_width} ]; then
         keys_header="${keys_header} · ${entry}"
-        line_width=$((line_width + 3 + ${#plain}))
+        line_width=$((line_width + 3 + entry_width))
     else
         keys_header="${keys_header}"$'\n'"${entry}"
-        line_width=${#plain}
+        line_width=${entry_width}
     fi
 done <<< "${mapped_keys}"
 footer_args=()
