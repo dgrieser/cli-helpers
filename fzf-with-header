@@ -145,11 +145,15 @@ collect_keys() {
     done < <(split_key_spec "${1}")
 }
 
-mapped_keys="${C_KEY}shift-←/→${C_HELP} preview-wrap"
+mapped_keys=""
 prev=""
 for arg in "$@"; do
     spec=""
     case "${arg}" in
+        --preview|--preview=*)
+            # preview-wrap bindings only matter with a preview window
+            mapped_keys="${C_KEY}shift-←/→${C_HELP} preview-wrap"$'\n'"${mapped_keys}"
+            ;;
         --bind=*)
             spec="${arg#--bind=}"
             ;;
@@ -167,7 +171,7 @@ for arg in "$@"; do
     [ -n "${spec}" ] && mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
     prev="${arg}"
 done
-keys_header="$(echo "${mapped_keys}" | awk '!seen[$0]++ { if (n++) printf " · "; printf "%s", $0 } END { print "" }')${C_RESET}"
+keys_header="$(echo "${mapped_keys}" | awk '$0 == "" { next } !seen[$0]++ { if (n++) printf " · "; printf "%s", $0 } END { print "" }')${C_RESET}"
 
 update_fzf() {
     local cmd="${1}"
