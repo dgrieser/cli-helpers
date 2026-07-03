@@ -146,6 +146,7 @@ collect_keys() {
 }
 
 mapped_keys=""
+has_preview=0
 prev=""
 for arg in "$@"; do
     spec=""
@@ -153,6 +154,7 @@ for arg in "$@"; do
         --preview|--preview=*)
             # preview-wrap bindings only matter with a preview window
             mapped_keys="${C_KEY}shift-←/→${C_HELP} preview-wrap"$'\n'"${mapped_keys}"
+            has_preview=1
             ;;
         --bind=*)
             spec="${arg#--bind=}"
@@ -171,7 +173,36 @@ for arg in "$@"; do
     [ -n "${spec}" ] && mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
     prev="${arg}"
 done
-keys_header="$(echo "${mapped_keys}" | awk '$0 == "" { next } !seen[$0]++ { if (n++) printf " · "; printf "%s", $0 } END { print "" }')${C_RESET}"
+# wrap the key list to the terminal width (footer lines never soft-wrap);
+# widths are measured on the entry with its ANSI colors stripped, and fzf
+# indents the footer by 2 columns
+term_cols="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
+[ -z "${term_cols}" ] && term_cols="$(tput cols 2>/dev/null)"
+[ -z "${term_cols}" ] && term_cols="${COLUMNS:-80}"
+max_line_width=$((term_cols - 4))
+# with a preview window the footer only spans the list half of the screen
+[ "${has_preview}" -eq 1 ] && max_line_width=$((term_cols / 2 - 4))
+keys_header=""
+line_width=0
+declare -A seen_keys
+while IFS= read -r entry; do
+    [ -z "${entry}" ] && continue
+    [ -n "${seen_keys[${entry}]+x}" ] && continue
+    seen_keys["${entry}"]=1
+    plain="$(echo "${entry}" | sed $'s/\033\\[[0-9;]*m//g')"
+    if [ -z "${keys_header}" ]; then
+        keys_header="${entry}"
+        line_width=${#plain}
+    elif [ $((line_width + 3 + ${#plain})) -le ${max_line_width} ]; then
+        keys_header="${keys_header} · ${entry}"
+        line_width=$((line_width + 3 + ${#plain}))
+    else
+        keys_header="${keys_header}"$'\n'"${entry}"
+        line_width=${#plain}
+    fi
+done <<< "${mapped_keys}"
+footer_args=()
+[ -n "${keys_header}" ] && footer_args=(--footer "${keys_header}${C_RESET}")
 
 update_fzf() {
     local cmd="${1}"
@@ -204,13 +235,13 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 --border=top --border-label " ${keys_header} " --border-label-pos=3 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 --border=top --border-label " ${keys_header} " --border-label-pos=3 --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
