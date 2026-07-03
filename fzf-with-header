@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-description <key>:<description> ...] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -49,10 +49,14 @@ while [ $# -gt 0 ]; do
             key_cmd="${1}"
             print_query=1
             ;;
-        --key-description)
+        --key-descriptions)
             shift
-            [[ "${1}" != *:* ]] && usage
-            key_desc["${1%%:*}"]="${1#*:}"
+            [ -z "${1}" ] && usage
+            IFS=',' read -ra desc_pairs <<< "${1}"
+            for desc_pair in "${desc_pairs[@]}"; do
+                [[ "${desc_pair}" != *:* ]] && usage
+                key_desc["${desc_pair%%:*}"]="${desc_pair#*:}"
+            done
             ;;
         --watch)
             shift
