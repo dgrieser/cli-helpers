@@ -15,6 +15,7 @@ C_RESET=$'\033[0m'
 cmd=""
 key_cmd=""
 declare -A key_desc
+key_desc_order=()
 args=""
 query=""
 delimiter='  +'
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
             for desc_pair in "${desc_pairs[@]}"; do
                 [[ "${desc_pair}" != *:* ]] && usage
                 key_desc["${desc_pair%%:*}"]="${desc_pair#*:}"
+                key_desc_order+=("${desc_pair%%:*}")
             done
             ;;
         --watch)
@@ -173,6 +175,14 @@ for arg in "$@"; do
     [ -n "${spec}" ] && mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
     prev="${arg}"
 done
+
+# explicit --key-descriptions: show exactly those keys, in the given order
+if [ "${#key_desc_order[@]}" -gt 0 ]; then
+    mapped_keys=""
+    for desc_key in "${key_desc_order[@]}"; do
+        mapped_keys="${mapped_keys}${C_KEY}${desc_key}${C_HELP} ${key_desc[${desc_key}]}"$'\n'
+    done
+fi
 # wrap the key list to the terminal width (footer lines never soft-wrap);
 # widths are measured on the entry with its ANSI colors stripped, and fzf
 # indents the footer by 2 columns
