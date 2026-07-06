@@ -43,24 +43,30 @@ else:
 '
 }
 
+call_bridge_string() {
+    local output
+    output="$(call_bridge "${@}")" || exit 1
+    unquote_gvariant_string <<<"${output}"
+}
+
 [ "$#" -ge 1 ] || usage
 
 case "${1}" in
     list)
-        call_bridge ListWindows | unquote_gvariant_string
+        call_bridge_string ListWindows
         ;;
     active)
-        call_bridge GetActiveWindow | unquote_gvariant_string
+        call_bridge_string GetActiveWindow
         ;;
     focus)
         [ "$#" -eq 2 ] || usage
         call_bridge FocusWindow "${2}" >/dev/null
         ;;
     pointer-monitor)
-        call_bridge GetPointerMonitor | unquote_gvariant_string
+        call_bridge_string GetPointerMonitor
         ;;
     active-monitor)
-        call_bridge GetActiveWindowMonitor | unquote_gvariant_string
+        call_bridge_string GetActiveWindowMonitor
         ;;
     set-above)
         [ "$#" -eq 2 ] || usage
