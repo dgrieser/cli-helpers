@@ -1,0 +1,48 @@
+# bash completion for cli-helpers tools.
+#
+# This file is installed once to the bash-completion completions directory
+# and gets one symlink per tool pointing at it. The bash-completion lazy
+# loader sources the symlink named after the command being completed, so the
+# registration at the bottom picks the command name from $1 (passed by newer
+# bash-completion versions) or from the sourced file name.
+#
+# Completion words are derived from the tool itself, in order of preference:
+#   1. If the tool implements a --bash-completion flag, run it with the
+#      previous word as argument and use its output (allows dynamic values).
+#   2. Python tools: option strings from argparse add_argument() calls.
+#   3. Bash tools: option names from the case labels of the argument loop.
+# Positional arguments fall back to default filename completion.
+
+_cli_helpers() {
+    local cmd="${1}" cur="${2}" prev="${3}"
+    local path words shebang
+
+    path="$(type -P "${cmd}")" || return
+    path="$(readlink -f -- "${path}" 2>/dev/null || echo "${path}")"
+    [ -r "${path}" ] || return
+
+    if grep -qE '^[[:space:]]*"?--bash-completion"?\)' "${path}"; then
+        words="$("${path}" --bash-completion "${prev}" 2>/dev/null)"
+    elif [[ "${cur}" != -* ]]; then
+        # Static parsing only yields option names; leave positional
+        # arguments to the default filename completion.
+        return
+    else
+        IFS= read -r shebang < "${path}"
+        if [[ "${shebang}" == *python* ]]; then
+            words="$(tr '\n' ' ' < "${path}" \
+                | grep -oE 'add_argument\([^)]*' \
+                | grep -oE "['\"]--?[A-Za-z0-9?][A-Za-z0-9_-]*['\"]" \
+                | tr -d "\"'" | sort -u)"
+            [ -n "${words}" ] && words="${words} -h --help"
+        else
+            words="$(grep -E '^[[:space:]]*-[-A-Za-z0-9?@|[:space:]"]*\)[[:space:]]*$' "${path}" \
+                | tr -d ' \t")' | tr '|' '\n' \
+                | grep -E '^--?[A-Za-z0-9?]' | sort -u)"
+        fi
+    fi
+
+    mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${cur}")
+}
+
+complete -F _cli_helpers -o default -o bashdefault "${1:-${BASH_SOURCE[0]##*/}}"
