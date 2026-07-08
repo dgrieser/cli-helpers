@@ -495,6 +495,7 @@ Edits or creates a file or command using an AI CLI tool (such as Codex) inside a
 |---|---|
 | `COMMAND` | The command or file to edit. Absolute paths (`/`) and relative paths (`./`) are used directly; otherwise resolved via `which`, falling back to `/usr/local/bin/<COMMAND>`. |
 | `-h, --help` | Show the help message. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -584,6 +585,7 @@ Edits or creates a file or command in vim (using sudo when needed), making new f
 |---|---|
 | `COMMAND` | The file or command to edit. Absolute (`/...`) and relative (`./...`) paths are used directly; otherwise resolved via `which`, falling back to `/usr/local/bin/COMMAND`. |
 | `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -1094,6 +1096,7 @@ Prints the contents of a script or command, resolving a bare command name throug
 | Argument / Flag | Description |
 |---|---|
 | `<file\|command>` | An absolute path, a `./` relative path, or a command name to resolve via `which` and print. |
+| `--bash-completion` | Output shell-completion candidates (every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -1111,6 +1114,7 @@ Copies one executable/script over another using sudo, resolving each argument th
 | `-h, --help` | Show usage and exit. |
 | `<command-source>` | Source command/script (resolved via path, `which`, or `/usr/local/bin/<name>`; must exist). |
 | `<command-target>` | Destination command/script, resolved the same way; copied to with `sudo cp -v`. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -1128,6 +1132,7 @@ Moves (renames) one executable to another using `sudo`, resolving each argument 
 | `-h, --help` | Show the usage message and exit. |
 | `<command-source>` | Source command or path to move. |
 | `<command-target>` | Target command or path. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -1143,6 +1148,7 @@ Installs a file or command into `/usr/local/bin` as a root-owned, executable cop
 | Argument / Flag | Description |
 |---|---|
 | `<file\|command>` | A file path, or a command name resolved via `which`, to copy into `/usr/local/bin`. |
+| `--bash-completion` | Output shell-completion candidates (every command in `PATH`). |
 
 **Examples:**
 ```bash
@@ -1397,6 +1403,7 @@ Prints information about a command, bash function, or alias, including its resol
 | `-l, --lines <#>` | Number of content lines to print (default 10). |
 | `-L, --all-lines` | Print all content lines. |
 | `-h, --help` | Print the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags plus commands, functions, and aliases). |
 
 **Examples:**
 ```bash

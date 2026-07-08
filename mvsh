@@ -27,6 +27,11 @@ command_target=""
 
 while [ ${#} -gt 0 ]; do
     case "${1}" in
+        --bash-completion)
+            # Both positionals are commands in PATH.
+            echo "-h --help $(compgen -c | sort -u | tr '\n' ' ')"
+            exit 0
+            ;;
         -h|--help)
             usage
             ;;

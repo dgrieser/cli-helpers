@@ -32,6 +32,17 @@ abort() {
     exit 1
 }
 
+completion() {
+    # COMMAND may be a command in PATH, a shell function, or an alias.
+    # Source the same files whichis reads so compgen sees functions/aliases.
+    shopt -s expand_aliases
+    [ -f /etc/profile ] && source /etc/profile &>/dev/null
+    [ -f ~/.profile ] && source ~/.profile &>/dev/null
+    [ -f ~/.bash_aliases ] && source ~/.bash_aliases &>/dev/null
+    echo "-h --help -l --lines -L --all-lines $(compgen -c | sort -u | tr '\n' ' ')"
+    exit 0
+}
+
 function print_content() {
     local max_lines="${1}"; shift
     local content="${1}"; shift
@@ -55,6 +66,9 @@ cmd=""
 lines=10
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
+        --bash-completion)
+            completion
+            ;;
         -h|--help)
             usage
             ;;

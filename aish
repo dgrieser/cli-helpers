@@ -37,6 +37,12 @@ abort() {
     exit 1
 }
 
+completion() {
+    # The COMMAND positional is any command in PATH.
+    echo "-h --help $(compgen -c | sort -u | tr '\n' ' ')"
+    exit 0
+}
+
 syntax-check() {
     local file="${1}"
     local shebang
@@ -63,6 +69,9 @@ file_or_cmd=""
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
+        --bash-completion)
+            completion
+            ;;
         -h|--help)
             usage
             ;;

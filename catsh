@@ -1,5 +1,13 @@
 #!/bin/bash
 
+case "${1}" in
+    --bash-completion)
+        # The <file|command> positional is any command in PATH.
+        compgen -c | sort -u
+        exit 0
+        ;;
+esac
+
 if [ $# -lt 1 ]; then
     echo "Usage: "$(basename ${0})" <file|command>"
     exit 1
