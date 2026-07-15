@@ -6,6 +6,7 @@ LIBDIR ?= $(PREFIX)/lib/cli-helpers
 COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
 COMPLETION := bash_completion/cli-helpers
 ENABLE_GNOME_EXTENSION ?= 1
+UPDATE_ARGS ?=
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
 EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
@@ -17,13 +18,14 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list install install-links extension-zip install-gnome-extension install-completions install-completions-links uninstall list-install
+.PHONY: list update install install-links extension-zip install-gnome-extension install-completions install-completions-links uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
 	@printf '  make list                     Show this help and available commands\n'
 	@printf '  make list-install             Show install destinations and installed files\n'
 	@printf '  make extension-zip            Package the GNOME extension\n'
+	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
@@ -31,6 +33,9 @@ list:
 	@printf '  sudo make uninstall           Remove installed files\n'
 	@printf '\nAvailable commands:\n'
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
+
+update:
+	./updater $(UPDATE_ARGS)
 
 install:
 	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"; do \

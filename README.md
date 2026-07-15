@@ -16,6 +16,7 @@ The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` 
 
 ```bash
 make list                     # show targets and the full command list
+make update                   # update installed software (use UPDATE_ARGS='--dry-run apt')
 sudo make install-links       # install as symlinks back to this repo (no copy)
 sudo make install             # copy commands + shared helpers + GNOME extension
 sudo make uninstall           # remove installed files
@@ -1790,6 +1791,30 @@ Reports the currently logged-in graphical-session user, optionally as a numeric 
 loggedin
 loggedin --id
 loggedin --home
+```
+
+### `updater`
+Updates a selectable set of system packages, desktop applications, and CLI tools using their appropriate package managers, vendor repositories, install scripts, or Git releases. With no software arguments, it processes every supported type except entries explicitly disabled in the script.
+
+**Usage:** `updater [OPTIONS] [SOFTWARE ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SOFTWARE` | One or more software types to update, or `all`; omit to process all supported types. |
+| `-d, --dry-run` | Check for updates without installing them. |
+| `-t, --types TYPES` | Deprecated comma-separated alternative to positional software types. |
+| `--verbose` | Print commands and additional update details. |
+| `-h, --help` | Show usage and the current list of supported software types. |
+| `--bash-completion` | Output completion candidates (flags plus software types). |
+
+The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`. Update methods have tool-specific dependencies such as `apt`, `flatpak`, `npm`, `curl`, `jq`, and `install-git-release`.
+
+**Examples:**
+```bash
+updater --dry-run apt flatpak
+updater codex claude
+updater --verbose all
+make update UPDATE_ARGS='--dry-run apt'
 ```
 
 ### `bluetooth-trigger`

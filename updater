@@ -1,0 +1,977 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+PLATFORM="$(dpkg --print-architecture)"
+UPDATE_MESSAGE="Running %PKGNAME% upgrade"
+# shellcheck disable=SC1090
+[ -f /etc/os-release ] && source <(sed -E 's/^([A-Z0-9_]+)=/OS_RELEASE_\1=/' /etc/os-release)
+
+possible_install_types=(
+    adb
+    albert
+    antigravity
+    apt
+    aws
+    boodschapper
+    chrome
+    claude
+    code
+    codex
+    dive
+    firmware
+    flatpak
+    gemini
+    gh
+    gitlab-ci-local
+    glab
+    gitlab_trackr
+    gnome-ext-hanabi
+    gradia
+    helm
+    himalaya
+    hwatch
+    kilocode
+    kubectl-mw
+    kubecolor
+    lazygit
+    mc
+    mw
+    nexus-cli
+    npm
+    nickpit
+    opencode
+    powerline-fonts
+    qwen
+    rampart
+    slack
+    snaxus-cli
+    spotify
+    threema
+    trivy
+    ueberzugpp
+    viddy
+    wezterm
+    yazi
+    yq
+    zed
+    zoom
+)
+
+
+disabled_install_types=(
+    ueberzugpp
+    albert
+    gnome-ext-hanabi
+)
+
+selected=""
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+verbose() {
+    [ "${verbose}" -eq 1 ] && echo "+ ${1}" 1>&2
+}
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] SOFTWARE ...
+
+Run ${APP_NAME} to update software.
+
+SOFTWARE         Software to update, all if omitted.
+                 Can be one of: $(echo "${possible_install_types[@]}" | tr ' ' ',')
+
+Options:
+  -h, --help          display this help and exit
+  -d, --dry-run       dry-run mode
+  -t, --types TYPES   comma separated list of install types (deprecated)
+  --verbose           verbose mode
+  --bash-completion   print shell completion candidates and exit
+EOF
+    exit 1
+}
+
+is_interactive() {
+    if [ -t 0 ] && [ -t 1 ]; then
+        return 0
+    fi
+    return 1
+}
+
+is_selected() {
+    local list="${selected_install_types[*]}"
+    local disabled_list="${disabled_install_types[*]}"
+    local item="${1}"
+    local result=1
+    [ -z "${list}" ] && return 1
+    [ -z "${item}" ] && return 1
+    echo "${list}" | grep -wq "${item}" && result=0 || result=1
+    [ "${result}" -eq 0 ] && echo "${disabled_list}" | grep -wq "${item}" && echo "WARNING: ${item} is disabled" 1>&2 && result=1
+    [ "${result}" -eq 0 ] && echo 1>&2 && echo "${APP_NAME}: ${UPDATE_MESSAGE//%PKGNAME%/${item}}" 1>&2 && export selected="${item}"
+    return ${result}
+}
+
+apt_add_with_list_file() {
+    local name="${1}"; shift
+    local list_url="${1}"; shift
+    local repo_key_url="${1}"; shift
+    local repo_list_path="/etc/apt/sources.list.d/${name}.list"
+    local repo_gpg_path="/etc/apt/keyrings/${name}-repo-key.gpg"
+
+    local repo_key_ext
+    repo_key_ext="$(echo "${repo_key_url}" | grep -oE "\.[a-z]{3}$")"
+    [ -z "${repo_key_ext}" ] && repo_key_ext=".gpg"
+
+    local file_args=()
+    [ "${verbose}" -eq 1 ] && file_args+=("-v")
+
+    [ "${verbose}" -eq 1 ] && echo "+ mktemp --suffix \".list\"" 1>&2
+    local tmp_list_file
+    local tmp_key_file=""
+    tmp_list_file="$(mktemp --suffix ".list")"
+    trap 'rm -f "${tmp_list_file}" "${tmp_key_file}"; trap - RETURN' RETURN
+    [ "${verbose}" -eq 1 ] && echo "+ tmp_list_file=${tmp_list_file}" 1>&2
+
+
+    [ "${verbose}" -eq 1 ] && echo "+ curl -fsSL ${list_url} > ${tmp_list_file}" 1>&2
+    curl -fsSL "${list_url}" > "${tmp_list_file}" || return 1
+
+    if [ "${dry_run}" -eq 0 ]; then
+        [ "${verbose}" -eq 1 ] && echo "+ mktemp --suffix \".${repo_key_ext}\"" 1>&2
+        tmp_key_file="$(mktemp --suffix "${repo_key_ext}")"
+        [ "${verbose}" -eq 1 ] && echo "+ tmp_key_file=${tmp_key_file}" 1>&2
+
+        [ "${verbose}" -eq 1 ] && echo "+ curl -fsSL ${repo_key_url} > ${tmp_key_file}" 1>&2
+        curl -fsSL "${repo_key_url}" > "${tmp_key_file}" || return 1
+
+        [ "${verbose}" -eq 1 ] && echo "+ gpg --with-colons --import-options show-only --import ${tmp_key_file} | awk -F: '\$1 == \"pub\" { print \$7; exit }" 1>&2
+        expiry_timestamp="$(gpg --with-colons --import-options show-only --import "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "pub" { print $7; exit }')"
+        [ -z "${expiry_timestamp}" ] && expiry_timestamp="0" && echo "WARNING: Failed to get expiry timestamp of ${repo_key_url}" 1>&2
+        expiry_date="$([ "${expiry_timestamp}" -gt "0" ] && date --date=@"${expiry_timestamp}" +%Y-%m-%d || echo "No expiry date" )"
+        now_timestamp="$(date +%s)"
+        if (( expiry_timestamp > 0 )) && (( expiry_timestamp < now_timestamp )); then
+            echo "ERROR: ${repo_key_url} has expired at ${expiry_date}" 1>&2
+            return 1
+        elif [ "${verbose}" -eq 1 ]; then
+            echo "+ expiry_date=${expiry_date}" 1>&2
+        fi
+
+        # parse keypath from list file
+        [ "${verbose}" -eq 1 ] && echo "+ grep -Eo -m 1 'signed-by=[^] ,]+' | ${tmp_list_file} | cut -d= -f2" 1>&2
+        key_path="$(grep -Eo -m 1 'signed-by=[^] ,]+' "${tmp_list_file}" | cut -d= -f2)"
+        [ "${verbose}" -eq 1 ] && echo "+ key_path='${key_path}'"
+        [ -n "${key_path}" ] && repo_gpg_path="${key_path}"
+
+        [ "${verbose}" -eq 1 ] && echo "+ mv ${file_args[*]} ${tmp_list_file} ${repo_list_path}" 1>&2
+        ${SUDO} LC_ALL=C mv "${file_args[@]}" "${tmp_list_file}" "${repo_list_path}" 2>&1 | sed 's/^/+ /' 1>&2
+
+        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} mkdir -p ${file_args[*]} $(dirname "${repo_gpg_path}")" 1>&2
+        ${SUDO} LC_ALL=C mkdir -p "${file_args[@]}" "$(dirname "${repo_gpg_path}")" 2>&1 | sed 's/^/+ /' 1>&2
+
+        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} gpg --dearmor --yes -o ${repo_gpg_path} < ${tmp_key_file}" 1>&2
+        ${SUDO} LC_ALL=C gpg --dearmor --yes -o "${repo_gpg_path}" < "${tmp_key_file}" || return 1
+
+        if [ "${verbose}" -eq 1 ]; then
+            echo "+ gpg --no-options --show-keys --with-fingerprint ${repo_gpg_path}"
+            LC_ALL=C ${SUDO_USER} gpg --no-options --show-keys --with-fingerprint "${repo_gpg_path}" 2>&1 | sed 's/^/+ /' 1>&2
+        fi
+    else
+        echo "Changes from ${list_url}:"
+        diff --color=always -u "${repo_list_path}" "${tmp_list_file}" 1>&2
+    fi
+
+    apt_upgrade "${name}"
+}
+
+apt_add_with_repo() {
+    local name="${1}"; shift
+    local repo_url="${1%/}"; shift
+
+    local repo_suite="${1}"; shift
+    [ -z "${repo_suite}" ] && repo_suite="/"
+
+    local repo_components="${1}"; shift
+
+    local repo_key_url="${1}"; shift
+    [ -z "${repo_key_url}" ] && repo_key_url="${repo_url}/Release.key"
+
+    local expected_repo_key_fingerprint="${1}"
+
+    local repo_key_ext
+    repo_key_ext="$(echo "${repo_key_url}" | grep -oE "\.[a-z]{3}$")"
+    [ -z "${repo_key_ext}" ] && repo_key_ext=".gpg"
+
+    local repo_list_path="/etc/apt/sources.list.d/${name}.list"
+    local repo_gpg_path="/etc/apt/keyrings/${name}-repo-key.gpg"
+    local repo_line="deb [signed-by=${repo_gpg_path}] ${repo_url}/ ${repo_suite}"
+    [ -n "${repo_components}" ] && repo_line="${repo_line} ${repo_components}"
+
+    if [ "${dry_run}" -eq 0 ]; then
+        ${SUDO} mkdir -p /etc/apt/keyrings
+        local tmp_key_file
+        tmp_key_file="$(mktemp --suffix "${repo_key_ext}")"
+        [ "${verbose}" -eq 1 ] && echo "+ curl -fsSL ${repo_key_url} > ${tmp_key_file}" 1>&2
+        if ! curl -fsSL "${repo_key_url}" > "${tmp_key_file}"; then
+            rm -f "${tmp_key_file}"
+            return 1
+        fi
+
+        local repo_key_fingerprint
+        repo_key_fingerprint="$(gpg --show-keys --with-colons "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+        if [ -z "${repo_key_fingerprint}" ]; then
+            error "No valid OpenPGP key found at ${repo_key_url}"
+            rm -f "${tmp_key_file}"
+            return 1
+        fi
+        if [ -n "${expected_repo_key_fingerprint}" ] && [ "${repo_key_fingerprint}" != "${expected_repo_key_fingerprint}" ]; then
+            error "Unexpected key fingerprint from ${repo_key_url}: ${repo_key_fingerprint}"
+            rm -f "${tmp_key_file}"
+            return 1
+        fi
+
+        [ "${verbose}" -eq 1 ] && echo "+ gpg --with-colons --import-options show-only --import ${tmp_key_file} | awk -F: '\$1 == \"pub\" { print \$7; exit }" 1>&2
+        expiry_timestamp="$(gpg --with-colons --import-options show-only --import "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "pub" { print $7; exit }')"
+        [ -z "${expiry_timestamp}" ] && expiry_timestamp="0"
+        expiry_date="$([ "${expiry_timestamp}" -gt "0" ] && date --date=@"${expiry_timestamp}" +%Y-%m-%d || echo "No expiry date" )"
+        now_timestamp="$(date +%s)"
+        if (( expiry_timestamp > 0 )) && (( expiry_timestamp < now_timestamp )); then
+            echo "ERROR: ${repo_key_url} has expired at ${expiry_date}" 1>&2
+            return 1
+        elif [ "${verbose}" -eq 1 ]; then
+            echo "+ expiry_date=${expiry_date}" 1>&2
+        fi
+        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} gpg --dearmor --yes -o ${repo_gpg_path} < ${tmp_key_file}" 1>&2
+        LC_ALL=C ${SUDO} gpg --dearmor --yes -o "${repo_gpg_path}" < "${tmp_key_file}" || return 1
+        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} chmod 644 ${repo_gpg_path}" 1>&2
+        LC_ALL=C ${SUDO} chmod 644 "${repo_gpg_path}" || return 1
+
+        if [ "${verbose}" -eq 1 ]; then
+            echo "+ gpg --no-options --show-keys --with-fingerprint ${repo_gpg_path}"
+            LC_ALL=C ${SUDO_USER} gpg --no-options --show-keys --with-fingerprint "${repo_gpg_path}" 2>&1 | grep -v "^$" | sed 's/^/+ /' 1>&2
+        fi
+
+        rm_args=( "${tmp_key_file}" )
+        [ "${verbose}" -eq 1 ] && rm_args+=( "-v" ) && echo "+ rm ${rm_args[*]}" 1>&2
+        LC_ALL=C rm "${rm_args[@]}" 2>&1 | sed 's/^/+ /' 1>&2
+        [ "${verbose}" -eq 1 ] && echo "+ echo ${repo_line} | ${SUDO} tee ${repo_list_path} > /dev/null" 1>&2
+        echo "${repo_line}" | ${SUDO} tee "${repo_list_path}" > /dev/null
+    else
+        current_repo_line="$(cat "${repo_list_path}" 2>/dev/null)"
+        if [ -z "${current_repo_line}" ]; then
+            echo "Would write ${repo_line} to ${repo_list_path}" 1>&2
+        elif [ "${current_repo_line}" != "${repo_line}" ]; then
+            echo "Would update to ${repo_line} from ${current_repo_line}" 1>&2
+        fi
+    fi
+    apt_upgrade "${name}"
+}
+
+apt_upgrade() {
+    local pkg="${1}"
+    echo "${APP_NAME}: Updating sources..." 1>&2
+    local apt_exit_code=-1
+    if [ "${verbose}" -eq 1 ]; then
+        LC_ALL=C ${SUDO} apt-get update
+        apt_exit_code=$?
+    else
+        local apt_update_output
+        apt_update_output="$(LC_ALL=C ${SUDO} apt-get update 2>&1)"
+        apt_exit_code=$?
+        [ ${apt_exit_code} -ne 0 ] && echo "${apt_update_output}" 1>&2
+    fi
+    [ ${apt_exit_code} -ne 0 ] && return 1
+
+    if [ "${dry_run}" -eq 0 ]; then
+        if [ -n "${pkg}" ]; then
+            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkg}" 1>&2
+        else
+            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 1>&2 \
+                && LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 1>&2
+        fi
+    else
+        apt_list_output="$(LC_ALL=C ${SUDO} apt list "${pkg}" --upgradable 2>/dev/null)"
+        apt_list_output="$(echo "${apt_list_output}" | awk -F'[][]' '
+  /^Listing/ { next }
+  /upgradable from:/ {
+    pkg = $1
+    sub(/\/.*/, "", pkg)       # remove /repo and everything after
+
+    new = $1
+    sub(/^[^ ]+ /, "", new)
+    sub(/ .*/, "", new)
+
+    old = $2
+    sub(/^upgradable from: /, "", old)
+
+    printf "%s\t%s\t%s\n", pkg, old, new
+  }
+')"
+        if [ -n "${apt_list_output}" ]; then
+            echo -e "NAME\tCURRENT\tUPDATE\n${apt_list_output}" | column -t -s $'\t'
+        else
+            echo "${pkg:-apt} is up to date" 1>&2
+        fi
+    fi
+}
+
+helm_plugin_update() {
+    local name="${1}"; shift
+    local url="${1}"; shift
+
+    if [ "${dry_run}" -eq 1 ]; then
+        if ${SUDO_USER} helm plugin list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qFx "${name}"; then
+            echo "Would update Helm plugin ${name}" 1>&2
+        else
+            echo "Would install Helm plugin ${name} from ${url}" 1>&2
+        fi
+        return 0
+    fi
+
+    if ${SUDO_USER} helm plugin list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qFx "${name}"; then
+        verbose "${SUDO_USER} helm plugin update ${name}"
+        ${SUDO_USER} helm plugin update "${name}"
+    else
+        verbose "${SUDO_USER} helm plugin install --verify=false ${url}"
+        ${SUDO_USER} helm plugin install --verify=false "${url}"
+    fi
+}
+
+flatpak_list_updates() {
+    local pkg="${1}"
+    all_updates="$(join -t $'\t' -j 1 <(flatpak list --app --columns=name,version | tail -n +2 | sort) <(flatpak remote-ls --updates --app --columns=name,version | tail -n +2 | sort))"
+    if [ -n "${pkg}" ]; then
+        updates="$(echo "${all_updates}" | grep -w "${pkg}")"
+    else
+        updates="${all_updates}"
+    fi
+    # now remove all rows without version changes
+    updates="$(echo "${updates}" | awk -F $'\t' '{if ($2 != $3) print $0}')"
+    if [ -n "${updates}" ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\n${updates}" | column -t -s $'\t'
+    else
+        echo "${pkg:-flatpak} is up to date" 1>&2
+    fi
+}
+
+flatpak_update() {
+    local pkg="${1}"
+    if [ "${dry_run}" -eq 0 ]; then
+        if [ -n "${pkg}" ]; then
+            # check if installed
+            if ${SUDO_USER} flatpak list --app --columns=application 2>/dev/null | tail -n +1 | grep -qFx "${pkg}"; then
+                ${SUDO_USER} flatpak update -y "${pkg}"
+            else
+                ${SUDO_USER} flatpak install -y "${pkg}"
+            fi
+        else
+            ${SUDO_USER} flatpak update -y
+        fi
+    else
+        flatpak_list_updates "${pkg}" 
+    fi
+}
+
+curl_update() {
+    local pkg="${1}"; shift   
+    local url="${1}"; shift
+    [ -z "${url}" ] && echo "ERROR: curl_update requires a URL" 1>&2 && return 1
+    [ -z "${pkg}" ] && echo "ERROR: curl_update requires a package name" 1>&2 && return 1
+    curl_args=( "--fail" "--location" )
+    [ "${verbose}" -eq 0 ] && curl_args+=( "--silent" "--show-error" )
+    curl_args+=( "${url}" )
+    if [ "${dry_run}" -eq 0 ]; then
+        [ "${verbose}" -eq 1 ] && echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash" 1>&2
+        curl "${curl_args[@]}" | ${SUDO_USER} bash
+    else
+        echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash"
+    fi
+}
+
+npm_update() {
+    local pkg="${1}"; shift
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "${1}" in
+            -f|--force)
+                force=1
+                ;;
+            *)
+                echo "ERROR: Unrecognized option: ${1}" 1>&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+    
+    local target_dir
+    target_dir="$(npm-pkg-dir "${pkg}")"
+    local backup_dir="${target_dir}.old"
+    local npm_json
+    local npm_table
+    [ -z "${pkg}" ] && echo "ERROR: npm_update requires a package name" 1>&2 && return 1
+
+    local sudo=""
+    if [ -d "${target_dir}" ] && [ ! -w "${target_dir}" ]; then
+        sudo="${SUDO}"
+    fi
+
+    if [ "${dry_run}" -eq 0 ]; then
+        if [ "${force}" -eq 1 ]; then
+            if [ -d "${backup_dir}" ]; then
+                [ "${verbose}" -eq 1 ] && echo "+ ${sudo} rm -rf ${backup_dir}" 1>&2
+                ${sudo} rm -rf "${backup_dir}"
+            fi
+            if [ -d "${target_dir}" ]; then
+                [ "${verbose}" -eq 1 ] && echo "+ ${sudo} mv ${target_dir} ${backup_dir}" 1>&2
+                ${sudo} mv "${target_dir}" "${backup_dir}"
+            fi
+        fi
+        npm_args=("install" "-g" "${pkg}")
+        [ "${verbose}" -eq 1 ] && npm_args+=("--verbose")
+        [ "${verbose}" -eq 1 ] && echo "+ ${sudo} npm ${npm_args[*]}" 1>&2
+        ${sudo} npm install "${npm_args[@]}"
+    else
+        if ! npm_json="$(NODE_PATH="/usr/lib/node_modules" npm outdated -g "${pkg}" --json)"; then
+            npm_table="$(echo "${npm_json}" | \
+                         jq -r 'to_entries[] | [.key, (.value.current // "<unknown>"), .value.wanted] | @tsv')"
+            echo -e "NAME\tCURRENT\tUPDATE\n${npm_table}" | column -t -s $'\t'
+        else
+            echo "${pkg} is up to date" 1>&2
+        fi
+    fi 
+}
+
+install_git_release() {
+    local url="${1}"; shift
+    local install_git_args=()
+    while [ $# -gt 0 ]; do
+        install_git_args+=("${1}")
+        shift
+    done
+    [ "${dry_run}" -eq 1 ] && install_git_args+=("--dry-run")
+    [ "${dry_run}" -eq 0 ] && install_git_args+=("--yes")
+    install-git-release "${url}" "${install_git_args[@]}"
+}
+
+install_from_git() {
+    local url=""
+    local branch=""
+    local script=""
+    local script_args=()
+    while [ $# -gt 0 ]; do
+        case "${1}" in
+            -b|--branch)
+                if [ -z "${branch}" ]; then
+                    shift
+                    branch="${1}"
+                else
+                    script_args+=("${1}")
+                fi
+                ;;
+            *)
+                if [ -z "${url}" ]; then
+                    url="${1}"
+                elif [ -z "${script}" ]; then
+                    script="${1}"
+                else
+                    script_args+=("${1}")
+                fi
+                ;;
+        esac
+        shift
+    done
+    [ -z "${url}" ] && echo "ERROR: install_from_git requires a URL" 1>&2 && return 1
+    [ -z "${script}" ] && echo "ERROR: install_from_git requires a script to run" 1>&2 && return 1
+
+    local tmp_dir
+    verbose "mktemp -d"
+    tmp_dir="$(mktemp -d)"
+    local file_args=()
+    [ "${verbose}" -eq 1 ] && file_args+=("-v")
+    trap 'rm -rf "${tmp_dir}"; trap - RETURN' RETURN
+    verbose "git clone ${url} ${tmp_dir}"
+    LC_ALL=C git clone "${url}" "${tmp_dir}"; exit_code=$?
+    [ "${exit_code}" -ne 0 ] && error "Failed to clone ${url}" && return 1
+    (
+        verbose "cd ${tmp_dir}"
+        cd "${tmp_dir}" || exit 1
+        if [ -n "${branch}" ]; then
+            verbose "git checkout ${branch}"
+            LC_ALL=C git checkout "${branch}"; exit_code=$?
+            [ "${exit_code}" -ne 0 ] && error "Failed to checkout ${branch}" && exit 1
+        else
+            verbose "git describe --abbrev=0 --tags"
+            latest_tag="$(LC_ALL=C git describe --abbrev=0 --tags)"; exit_code=$?
+            [ "${exit_code}" -ne 0 ] && error "Failed to get latest tag" && exit 1
+            verbose "latest_tag=${latest_tag}"
+            verbose "git checkout ${latest_tag}"
+            result="$(LC_ALL=C git checkout "${latest_tag}" 2>&1)"; exit_code=$?
+            verbose "${result}"
+            [ "${exit_code}" -ne 0 ] && error "Failed to checkout ${latest_tag}" && exit 1
+        fi
+
+        local cmd=()
+        [[ "${script}" != *"/bash" ]] && [[ "${script}" != "bash" ]] && cmd+=("bash")
+        cmd+=("${script}")
+
+        if [ "${dry_run}" -eq 0 ]; then
+            verbose "${cmd[*]} ${script_args[*]}"
+            "${cmd[@]}" "${script_args[@]}"; exit_code=$?
+            [ "${exit_code}" -ne 0 ] && error "Failed to run ${script}" && exit 1
+        else
+            echo "Would run: ${cmd[*]} ${script_args[*]}"
+        fi
+    ) || return 1
+}
+
+install_adb() {
+    apt_upgrade "adb" || return 1
+    local tmp_dir
+    verbose "mktemp -d"
+	tmp_dir="$(mktemp -d)"
+	local file_args=()
+	[ "${verbose}" -eq 1 ] && file_args+=("-v")
+    trap 'rm -rf "${tmp_dir}"; trap - RETURN' RETURN
+	local git_dir="${tmp_dir}/android-udev-rules"
+
+    verbose "mkdir ${file_args[*]} -p ${git_dir}"
+	LC_ALL=C mkdir "${file_args[@]}" -p "${git_dir}"
+    verbose "git clone https://github.com/M0Rf30/android-udev-rules.git ${tmp_dir}/android-udev-rules"
+    LC_ALL=C git clone "https://github.com/M0Rf30/android-udev-rules.git" "${tmp_dir}/android-udev-rules"; exit_code=$?
+	[ "${exit_code}" -ne 0 ] && error "Failed to clone https://github.com/M0Rf30/android-udev-rules.git" && return 1
+    (
+        verbose "cd ${tmp_dir}/android-udev-rules"
+        cd "${tmp_dir}/android-udev-rules" || return 1
+
+        verbose "ls -1 [0-9][0-9]-android.rules"
+    	rules_file="$(ls -1 [0-9][0-9]-android.rules 2>/dev/null || true)"
+        verbose "rules_file=${rules_file}"
+
+        verbose "ls -1 android-udev.conf"
+        conf_file="$(ls -1 android-udev.conf 2>/dev/null || true)"
+        verbose "conf_file=${conf_file}"
+
+    	[ -z "${rules_file}" ] && error "No **-android.rules files found" && return 1
+    	[ "$(echo "${rules_file}" | wc -l)" -gt 1 ] && error "Multiple **-android.rules files found" && return 1
+        [ -z "${conf_file}" ] && error "No android-udev.conf file found" && return 1
+
+        verbose "rm -f ${file_args[*]} /etc/udev/rules.d/[0-9][0-9]-android.rules"
+    	${SUDO} LC_ALL=C rm -f "${file_args[@]}" "/etc/udev/rules.d/"[0-9][0-9]"-android.rules"
+        verbose "cp ${file_args[*]} ${rules_file} /etc/udev/rules.d/${rules_file}" || return 1
+        ${SUDO} LC_ALL=C cp "${file_args[@]}" "${rules_file}" "/etc/udev/rules.d/${rules_file}"
+        verbose "chmod ${file_args[*]} a+r /etc/udev/rules.d/${rules_file}" || return 1
+    	${SUDO} LC_ALL=C chmod "${file_args[@]}" a+r "/etc/udev/rules.d/${rules_file}"
+        verbose "rm -f ${file_args[*]} /usr/lib/sysusers.d/android-udev.conf" || true
+        ${SUDO} LC_ALL=C rm -f "${file_args[@]}" /usr/lib/sysusers.d/android-udev.conf
+        verbose "cp ${file_args[*]} ${conf_file} /usr/lib/sysusers.d/" || return 1
+    	${SUDO} LC_ALL=C cp "${file_args[@]}" "${conf_file}" /usr/lib/sysusers.d/
+    ) || return 1
+
+    verbose "systemd-sysusers"
+	${SUDO} LC_ALL=C systemd-sysusers
+    verbose "gpasswd -a ${CURRENT_USER_NAME} adbusers"
+	${SUDO} LC_ALL=C gpasswd -a "${CURRENT_USER_NAME}" adbusers
+    verbose "udevadm control --reload-rules"
+	${SUDO} LC_ALL=C udevadm control --reload-rules
+    verbose "systemctl restart systemd-udevd.service"
+	${SUDO} LC_ALL=C systemctl restart systemd-udevd.service
+
+    verbose "adb kill-server"
+	${SUDO_USER} adb kill-server
+    verbose "adb devices"
+	${SUDO_USER} adb devices &>/dev/null; exit_code=$?
+    [ "${exit_code}" -ne 0 ] && error "Failed to run adb devices" && return 1
+    echo "ADB installed successfully" 1>&2
+}
+
+selected_install_types=()
+dry_run=0
+verbose=0
+update_failed=0
+
+LOGFILE_PATH="/var/log/${APP_NAME}.log"
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "-h --help -d --dry-run -t --types --verbose all ${possible_install_types[*]}"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -d|--dry-run)
+            dry_run=1
+            ;;
+        -t|--types)
+            shift
+            [ -z "${1}" ] && usage
+            selected_install_types=()
+            for t in ${1//,/ }; do
+                # lowercase
+                t="${t,,}"
+                if echo "${possible_install_types[@]}" | grep -wq "${t}"; then
+                    selected_install_types+=("${t}")
+                elif [ "${t}" = "all" ]; then
+                    selected_install_types=("${possible_install_types[@]}")
+                else
+                    echo "ERROR: Unknown type: ${t}" 1>&2
+                    usage
+                fi
+            done
+            ;;
+        --verbose)
+            verbose=1
+            ;;
+        *)
+            if [ "${1}" == "all" ]; then
+                selected_install_types=("${possible_install_types[@]}")
+            elif echo "${possible_install_types[@]}" | grep -wq "${1}"; then
+                selected_install_types+=("${1}")
+            else
+                echo "ERROR: Unknown argument: $1" 1>&2
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+loggedin_id_name="$(loggedin --id-name)"
+CURRENT_USER_ID="$(echo "${loggedin_id_name}" | cut -d: -f1)"
+CURRENT_USER_NAME="$(echo "${loggedin_id_name}" | cut -d: -f2)"
+unset loggedin_id_name
+
+if [ "${#selected_install_types[@]}" -eq 0 ]; then
+    selected_install_types=("${possible_install_types[@]}")
+fi
+
+SUDO=""
+# must be run as root
+if [ "${EUID}" -ne 0 ]; then
+    SUDO="sudo"
+    #if [ "${dry_run}" -eq 0 ]; then
+    #    echo "Running ${APP_NAME} needs to be run as root..." 1>&2
+    #    ${SUDO} echo "OK" 1>&2
+    #fi
+fi
+
+[ -z "${CURRENT_USER_NAME}" ] && echo "ERROR: Failed to determine CURRENT_USER_NAME" 1>&2 && exit 1
+[ -z "${CURRENT_USER_ID}" ] && echo "ERROR: Failed to determine CURRENT_USER_ID" 1>&2 && exit 1
+
+SUDO_USER=""
+if [ "${EUID}" -ne "${CURRENT_USER_ID}" ]; then
+    SUDO_USER="sudo -n -i -u ${CURRENT_USER_NAME}"
+fi
+
+if [ "${dry_run}" -eq 0 ]; then
+    echo "Running ${APP_NAME} (see ${LOGFILE_PATH})..." | logger -t "${APP_NAME}"
+    # make sure LOGFILE_PATH is writable
+    if ! ${SUDO_USER} test -w "${LOGFILE_PATH}"; then
+        ${SUDO} touch "${LOGFILE_PATH}"
+        ${SUDO} chown "${CURRENT_USER_NAME}":"${CURRENT_USER_NAME}" "${LOGFILE_PATH}"
+    fi
+    if is_interactive; then
+        exec 1> >(${SUDO_USER} tee -a "${LOGFILE_PATH}")
+        exec 2> >(${SUDO_USER} tee -a "${LOGFILE_PATH}" 1>&2)
+        echo "Running ${APP_NAME} in interactive mode..." 1>&2
+    else
+        exec 1> >(${SUDO_USER} tee -a "${LOGFILE_PATH}" &>/dev/null)
+        exec 2>&1
+    fi
+else
+    UPDATE_MESSAGE="Checking %PKGNAME% upgrade"
+    echo "Running ${APP_NAME} in dry-run mode..." 1>&2
+fi
+
+if is_selected "firmware"; then
+    ${SUDO} fwupdmgr get-devices --force \
+        && ${SUDO} fwupdmgr refresh --force \
+        && ${SUDO} fwupdmgr get-updates \
+        && [ "${dry_run}" -eq 0 ] && yes | ${SUDO} fwupdmgr update
+fi
+
+if is_selected "apt"; then
+    apt_upgrade
+fi
+
+if is_selected "npm"; then
+    npm_update npm
+fi
+
+if is_selected "flatpak"; then
+    flatpak_update
+fi
+
+if is_selected "adb"; then
+	install_adb
+fi
+
+if is_selected "chrome"; then
+    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
+fi
+
+if is_selected "mw"; then
+    npm_update @mittwald/cli
+fi
+
+if is_selected "claude"; then
+    curl_update "claude" "https://claude.ai/install.sh"
+fi
+
+if is_selected "code"; then
+    apt_upgrade "${selected}"
+fi
+
+if is_selected "kubectl-mw"; then
+    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"
+fi
+
+if is_selected "powerline-fonts"; then
+    install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"
+fi
+
+if is_selected "nickpit"; then
+    install_git_release "https://github.com/dgrieser/nickpit"
+fi
+
+if is_selected "slack"; then
+    # jessie is the only supported version
+    apt_add_with_list_file "slack-desktop" \
+                           "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
+                           "https://packagecloud.io/slacktechnologies/slack/gpgkey"
+fi
+
+if is_selected "rampart"; then
+    install_from_git "https://github.com/peg/rampart.git" "bash" "-c" "make linux; mv rampart-linux /usr/local/bin/rampart; cd preload; make install"
+fi
+
+if is_selected "gitlab-ci-local"; then
+    install_git_release "https://github.com/firecow/gitlab-ci-local"
+fi
+
+if is_selected "yq"; then
+    install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"
+fi
+
+if is_selected "gitlab_trackr"; then
+    install_git_release "https://github.com/BjarneSeger/gitlab_trackr"
+fi
+
+if is_selected "nexus-cli"; then
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"
+fi
+
+if is_selected "snaxus-cli"; then
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"
+fi
+
+if is_selected "boodschapper"; then
+    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"
+fi
+
+if is_selected "himalaya"; then
+    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya
+fi
+
+if is_selected "antigravity"; then
+    apt_add_with_repo "${selected}" \
+                      "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/" \
+                      "antigravity-debian" \
+                      "main" \
+                      "https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg"
+fi
+
+if is_selected "zed"; then
+    curl_update "zed" "https://zed.dev/install.sh"
+fi
+
+if is_selected "hwatch"; then
+    install_git_release "https://github.com/blacknon/hwatch"
+fi
+
+if is_selected "gradia"; then
+    flatpak_update "be.alexandervanhee.gradia"
+fi
+
+if is_selected "lazygit"; then
+    install_git_release "https://github.com/jesseduffield/lazygit"
+fi
+
+if is_selected "viddy"; then
+    install_git_release "https://github.com/sachaos/viddy"
+fi
+
+if is_selected "spotify"; then
+    apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
+fi
+
+if is_selected "trivy"; then
+    apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
+fi
+
+if is_selected "threema"; then
+    flatpak_update "ch.threema.threema-desktop"
+fi
+
+if is_selected "gnome-ext-hanabi"; then
+    install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"
+fi
+
+if is_selected "opencode"; then
+    curl_update "opencode" "https://opencode.ai/install"
+fi
+
+if is_selected "zoom"; then
+    zoom_package_name="${selected}"
+    zoom_deb_file_name="${zoom_package_name}_${PLATFORM}.deb"
+    zoom_deb_file_path="/tmp/${zoom_deb_file_name}"
+    zoom_base_url="https://zoom.us"
+    zoom_rest_url="${zoom_base_url}/rest/download?os=linux"
+    zoom_client_url="${zoom_base_url}/client"
+    zoom_rest_response="$(curl -sS "${zoom_rest_url}")"
+    version="$(echo "${zoom_rest_response}" | jq -r '.result.downloadVO.zoom.version')"
+    if [ -z "${version}" ] || [[ ! "${version}" =~ ^[0-9\.]+$ ]]; then
+        echo "ERROR: Failed to get latest version of Zoom" 1>&2
+        echo "${zoom_rest_url} returned:" 1>&2
+        echo "${zoom_rest_response}" 1>&2
+    fi
+    installed_version="$(dpkg -s "${zoom_package_name}" 2> /dev/null | grep -m 1 '^Version:' | awk '{print $2}')"
+    [ -z "${installed_version}" ] && installed_version="<unknown>"
+    if [ -n "${version}" ] && [ "${version}" != "${installed_version}" ]; then
+        echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
+        if [ "${dry_run}" -eq 0 ]; then
+            if curl -L "${zoom_client_url}/${version}/${zoom_deb_file_name}" -o "${zoom_deb_file_path}"; then
+                ${SUDO} apt install "${zoom_deb_file_path}"
+            else
+                echo "ERROR: Failed to download latest version of Zoom from ${zoom_client_url}" 1>&2
+            fi
+            rm "${zoom_deb_file_path}"
+        else
+            echo -e "NAME\tCURRENT\tUPDATE\nZoom\t${installed_version}\t${version}" | column -t -s $'\t'
+        fi
+    else
+        echo "${APP_NAME}: Zoom ${installed_version} is up to date" 1>&2
+    fi
+fi
+
+if is_selected "glab"; then
+    install_git_release "https://gitlab.com/gitlab-org/cli"
+fi
+
+if is_selected "gh"; then
+    apt_add_with_repo "${selected}" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"
+fi
+
+if is_selected "helm"; then
+    legacy_helm_repo_path="/etc/apt/sources.list.d/helm-stable-debian.list"
+    if grep -qF "baltocdn.com" "${legacy_helm_repo_path}" 2>/dev/null; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would remove obsolete Helm repository ${legacy_helm_repo_path}" 1>&2
+        else
+            verbose "${SUDO} rm -f ${legacy_helm_repo_path}"
+            ${SUDO} rm -f "${legacy_helm_repo_path}"
+        fi
+    fi
+    if apt_add_with_repo "${selected}" \
+            "https://packages.buildkite.com/helm-linux/helm-debian/any/" \
+            "any" \
+            "main" \
+            "https://packages.buildkite.com/helm-linux/helm-debian/gpgkey" \
+            "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" \
+            && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
+            && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"; then
+        :
+    else
+        update_failed=1
+    fi
+fi
+
+if is_selected "wezterm"; then
+    apt_add_with_repo "${selected}" "https://apt.fury.io/wez" "*" "*" "https://apt.fury.io/wez/gpg.key"
+fi
+
+if is_selected "dive"; then
+    install_git_release "https://github.com/wagoodman/dive"
+fi
+
+if is_selected "kubecolor"; then
+    install_git_release "https://github.com/kubecolor/kubecolor"
+fi
+
+if is_selected "mc"; then
+    # TODO: add proper version printing on dry-run
+    mc_target_path="/usr/local/bin/mc"
+    [ ${dry_run} -eq 1 ] && mc_target_path="/tmp/mc-dry-run"
+    ${SUDO} curl -sS -L https://dl.min.io/client/mc/release/linux-amd64/mc -o "${mc_target_path}"
+    ${SUDO} chmod +x "${mc_target_path}"
+    ${mc_target_path} --version
+    [ ${dry_run} -eq 1 ] && ${SUDO} rm "${mc_target_path}"
+fi
+
+if is_selected "gemini"; then
+    npm_update @google/gemini-cli --force
+fi
+
+if is_selected "qwen"; then
+    npm_update @qwen-code/qwen-code --force
+fi
+
+if is_selected "codex"; then
+    npm_update @openai/codex
+fi
+
+if is_selected "kilocode"; then
+    npm_update @kilocode/cli
+fi
+
+if is_selected "aws"; then
+    aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"    
+    aws_file_name="$(basename "${aws_url}")"
+    aws_file_path="/tmp/${aws_file_name}"
+    aws_folder_path="${aws_file_path%.zip}"
+    aws_target_parent_folder="/usr/local"
+    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/aws-dry-run" && mkdir -p "${aws_target_parent_folder}"
+    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"
+    curl -sS -L "${aws_url}" -o "${aws_file_path}"
+    unzip "${aws_file_path}" -d "${aws_folder_path}"
+    ${SUDO} rm "${aws_file_path}"
+    ${SUDO} "${aws_folder_path}/awscli-bundle/install" -i "${aws_target_parent_folder}"/aws -b "${aws_target_parent_folder}"/bin/aws
+    ${SUDO} rm -rf "${aws_folder_path}"
+    ${aws_target_parent_folder}/bin/aws --version
+    [ ${dry_run} -eq 1 ] && ${SUDO} rm -rf "${aws_target_parent_folder}"/aws "${aws_target_parent_folder}"/bin/aws
+fi
+
+if is_selected "albert"; then
+    apt_add_with_repo "albert" "http://download.opensuse.org/repositories/home:/manuelschneid3r/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
+fi
+
+if is_selected "ueberzugpp"; then
+    apt_add_with_repo "ueberzugpp" "http://download.opensuse.org/repositories/home:/justkidding/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
+fi
+
+if is_selected "yazi"; then
+    install_git_release "https://github.com/sxyazi/yazi"
+fi
+
+if [ "${update_failed}" -ne 0 ]; then
+    fail "One or more updates failed"
+fi
+
+echo "${APP_NAME}: Done" 1>&2
