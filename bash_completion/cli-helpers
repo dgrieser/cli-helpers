@@ -8,7 +8,8 @@
 #
 # Completion words are derived from the tool itself, in order of preference:
 #   1. If the tool implements a --bash-completion flag, run it with the
-#      previous word as argument and use its output (allows dynamic values).
+#      previous word and command arguments as input, then use its output
+#      (allows dynamic values that depend on earlier arguments).
 #   2. Python tools: option strings from argparse add_argument() calls.
 #   3. Bash tools: option names from the case labels of the argument loop.
 # Positional arguments fall back to default filename completion.
@@ -22,7 +23,7 @@ _cli_helpers() {
     [ -r "${path}" ] || return
 
     if grep -qE '^[[:space:]]*"?--bash-completion"?\)' "${path}"; then
-        words="$("${path}" --bash-completion "${prev}" 2>/dev/null)"
+        words="$("${path}" --bash-completion "${prev}" "${COMP_WORDS[@]:1}" 2>/dev/null)"
     elif [[ "${cur}" != -* ]]; then
         # Static parsing only yields option names; leave positional
         # arguments to the default filename completion.

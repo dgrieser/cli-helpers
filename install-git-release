@@ -42,8 +42,61 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
         -y, --yes           Answer yes to all prompts
 
         -d, --dry-run       Perform a trial run with no changes made
+
+        --bash-completion   Print completion candidates and exit
 EOF
     exit 1
+}
+
+function completion() {
+    local previous="${1}"
+    local project=""
+    local argument=""
+    local skip_next=0
+
+    if [ "${previous}" != "-r" ] && [ "${previous}" != "--release" ]; then
+        echo "-h --help -p --pattern -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
+        return
+    fi
+    shift
+
+    # Find the positional project argument. Completion is intentionally limited
+    # to an explicit repository so it never starts an interactive git-search.
+    for argument in "${@}"; do
+        if [ "${skip_next}" -eq 1 ]; then
+            skip_next=0
+            continue
+        fi
+        case "${argument}" in
+            -p|--pattern|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
+                skip_next=1
+                ;;
+            -*)
+                ;;
+            *)
+                project="${argument}"
+                ;;
+        esac
+    done
+
+    [ -z "${project}" ] && return
+
+    case "${project}" in
+        https://gitlab.com/*|http://gitlab.com/*|gitlab.com/*)
+            project="${project#http://}"
+            project="${project#https://}"
+            project="${project#gitlab.com/}"
+            project="${project%.git}"
+            glab release list --repo "${project}" --per-page 100 | awk 'NR > 1 { print $1 }'
+            ;;
+        https://github.com/*|http://github.com/*|github.com/*|*/*)
+            project="${project#http://}"
+            project="${project#https://}"
+            project="${project#github.com/}"
+            project="${project%.git}"
+            gh release list --repo "${project}" --limit 100 --json tagName --jq '.[].tagName'
+            ;;
+    esac
 }
 
 function error() {
@@ -791,6 +844,11 @@ ARCH_DPKG="$(dpkg --print-architecture 2>/dev/null || true)"
 
 while [ $# -gt 0 ]; do
     case "${1}" in
+        --bash-completion)
+            shift
+            completion "${@}"
+            exit 0
+            ;;
         -h|--help)
             usage
             ;;

@@ -1345,6 +1345,7 @@ Downloads a release artifact from a GitHub or GitLab project (resolving reposito
 | `-c, --post-install CMD` | Command to run after a successful install (in the unpacked dir); repeatable. Receives env vars `INSTALL_PATH`, `BINARY_NAME`, `BINARY_PATH`, `ARTIFACT`, `UNPACK_DIR`. |
 | `-y, --yes` | Answer yes to all prompts (non-interactive). |
 | `-d, --dry-run` | Trial run: download and inspect but make no changes. |
+| `--bash-completion` | Output shell-completion candidates; release tags are offered when `PROJECT` is an explicit repository. |
 
 **Examples:**
 ```bash
