@@ -16,6 +16,9 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
         -p, --pattern       Pattern of the artifact to install
                             Default: *linux*64*
 
+        -r, --release       Release tag to install
+                            Default: latest release
+
         -b, --binary        Pattern of the binary to install
 
         -n, --name          Name to install the final binary as
@@ -131,7 +134,7 @@ function filter_excluded_artifacts() {
         [ -z "${artifact}" ] && continue
         excluded_name="$(basename "${artifact}")"
         case "${excluded_name}" in
-            README|README.md|RELEASE|RELEASE.md|CONTRIBUTING|CONTRIBUTING.md|LICENSE|LICENSE.md|SECURITY|SECURITY.md|CHANGELOG|CHANGELOG.md)
+            README|README.md|README-??_??.md|RELEASE|RELEASE.md|CONTRIBUTING|CONTRIBUTING.md|LICENSE|LICENSE.md|SECURITY|SECURITY.md|CHANGELOG|CHANGELOG.md)
                 continue
                 ;;
         esac
@@ -774,6 +777,7 @@ fi
 YES=0
 DRY_RUN=0
 PATTERNS=()
+RELEASE=""
 INSTALL_PATH="/usr/local/bin"
 BUNDLE=0
 BUNDLE_PATH="/usr/local/share"
@@ -797,6 +801,11 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             PATTERNS+=("${1}")
+            ;;
+        -r|--release)
+            shift
+            [ -z "${1}" ] && usage
+            RELEASE="${1}"
             ;;
         -i|--install-path)
             shift
@@ -863,7 +872,9 @@ tmpfolder=$(mktemp -d)
 trap cleanup EXIT
 
 
-echo "Retrieving artifact from '${project}' with patterns ${PATTERNS[*]}..." 1>&2
+release_description="latest release"
+[ -n "${RELEASE}" ] && release_description="release '${RELEASE}'"
+echo "Retrieving artifact from '${project}' (${release_description}) with patterns ${PATTERNS[*]}..." 1>&2
 
 if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     echo 1>&2
@@ -890,6 +901,7 @@ fi
 
 if [[ "${project}" == "https://github.com"* ]]; then
     gh_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
+    [ -n "${RELEASE}" ] && gh_args+=( "${RELEASE}" )
     for pattern in "${PATTERNS[@]}"; do
         gh_args+=( "-p" "${pattern}" )
     done
@@ -906,6 +918,7 @@ else
     fi
 
     glab_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
+    [ -n "${RELEASE}" ] && glab_args+=( "${RELEASE}" )
     for pattern in "${PATTERNS[@]}"; do
         glab_args+=( "-n" "${pattern}" )
     done
