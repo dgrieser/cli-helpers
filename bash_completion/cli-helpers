@@ -16,14 +16,17 @@
 
 _cli_helpers() {
     local cmd="${1}" cur="${2}" prev="${3}"
-    local path words shebang
+    local command_path path words shebang
 
-    path="$(type -P "${cmd}")" || return
-    path="$(readlink -f -- "${path}" 2>/dev/null || echo "${path}")"
+    command_path="$(type -P "${cmd}")" || return
+    # The tool itself is called through the name being completed, so tools that
+    # change behavior based on their name (symlinks) complete accordingly, while
+    # the resolved path is used to read the script.
+    path="$(readlink -f -- "${command_path}" 2>/dev/null || echo "${command_path}")"
     [ -r "${path}" ] || return
 
     if grep -qE '^[[:space:]]*"?--bash-completion"?\)' "${path}"; then
-        words="$("${path}" --bash-completion "${prev}" "${COMP_WORDS[@]:1}" 2>/dev/null)"
+        words="$("${command_path}" --bash-completion "${prev}" "${COMP_WORDS[@]:1}" 2>/dev/null)"
     elif [[ "${cur}" != -* ]]; then
         # Static parsing only yields option names; leave positional
         # arguments to the default filename completion.

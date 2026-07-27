@@ -487,6 +487,38 @@ serve-clip
 
 ## AI Helpers
 
+### `agent-session`
+Lists and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. Sessions of both agents are listed together, sorted by last activity.
+
+**Usage:** `agent-session [OPTIONS] [SESSION]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SESSION` | The ID of the session to print; omit to list all sessions instead. |
+| `-h, --help` | Show the help message and exit. |
+| `-a, --agent AGENT` | Only use sessions of `claude` or `codex` (default: both). |
+| `-l, --last` | Print the latest session. |
+| `-n, --limit LIMIT` | Limit the number of sessions shown in the listing (default: 50). |
+| `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
+| `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
+| `-r, --raw` | Print raw output instead of rendering it through `glow`. |
+| `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
+
+Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first until the limit is reached. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+| `--verbose` | Print verbose diagnostic output to stderr. |
+
+Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
+
+**Examples:**
+```bash
+agent-session
+agent-session --last
+agent-session --agent codex -n 10 --grep "TODO"
+agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
+claude-session -n 20 --igrep "docker compose"
+codex-session --last
+```
+
 ### `aish`
 Edits or creates a file or command using an AI CLI tool (such as Codex) inside a temporary git repository, runs a syntax check, shows a diff, and optionally applies the changes back to the original file (using sudo when needed).
 
@@ -506,28 +538,7 @@ aish ./new-tool
 ```
 
 ### `claude-session`
-Lists and prints conversation sessions from the Claude CLI, stored as JSONL files under `~/.claude/projects`, rendering them as Markdown (via `glow`) unless raw output is requested.
-
-**Usage:** `claude-session [OPTIONS] [SESSION]`
-
-| Argument / Flag | Description |
-|---|---|
-| `SESSION` | The ID of the session to print; omit to list all sessions instead. |
-| `-h, --help` | Show the help message and exit. |
-| `-l, --last` | Print the most recently modified session. |
-| `-n, --limit LIMIT` | Limit the number of sessions shown in the listing (default: 50). |
-| `-g, --grep GREP` | Filter listed sessions to those whose contents match the given regex. |
-| `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their contents. |
-| `-r, --raw` | Print raw output instead of rendering it through `glow`. |
-| `--verbose` | Print verbose diagnostic output to stderr. |
-
-**Examples:**
-```bash
-claude-session
-claude-session --last
-claude-session -n 20 --igrep "docker compose"
-claude-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
-```
+Symlink to [`agent-session`](#agent-session) that only uses sessions of the Claude CLI.
 
 ### `codex-chat`
 Sends a prompt to the Codex AI CLI (run in `--full-auto exec` mode and instructed to ground answers with web search), automatically creating or resuming a per-TTY session and storing chat logs under `~/.codex-chat`.
@@ -554,28 +565,7 @@ codex-chat --print-history
 ```
 
 ### `codex-session`
-Lists and prints conversation sessions from the Codex CLI, stored as `rollout-*.jsonl` files under `~/.codex/sessions`, extracting assistant messages and rendering them as Markdown (via `glow`) unless raw output is requested.
-
-**Usage:** `codex-session [OPTIONS] [SESSION]`
-
-| Argument / Flag | Description |
-|---|---|
-| `SESSION` | The ID of the session to print; omit to list all sessions instead. |
-| `-h, --help` | Show the help message and exit. |
-| `-l, --last` | Print the latest session. |
-| `-n, --limit LIMIT` | Limit the number of sessions shown in the listing (default: 50). |
-| `-g, --grep GREP` | Filter listed sessions to those whose contents match the given regex. |
-| `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their contents. |
-| `-r, --raw` | Print raw output instead of rendering it through `glow`. |
-| `--verbose` | Print verbose diagnostic output to stderr. |
-
-**Examples:**
-```bash
-codex-session
-codex-session --last
-codex-session -n 10 --grep "TODO"
-codex-session 0a1b2c3d-4e5f-6789-abcd-ef0123456789 --raw
-```
+Symlink to [`agent-session`](#agent-session) that only uses sessions of the Codex CLI.
 
 ### `vish`
 Edits or creates a file or command in vim (using sudo when needed), making new files executable bash scripts, handling vim swap-file recovery, and running a syntax check on save with the option to re-edit.
