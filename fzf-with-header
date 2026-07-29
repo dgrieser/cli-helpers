@@ -246,7 +246,7 @@ if [ -n "${cmd}" ] && [ -z "${key_desc[${refresh_key}]+x}" ] &&
     # the manual reload already happened, the watcher only restarts its timer
     [ -n "${watch_reset_file}" ] && refresh_action="${refresh_action}+execute-silent(touch '${watch_reset_file}')"
     refresh_bind_args=(--bind "${refresh_key}:${refresh_action}")
-    mapped_keys="${mapped_keys}"$'\n'"${refresh_key}"$'\t'"refresh"
+    mapped_keys="${mapped_keys}"$'\n'"${refresh_key}"$'\t'"↻"
 fi
 
 # merge keys sharing a description: "alt-+ stage" + "insert stage" -> "alt-+/insert stage"
