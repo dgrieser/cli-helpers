@@ -6,65 +6,10 @@ UPDATE_MESSAGE="Running %PKGNAME% upgrade"
 # shellcheck disable=SC1090
 [ -f /etc/os-release ] && source <(sed -E 's/^([A-Z0-9_]+)=/OS_RELEASE_\1=/' /etc/os-release)
 
-possible_install_types=(
-    adb
-    albert
-    antigravity
-    apt
-    aws-v1
-    aws
-    boodschapper
-    chrome
-    claude
-    code
-    codex
-    dive
-    firmware
-    flatpak
-    gemini
-    gh
-    gitlab-ci-local
-    glab
-    gitlab_trackr
-    gnome-ext-hanabi
-    gradia
-    helm
-    himalaya
-    hwatch
-    kilocode
-    kubectl-mw
-    kubecolor
-    lazygit
-    mc
-    mw
-    nexus-cli
-    npm
-    nickpit
-    opencode
-    powerline-fonts
-    qwen
-    rampart
-    slack
-    snaxus-cli
-    spotify
-    threema
-    trivy
-    ueberzugpp
-    viddy
-    wezterm
-    yazi
-    yq
-    zed
-    zoom
-)
-
-
-disabled_install_types=(
-    ueberzugpp
-    albert
-    gnome-ext-hanabi
-)
-
+possible_install_types=()
+software_install_types=()
+declare -A software_handlers=()
+declare -A software_disabled=()
 selected=""
 
 error() {
@@ -87,6 +32,17 @@ abort() {
 
 verbose() {
     [ "${verbose}" -eq 1 ] && echo "+ ${1}" 1>&2
+}
+
+require_cmd() {
+    local cmd
+    local missing=()
+    for cmd in "${@}"; do
+        command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+    error "${selected:-${APP_NAME}} requires missing command(s): ${missing[*]}"
+    return 1
 }
 
 usage() {
@@ -115,20 +71,92 @@ is_interactive() {
     return 1
 }
 
-is_selected() {
-    local list="${selected_install_types[*]}"
-    local disabled_list="${disabled_install_types[*]}"
-    local item="${1}"
-    local result=1
-    [ -z "${list}" ] && return 1
-    [ -z "${item}" ] && return 1
-    echo "${list}" | grep -wq "${item}" && result=0 || result=1
-    [ "${result}" -eq 0 ] && echo "${disabled_list}" | grep -wq "${item}" && echo "WARNING: ${item} is disabled" 1>&2 && result=1
-    [ "${result}" -eq 0 ] && echo 1>&2 && echo "${APP_NAME}: ${UPDATE_MESSAGE//%PKGNAME%/${item}}" 1>&2 && export selected="${item}"
-    return ${result}
+is_install_type() {
+    local item
+    for item in "${possible_install_types[@]}"; do
+        [ "${item}" = "${1}" ] && return 0
+    done
+    return 1
+}
+
+is_install_type_selected() {
+    local item
+    for item in "${selected_install_types[@]}"; do
+        [ "${item}" = "${1}" ] && return 0
+    done
+    return 1
+}
+
+discover_software() {
+    local declaration
+    local disabled
+    local handler
+    local name
+    local order
+    local -a entries=()
+    local -A seen_orders=()
+
+    while read -r declaration _ handler; do
+        [ "${declaration}" = "declare" ] || continue
+        disabled=0
+        if [[ "${handler}" =~ ^software-disabled-([0-9]+)-([a-z0-9][a-z0-9_-]*)$ ]]; then
+            disabled=1
+        elif [[ "${handler}" =~ ^software-([0-9]+)-([a-z0-9][a-z0-9_-]*)$ ]]; then
+            :
+        else
+            # catch typos like software-500-Foo or software-abc-bar instead of skipping silently
+            [[ "${handler}" == software-* ]] && warning "Ignoring malformed software handler: ${handler}"
+            continue
+        fi
+
+        order="$((10#${BASH_REMATCH[1]}))"
+        name="${BASH_REMATCH[2]}"
+        entries+=("${order}"$'\t'"${name}"$'\t'"${handler}"$'\t'"${disabled}")
+    done < <(declare -F)
+
+    [ "${#entries[@]}" -gt 0 ] || fail "No software handlers found"
+
+    while IFS=$'\t' read -r order name handler disabled; do
+        if [ -n "${software_handlers[${name}]+registered}" ]; then
+            fail "Duplicate software name: ${name}"
+        fi
+        if [ -n "${seen_orders[${order}]+registered}" ]; then
+            fail "Duplicate software order: ${order}"
+        fi
+        seen_orders["${order}"]="${name}"
+        software_handlers["${name}"]="${handler}"
+        software_disabled["${name}"]="${disabled}"
+        software_install_types+=("${name}")
+    done < <(printf '%s\n' "${entries[@]}" | sort -n -k1,1)
+
+    mapfile -t possible_install_types < <(printf '%s\n' "${software_install_types[@]}" | sort)
+}
+
+run_selected_software() {
+    local handler
+    local item
+
+    for item in "${software_install_types[@]}"; do
+        is_install_type_selected "${item}" || continue
+        if [ "${software_disabled[${item}]}" -eq 1 ]; then
+            warning "${item} is disabled"
+            continue
+        fi
+
+        echo 1>&2
+        echo "${APP_NAME}: ${UPDATE_MESSAGE//%PKGNAME%/${item}}" 1>&2
+        selected="${item}"
+        export selected
+        handler="${software_handlers[${item}]}"
+        if ! "${handler}"; then
+            error "Failed to update ${item}"
+            update_failed=1
+        fi
+    done
 }
 
 apt_add_with_list_file() {
+    require_cmd curl gpg apt-get || return 1
     local name="${1}"; shift
     local list_url="${1}"; shift
     local repo_key_url="${1}"; shift
@@ -201,6 +229,7 @@ apt_add_with_list_file() {
 }
 
 apt_add_with_repo() {
+    require_cmd curl gpg apt-get || return 1
     local name="${1}"; shift
     local repo_url="${1%/}"; shift
 
@@ -284,6 +313,7 @@ apt_add_with_repo() {
 }
 
 apt_upgrade() {
+    require_cmd apt-get || return 1
     local pkg="${1}"
     echo "${APP_NAME}: Updating sources..." 1>&2
     local apt_exit_code=-1
@@ -332,6 +362,7 @@ apt_upgrade() {
 }
 
 helm_plugin_update() {
+    require_cmd helm || return 1
     local name="${1}"; shift
     local url="${1}"; shift
 
@@ -371,6 +402,7 @@ flatpak_list_updates() {
 }
 
 flatpak_update() {
+    require_cmd flatpak || return 1
     local pkg="${1}"
     if [ "${dry_run}" -eq 0 ]; then
         if [ -n "${pkg}" ]; then
@@ -393,6 +425,7 @@ curl_update() {
     local url="${1}"; shift
     [ -z "${url}" ] && echo "ERROR: curl_update requires a URL" 1>&2 && return 1
     [ -z "${pkg}" ] && echo "ERROR: curl_update requires a package name" 1>&2 && return 1
+    require_cmd curl || return 1
     curl_args=( "--fail" "--location" )
     [ "${verbose}" -eq 0 ] && curl_args+=( "--silent" "--show-error" )
     curl_args+=( "${url}" )
@@ -405,6 +438,7 @@ curl_update() {
 }
 
 npm_update() {
+    require_cmd npm npm-pkg-dir || return 1
     local pkg="${1}"; shift
     local force=0
     while [ $# -gt 0 ]; do
@@ -448,6 +482,7 @@ npm_update() {
         [ "${verbose}" -eq 1 ] && echo "+ ${sudo} npm ${npm_args[*]}" 1>&2
         ${sudo} npm install "${npm_args[@]}"
     else
+        require_cmd jq || return 1
         if ! npm_json="$(NODE_PATH="/usr/lib/node_modules" npm outdated -g "${pkg}" --json)"; then
             npm_table="$(echo "${npm_json}" | \
                          jq -r 'to_entries[] | [.key, (.value.current // "<unknown>"), .value.wanted] | @tsv')"
@@ -459,6 +494,7 @@ npm_update() {
 }
 
 install_git_release() {
+    require_cmd install-git-release || return 1
     local url="${1}"; shift
     local install_git_args=()
     while [ $# -gt 0 ]; do
@@ -499,6 +535,7 @@ install_from_git() {
     done
     [ -z "${url}" ] && echo "ERROR: install_from_git requires a URL" 1>&2 && return 1
     [ -z "${script}" ] && echo "ERROR: install_from_git requires a script to run" 1>&2 && return 1
+    require_cmd git || return 1
 
     local tmp_dir
     verbose "mktemp -d"
@@ -542,6 +579,7 @@ install_from_git() {
 }
 
 install_adb() {
+    require_cmd git gpasswd udevadm systemd-sysusers systemctl || return 1
     apt_upgrade "adb" || return 1
     local tmp_dir
     verbose "mktemp -d"
@@ -601,12 +639,243 @@ install_adb() {
     echo "ADB installed successfully" 1>&2
 }
 
+# Software registry. Add one function using either form:
+#   software-ORDER-NAME() { ...; }
+#   software-disabled-ORDER-NAME() { ...; }
+# ORDER controls execution order; NAME becomes the command-line software name.
+software-010-firmware() {
+    require_cmd fwupdmgr || return 1
+    ${SUDO} fwupdmgr get-devices --force \
+        && ${SUDO} fwupdmgr refresh --force \
+        && ${SUDO} fwupdmgr get-updates \
+        || return 1
+    if [ "${dry_run}" -eq 0 ]; then
+        yes | ${SUDO} fwupdmgr update
+    fi
+}
+
+software-020-apt() { apt_upgrade; }
+software-030-npm() { npm_update npm; }
+software-040-flatpak() { flatpak_update; }
+software-050-adb() { install_adb; }
+
+software-060-chrome() {
+    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
+}
+
+software-070-mw() { npm_update @mittwald/cli; }
+software-080-claude() { curl_update "claude" "https://claude.ai/install.sh"; }
+software-090-code() { apt_upgrade "code"; }
+software-100-kubectl-mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
+software-110-powerline-fonts() { install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"; }
+software-120-nickpit() { install_git_release "https://github.com/dgrieser/nickpit"; }
+
+software-130-slack() {
+    # jessie is the only supported version
+    apt_add_with_list_file "slack-desktop" \
+        "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
+        "https://packagecloud.io/slacktechnologies/slack/gpgkey"
+}
+
+software-140-rampart() {
+    install_from_git "https://github.com/peg/rampart.git" "bash" "-c" "make linux; mv rampart-linux /usr/local/bin/rampart; cd preload; make install"
+}
+
+software-150-gitlab-ci-local() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
+software-160-yq() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
+software-170-gitlab_trackr() { install_git_release "https://github.com/BjarneSeger/gitlab_trackr"; }
+software-180-nexus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
+software-190-snaxus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
+software-200-boodschapper() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
+software-210-himalaya() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
+
+software-220-antigravity() {
+    apt_add_with_repo "antigravity" \
+        "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/" \
+        "antigravity-debian" \
+        "main" \
+        "https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg"
+}
+
+software-230-zed() { curl_update "zed" "https://zed.dev/install.sh"; }
+software-240-hwatch() { install_git_release "https://github.com/blacknon/hwatch"; }
+software-250-gradia() { flatpak_update "be.alexandervanhee.gradia"; }
+software-260-lazygit() { install_git_release "https://github.com/jesseduffield/lazygit"; }
+software-270-viddy() { install_git_release "https://github.com/sachaos/viddy"; }
+
+software-280-spotify() {
+    apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
+}
+
+software-290-trivy() {
+    apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
+}
+
+software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
+software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
+software-320-opencode() { curl_update "opencode" "https://opencode.ai/install"; }
+
+software-330-zoom() {
+    require_cmd curl jq dpkg apt-get || return 1
+    local zoom_package_name="zoom"
+    local zoom_deb_file_name="${zoom_package_name}_${PLATFORM}.deb"
+    local zoom_deb_file_path="/tmp/${zoom_deb_file_name}"
+    local zoom_base_url="https://zoom.us"
+    local zoom_rest_url="${zoom_base_url}/rest/download?os=linux"
+    local zoom_client_url="${zoom_base_url}/client"
+    local zoom_rest_response
+    local version
+    local installed_version
+
+    zoom_rest_response="$(curl -sS "${zoom_rest_url}")" || return 1
+    version="$(echo "${zoom_rest_response}" | jq -r '.result.downloadVO.zoom.version')"
+    if [ -z "${version}" ] || [[ ! "${version}" =~ ^[0-9\.]+$ ]]; then
+        error "Failed to get latest version of Zoom"
+        echo "${zoom_rest_url} returned:" 1>&2
+        echo "${zoom_rest_response}" 1>&2
+        return 1
+    fi
+
+    installed_version="$(dpkg -s "${zoom_package_name}" 2>/dev/null | grep -m 1 '^Version:' | awk '{print $2}')"
+    [ -z "${installed_version}" ] && installed_version="<unknown>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: Zoom ${installed_version} is up to date" 1>&2
+        return 0
+    fi
+
+    echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
+    if [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\nZoom\t${installed_version}\t${version}" | column -t -s $'\t'
+        return 0
+    fi
+
+    trap 'rm -f "${zoom_deb_file_path}"; trap - RETURN' RETURN
+    if ! curl -L "${zoom_client_url}/${version}/${zoom_deb_file_name}" -o "${zoom_deb_file_path}"; then
+        error "Failed to download latest version of Zoom from ${zoom_client_url}"
+        return 1
+    fi
+    LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${zoom_deb_file_path}"
+}
+
+software-340-glab() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
+software-350-gh() { apt_add_with_repo "gh" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"; }
+
+software-360-helm() {
+    local legacy_helm_repo_path="/etc/apt/sources.list.d/helm-stable-debian.list"
+    if grep -qF "baltocdn.com" "${legacy_helm_repo_path}" 2>/dev/null; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would remove obsolete Helm repository ${legacy_helm_repo_path}" 1>&2
+        else
+            verbose "${SUDO} rm -f ${legacy_helm_repo_path}"
+            ${SUDO} rm -f "${legacy_helm_repo_path}" || return 1
+        fi
+    fi
+    apt_add_with_repo "helm" \
+        "https://packages.buildkite.com/helm-linux/helm-debian/any/" \
+        "any" \
+        "main" \
+        "https://packages.buildkite.com/helm-linux/helm-debian/gpgkey" \
+        "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" \
+        && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
+        && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
+}
+
+software-370-wezterm() { apt_add_with_repo "wezterm" "https://apt.fury.io/wez" "*" "*" "https://apt.fury.io/wez/gpg.key"; }
+software-380-dive() { install_git_release "https://github.com/wagoodman/dive"; }
+software-390-kubecolor() { install_git_release "https://github.com/kubecolor/kubecolor"; }
+
+software-400-mc() {
+    # TODO: add proper version printing on dry-run
+    require_cmd curl || return 1
+    local mc_target_path="/usr/local/bin/mc"
+    [ "${dry_run}" -eq 1 ] && mc_target_path="/tmp/mc-dry-run"
+    ${SUDO} curl -sS -L https://dl.min.io/client/mc/release/linux-amd64/mc -o "${mc_target_path}" || return 1
+    ${SUDO} chmod +x "${mc_target_path}" || return 1
+    "${mc_target_path}" --version || return 1
+    if [ "${dry_run}" -eq 1 ]; then
+        ${SUDO} rm "${mc_target_path}"
+    fi
+}
+
+software-410-gemini() { npm_update @google/gemini-cli --force; }
+software-420-qwen() { npm_update @qwen-code/qwen-code --force; }
+software-430-codex() { npm_update @openai/codex; }
+software-440-kilocode() { npm_update @kilocode/cli; }
+
+software-450-aws() {
+    require_cmd curl unzip || return 1
+    local aws_name="aws"
+    local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+    local aws_file_name
+    local aws_file_path
+    local aws_folder_path
+    local aws_target_parent_folder="/usr/local"
+    local -a install_args
+
+    aws_file_name="$(basename "${aws_url}")"
+    aws_file_path="/tmp/${aws_file_name}"
+    aws_folder_path="${aws_file_path%.zip}"
+    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}" || return 1
+    trap '${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"; trap - RETURN' RETURN
+    if [ "${dry_run}" -eq 1 ]; then
+        aws_target_parent_folder="/tmp/${aws_name}-dry-run"
+        mkdir -p "${aws_target_parent_folder}" || return 1
+        trap '${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}" "${aws_target_parent_folder}"; trap - RETURN' RETURN
+    fi
+    curl -sS -L "${aws_url}" -o "${aws_file_path}" || return 1
+    unzip "${aws_file_path}" -d "${aws_folder_path}" || return 1
+    install_args=("--install-dir" "${aws_target_parent_folder}/${aws_name}" "--bin-dir" "${aws_target_parent_folder}/bin")
+    [ -d "${aws_target_parent_folder}/${aws_name}" ] && install_args+=("--update")
+    ${SUDO} "${aws_folder_path}/aws/install" "${install_args[@]}" || return 1
+    "${aws_target_parent_folder}/bin/${aws_name}" --version || return 1
+}
+
+software-460-aws-v1() {
+    require_cmd curl unzip || return 1
+    local aws_name="aws-v1"
+    local aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
+    local aws_file_name
+    local aws_file_path
+    local aws_folder_path
+    local aws_target_parent_folder="/usr/local"
+
+    aws_file_name="$(basename "${aws_url}")"
+    aws_file_path="/tmp/${aws_file_name}"
+    aws_folder_path="${aws_file_path%.zip}"
+    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}" || return 1
+    trap '${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"; trap - RETURN' RETURN
+    if [ "${dry_run}" -eq 1 ]; then
+        aws_target_parent_folder="/tmp/${aws_name}-dry-run"
+        mkdir -p "${aws_target_parent_folder}" || return 1
+        trap '${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}" "${aws_target_parent_folder}"; trap - RETURN' RETURN
+    fi
+    curl -sS -L "${aws_url}" -o "${aws_file_path}" || return 1
+    unzip "${aws_file_path}" -d "${aws_folder_path}" || return 1
+    ${SUDO} "${aws_folder_path}/awscli-bundle/install" \
+        -i "${aws_target_parent_folder}/${aws_name}" \
+        -b "${aws_target_parent_folder}/bin/${aws_name}" \
+        || return 1
+    "${aws_target_parent_folder}/bin/${aws_name}" --version || return 1
+}
+
+software-disabled-470-albert() {
+    apt_add_with_repo "albert" "http://download.opensuse.org/repositories/home:/manuelschneid3r/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
+}
+
+software-disabled-480-ueberzugpp() {
+    apt_add_with_repo "ueberzugpp" "http://download.opensuse.org/repositories/home:/justkidding/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
+}
+
+software-490-yazi() { install_git_release "https://github.com/sxyazi/yazi"; }
+
 selected_install_types=()
 dry_run=0
 verbose=0
 update_failed=0
 
 LOGFILE_PATH="/var/log/${APP_NAME}.log"
+
+discover_software
 
 while [ $# -gt 0 ]; do
     case "${1}" in
@@ -625,14 +894,13 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             selected_install_types=()
             for t in ${1//,/ }; do
-                # lowercase
                 t="${t,,}"
-                if echo "${possible_install_types[@]}" | grep -wq "${t}"; then
+                if is_install_type "${t}"; then
                     selected_install_types+=("${t}")
                 elif [ "${t}" = "all" ]; then
                     selected_install_types=("${possible_install_types[@]}")
                 else
-                    echo "ERROR: Unknown type: ${t}" 1>&2
+                    error "Unknown type: ${t}"
                     usage
                 fi
             done
@@ -641,12 +909,12 @@ while [ $# -gt 0 ]; do
             verbose=1
             ;;
         *)
-            if [ "${1}" == "all" ]; then
+            if [ "${1}" = "all" ]; then
                 selected_install_types=("${possible_install_types[@]}")
-            elif echo "${possible_install_types[@]}" | grep -wq "${1}"; then
+            elif is_install_type "${1}"; then
                 selected_install_types+=("${1}")
             else
-                echo "ERROR: Unknown argument: $1" 1>&2
+                error "Unknown argument: ${1}"
                 usage
             fi
             ;;
@@ -654,7 +922,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-loggedin_id_name="$(loggedin --id-name)"
+loggedin_id_name="$(loggedin --id-name)" || fail "Failed to run loggedin --id-name"
 CURRENT_USER_ID="$(echo "${loggedin_id_name}" | cut -d: -f1)"
 CURRENT_USER_NAME="$(echo "${loggedin_id_name}" | cut -d: -f2)"
 unset loggedin_id_name
@@ -664,17 +932,12 @@ if [ "${#selected_install_types[@]}" -eq 0 ]; then
 fi
 
 SUDO=""
-# must be run as root
 if [ "${EUID}" -ne 0 ]; then
     SUDO="sudo"
-    #if [ "${dry_run}" -eq 0 ]; then
-    #    echo "Running ${APP_NAME} needs to be run as root..." 1>&2
-    #    ${SUDO} echo "OK" 1>&2
-    #fi
 fi
 
-[ -z "${CURRENT_USER_NAME}" ] && echo "ERROR: Failed to determine CURRENT_USER_NAME" 1>&2 && exit 1
-[ -z "${CURRENT_USER_ID}" ] && echo "ERROR: Failed to determine CURRENT_USER_ID" 1>&2 && exit 1
+[ -z "${CURRENT_USER_NAME}" ] && fail "Failed to determine CURRENT_USER_NAME"
+[ -z "${CURRENT_USER_ID}" ] && fail "Failed to determine CURRENT_USER_ID"
 
 SUDO_USER=""
 if [ "${EUID}" -ne "${CURRENT_USER_ID}" ]; then
@@ -683,7 +946,6 @@ fi
 
 if [ "${dry_run}" -eq 0 ]; then
     echo "Running ${APP_NAME} (see ${LOGFILE_PATH})..." | logger -t "${APP_NAME}"
-    # make sure LOGFILE_PATH is writable
     if ! ${SUDO_USER} test -w "${LOGFILE_PATH}"; then
         ${SUDO} touch "${LOGFILE_PATH}"
         ${SUDO} chown "${CURRENT_USER_NAME}":"${CURRENT_USER_NAME}" "${LOGFILE_PATH}"
@@ -701,296 +963,7 @@ else
     echo "Running ${APP_NAME} in dry-run mode..." 1>&2
 fi
 
-if is_selected "firmware"; then
-    ${SUDO} fwupdmgr get-devices --force \
-        && ${SUDO} fwupdmgr refresh --force \
-        && ${SUDO} fwupdmgr get-updates \
-        && [ "${dry_run}" -eq 0 ] && yes | ${SUDO} fwupdmgr update
-fi
-
-if is_selected "apt"; then
-    apt_upgrade
-fi
-
-if is_selected "npm"; then
-    npm_update npm
-fi
-
-if is_selected "flatpak"; then
-    flatpak_update
-fi
-
-if is_selected "adb"; then
-	install_adb
-fi
-
-if is_selected "chrome"; then
-    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
-fi
-
-if is_selected "mw"; then
-    npm_update @mittwald/cli
-fi
-
-if is_selected "claude"; then
-    curl_update "claude" "https://claude.ai/install.sh"
-fi
-
-if is_selected "code"; then
-    apt_upgrade "${selected}"
-fi
-
-if is_selected "kubectl-mw"; then
-    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"
-fi
-
-if is_selected "powerline-fonts"; then
-    install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"
-fi
-
-if is_selected "nickpit"; then
-    install_git_release "https://github.com/dgrieser/nickpit"
-fi
-
-if is_selected "slack"; then
-    # jessie is the only supported version
-    apt_add_with_list_file "slack-desktop" \
-                           "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
-                           "https://packagecloud.io/slacktechnologies/slack/gpgkey"
-fi
-
-if is_selected "rampart"; then
-    install_from_git "https://github.com/peg/rampart.git" "bash" "-c" "make linux; mv rampart-linux /usr/local/bin/rampart; cd preload; make install"
-fi
-
-if is_selected "gitlab-ci-local"; then
-    install_git_release "https://github.com/firecow/gitlab-ci-local"
-fi
-
-if is_selected "yq"; then
-    install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"
-fi
-
-if is_selected "gitlab_trackr"; then
-    install_git_release "https://github.com/BjarneSeger/gitlab_trackr"
-fi
-
-if is_selected "nexus-cli"; then
-    install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"
-fi
-
-if is_selected "snaxus-cli"; then
-    install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"
-fi
-
-if is_selected "boodschapper"; then
-    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"
-fi
-
-if is_selected "himalaya"; then
-    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya
-fi
-
-if is_selected "antigravity"; then
-    apt_add_with_repo "${selected}" \
-                      "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/" \
-                      "antigravity-debian" \
-                      "main" \
-                      "https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg"
-fi
-
-if is_selected "zed"; then
-    curl_update "zed" "https://zed.dev/install.sh"
-fi
-
-if is_selected "hwatch"; then
-    install_git_release "https://github.com/blacknon/hwatch"
-fi
-
-if is_selected "gradia"; then
-    flatpak_update "be.alexandervanhee.gradia"
-fi
-
-if is_selected "lazygit"; then
-    install_git_release "https://github.com/jesseduffield/lazygit"
-fi
-
-if is_selected "viddy"; then
-    install_git_release "https://github.com/sachaos/viddy"
-fi
-
-if is_selected "spotify"; then
-    apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
-fi
-
-if is_selected "trivy"; then
-    apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
-fi
-
-if is_selected "threema"; then
-    flatpak_update "ch.threema.threema-desktop"
-fi
-
-if is_selected "gnome-ext-hanabi"; then
-    install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"
-fi
-
-if is_selected "opencode"; then
-    curl_update "opencode" "https://opencode.ai/install"
-fi
-
-if is_selected "zoom"; then
-    zoom_package_name="${selected}"
-    zoom_deb_file_name="${zoom_package_name}_${PLATFORM}.deb"
-    zoom_deb_file_path="/tmp/${zoom_deb_file_name}"
-    zoom_base_url="https://zoom.us"
-    zoom_rest_url="${zoom_base_url}/rest/download?os=linux"
-    zoom_client_url="${zoom_base_url}/client"
-    zoom_rest_response="$(curl -sS "${zoom_rest_url}")"
-    version="$(echo "${zoom_rest_response}" | jq -r '.result.downloadVO.zoom.version')"
-    if [ -z "${version}" ] || [[ ! "${version}" =~ ^[0-9\.]+$ ]]; then
-        echo "ERROR: Failed to get latest version of Zoom" 1>&2
-        echo "${zoom_rest_url} returned:" 1>&2
-        echo "${zoom_rest_response}" 1>&2
-    fi
-    installed_version="$(dpkg -s "${zoom_package_name}" 2> /dev/null | grep -m 1 '^Version:' | awk '{print $2}')"
-    [ -z "${installed_version}" ] && installed_version="<unknown>"
-    if [ -n "${version}" ] && [ "${version}" != "${installed_version}" ]; then
-        echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
-        if [ "${dry_run}" -eq 0 ]; then
-            if curl -L "${zoom_client_url}/${version}/${zoom_deb_file_name}" -o "${zoom_deb_file_path}"; then
-                ${SUDO} apt install "${zoom_deb_file_path}"
-            else
-                echo "ERROR: Failed to download latest version of Zoom from ${zoom_client_url}" 1>&2
-            fi
-            rm "${zoom_deb_file_path}"
-        else
-            echo -e "NAME\tCURRENT\tUPDATE\nZoom\t${installed_version}\t${version}" | column -t -s $'\t'
-        fi
-    else
-        echo "${APP_NAME}: Zoom ${installed_version} is up to date" 1>&2
-    fi
-fi
-
-if is_selected "glab"; then
-    install_git_release "https://gitlab.com/gitlab-org/cli"
-fi
-
-if is_selected "gh"; then
-    apt_add_with_repo "${selected}" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"
-fi
-
-if is_selected "helm"; then
-    legacy_helm_repo_path="/etc/apt/sources.list.d/helm-stable-debian.list"
-    if grep -qF "baltocdn.com" "${legacy_helm_repo_path}" 2>/dev/null; then
-        if [ "${dry_run}" -eq 1 ]; then
-            echo "Would remove obsolete Helm repository ${legacy_helm_repo_path}" 1>&2
-        else
-            verbose "${SUDO} rm -f ${legacy_helm_repo_path}"
-            ${SUDO} rm -f "${legacy_helm_repo_path}"
-        fi
-    fi
-    if apt_add_with_repo "${selected}" \
-            "https://packages.buildkite.com/helm-linux/helm-debian/any/" \
-            "any" \
-            "main" \
-            "https://packages.buildkite.com/helm-linux/helm-debian/gpgkey" \
-            "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" \
-            && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
-            && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"; then
-        :
-    else
-        update_failed=1
-    fi
-fi
-
-if is_selected "wezterm"; then
-    apt_add_with_repo "${selected}" "https://apt.fury.io/wez" "*" "*" "https://apt.fury.io/wez/gpg.key"
-fi
-
-if is_selected "dive"; then
-    install_git_release "https://github.com/wagoodman/dive"
-fi
-
-if is_selected "kubecolor"; then
-    install_git_release "https://github.com/kubecolor/kubecolor"
-fi
-
-if is_selected "mc"; then
-    # TODO: add proper version printing on dry-run
-    mc_target_path="/usr/local/bin/mc"
-    [ ${dry_run} -eq 1 ] && mc_target_path="/tmp/mc-dry-run"
-    ${SUDO} curl -sS -L https://dl.min.io/client/mc/release/linux-amd64/mc -o "${mc_target_path}"
-    ${SUDO} chmod +x "${mc_target_path}"
-    ${mc_target_path} --version
-    [ ${dry_run} -eq 1 ] && ${SUDO} rm "${mc_target_path}"
-fi
-
-if is_selected "gemini"; then
-    npm_update @google/gemini-cli --force
-fi
-
-if is_selected "qwen"; then
-    npm_update @qwen-code/qwen-code --force
-fi
-
-if is_selected "codex"; then
-    npm_update @openai/codex
-fi
-
-if is_selected "kilocode"; then
-    npm_update @kilocode/cli
-fi
-
-if is_selected "aws"; then
-    aws_name="aws"
-    aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
-    aws_file_name="$(basename "${aws_url}")"
-    aws_file_path="/tmp/${aws_file_name}"
-    aws_folder_path="${aws_file_path%.zip}"
-    aws_target_parent_folder="/usr/local"
-    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/${aws_name}-dry-run" && mkdir -p "${aws_target_parent_folder}"
-    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"
-    curl -sS -L "${aws_url}" -o "${aws_file_path}"
-    unzip "${aws_file_path}" -d "${aws_folder_path}"
-    ${SUDO} rm "${aws_file_path}"
-    install_args=("--install-dir" "${aws_target_parent_folder}/${aws_name}" "--bin-dir" "${aws_target_parent_folder}/bin")
-    [ -d "${aws_target_parent_folder}/${aws_name}" ] && install_args+=("--update")
-    ${SUDO} "${aws_folder_path}/aws/install" "${install_args[@]}"
-    ${SUDO} rm -rf "${aws_folder_path}"
-    ${aws_target_parent_folder}/bin/${aws_name} --version
-    [ ${dry_run} -eq 1 ] && ${SUDO} rm "${aws_target_parent_folder}/bin/${aws_name}"
-fi
-
-if is_selected "aws-v1"; then
-    aws_name="aws-v1"
-    aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
-    aws_file_name="$(basename "${aws_url}")"
-    aws_file_path="/tmp/${aws_file_name}"
-    aws_folder_path="${aws_file_path%.zip}"
-    aws_target_parent_folder="/usr/local"
-    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/${aws_name}-dry-run" && mkdir -p "${aws_target_parent_folder}"
-    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"
-    curl -sS -L "${aws_url}" -o "${aws_file_path}"
-    unzip "${aws_file_path}" -d "${aws_folder_path}"
-    ${SUDO} rm "${aws_file_path}"
-    ${SUDO} "${aws_folder_path}/awscli-bundle/install" -i "${aws_target_parent_folder}/${aws_name}" -b "${aws_target_parent_folder}/bin/${aws_name}"
-    ${SUDO} rm -rf "${aws_folder_path}"
-    ${aws_target_parent_folder}/bin/${aws_name} --version
-    [ ${dry_run} -eq 1 ] && ${SUDO} rm -rf "${aws_target_parent_folder}/${aws_name}" "${aws_target_parent_folder}/bin/${aws_name}"
-fi
-
-if is_selected "albert"; then
-    apt_add_with_repo "albert" "http://download.opensuse.org/repositories/home:/manuelschneid3r/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
-fi
-
-if is_selected "ueberzugpp"; then
-    apt_add_with_repo "ueberzugpp" "http://download.opensuse.org/repositories/home:/justkidding/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
-fi
-
-if is_selected "yazi"; then
-    install_git_release "https://github.com/sxyazi/yazi"
-fi
+run_selected_software
 
 if [ "${update_failed}" -ne 0 ]; then
     fail "One or more updates failed"
