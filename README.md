@@ -1612,12 +1612,12 @@ A wrapper around `fzf` that treats the first input line as a fixed header, with 
 
 | Argument / Flag | Description |
 |---|---|
-| `--command <command>` | Command whose output is piped into `fzf`; enables `--print-query` and is required for `--watch`. |
+| `--command <command>` | Command whose output is piped into `fzf`; enables `--print-query` and is required for `--watch`. Binds `ctrl-r` to reload the output on demand (skipped if `ctrl-r` is already bound or described by the caller). |
 | `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. |
 | `--key-descriptions <key>:<description>,...` | When given, only these keys are shown at the top, with these descriptions and in this order (inferred keys are suppressed). Useful for `--expect` keys, whose effect lives in the `--key-command`. |
-| `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). |
+| `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). A leading `↻ <n>s` indicator in the key list names the current reload interval (the delay until the first reload, then the interval); `ctrl-r` restarts the interval. |
 | `--watch-delay <seconds>` | Delay before the first reload (default: 2). |
-| `--watch-while <command>` | Keep reloading only while this command exits successfully; it is checked after each reload interval, so the first reload always happens. Lets a view stop refreshing once whatever it watches reached a final state (requires `--watch`). |
+| `--watch-while <command>` | Keep reloading only while this command exits successfully; it is checked after each reload interval, so the first reload always happens. Lets a view stop refreshing once whatever it watches reached a final state (requires `--watch`). The indicator switches to `↻ off` once reloading stopped. |
 | `--columns <cols>` | Comma-separated columns to display (passed to `fzf --with-nth`). |
 | `--filter-columns <cols>` | Comma-separated columns to match against (passed to `fzf --nth`). |
 | `--delimiter <delimiter>` | Field delimiter for `fzf` (default: two-or-more spaces). |

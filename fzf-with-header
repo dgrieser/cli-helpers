@@ -23,6 +23,8 @@ watch_seconds=0
 watch_delay=2
 watch_while_cmd=""
 watcher_pid=""
+watch_reset_file=""
+refresh_key="ctrl-r"
 reverse=1
 print_query=0
 fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
@@ -110,6 +112,9 @@ fi
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
 
+# a manual refresh signals the watcher through this file to restart its timer
+[ ${watch_seconds} -gt 0 ] && watch_reset_file="${TMPDIR:-/tmp}/fzf-with-header-refresh.$$"
+
 if [ ${reverse} -eq 1 ]; then
     [ -n "${args}" ] && args="${args} "    
     args="${args}--layout=default"
@@ -186,6 +191,7 @@ parse_preview_window() {
 }
 
 mapped_keys=""
+used_keys=""
 has_preview=0
 prev=""
 for arg in "$@"; do
@@ -216,7 +222,10 @@ for arg in "$@"; do
             esac
             ;;
     esac
-    [ -n "${spec}" ] && mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
+    if [ -n "${spec}" ]; then
+        mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
+        used_keys="${used_keys}"$'\n'"$(split_key_spec "${spec}" | sed 's/:.*//')"
+    fi
     prev="${arg}"
 done
 
@@ -226,6 +235,18 @@ if [ "${#key_desc_order[@]}" -gt 0 ]; then
     for desc_key in "${key_desc_order[@]}"; do
         mapped_keys="${mapped_keys}${desc_key}"$'\t'"${key_desc[${desc_key}]}"$'\n'
     done
+fi
+
+# any --command view can be reloaded on demand; leave the key alone if the
+# caller already uses it for something else
+refresh_bind_args=()
+if [ -n "${cmd}" ] && [ -z "${key_desc[${refresh_key}]+x}" ] &&
+   ! printf '%s\n' "${used_keys}" | grep -qxF -- "${refresh_key}"; then
+    refresh_action="reload(${cmd})"
+    # the manual reload already happened, the watcher only restarts its timer
+    [ -n "${watch_reset_file}" ] && refresh_action="${refresh_action}+execute-silent(touch '${watch_reset_file}')"
+    refresh_bind_args=(--bind "${refresh_key}:${refresh_action}")
+    mapped_keys="${mapped_keys}"$'\n'"${refresh_key}"$'\t'"refresh"
 fi
 
 # merge keys sharing a description: "alt-+ stage" + "insert stage" -> "alt-+/insert stage"
@@ -257,8 +278,23 @@ if [ "${has_preview}" -eq 1 ]; then
     esac
 fi
 [ "${max_line_width}" -lt 10 ] && max_line_width=10
+
+# with --watch the key list is led by a "↻ <n>s" indicator naming the reload
+# interval; reserve its widest form so the wrapping stays put when it changes
+footer_ind_sep=""
+watch_indicator=0
+ind_width=0
+if [ ${watch_seconds} -gt 0 ]; then
+    watch_indicator=1
+    ind_text="${watch_seconds}s"
+    [ ${watch_delay} -gt ${watch_seconds} ] && ind_text="${watch_delay}s"
+    ind_width=$(( 2 + ${#ind_text} ))
+    # "↻ off" is shown once watching stopped
+    [ ${ind_width} -lt 5 ] && ind_width=5
+fi
+
 keys_header=""
-line_width=0
+line_width=${ind_width}
 while IFS=$'\t' read -r entry_key entry_desc; do
     [ -z "${entry_key}" ] && continue
     if [ -n "${entry_desc}" ]; then
@@ -270,7 +306,16 @@ while IFS=$'\t' read -r entry_key entry_desc; do
     fi
     if [ -z "${keys_header}" ]; then
         keys_header="${entry}"
-        line_width=${entry_width}
+        if [ ${ind_width} -eq 0 ]; then
+            line_width=${entry_width}
+        elif [ $((line_width + 3 + entry_width)) -le ${max_line_width} ]; then
+            # the indicator holds the first slot of the line
+            footer_ind_sep=" · "
+            line_width=$((line_width + 3 + entry_width))
+        else
+            footer_ind_sep=$'\n'
+            line_width=${entry_width}
+        fi
     elif [ $((line_width + 3 + entry_width)) -le ${max_line_width} ]; then
         keys_header="${keys_header} · ${entry}"
         line_width=$((line_width + 3 + entry_width))
@@ -279,23 +324,72 @@ while IFS=$'\t' read -r entry_key entry_desc; do
         line_width=${entry_width}
     fi
 done <<< "${mapped_keys}"
+
+build_footer() {
+    local indicator="${1}"
+    if [ ${watch_indicator} -eq 0 ] || [ -z "${indicator}" ]; then
+        printf '%s' "${keys_header}${C_RESET}"
+    else
+        printf '%s' "${C_HELP}↻ ${indicator}${footer_ind_sep}${keys_header}${C_RESET}"
+    fi
+}
+
+# until the first reload the wait is the delay, afterwards the interval
+if [ ${watch_delay} -gt 0 ]; then
+    initial_indicator="${watch_delay}s"
+else
+    initial_indicator="${watch_seconds}s"
+fi
+
 footer_args=()
-[ -n "${keys_header}" ] && footer_args=(--footer "${keys_header}${C_RESET}")
+if [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ]; then
+    [ ${watch_indicator} -eq 0 ] && initial_indicator=""
+    footer_args=(--footer "$(build_footer "${initial_indicator}")")
+fi
 
 update_fzf() {
     local cmd="${1}"
     local port="${2}"
     local seconds="${3}"
-    sleep "${watch_delay}"
+    local remaining="${watch_delay}"
+    local first=1
+    rm -f "${watch_reset_file}"
+    # fzf is started after this watcher, so give it a moment to open its port
+    [ ${remaining} -eq 0 ] && sleep 1
     while true; do
+        # counted down in steps instead of one sleep, so a manual refresh can
+        # restart the wait; the indicator only names the interval, so no redraw
+        while [ ${remaining} -gt 0 ]; do
+            sleep 1
+            remaining=$(( remaining - 1 ))
+            # a manual refresh reloaded already, so only the timer restarts
+            if [ -e "${watch_reset_file}" ]; then
+                rm -f "${watch_reset_file}"
+                remaining="${seconds}"
+            fi
+        done
         # the first reload always happens; the condition only decides whether
         # to keep going, so a state the command reports after that reload counts
-        reload_fzf "${cmd}" "${port}" || break
-        sleep "${seconds}"
-        if [ -n "${watch_while_cmd}" ] && ! ${watch_while_cmd} >/dev/null 2>&1; then
+        if [ ${first} -eq 0 ] && [ -n "${watch_while_cmd}" ] && ! ${watch_while_cmd} >/dev/null 2>&1; then
+            post_footer "${port}" "off"
             break
         fi
+        reload_fzf "${cmd}" "${port}" || break
+        # the delay only applies before the first reload
+        if [ ${first} -eq 1 ] && [ "${initial_indicator}" != "${seconds}s" ]; then
+            post_footer "${port}" "${seconds}s"
+        fi
+        first=0
+        remaining="${seconds}"
     done
+}
+
+post_footer() {
+    local port="${1}"
+    local indicator="${2}"
+    # --data-binary keeps the newlines of a wrapped footer intact
+    curl -XPOST 127.0.0.1:${port} --data-binary "change-footer($(build_footer "${indicator}"))" &> /dev/null
+    return 0
 }
 
 reload_fzf() {
@@ -306,6 +400,7 @@ reload_fzf() {
 }
 
 stop_watcher() {
+    [ -n "${watch_reset_file}" ] && rm -f "${watch_reset_file}"
     [ -z "${watcher_pid}" ] && return 0
     kill "${watcher_pid}" &> /dev/null
     watcher_pid=""
@@ -329,7 +424,7 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
