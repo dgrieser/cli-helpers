@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -20,6 +20,9 @@ args=""
 query=""
 delimiter='  +'
 watch_seconds=0
+watch_delay=2
+watch_while_cmd=""
+watcher_pid=""
 reverse=1
 print_query=0
 fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
@@ -65,6 +68,16 @@ while [ $# -gt 0 ]; do
             [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
             watch_seconds="${1}"
             ;;
+        --watch-delay)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            watch_delay="${1}"
+            ;;
+        --watch-while)
+            shift
+            [ -z "${1}" ] && usage
+            watch_while_cmd="${1}"
+            ;;
         --delimiter)
             shift
             [ -z "${1}" ] && usage
@@ -95,6 +108,7 @@ if [ ${print_query} -eq 1 ]; then
 fi
 
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
+[ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
 
 if [ ${reverse} -eq 1 ]; then
     [ -n "${args}" ] && args="${args} "    
@@ -272,10 +286,15 @@ update_fzf() {
     local cmd="${1}"
     local port="${2}"
     local seconds="${3}"
-    sleep 2
+    sleep "${watch_delay}"
     while true; do
+        # the first reload always happens; the condition only decides whether
+        # to keep going, so a state the command reports after that reload counts
         reload_fzf "${cmd}" "${port}" || break
         sleep "${seconds}"
+        if [ -n "${watch_while_cmd}" ] && ! ${watch_while_cmd} >/dev/null 2>&1; then
+            break
+        fi
     done
 }
 
@@ -286,20 +305,32 @@ reload_fzf() {
     return ${?}
 }
 
+stop_watcher() {
+    [ -z "${watcher_pid}" ] && return 0
+    kill "${watcher_pid}" &> /dev/null
+    watcher_pid=""
+}
+
+trap stop_watcher EXIT
+
 while true; do
     if [ -n "${cmd}" ]; then
+        # a fresh listen port per round, so restarts after a key command do not
+        # reuse the port of an fzf that is already gone
+        listen_arg=""
         if [ ${watch_seconds} -gt 0 ]; then
             port=$((39000+RANDOM%1000))
             while lsof -nP -i:${port} &> /dev/null; do
                 port=$((port+1))
             done
-            [ -n "${args}" ] && args="${args} "
-            args="${args}--listen=127.0.0.1:${port}"
+            listen_arg="--listen=127.0.0.1:${port}"
             update_fzf "${cmd}" "${port}" "${watch_seconds}" &
+            watcher_pid=$!
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"

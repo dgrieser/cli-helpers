@@ -11,6 +11,7 @@ possible_install_types=(
     albert
     antigravity
     apt
+    aws-v1
     aws
     boodschapper
     chrome
@@ -942,20 +943,41 @@ if is_selected "kilocode"; then
 fi
 
 if is_selected "aws"; then
-    aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"    
+    aws_name="aws"
+    aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
     aws_file_name="$(basename "${aws_url}")"
     aws_file_path="/tmp/${aws_file_name}"
     aws_folder_path="${aws_file_path%.zip}"
     aws_target_parent_folder="/usr/local"
-    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/aws-dry-run" && mkdir -p "${aws_target_parent_folder}"
+    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/${aws_name}-dry-run" && mkdir -p "${aws_target_parent_folder}"
     ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"
     curl -sS -L "${aws_url}" -o "${aws_file_path}"
     unzip "${aws_file_path}" -d "${aws_folder_path}"
     ${SUDO} rm "${aws_file_path}"
-    ${SUDO} "${aws_folder_path}/awscli-bundle/install" -i "${aws_target_parent_folder}"/aws -b "${aws_target_parent_folder}"/bin/aws
+    install_args=("--install-dir" "${aws_target_parent_folder}/${aws_name}" "--bin-dir" "${aws_target_parent_folder}/bin")
+    [ -d "${aws_target_parent_folder}/${aws_name}" ] && install_args+=("--update")
+    ${SUDO} "${aws_folder_path}/aws/install" "${install_args[@]}"
     ${SUDO} rm -rf "${aws_folder_path}"
-    ${aws_target_parent_folder}/bin/aws --version
-    [ ${dry_run} -eq 1 ] && ${SUDO} rm -rf "${aws_target_parent_folder}"/aws "${aws_target_parent_folder}"/bin/aws
+    ${aws_target_parent_folder}/bin/${aws_name} --version
+    [ ${dry_run} -eq 1 ] && ${SUDO} rm "${aws_target_parent_folder}/bin/${aws_name}"
+fi
+
+if is_selected "aws-v1"; then
+    aws_name="aws-v1"
+    aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
+    aws_file_name="$(basename "${aws_url}")"
+    aws_file_path="/tmp/${aws_file_name}"
+    aws_folder_path="${aws_file_path%.zip}"
+    aws_target_parent_folder="/usr/local"
+    [ ${dry_run} -eq 1 ] && aws_target_parent_folder="/tmp/${aws_name}-dry-run" && mkdir -p "${aws_target_parent_folder}"
+    ${SUDO} rm -rf "${aws_file_path}" "${aws_folder_path}"
+    curl -sS -L "${aws_url}" -o "${aws_file_path}"
+    unzip "${aws_file_path}" -d "${aws_folder_path}"
+    ${SUDO} rm "${aws_file_path}"
+    ${SUDO} "${aws_folder_path}/awscli-bundle/install" -i "${aws_target_parent_folder}/${aws_name}" -b "${aws_target_parent_folder}/bin/${aws_name}"
+    ${SUDO} rm -rf "${aws_folder_path}"
+    ${aws_target_parent_folder}/bin/${aws_name} --version
+    [ ${dry_run} -eq 1 ] && ${SUDO} rm -rf "${aws_target_parent_folder}/${aws_name}" "${aws_target_parent_folder}/bin/${aws_name}"
 fi
 
 if is_selected "albert"; then

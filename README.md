@@ -1608,7 +1608,7 @@ key="$(readkey | tail -n1)"
 ### `fzf-with-header`
 A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed at the top, wrapped to the terminal width; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name.
 
-**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
+**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
 
 | Argument / Flag | Description |
 |---|---|
@@ -1616,6 +1616,8 @@ A wrapper around `fzf` that treats the first input line as a fixed header, with 
 | `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. |
 | `--key-descriptions <key>:<description>,...` | When given, only these keys are shown at the top, with these descriptions and in this order (inferred keys are suppressed). Useful for `--expect` keys, whose effect lives in the `--key-command`. |
 | `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). |
+| `--watch-delay <seconds>` | Delay before the first reload (default: 2). |
+| `--watch-while <command>` | Keep reloading only while this command exits successfully; it is checked after each reload interval, so the first reload always happens. Lets a view stop refreshing once whatever it watches reached a final state (requires `--watch`). |
 | `--columns <cols>` | Comma-separated columns to display (passed to `fzf --with-nth`). |
 | `--filter-columns <cols>` | Comma-separated columns to match against (passed to `fzf --nth`). |
 | `--delimiter <delimiter>` | Field delimiter for `fzf` (default: two-or-more spaces). |
@@ -1626,6 +1628,7 @@ A wrapper around `fzf` that treats the first input line as a fixed header, with 
 **Examples:**
 ```bash
 fzf-with-header --command "ps aux" --watch 5
+fzf-with-header --command "list-builds" --watch 5 --watch-delay 3 --watch-while "has-running-builds"
 fzf-with-header --command "cat data.tsv" --columns 1,3 --delimiter $'\t'
 fzf-with-header docker -- --height=40%
 fzf-with-header --key-command handle-key --key-descriptions "ctrl-x:delete entry,ctrl-r:refresh" -- --expect=ctrl-x,ctrl-r
