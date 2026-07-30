@@ -1495,23 +1495,77 @@ reminder --add
 ## Interactive Input Prompts
 
 ### `prompt`
-Reads input from the terminal, in either multi-line mode (collecting lines until Ctrl-D) or single-line mode, with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
+Reads input from the terminal in one of four modes: multi-line (collecting lines until Ctrl-D), single-line, list selection (`--select`), or single-line input with completion (`--complete`), with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
 
-**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE]`
+**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--ignore-case] [--substring] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
 
 | Argument / Flag | Description |
 |---|---|
-| `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line) or `Enter input:` (single-line). |
-| `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line) or empty (single-line). |
+| `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line) or `Enter input:` (single-line, completion mode) or `Select an item:` (select mode). |
+| `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
 | `-s, --single-line` | Read a single line (no prompt character shown). |
 | `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
-| `-d, --default <value>` | Default value used when the user enters nothing; only valid in non-protected single-line mode. |
+| `-d, --default <value>` | Default value used when the user enters nothing; in select mode the key, title or number of the entry the cursor starts on. Only valid in select mode, completion mode, or non-protected single-line mode. |
+| `-l, --select` | Select one entry from a colored list; prints the selected item's key (see `--return`). |
+| `-a, --complete` | Read a single line with Tab-completion against the given candidates. |
+| `--delimiter <delim>` | Select mode only: splits each item into `<key><delim><title>` (default `=`); escape sequences like `\t` are honored, an empty value disables key parsing. |
+| `--delimiter-regex <regex>` | Select mode only: like `--delimiter`, but the split point is the first (non-empty) match of this regular expression, e.g. `\s{2,}` for "at least two spaces"; the matched text itself is dropped. |
+| `--key-regex <regex>` | Select mode only: takes the key from the first match of this regular expression (capture group 1 when the pattern has one) and keeps the whole item as the title, e.g. `^\S+` to display a full table row but return its first column. Mutually exclusive with `--delimiter` and `--delimiter-regex`. |
+| `--return key\|title\|index\|number` | Select mode only: print the item's key (default), its title, its 0-based index or its 1-based number. |
+| `--show-keys` | Select mode only: show the item keys next to the titles. |
+| `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. |
+| `--ignore-case` | Completion mode only: match candidates case-insensitively. |
+| `--substring` | Completion mode only: match candidates anywhere instead of at the start (disables the inline suggestion). |
+| `--prefill <text>` | Completion mode only: pre-filled, editable input text. |
+| `--height <n>` | Maximum number of list rows shown at once; defaults to what fits the terminal. |
+| `--no-color` | Disable colored output (also honored: `NO_COLOR`, `TERM=dumb`, non-terminal output). |
+| `<items ...>` | Select/completion mode only: the list items or completion candidates. Lines piped on stdin are appended to them. |
+
+All modes draw their prompt on stderr (select and completion mode fall back to `/dev/tty` when stderr is redirected) and print the result to stdout. Colors come from the same `COLOR_*` variables the [color-parse](#color-parse) family uses and are dropped automatically when the output is not a terminal, when `--no-color` is given, or when `NO_COLOR` is set or `TERM` is empty/`dumb`:
+
+| Element | Variable |
+|---|---|
+| Prompt text, select mode items | `COLOR_TEXT_BOLD`, `COLOR_TEXT_DEFAULT` |
+| Typed input (echoed while typing), accepted answer | `COLOR_TEXT_DEFAULT`, `COLOR_TEXT_SUCCESS` |
+| `(default)` hint, key hints, inline completion suggestion | `COLOR_TEXT_FADED` |
+| Prompt character (`> `) and pointer (`❯`), highlighted row | `COLOR_TEXT_INFO` + `COLOR_SELECTION_BACKGROUND` |
+| Item numbers, item keys | `COLOR_TEXT_NUMERIC`, `COLOR_TEXT_MUTED` |
+| `--header-lines` header | `COLOR_TABLE_HEADER` |
+
+Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
+
+#### Select mode keys (`--select` / `prompt-select`)
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `k` / `j`, Ctrl-P / Ctrl-N | Move the cursor (wraps around). |
+| PageUp / PageDown | Move by one screen. |
+| Home / `g`, End / `G` | Jump to the first / last entry. |
+| `1`…`9`, `0` | Jump to that entry (`0` is the tenth). |
+| Enter | Select the highlighted entry and print it. |
+| Esc, `q` | Abort (exit 1). |
+| Ctrl-C | Abort (exit 130). |
+
+#### Completion mode keys (`--complete` / `prompt-complete`)
+
+| Key | Action |
+|---|---|
+| Tab | Complete as far as all matches agree; when that is ambiguous, open the candidate menu, then cycle forward through it. |
+| Shift-Tab | Cycle backwards through the menu. |
+| `↑` / `↓` | Open the menu (at the last / first candidate) and move through it; the input line always shows the highlighted candidate. |
+| `→` at end of line | Accept the greyed-out inline suggestion. |
+| Enter | Submit the current line (the highlighted candidate when the menu is open). |
+| Esc | Close the menu and restore what was typed; with no menu open, abort (exit 1). |
+| `←` / `→`, Home / End, Ctrl-A / Ctrl-E, Backspace, Delete, Ctrl-U, Ctrl-K, Ctrl-W | Standard line editing. |
+| Ctrl-C | Abort (exit 130). |
 
 **Examples:**
 ```bash
 prompt --single-line --prompt "Your name:"
 prompt --protected --single-line --prompt "Password:"
 echo | prompt --single-line --default "fallback"
+prompt --select --prompt "Pick a service:" api worker db
+prompt --complete --prompt "Branch:" main develop staging
 ```
 
 #### Symlink aliases (all point to `prompt`)
@@ -1526,6 +1580,8 @@ The script branches on its invoked name (`argv[0]`):
 | `prompt-input` | Single-line input; prints the entered value; trailing args become the prompt text. |
 | `prompt-multiline` | Multi-line input (until Ctrl-D), printing all lines; trailing args become the prompt text. |
 | `prompt-password` | Single-line masked secret entry (prompt `Password:`), printing the entered value. |
+| `prompt-select` | Implies `--select`; trailing args are the list items (not the prompt text, use `-p` for that). |
+| `prompt-complete` | Implies `--complete`; trailing args are the completion candidates (not the prompt text, use `-p` for that). |
 
 **Examples:**
 ```bash
@@ -1533,6 +1589,14 @@ prompt-continue "Delete everything?" && rm -rf ./build
 prompt-yes-no "Proceed with deploy" && deploy
 name="$(prompt-input "What is your name?")"
 secret="$(prompt-password)"
+service="$(prompt-select -p "Pick a service:" "api=Public API gateway" "worker=Background worker")"
+number="$(prompt-select --return number apple banana cherry)"
+kubectl get pods -o name | prompt-select -p "Pod:" --delimiter ''
+kubectl get pods | prompt-select -p "Pod:" --delimiter '' --header-lines 1
+id="$(docker ps | prompt-select -p "Container:" --key-regex '^\S+' --header-lines 1)"
+sha="$(git log --oneline -20 | prompt-select -p "Commit:" --delimiter-regex '\s+')"
+branch="$(git branch --format '%(refname:short)' | prompt-complete -p "Branch:")"
+host="$(prompt-complete --ignore-case -p "Host:" web-01 web-02 db-01)"
 ```
 
 ### `prompt-command`
