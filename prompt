@@ -907,7 +907,7 @@ def main():
         )
 
     parser = argparse.ArgumentParser(description=description, epilog=epilog)
-    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode and "Enter input:" for a single line mode')
+    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode, "Enter input:" for a single line mode and "Select an item:" in select mode; an empty value shows no prompt at all')
     parser.add_argument('--prompt-char', '-c', type=str, help='Custom prompt character, defaults to "> " for multiple line mode, "" for a single line mode and "' + POINTER + '" (the pointer) in select mode')
     parser.add_argument('--single-line', '-s', action='store_true', help='Read a single line from stdin, without the prompt char')
     parser.add_argument('--protected', '-P', action='store_true', help='Prompt for a secret')
@@ -1017,7 +1017,9 @@ def main():
         print('ERROR: --default can only be used in non-protected, single line mode.', file=sys.stderr)
         exit(1)
 
-    if not prompt:
+    # an explicitly empty --prompt asks for no prompt at all, only a missing one
+    # falls back to the default
+    if prompt is None:
         if prompt_select:
             prompt = 'Select an item:'
         elif prompt_single_line or prompt_complete:
@@ -1035,7 +1037,7 @@ def main():
     end = ' ' if prompt_single_line else '\n'
 
     prompt_base = prompt
-    if prompt_default and not prompt_select:
+    if prompt_default and prompt and not prompt_select:
         if prompt[-1] == ':': prompt = prompt[:-1]
         prompt = prompt + ' (' + prompt_default + '):'
 
@@ -1047,7 +1049,7 @@ def main():
     prompt_display = paint_prompt(theme, prompt_base, prompt_default)
     prompt_char_display = paint_prompt_char(theme, prompt_char)
 
-    if not (prompt_protected and prompt_single_line):
+    if prompt and not (prompt_protected and prompt_single_line):
         print(prompt_display, end=end, file=sys.stderr)
         sys.stderr.flush()
 
