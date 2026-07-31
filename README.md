@@ -1538,6 +1538,25 @@ All modes draw their prompt on stderr (select and completion mode fall back to `
 
 Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
 
+#### Multi-line mode keys (`prompt` / `prompt-multiline`)
+On a terminal, multi-line mode is a small editor: the text is redrawn in place, so the cursor can be moved freely through everything typed so far. Piped input and `--protected` keep using the plain line reader instead, so `printf 'a\nb\n' | prompt` behaves as before.
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Move by one character, wrapping into the previous/next line. |
+| `↑` / `↓` | Move between lines, keeping the column you started from even across shorter lines. |
+| PageUp / PageDown | Move by one screen. |
+| Home / End, Ctrl-A / Ctrl-E | Jump to start / end of the current line. |
+| Backspace | Delete before the cursor; at column 0 it joins the line to the previous one. |
+| Delete | Delete under the cursor; at the end of a line it pulls the next line up. |
+| Enter | Split the line at the cursor. |
+| Tab | Insert a literal tab (drawn four columns wide). |
+| Ctrl-U / Ctrl-K / Ctrl-W | Kill to start of line / to end of line / the previous word. |
+| Ctrl-D | Finish and print the text. |
+| Ctrl-C | Abort (exit 130). |
+
+Lines longer than the terminal scroll sideways instead of wrapping (the off-screen part is marked with `…`), and when the text outgrows the screen the visible window follows the cursor and a faded `line/total` counter is shown.
+
 #### Select mode keys (`--select` / `prompt-select`)
 
 | Key | Action |
