@@ -1507,7 +1507,7 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
 | `-s, --single-line` | Read a single line (no prompt character shown). |
 | `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
-| `-d, --default <value>` | Default value used when the user enters nothing; in select mode the key, title or number of the entry the cursor starts on. Only valid in select mode, completion mode, or non-protected single-line mode. |
+| `-d, --default <value>` | Default value used when the user enters nothing; in select mode the key, title or number of the entry the cursor starts on; in the `--files`/`--dirs` modes it is also pre-filled into the input line (and the `(default)` hint is then dropped as redundant). Only valid in select mode, completion mode, or non-protected single-line mode. |
 | `-l, --select` | Select one entry from a colored list; prints the selected item's key (see `--return`). |
 | `-a, --complete` | Read a single line with Tab-completion against the given candidates. |
 | `--delimiter <delim>` | Select mode only: splits each item into `<key><delim><title>` (default `=`); escape sequences like `\t` are honored, an empty value disables key parsing. |
@@ -1646,35 +1646,39 @@ cmd="$(prompt-command --default 'git status')"
 ### `prompt-file`
 Symlink to [prompt](#prompt) implying `--complete --files`: prompts for a file path with path completion (Tab completes the current component, completing a directory descends into it), pre-filled with the current working directory, and prints the chosen path.
 
-**Usage:** `prompt-file [<prompt text ...>] [--prefill PATH] [--height N]`
+**Usage:** `prompt-file [<prompt text ...>] [-d|--default PATH] [--prefill PATH] [--height N]`
 
 | Argument / Flag | Description |
 |---|---|
 | `<prompt text ...>` | Custom prompt text; defaults to `Enter file:`. |
-| `--prefill <path>` | Start from this path instead of the current working directory. |
+| `-d, --default <path>` | Default path: it is pre-filled into the input line (so Enter accepts it, and it stays editable and completable) and is also used when the line is cleared. |
+| `--prefill <path>` | Start from this path instead of the current working directory or the default. |
 | `--height <n>` | Maximum number of candidate rows shown at once. |
 
 **Examples:**
 ```bash
 file="$(prompt-file)"
 file="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
+file="$(prompt-file -d "${HOME}/.bashrc")"
 ```
 
 ### `prompt-folder`
 Symlink to [prompt](#prompt) implying `--complete --dirs`: same as `prompt-file`, but only directories are offered.
 
-**Usage:** `prompt-folder [<prompt text ...>] [--prefill PATH] [--height N]`
+**Usage:** `prompt-folder [<prompt text ...>] [-d|--default PATH] [--prefill PATH] [--height N]`
 
 | Argument / Flag | Description |
 |---|---|
 | `<prompt text ...>` | Custom prompt text; defaults to `Enter directory:`. |
-| `--prefill <path>` | Start from this path instead of the current working directory. |
+| `-d, --default <path>` | Default path: it is pre-filled into the input line (so Enter accepts it, and it stays editable and completable) and is also used when the line is cleared. |
+| `--prefill <path>` | Start from this path instead of the current working directory or the default. |
 | `--height <n>` | Maximum number of candidate rows shown at once. |
 
 **Examples:**
 ```bash
 dir="$(prompt-folder)"
 dir="$(prompt-folder "Where to install:" --prefill /usr/local/)"
+dir="$(prompt-folder -d "${HOME}/Downloads")"
 ```
 
 ### `choose`

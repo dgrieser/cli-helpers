@@ -13,7 +13,9 @@ command -v prompt-select &>/dev/null || fail "'prompt-select' is required for th
 command -v screen &>/dev/null || fail "'screen' is not installed."
 
 get_sessions() {
-    screen -ls | grep -E '^\s+[0-9]+\.' | awk '{print $1, $2}'
+    # screen -ls prints tab separated fields, the status is always the last one
+    # ("<id>.<name>", optionally a timestamp, then "(Detached)"/"(Attached)")
+    screen -ls | grep -E '^[[:space:]]+[0-9]+\.' | awk -F'\t' '{print $2, $NF}'
 }
 
 while true; do
