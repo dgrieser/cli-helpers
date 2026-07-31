@@ -1727,7 +1727,7 @@ key="$(readkey | tail -n1)"
 ```
 
 ### `fzf-with-header`
-A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed at the top, wrapped to the terminal width; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name.
+A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed at the top, wrapped to the terminal width; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name. The key list shrinks on short terminals so the list keeps at least three rows: it is packed into fewer lines with the keys that no longer fit dropped behind a `…`, and once not even one line is left it is hidden completely.
 
 **Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
 

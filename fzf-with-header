@@ -190,6 +190,13 @@ parse_preview_window() {
     done
 }
 
+# with --height the footer has to fit into that window instead of the terminal
+height_spec=""
+parse_height() {
+    local spec="${1#\~}"
+    [[ "${spec}" =~ ^[0-9]+%?$ ]] && height_spec="${spec}"
+}
+
 mapped_keys=""
 used_keys=""
 has_preview=0
@@ -205,6 +212,9 @@ for arg in "$@"; do
         --preview-window=*)
             parse_preview_window "${arg#--preview-window=}"
             ;;
+        --height=*)
+            parse_height "${arg#--height=}"
+            ;;
         --bind=*)
             spec="${arg#--bind=}"
             ;;
@@ -218,6 +228,9 @@ for arg in "$@"; do
                     ;;
                 --preview-window)
                     parse_preview_window "${arg}"
+                    ;;
+                --height)
+                    parse_height "${arg}"
                     ;;
             esac
             ;;
@@ -293,37 +306,104 @@ if [ ${watch_seconds} -gt 0 ]; then
     [ ${ind_width} -lt 5 ] && ind_width=5
 fi
 
-keys_header=""
-line_width=${ind_width}
+# how many footer lines the terminal can spare
+term_lines="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)"
+[ -z "${term_lines}" ] && term_lines="$(tput lines 2>/dev/null)"
+[ -z "${term_lines}" ] && term_lines="${LINES:-24}"
+window_lines="${term_lines}"
+if [ -n "${height_spec}" ]; then
+    if [ "${height_spec}" != "${height_spec%\%}" ]; then
+        window_lines=$(( term_lines * ${height_spec%\%} / 100 ))
+        # a percentage never shrinks the window below fzf's --min-height
+        [ "${window_lines}" -lt 10 ] && window_lines=10
+    else
+        window_lines="${height_spec}"
+    fi
+    [ "${window_lines}" -gt "${term_lines}" ] && window_lines="${term_lines}"
+fi
+# fzf spends three lines on the header, its separator and the prompt, and one
+# more on the border above the footer
+avail_lines=$(( window_lines - 4 ))
+# an up/down preview eats list lines as well; a left/right one does not
+if [ "${has_preview}" -eq 1 ]; then
+    case "${preview_pos}" in
+        up|down)
+            if [ "${preview_size_pct}" -eq 1 ]; then
+                avail_lines=$(( avail_lines - window_lines * preview_size / 100 ))
+            else
+                # plus the two lines of the preview border
+                avail_lines=$(( avail_lines - preview_size - 2 ))
+            fi
+            ;;
+    esac
+fi
+# whatever the footer would like, the list keeps at least this many rows
+min_list_lines=3
+max_footer_lines=$(( avail_lines - min_list_lines ))
+
+entry_texts=()
+entry_widths=()
 while IFS=$'\t' read -r entry_key entry_desc; do
     [ -z "${entry_key}" ] && continue
     if [ -n "${entry_desc}" ]; then
-        entry="${C_KEY}${entry_key}${C_HELP} ${entry_desc}"
-        entry_width=$(( ${#entry_key} + 1 + ${#entry_desc} ))
+        entry_texts+=("${C_KEY}${entry_key}${C_HELP} ${entry_desc}")
+        entry_widths+=($(( ${#entry_key} + 1 + ${#entry_desc} )))
     else
-        entry="${C_KEY}${entry_key}"
-        entry_width=${#entry_key}
-    fi
-    if [ -z "${keys_header}" ]; then
-        keys_header="${entry}"
-        if [ ${ind_width} -eq 0 ]; then
-            line_width=${entry_width}
-        elif [ $((line_width + 3 + entry_width)) -le ${max_line_width} ]; then
-            # the indicator holds the first slot of the line
-            footer_ind_sep=" · "
-            line_width=$((line_width + 3 + entry_width))
-        else
-            footer_ind_sep=$'\n'
-            line_width=${entry_width}
-        fi
-    elif [ $((line_width + 3 + entry_width)) -le ${max_line_width} ]; then
-        keys_header="${keys_header} · ${entry}"
-        line_width=$((line_width + 3 + entry_width))
-    else
-        keys_header="${keys_header}"$'\n'"${entry}"
-        line_width=${entry_width}
+        entry_texts+=("${C_KEY}${entry_key}")
+        entry_widths+=("${#entry_key}")
     fi
 done <<< "${mapped_keys}"
+
+# every footer line is a line the list does not get, so on a short terminal the
+# keys are packed into fewer lines and the ones that no longer fit are dropped
+# behind a "…"
+pack_keys_header() {
+    local max_lines="${1}"
+    local i lines=1 line_width=${ind_width} entry_width limit
+    keys_header=""
+    footer_ind_sep=""
+    for (( i = 0; i < ${#entry_texts[@]}; i++ )); do
+        entry_width="${entry_widths[i]}"
+        # the last line still has to fit the "…" marker
+        limit=${max_line_width}
+        [ ${lines} -ge ${max_lines} ] && limit=$(( max_line_width - 2 ))
+        if [ -z "${keys_header}" ] && [ ${ind_width} -eq 0 ]; then
+            keys_header="${entry_texts[i]}"
+            line_width=${entry_width}
+        elif [ $((line_width + 3 + entry_width)) -le ${limit} ]; then
+            if [ -z "${keys_header}" ]; then
+                # the indicator holds the first slot of the line
+                footer_ind_sep=" · "
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header} · ${entry_texts[i]}"
+            fi
+            line_width=$((line_width + 3 + entry_width))
+        elif [ ${lines} -lt ${max_lines} ]; then
+            if [ -z "${keys_header}" ]; then
+                footer_ind_sep=$'\n'
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header}"$'\n'"${entry_texts[i]}"
+            fi
+            line_width=${entry_width}
+            lines=$((lines + 1))
+        else
+            [ -z "${keys_header}" ] && [ ${ind_width} -gt 0 ] && footer_ind_sep=" "
+            keys_header="${keys_header}${C_HELP}…"
+            break
+        fi
+    done
+}
+
+footer_enabled=1
+if [ ${max_footer_lines} -lt 1 ]; then
+    # not even one line to spare: the list needs every row it can get
+    footer_enabled=0
+    keys_header=""
+else
+    pack_keys_header ${max_footer_lines}
+fi
 
 build_footer() {
     local indicator="${1}"
@@ -342,7 +422,7 @@ else
 fi
 
 footer_args=()
-if [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ]; then
+if [ ${footer_enabled} -eq 1 ] && { [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ]; }; then
     [ ${watch_indicator} -eq 0 ] && initial_indicator=""
     footer_args=(--footer "$(build_footer "${initial_indicator}")")
 fi
@@ -387,6 +467,8 @@ update_fzf() {
 post_footer() {
     local port="${1}"
     local indicator="${2}"
+    # no footer was shown in the first place
+    [ ${footer_enabled} -eq 0 ] && return 0
     # --data-binary keeps the newlines of a wrapped footer intact
     curl -XPOST 127.0.0.1:${port} --data-binary "change-footer($(build_footer "${indicator}"))" &> /dev/null
     return 0
