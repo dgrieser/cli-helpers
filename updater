@@ -867,6 +867,7 @@ software-disabled-480-ueberzugpp() {
 }
 
 software-490-yazi() { install_git_release "https://github.com/sxyazi/yazi"; }
+software-500-atoss-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 
 selected_install_types=()
 dry_run=0
