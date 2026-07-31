@@ -123,7 +123,7 @@ function success() {
 
 function manual_download() {
     echo 1>&2
-    read -r -p "Please provide download URL: " download_url 1>&2
+    download_url="$(prompt-input "Please provide download URL:")"
     [ -z "${download_url}" ] && abort
     (cd "${tmpfolder}" && curl -L -O "${download_url}")
     return $?
@@ -406,7 +406,7 @@ function choose_binary_from_files() {
         binary_path="${files}"
     elif [ "${count}" -gt 1 ]; then
         [ ${YES} -eq 1 ] && echo 1>&2 && echo "${files}" 1>&2 && error "Found ${count} files in '${artifact}' archive" && return 1
-        binary_path="$(choose -n -p "Binary to install:" "${files}")"
+        binary_path="$(printf '%s\n' "${files}" | prompt-select -p "Binary to install:" --delimiter '')"
     else
         echo "No files found in '${artifact}'" 1>&2
         return 1
@@ -446,8 +446,7 @@ function prompt_readme() {
     [ ${YES} -eq 1 ] && return 1
     [ ${DRY_RUN} -eq 1 ] && return 1
     echo 1>&2
-    read -p "Show readme '${readme}'? [y/N] " -r REPLY 1>&2
-    [[ "${REPLY}" =~ ^[Yy]$ ]] && return 0
+    prompt-no-yes "Show readme '${readme}'?" && return 0
     return 1
 }
 
@@ -456,8 +455,7 @@ function prompt_install() {
     local target_path="${2}"
     [ ${YES} -eq 1 ] && return 0
     [ ${DRY_RUN} -eq 1 ] && return 0
-    read -p "Install binary '${binary}' to '${target_path}/${binary}'? [Y/n] " -r REPLY 1>&2
-    [[ "${REPLY}" =~ ^[Nn]$ ]] && abort
+    prompt-yes-no "Install binary '${binary}' to '${target_path}/${binary}'" || abort
     return 0
 }
 
@@ -466,8 +464,7 @@ function prompt_bundle_install() {
     local bundle_path="${2}"
     [ ${YES} -eq 1 ] && return 0
     [ ${DRY_RUN} -eq 1 ] && return 0
-    read -p "Install archive as bundled app under '${bundle_path}/${package}'? [Y/n] " -r REPLY 1>&2
-    [[ "${REPLY}" =~ ^[Nn]$ ]] && return 1
+    prompt-yes-no "Install archive as bundled app under '${bundle_path}/${package}'" || return 1
     return 0
 }
 
@@ -948,7 +945,8 @@ if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     count=$(echo "${repo}" | wc -l)
     if [ "${count}" -gt 1 ]; then
         [ ${YES} -eq 1 ] && fail "Found multiple repositories: ${repo}"
-        repo="$(choose -n -p "Found multiple repositories:" "${repo}")"
+        echo 1>&2
+        repo="$(printf '%s\n' "${repo}" | prompt-select -p "Found multiple repositories:" --delimiter '')"
     fi
     if [ -n "${repo}" ]; then
         project="${repo}"
@@ -1038,7 +1036,8 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
 
     if [ -z "${best}" ]; then
         [ ${YES} -eq 1 ] && fail "Multiple artifacts found"
-        best="$(choose -n -p "Please select the artifact to install:" "${artifact_list}")"
+        echo 1>&2
+        best="$(printf '%s\n' "${artifact_list}" | prompt-select -p "Please select the artifact to install:" --delimiter '')"
     fi
     echo "Chose '$(basename "${best}")' as best candidate" 1>&2
     artifact="${best}"

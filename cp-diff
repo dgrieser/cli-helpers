@@ -62,23 +62,18 @@ while read -r -u 7 src_file; do
                 echo
                 echo "${src_file_link} != ${dest_file_link}"
                 echo
-                while true; do
-                    read -p "Symbolic link files differ. (u)pdate or (s)kip? " link_choice
-                    case ${link_choice} in
-                        u|U)
-                            ln -sf "$(readlink "${src_file}")" "${dest_file}"
-                            echo "Updated symbolic link: ${dest_file}"
-                            break
-                            ;;
-                        s|S)
-                            echo "Skipped: ${src_file}"
-                            break
-                            ;;
-                        *)
-                            echo "Invalid choice. Please enter 'u' or 's'."
-                            ;;
-                    esac
-                done
+                link_choice="$(prompt-select -p "Symbolic link files differ." \
+                    "u=Update the symbolic link" "s=Skip this file")"
+                [ ${?} -eq 130 ] && exit 130
+                case ${link_choice} in
+                    u)
+                        ln -sf "$(readlink "${src_file}")" "${dest_file}"
+                        echo "Updated symbolic link: ${dest_file}"
+                        ;;
+                    *)
+                        echo "Skipped: ${src_file}"
+                        ;;
+                esac
             fi
         else
             mkdir -p "$(dirname "${dest_file}")"
@@ -94,17 +89,17 @@ while read -r -u 7 src_file; do
 	        echo "${src_file} -> ${dest_file}:"
             
             while true; do
-                read -p "Files differ. (o)verwrite, (s)kip, or (e)dit? " choice
+                choice="$(prompt-select -p "Files differ." \
+                    "o=Overwrite the destination file" \
+                    "s=Skip this file" \
+                    "e=Edit the diff before copying")"
+                [ ${?} -eq 130 ] && exit 130
                 case ${choice} in
-                    o|O)
+                    o)
                         copy_file "${src_file}" "${dest_file}"
                         break
                         ;;
-                    s|S)
-                        echo "Skipped: ${src_file}"
-                        break
-                        ;;
-                    e|E)
+                    e)
                         tmp_file=$(create_editable_diff "${src_file}" "${dest_file}")
                         if [ ! -s "${tmp_file}" ]; then
                             echo "Edit was aborted."
@@ -112,8 +107,7 @@ while read -r -u 7 src_file; do
                             echo "Files identical after editing. Skipped: ${src_file}"
                             break
                         else
-                            read -p "Apply changes? [Y/n] " choice
-                            if [ "${choice,,}" != "n" ]; then
+                            if prompt-yes-no "Apply changes"; then
                                 cat "{tmp_file}" > "${dest_file}"
                                 echo "Edited and saved: ${dest_file}"
                                 break
@@ -124,7 +118,8 @@ while read -r -u 7 src_file; do
                         rm "${tmp_file}"
                         ;;
                     *)
-                        echo "Invalid choice. Please enter 'o', 's', or 'e'."
+                        echo "Skipped: ${src_file}"
+                        break
                         ;;
                 esac
             done
@@ -134,8 +129,7 @@ while read -r -u 7 src_file; do
     fi
 
     if [ ${prompt_for_continue} -eq 1 ]; then
-        read -p "Continue? [Y/n] " choice
-        if [ "${choice,,}" = "n" ]; then
+        if ! prompt-continue-yes; then
             echo "Aborted."
             exit 1
         fi

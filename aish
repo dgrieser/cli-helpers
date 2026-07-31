@@ -2,7 +2,8 @@
 
 APP_PATH="${0}"
 APP_NAME="$(basename "${APP_PATH}")"
-DEFAULT_CLI="codex"
+DEFAULT_CLI="claude"
+CLI_CHOICES="codex claude opencode"
 RM_CMD="$(command -v trash 2>/dev/null || command -v rm 2>/dev/null)"
 
 usage() {
@@ -124,8 +125,8 @@ cp "${HOME}/Dokumente/instructions/bash-cli-instructions.md" "${tmp_repo}"/.
 git add .
 git commit -m "Initial commit of ${local_file}"
 
-echo; echo "Choose CLI to use:"
-cli=$(prompt-command -d "${DEFAULT_CLI}")
+echo
+cli=$(prompt-complete -p "Choose CLI to use:" -d "${DEFAULT_CLI}" ${CLI_CHOICES})
 
 # run cli tool
 ${cli}

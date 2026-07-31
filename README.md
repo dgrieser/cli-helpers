@@ -238,7 +238,7 @@ track="$(rec)"
 ```
 
 ### `readme`
-Reads typed text aloud: collects lines until Ctrl-C, converts the text to speech via an OpenAI or ElevenLabs TTS engine, and plays the resulting MP3.
+Reads typed text aloud: collects the text in [prompt](#prompt)'s multi-line editor (Ctrl-D when done), asks for confirmation, converts the text to speech via an OpenAI or ElevenLabs TTS engine, and plays the resulting MP3.
 
 **Usage:** `readme [--tts <11labs|openai>] [-r|--repeat] [-v|--voice <voice name>]`
 
@@ -280,8 +280,8 @@ Takes no arguments. Once running, it reads single keys in a loop:
 | `r` | Reset all settings to camera defaults |
 | `d` | Apply the `default` preset (if present) |
 | `b`, `B`, `n`, `N` | Apply the 1st–4th non-default preset (if present) |
-| `p` | List presets and prompt to apply one by name |
-| `P` | Prompt for a name and store the current settings as a preset |
+| `p` | Pick a preset to apply from a list |
+| `P` | Prompt for a name, completing against the existing presets, and store the current settings under it |
 | `h` | Print the key-binding help again |
 
 **Examples:**
@@ -520,7 +520,7 @@ codex-session --last
 ```
 
 ### `aish`
-Edits or creates a file or command using an AI CLI tool (such as Codex) inside a temporary git repository, runs a syntax check, shows a diff, and optionally applies the changes back to the original file (using sudo when needed).
+Edits or creates a file or command using an AI CLI tool inside a temporary git repository, runs a syntax check, shows a diff, and optionally applies the changes back to the original file (using sudo when needed). The CLI to run is picked with completion over `codex`, `claude` and `opencode` (default `claude`), and any other command can be typed instead.
 
 **Usage:** `aish [OPTIONS] COMMAND`
 
@@ -1192,7 +1192,7 @@ suvi /etc/hosts
 ```
 
 ### `cp-diff`
-Recursively copies files from a source directory to a destination, prompting interactively (overwrite, skip, or edit via meld) whenever a destination file or symlink already differs from the source.
+Recursively copies files from a source directory to a destination, showing a [prompt](#prompt) select list (overwrite, skip, or edit via meld) whenever a destination file or symlink already differs from the source, and asking whether to continue after each change.
 
 **Usage:** `cp-diff <source_directory> <destination_directory>`
 
@@ -1497,11 +1497,13 @@ reminder --add
 ### `prompt`
 Reads input from the terminal in one of four modes: multi-line (collecting lines until Ctrl-D), single-line, list selection (`--select`), or single-line input with completion (`--complete`), with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
 
-**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
+**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--files|--dirs] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
 
 | Argument / Flag | Description |
 |---|---|
 | `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line), `Enter input:` (single-line, completion mode) or `Choose:` (select mode, and nothing at all when `--header-lines` is given). An empty value (`-p ''`) shows no prompt in any mode. |
+| `--files` | Completion mode only: complete against file and directory names instead of a candidate list. Completing a directory appends a slash, so the next completion descends into it; hidden entries appear once a dot is typed. |
+| `--dirs` | Like `--files`, but offers directories only. |
 | `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
 | `-s, --single-line` | Read a single line (no prompt character shown). |
 | `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
@@ -1605,6 +1607,8 @@ The script branches on its invoked name (`argv[0]`):
 | `prompt-password` | Single-line masked secret entry (prompt `Password:`), printing the entered value. |
 | `prompt-select` | Implies `--select`; trailing args are the list items (not the prompt text, use `-p` for that). |
 | `prompt-complete` | Implies `--complete`; trailing args are the completion candidates (not the prompt text, use `-p` for that). |
+| `prompt-file` | Implies `--complete --files` with prompt `Enter file:`, pre-filled with the current directory; trailing args become the prompt text. |
+| `prompt-folder` | Implies `--complete --dirs` with prompt `Enter directory:`, pre-filled with the current directory; trailing args become the prompt text. |
 
 **Examples:**
 ```bash
@@ -1620,6 +1624,7 @@ id="$(docker ps | prompt-select -p "Container:" --key-regex '^\S+' --header-line
 sha="$(git log --oneline -20 | prompt-select -p "Commit:" --delimiter-regex '\s+')"
 branch="$(git branch --format '%(refname:short)' | prompt-complete -p "Branch:")"
 host="$(prompt-complete --ignore-case -p "Host:" web-01 web-02 db-01)"
+config="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
 ```
 
 ### `prompt-command`
@@ -1639,31 +1644,41 @@ cmd="$(prompt-command --default 'git status')"
 ```
 
 ### `prompt-file`
-Prompts the user to enter a file path using readline with default filename completion, pre-filled with the current working directory, and prints the chosen path.
+Symlink to [prompt](#prompt) implying `--complete --files`: prompts for a file path with path completion (Tab completes the current component, completing a directory descends into it), pre-filled with the current working directory, and prints the chosen path.
 
-**Usage:** `prompt-file`
+**Usage:** `prompt-file [<prompt text ...>] [--prefill PATH] [--height N]`
 
-Takes no arguments.
+| Argument / Flag | Description |
+|---|---|
+| `<prompt text ...>` | Custom prompt text; defaults to `Enter file:`. |
+| `--prefill <path>` | Start from this path instead of the current working directory. |
+| `--height <n>` | Maximum number of candidate rows shown at once. |
 
 **Examples:**
 ```bash
 file="$(prompt-file)"
+file="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
 ```
 
 ### `prompt-folder`
-Prompts the user to enter a directory path using readline with directory-only completion, pre-filled with the current working directory, and prints the chosen path.
+Symlink to [prompt](#prompt) implying `--complete --dirs`: same as `prompt-file`, but only directories are offered.
 
-**Usage:** `prompt-folder`
+**Usage:** `prompt-folder [<prompt text ...>] [--prefill PATH] [--height N]`
 
-Takes no arguments.
+| Argument / Flag | Description |
+|---|---|
+| `<prompt text ...>` | Custom prompt text; defaults to `Enter directory:`. |
+| `--prefill <path>` | Start from this path instead of the current working directory. |
+| `--height <n>` | Maximum number of candidate rows shown at once. |
 
 **Examples:**
 ```bash
 dir="$(prompt-folder)"
+dir="$(prompt-folder "Where to install:" --prefill /usr/local/)"
 ```
 
 ### `choose`
-Presents a numbered menu of choices on stderr, prompts the user to pick one by number, and prints the chosen item to stdout.
+Thin wrapper around [prompt](#prompt)'s select mode for callers that pass their items as one newline separated string: shows the colored, arrow-key navigable list on stderr and prints the chosen item to stdout. Exits 1 when aborted with Esc and 130 on Ctrl-C.
 
 **Usage:** `choose [-p|--prompt <prompt>] [-n|--newlines] <list of choices>`
 
@@ -1671,7 +1686,7 @@ Presents a numbered menu of choices on stderr, prompts the user to pick one by n
 |---|---|
 | `-p, --prompt <prompt>` | Custom prompt text shown above the list (default: "Choose from list"). |
 | `-n, --newlines` | Print a blank line before and after the menu. |
-| `<list of choices>` | One or more positional arguments, each a selectable menu item. |
+| `<list of choices>` | One or more positional arguments, each a selectable menu item; arguments containing newlines are split into one item per line. |
 
 **Examples:**
 ```bash
@@ -1798,7 +1813,7 @@ terminal-session
 ```
 
 ### `screener`
-Interactive whiptail menu for listing, resuming, force-detaching, or creating GNU `screen` sessions.
+Interactive menu for listing, resuming, force-detaching, or creating GNU `screen` sessions, built on [prompt](#prompt)'s select mode (arrow keys, Esc cancels).
 
 **Usage:** `screener`
 

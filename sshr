@@ -36,8 +36,10 @@ host="$(echo "${ssh_command}" | sed -E "s/^ssh(\s-[^ ]+)*\s+([^-][^ ]+).*$/\2/" 
 [ -z "${host}" ] && echo "ERROR: No host found in command." 1>&2 && usage
 
 if [ "${PROMPT}" -eq 1 ]; then
-    read -p "Re-add host ${host} to known hosts? [Y/n] " -r
-    [[ $REPLY =~ ^[nN]$ ]] && exit 0
+    prompt-yes-no "Re-add host ${host} to known hosts"
+    status="${?}"
+    [ "${status}" -eq 130 ] && exit 130
+    [ "${status}" -ne 0 ] && exit 0
 fi
 
 actual_host="$(ssh -G "${host}" | awk '/^hostname / { print $2 }')"

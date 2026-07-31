@@ -91,14 +91,12 @@ read_keys() {
             echo "No other preset found"
         fi
     elif [[ $key == 'p' ]]; then
-        echo; echo -n "Presets: "
-        preset_list="$(cam-settings preset list | tr $'\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
-        echo "${preset_list}"; echo
-        preset_name="$(prompt-input "Apply preset:")"
+        echo
+        preset_name="$(cam-settings preset list | prompt-select -p "Apply preset:")"
         [ -n "${preset_name}" ] && cam-settings preset apply "${preset_name}"
     elif [[ $key == 'P' ]]; then
         echo
-        preset_name="$(prompt-input "Store preset:")"
+        preset_name="$(cam-settings preset list | prompt-complete -p "Store preset:")"
         [ -n "${preset_name}" ] && cam-settings preset store "${preset_name}"
     elif [[ $key == '.' ]]; then
         cam-settings increase gamma

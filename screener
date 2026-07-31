@@ -9,7 +9,7 @@ fail() {
     exit 1
 }
 
-command -v whiptail &>/dev/null || fail "'whiptail' is required for the menu interface."
+command -v prompt-select &>/dev/null || fail "'prompt-select' is required for the menu interface."
 command -v screen &>/dev/null || fail "'screen' is not installed."
 
 get_sessions() {
@@ -18,24 +18,21 @@ get_sessions() {
 
 while true; do
     MENU_OPTIONS=()
-    
+
     while read -r session_id status; do
         # Clean up parentheses around status, e.g., (Attached) -> Attached
         clean_status=$(echo "$status" | tr -d '()')
-        
+
         if [ -n "$session_id" ]; then
-            MENU_OPTIONS+=("$session_id" "$clean_status")
+            MENU_OPTIONS+=("${session_id}=${session_id} (${clean_status})")
         fi
     done < <(get_sessions)
 
-    MENU_OPTIONS+=("NEW" "Create a new session...")
+    MENU_OPTIONS+=("NEW=Create a new session...")
 
-    CHOICE=$(whiptail --title "Screen Session Manager" \
-                      --menu "Select a session to resume or create a new one:" \
-                      --default-item "NEW" \
-                      20 70 10 \
-                      "${MENU_OPTIONS[@]}" \
-                      3>&1 1>&2 2>&3)
+    CHOICE=$(prompt-select --prompt "Select a session to resume or create a new one:" \
+                           --default "NEW" \
+                           "${MENU_OPTIONS[@]}")
 
     if [ $? -ne 0 ]; then
         echo "Cancelled."
@@ -43,7 +40,7 @@ while true; do
     fi
 
     if [ "$CHOICE" == "NEW" ]; then
-        NEW_NAME=$(whiptail --inputbox "Enter name for the new session:" 10 60 3>&1 1>&2 2>&3)
+        NEW_NAME=$(prompt-input "Enter name for the new session:")
         if [ $? -eq 0 ] && [ -n "$NEW_NAME" ]; then
             clear
             echo "Starting new session: $NEW_NAME"
@@ -56,9 +53,8 @@ while true; do
         SESSION_ID="$CHOICE"
         IS_ATTACHED=$(screen -ls | grep "$SESSION_ID" | grep -i "(Attached)")
         if [ -n "$IS_ATTACHED" ]; then
-            if whiptail --title "Session Occupied" \
-                        --yesno "Session '$SESSION_ID' is currently attached elsewhere.\n\nDo you want to force detach it and resume here?" \
-                        10 60; then
+            echo "Session '$SESSION_ID' is currently attached elsewhere."
+            if prompt-no-yes "Force detach it and resume here?"; then
                 clear
                 echo "Force resuming session: $SESSION_ID"
                 screen -rd "$SESSION_ID"

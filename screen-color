@@ -267,6 +267,24 @@ def display_state(last_action, output, r, g, b, display_name=None):
         sys.stdout.write("\r" + " " * 100 + "\n")
     sys.stdout.flush()
 
+def ask_for_preset(presets, label, mode):
+    """Ask for a preset name through the prompt helper.
+
+    mode "select" only offers existing presets, mode "complete" also accepts a
+    new name. The helper draws on stderr and reads the keyboard from /dev/tty,
+    so only its stdout is captured here. Returns (name, lines_written).
+    """
+    command = ["prompt-select" if mode == "select" else "prompt-complete", "-p", label]
+    try:
+        result = subprocess.run(command, input="\n".join(presets), text=True, stdout=subprocess.PIPE)
+    except OSError:
+        sys.stdout.write(f"{label} ")
+        sys.stdout.flush()
+        return input().strip(), 1
+    if result.returncode != 0:
+        return "", 1
+    return result.stdout.strip(), 1
+
 # Function to handle key inputs
 def get_key():
     fd = sys.stdin.fileno()
@@ -372,13 +390,11 @@ def interactive_mode(output=None, load_alias=None):
                 # Load preset
                 lines = 0
                 presets = list_configs()
-                if presets:
-                    lines += 1
-                    sys.stdout.write(f"Presets: {', '.join(presets)}\n")
-                lines += 1
-                sys.stdout.write("Load:    ")
-                sys.stdout.flush()
-                preset_name = input().strip()
+                if not presets:
+                    last_action = "No presets found"
+                    preset_name = ""
+                else:
+                    preset_name, lines = ask_for_preset(presets, "Load preset:", "select")
                 if preset_name:
                     config_data = load_config(preset_name)
                     if config_data:
@@ -403,15 +419,8 @@ def interactive_mode(output=None, load_alias=None):
                     sys.stdout.write("\r" + " " * 100)
             elif key == "P":
                 # Save preset
-                lines = 0
                 presets = list_configs()
-                if presets:
-                    lines += 1
-                    sys.stdout.write(f"Presets: {', '.join(presets)}\n")
-                lines += 1
-                sys.stdout.write("Save:    ")
-                sys.stdout.flush()
-                preset_name = input().strip()
+                preset_name, lines = ask_for_preset(presets, "Save preset:", "complete")
                 if preset_name:
                     # Save all output configurations
                     all_outputs_data = {}

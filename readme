@@ -70,19 +70,6 @@ function abort() {
     exit 1
 }
 
-function ctrl_c() {
-    echo -ne "\r"
-    [ -z "${lines}" ] && abort
-
-    text="${lines}"
-    export lines=""
-
-    echo && read -p "Convert and play? [Y/n] " answer
-    [ "${answer,,}" == "n" ] && abort
-
-    run_tts "${text}"
-}
-
 function post_process() {
     text="${1}"
     # replace links
@@ -99,10 +86,10 @@ function run_tts()
     echo "Converting..." 
     case "${tts_engine}" in
         11labs)
-            tts-11 -v "${tts_voice}" -f "${output}" "$(echo -e "${text}")" >/dev/null
+            tts-11 -v "${tts_voice}" -f "${output}" "${text}" >/dev/null
             ;;
         openai) 
-            tts -v "${tts_voice}" -s 0.95 -f "${output}" "$(echo -e "${text}")" >/dev/null
+            tts -v "${tts_voice}" -s 0.95 -f "${output}" "${text}" >/dev/null
             ;;
     esac
 
@@ -115,18 +102,13 @@ function run_tts()
     play-track "${output}"
 }
 
-trap ctrl_c INT
+# collect the text to read, until the user presses CTRL-D
+text="$(prompt-multiline)"
+status=${?}
+[ ${status} -eq 130 ] && abort
+[ -z "${text}" ] && abort
 
-echo "Enter text to read (press CTRL+C when done):"
 echo
+prompt-yes-no "Convert and play" || abort
 
-# collect text, until user presses CTRL+C
-export lines=""
-while true
-do
-    read -r line
-    if [ -n "${line}" ]; then
-        [ -n "${lines}" ] && export lines="${lines}\n"
-        export lines="${lines}$(echo ${line} | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')"
-    fi
-done
+run_tts "${text}"

@@ -37,8 +37,7 @@ if [ -f "${new_file}" ]; then
     ${sudo}diff -u --color=always "${new_file}" "${file}"
     # prompt whether to overwrite the new file with y/N
     echo
-    read -p "Overwrite existing executable ${new_file}? [y/N] " -r
-    if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
+    if ! prompt-no-yes "Overwrite existing executable ${new_file}?"; then
         echo "Aborting"
         exit 0
     fi
@@ -59,8 +58,7 @@ fi
 
 if [ "${file}" != "${new_file}" ]; then
     # prompt whether to delete the old file with y/N
-    read -p "Delete old file ${file}? [y/N] " -r
-    if [[ ${REPLY} =~ ^[Yy]$ ]]; then
+    if prompt-no-yes "Delete old file ${file}?"; then
         ${sudo}rm "${file}"
         echo "Deleted ${file}"
     fi 
