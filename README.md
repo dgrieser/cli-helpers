@@ -1505,9 +1505,9 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--files` | Completion mode only: complete against file and directory names instead of a candidate list. Completing a directory appends a slash, so the next completion descends into it; hidden entries appear once a dot is typed. |
 | `--dirs` | Like `--files`, but offers directories only. |
 | `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
-| `-s, --single-line` | Read a single line (no prompt character shown). |
+| `-s, --single-line` | Read a single line (no prompt character shown). On a terminal this is an editable line: the cursor keys, Home/End, Backspace, Delete and Ctrl-A/E/U/K/W all work, while `↑`/`↓`, Tab and Esc do nothing. |
 | `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
-| `-d, --default <value>` | Default value used when the user enters nothing; in select mode the key, title or number of the entry the cursor starts on; in the `--files`/`--dirs` modes it is also pre-filled into the input line (and the `(default)` hint is then dropped as redundant). Only valid in select mode, completion mode, or non-protected single-line mode. |
+| `-d, --default <value>` | Default value used when the user enters nothing (or clears the input again); in select mode the key, title or number of the entry the cursor starts on. In single-line mode, multi-line mode and the `--files`/`--dirs` modes it is pre-filled into the input, so Enter (or Ctrl-D) accepts it while it stays editable, and the `(default)` hint is then dropped as redundant. Cannot be combined with `--protected`. |
 | `-l, --select` | Select one entry from a colored list; prints the selected item's key (see `--return`). |
 | `-a, --complete` | Read a single line with Tab-completion against the given candidates. |
 | `--delimiter <delim>` | Select mode only: splits each item into `<key><delim><title>` (default `=`); escape sequences like `\t` are honored, an empty value disables key parsing. |
@@ -1519,7 +1519,7 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--no-header-uppercase` | Select mode only: print the `--header-lines` header as given instead of upper-casing it. |
 | `--ignore-case` | Completion mode only: match candidates case-insensitively. |
 | `--substring` | Completion mode only: match candidates anywhere instead of at the start (disables the inline suggestion). |
-| `--prefill <text>` | Completion mode only: pre-filled, editable input text. |
+| `--prefill <text>` | Pre-filled, editable input text for single-line, completion and multi-line mode. Wins over `-d`, which then keeps its `(default)` hint and stays the fallback for an emptied input. Not valid with `--protected` or in select mode. |
 | `--height <n>` | Maximum number of list rows shown at once; defaults to what fits the terminal. |
 | `--no-color` | Disable colored output (also honored: `NO_COLOR`, `TERM=dumb`, non-terminal output). |
 | `<items ...>` | Select/completion mode only: the list items or completion candidates. Lines piped on stdin are appended to them. |
@@ -1540,8 +1540,21 @@ All modes draw their prompt on stderr (select and completion mode fall back to `
 
 Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
 
+#### Single-line mode keys (`--single-line` / `prompt-input` and the confirmation aliases)
+On a terminal the line is edited in place, so a pre-filled `-d`/`--prefill` value can be changed instead of only accepted or retyped. Piped input and `--protected` use a plain read instead.
+
+| Key | Action |
+|---|---|
+| `←` / `→`, Home / End, Ctrl-A / Ctrl-E | Move within the line. |
+| Backspace / Delete | Delete before / under the cursor. |
+| Ctrl-U / Ctrl-K / Ctrl-W | Kill to start of line / to end of line / the previous word. |
+| Enter | Submit; an empty line returns `-d` when one was given. |
+| `↑` / `↓`, Tab, Esc | Ignored. |
+| Ctrl-D | Abort on an empty line (exit 1). |
+| Ctrl-C | Abort (exit 130). |
+
 #### Multi-line mode keys (`prompt` / `prompt-multiline`)
-On a terminal, multi-line mode is a small editor: the text is redrawn in place, so the cursor can be moved freely through everything typed so far. Piped input and `--protected` keep using the plain line reader instead, so `printf 'a\nb\n' | prompt` behaves as before.
+On a terminal, multi-line mode is a small editor: the text is redrawn in place, so the cursor can be moved freely through everything typed so far. `-d`/`--prefill` seed the buffer with editable text (newlines included), and an emptied buffer falls back to `-d`. Piped input and `--protected` keep using the plain line reader instead, so `printf 'a\nb\n' | prompt` behaves as before.
 
 | Key | Action |
 |---|---|
@@ -1558,6 +1571,8 @@ On a terminal, multi-line mode is a small editor: the text is redrawn in place, 
 | Ctrl-C | Abort (exit 130). |
 
 Lines longer than the terminal scroll sideways instead of wrapping (the off-screen part is marked with `…`), and when the text outgrows the screen the visible window follows the cursor and a faded `line/total` counter is shown.
+
+Pasting works as expected: a pasted `\r\n` counts as one line break rather than two (so blank lines inside pasted text stay single), tabs are kept, and while a paste is still arriving the redraw is held back until the burst is through, so large pastes neither flicker nor slow down.
 
 #### Select mode keys (`--select` / `prompt-select`)
 

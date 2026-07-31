@@ -272,6 +272,9 @@ class Terminal:
     def read_key(self):
         return self.reader.read()
 
+    def input_pending(self):
+        return self.reader.pending()
+
 
 class KeyReader:
     def __init__(self, fd):
@@ -331,12 +334,23 @@ class KeyReader:
             return (name, '')
         return ('unknown', '\033' + lead + sequence)
 
+    def pending(self):
+        # already decoded input, or bytes waiting to be read right now
+        return bool(self.buffer) or self._fill(0)
+
     def read(self):
         char = self._next_char()
         if not char:
             return ('eof', '')
         if char == '\033':
             return self._read_escape()
+        if char == '\r':
+            # a pasted CRLF is one line break, not two: drop the trailing LF
+            if not self.buffer:
+                self._fill(0)
+            if self.buffer[:1] == '\n':
+                self.buffer = self.buffer[1:]
+            return ('enter', '')
         if char in CTRL_KEYS:
             return (CTRL_KEYS[char], '')
         if char < ' ':
@@ -705,20 +719,23 @@ def render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset,
     return frame, cursor_line, cursor_col
 
 
-def run_multiline(term, theme, prompt, prompt_char, max_height):
+def run_multiline(term, theme, prompt, prompt_char, max_height, prefill=''):
     renderer = Renderer(term)
-    lines = ['']
-    row = 0
-    col = 0
-    desired_col = 0
+    lines = prefill.split('\n') if prefill else ['']
+    row = len(lines) - 1
+    col = len(lines[row])
+    desired_col = col
     while True:
         width, rows = term.size()
         width = max(20, width - 1)
         view = max_height if max_height > 0 else max(1, rows - 2)
         view = max(1, min(view, len(lines)))
         offset = visible_window(row, len(lines), view)
-        frame, cursor_line, cursor_col = render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset, view)
-        renderer.draw(frame, cursor_line=cursor_line, cursor_col=cursor_col)
+        # a paste arrives as a burst of keys; drawing every intermediate state
+        # would only flicker, so redraw once the burst is through
+        if not term.input_pending():
+            frame, cursor_line, cursor_col = render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset, view)
+            renderer.draw(frame, cursor_line=cursor_line, cursor_col=cursor_col)
         key, char = term.read_key()
 
         if key == 'ctrl-c':
@@ -826,7 +843,7 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_la
     return lines, cursor_col
 
 
-def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None):
+def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True):
     renderer = Renderer(term)
     head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
     head_width = len(prompt) + 1 if prompt else 0
@@ -859,9 +876,10 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
         width, rows = term.size()
         width = max(20, width - 1)
         view = max_height if max_height > 0 else max(1, rows - 3)
-        menu_labels = [label(entry) for entry in menu] if (menu and label) else menu
-        lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu_labels, menu_index, view)
-        renderer.draw(lines, cursor_line=0, cursor_col=cursor_col)
+        if not term.input_pending():
+            menu_labels = [label(entry) for entry in menu] if (menu and label) else menu
+            lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu_labels, menu_index, view)
+            renderer.draw(lines, cursor_line=0, cursor_col=cursor_col)
         key, char = term.read_key()
 
         if key == 'ctrl-c':
@@ -875,9 +893,10 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
                 text = menu_base
                 cursor = len(text)
                 menu = None
-                continue
-            renderer.clear()
-            return None
+            elif esc_aborts:
+                renderer.clear()
+                return None
+            continue
         if key == 'eof' or (key == 'ctrl-d' and not text):
             renderer.clear()
             return None
@@ -891,7 +910,6 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
                 continue
             found = matches_for(text)
             if not found:
-                term.write('\a')
                 continue
             if len(found) == 1:
                 text = found[0]
@@ -918,7 +936,6 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
                 continue
             found = matches_for(text)
             if not found:
-                term.write('\a')
                 continue
             menu_base = text
             menu = found
@@ -998,6 +1015,50 @@ def is_interactive():
     return sys.__stdin__.isatty() and sys.__stdout__.isatty()
 
 
+def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_code_pattern):
+    term = Terminal()
+    if not term.open():
+        # no terminal to edit on, the plain line reader takes over
+        return
+    theme = Theme(term.supports_color() and not args.no_color)
+    prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
+    old_settings = raw_mode(term.in_fd)
+    line = None
+    interrupted = False
+    try:
+        # no candidates, so Tab and the arrow keys have nothing to offer; Esc is
+        # ignored here instead of aborting
+        line = run_complete(term, theme, prompt, prompt_display, prompt_char, lambda text: [],
+                            args.prefill, False, False, 0, None, False)
+    except KeyboardInterrupt:
+        interrupted = True
+        term.write('\r\n')
+        term.flush()
+    finally:
+        restore_mode(term.in_fd, old_settings)
+
+    if interrupted:
+        term.close()
+        exit(130)
+
+    head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
+    if line is None:
+        # Ctrl-D on an empty line
+        term.write(theme.paint('hint', 'Abort.') + '\r\n')
+        term.flush()
+        term.close()
+        exit(1)
+    if not line:
+        line = default
+    term.write(head + line + '\r\n')
+    term.flush()
+    term.close()
+    if exit_code_pattern:
+        exit(0 if re.match(exit_code_pattern, line) else 1)
+    print(line, end='')
+    exit(0)
+
+
 def run_multiline_mode(args, prompt, prompt_char):
     term = Terminal()
     if not term.open():
@@ -1008,7 +1069,7 @@ def run_multiline_mode(args, prompt, prompt_char):
     lines = None
     interrupted = False
     try:
-        lines = run_multiline(term, theme, prompt, prompt_char, args.height if args.height else 0)
+        lines = run_multiline(term, theme, prompt, prompt_char, args.height if args.height else 0, args.prefill)
     except KeyboardInterrupt:
         interrupted = True
         term.write('\r\n')
@@ -1023,6 +1084,9 @@ def run_multiline_mode(args, prompt, prompt_char):
     # the empty line the cursor sits on after the last Enter is an artifact
     if len(lines) > 1 and not lines[-1]:
         lines = lines[:-1]
+    # nothing left in the buffer falls back to the default, as in the other modes
+    if args.default and not any(lines):
+        lines = args.default.split('\n')
     if prompt:
         term.write(paint_prompt(theme, prompt) + '\r\n')
     char_display = paint_prompt_char(theme, prompt_char)
@@ -1152,7 +1216,7 @@ def main():
     parser.add_argument('--prompt-char', '-c', type=str, help='Custom prompt character, defaults to "> " for multiple line mode, "" for a single line mode and "' + POINTER + '" (the pointer) in select mode')
     parser.add_argument('--single-line', '-s', action='store_true', help='Read a single line from stdin, without the prompt char')
     parser.add_argument('--protected', '-P', action='store_true', help='Prompt for a secret')
-    parser.add_argument('--default', '-d', type=str, default='', help='Default value, in select mode the key, title or number of the entry to start on, in the --files and --dirs modes also the pre-filled path')
+    parser.add_argument('--default', '-d', type=str, default='', help='Default value, in select mode the key, title or number of the entry to start on, in multiple line mode and the --files and --dirs modes also the pre-filled text')
     parser.add_argument('--select', '-l', action='store_true', help='Select one entry from a colored list of items (arrow keys, digits, Enter selects, Esc aborts); items come from the positional arguments and stdin')
     parser.add_argument('--complete', '-a', action='store_true', help='Read a single line with completion against the given candidates (Tab completes what is unambiguous and opens a navigable menu otherwise); candidates come from the positional arguments and stdin')
     parser.add_argument('--delimiter', type=str, help='Delimiter splitting each select mode item into "<key><delimiter><title>" (default: "="); escape sequences like "\\t" are honored, an empty value disables key parsing')
@@ -1166,7 +1230,7 @@ def main():
     parser.add_argument('--substring', action='store_true', help='Match completion candidates anywhere instead of at the start')
     parser.add_argument('--files', action='store_true', help='Complete against file and directory names instead of a candidate list; completing a directory appends a slash, so the next completion descends into it')
     parser.add_argument('--dirs', action='store_true', help='Like --files, but offers directories only')
-    parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode (defaults to the current directory in the --files and --dirs modes)')
+    parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode and multiple line mode (defaults to the current directory in the --files and --dirs modes)')
     parser.add_argument('--height', type=int, help='Maximum number of list rows shown at once (default: fit the terminal)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
@@ -1265,8 +1329,15 @@ def main():
     if args.header_lines < 0:
         print('ERROR: --header-lines must not be negative.', file=sys.stderr)
         exit(1)
-    if not prompt_complete and (args.prefill or args.ignore_case or args.substring or args.files or args.dirs):
-        print('ERROR: --prefill, --ignore-case, --substring, --files and --dirs can only be used in completion mode.', file=sys.stderr)
+    multiline_mode = not (prompt_single_line or prompt_select or prompt_complete or prompt_protected)
+    if not prompt_complete and (args.ignore_case or args.substring or args.files or args.dirs):
+        print('ERROR: --ignore-case, --substring, --files and --dirs can only be used in completion mode.', file=sys.stderr)
+        exit(1)
+    if args.prefill and prompt_protected:
+        print('ERROR: --prefill cannot be used with --protected.', file=sys.stderr)
+        exit(1)
+    if args.prefill and prompt_select:
+        print('ERROR: --prefill cannot be used in select mode.', file=sys.stderr)
         exit(1)
     if args.files and args.dirs:
         print('ERROR: --files and --dirs are mutually exclusive.', file=sys.stderr)
@@ -1279,9 +1350,12 @@ def main():
     if args.height is not None and args.height < 1:
         print('ERROR: --height must be a positive number.', file=sys.stderr)
         exit(1)
-    if prompt_default and not (prompt_select or prompt_complete) and (prompt_protected or not prompt_single_line):
-        print('ERROR: --default can only be used in non-protected, single line mode.', file=sys.stderr)
+    if prompt_default and prompt_protected:
+        print('ERROR: --default cannot be used with --protected.', file=sys.stderr)
         exit(1)
+    if (multiline_mode or prompt_single_line) and prompt_default and not args.prefill and not prompt_protected:
+        # the default text is edited in place, so Enter (or Ctrl-D) accepts it
+        args.prefill = prompt_default
 
     # an explicitly empty --prompt asks for no prompt at all, only a missing one
     # falls back to the default
@@ -1319,10 +1393,13 @@ def main():
     prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
     prompt_char_display = paint_prompt_char(theme, prompt_char)
 
-    # multiple line mode gets a full editor on a terminal, piped input and
-    # secrets keep using the plain line reader below
-    if not prompt_single_line and not prompt_protected and sys.stdin is not None and sys.stdin.isatty():
-        run_multiline_mode(args, prompt, prompt_char)
+    # on a terminal both input modes get a real editor, piped input and secrets
+    # keep using the plain line reader below
+    if not prompt_protected and sys.stdin is not None and sys.stdin.isatty():
+        if prompt_single_line:
+            run_single_line_mode(args, prompt, prompt_base, prompt_char, prompt_default, prompt_exit_code_pattern)
+        else:
+            run_multiline_mode(args, prompt, prompt_char)
 
     if prompt and not (prompt_protected and prompt_single_line):
         print(prompt_display, end=end, file=sys.stderr)
@@ -1339,6 +1416,9 @@ def main():
         except KeyboardInterrupt:
             print('')
             exit(130)
+        except EOFError:
+            # nothing on stdin at all still honors the default
+            line = prompt_default
         if prompt_exit_code_pattern:
             if not line:
                 line = ''
@@ -1364,6 +1444,11 @@ def main():
             except EOFError:
                 break
             lines.append(line)
+
+        # args.default survives the loop blanking prompt_default after the
+        # first read, and keeps the piped path in line with the editor above
+        if args.default and not any(lines):
+            lines = args.default.split('\n')
 
         print('\r' + ' ' * len(prompt_char) + '\r', end='', file=sys.stderr)
         print('\n'.join(lines))
