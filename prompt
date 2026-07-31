@@ -182,7 +182,9 @@ class Theme:
         selection = self.spec('COLOR_SELECTION_BACKGROUND')
         highlight = self.combine(self.spec('COLOR_TEXT_INFO'), 'bold')
         self.roles = {
-            'title': self.spec('COLOR_TEXT_BOLD'),
+            # the question itself carries the accent color, the answer stays
+            # unstyled so it reads like ordinary terminal input
+            'title': highlight,
             'header': self.spec('COLOR_TABLE_HEADER'),
             'item': self.spec('COLOR_TEXT_DEFAULT'),
             'number': self.spec('COLOR_TEXT_NUMERIC'),
@@ -204,18 +206,10 @@ class Theme:
     def combine(self, *specs):
         return ':'.join([spec for spec in specs if spec])
 
-    def code(self, role):
-        if not self.enabled:
-            return ''
-        return ansi(self.roles.get(role, ''))
-
-    def reset(self):
-        return RESET if self.enabled else ''
-
     def paint(self, role, text):
         if not self.enabled or not text:
             return text
-        code = self.code(role)
+        code = ansi(self.roles.get(role, ''))
         if not code:
             return text
         return code + text + RESET
@@ -432,13 +426,62 @@ def parse_items(entries, delimiter, split_pattern=None, key_pattern=None):
     return items
 
 
-def paint_prompt(theme, prompt, default):
-    # the "(default)" hint stays muted, the prompt text itself is emphasized
-    if not default:
-        return theme.paint('title', prompt)
-    base = prompt[:-1] if prompt.endswith(':') else prompt
-    suffix = ':' if prompt.endswith(':') else ''
-    return theme.paint('title', base) + ' ' + theme.paint('hint', '(' + default + ')') + theme.paint('title', suffix)
+def split_prompt(prompt):
+    # "Do it? [y/N]:" -> text "Do it?", separator " ", options "[y/N]", tail ":"
+    body = prompt
+    tail = ''
+    while body and body[-1] in ' \t:':
+        tail = body[-1] + tail
+        body = body[:-1]
+    options = ''
+    if body.endswith(']'):
+        start = body.rfind('[')
+        if start >= 0:
+            options = body[start:]
+            body = body[:start]
+    text = body.rstrip()
+    separator = body[len(text):]
+    return text, separator, options, tail
+
+
+def paint_options(theme, options):
+    # the brackets and the alternatives stay muted, the default one (spelled
+    # in upper case, as in "[y/N]") is highlighted
+    result = ''
+    buffer = ''
+    buffer_role = None
+    for char in options:
+        role = 'item' if char.isalpha() and char.isupper() else 'hint'
+        if role == buffer_role:
+            buffer += char
+            continue
+        result += theme.paint(buffer_role, buffer) if buffer else ''
+        buffer = char
+        buffer_role = role
+    if buffer:
+        result += theme.paint(buffer_role, buffer)
+    return result
+
+
+def paint_prompt(theme, prompt, default=''):
+    # only the question itself is emphasized; the "[y/N]" options, the
+    # "(default)" hint and the trailing colon stay muted
+    text, separator, options, tail = split_prompt(prompt)
+    if default and not tail:
+        tail = ':'
+    parts = []
+    if text:
+        # a fully parenthesized prompt is an instruction, not a question, e.g.
+        # the multi-line mode's "(Press Ctrl-D when done)"
+        role = 'hint' if text.startswith('(') and text.endswith(')') else 'title'
+        parts.append(theme.paint(role, text))
+    if default:
+        parts.append(' ' + theme.paint('hint', '(' + default + ')'))
+    if options:
+        parts.append(separator + paint_options(theme, options))
+    if tail:
+        parts.append(theme.paint('hint', tail))
+    return ''.join(parts)
 
 
 def paint_prompt_char(theme, prompt_char):
@@ -446,17 +489,6 @@ def paint_prompt_char(theme, prompt_char):
     if not stripped:
         return prompt_char
     return theme.paint('pointer', stripped) + prompt_char[len(stripped):]
-
-
-def read_line(theme, default=''):
-    # color what the terminal echoes back while the line is being typed
-    sys.stderr.write(theme.code('item'))
-    sys.stderr.flush()
-    try:
-        return input_with_default(default)
-    finally:
-        sys.stderr.write(theme.reset())
-        sys.stderr.flush()
 
 
 def compile_pattern(pattern, option):
@@ -521,7 +553,7 @@ def visible_window(index, count, view):
 def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys):
     lines = []
     if prompt:
-        lines.append(theme.paint('title', truncate(prompt, width)))
+        lines.append(paint_prompt(theme, truncate(prompt, width)))
     count = len(items)
     number_width = len(str(count))
     marker_width = len(pointer) + 1
@@ -610,7 +642,7 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu, m
     visible = text[start:start + available]
     if len(visible) + len(ghost) > available:
         ghost = ghost[:max(0, available - len(visible))]
-    lines = [head + theme.paint('item', visible) + (theme.paint('ghost', ghost) if ghost else '')]
+    lines = [head + visible + (theme.paint('ghost', ghost) if ghost else '')]
     cursor_col = head_width + (cursor - start)
     if menu:
         count = len(menu)
@@ -820,6 +852,8 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
         # the header goes through the same parsing, so its columns keep lining
         # up with the titles below it
         header = [title for _, title in parse_items(entries[:header_lines], delimiter, split_pattern, key_pattern)]
+        if not args.no_header_uppercase:
+            header = [line.upper() for line in header]
         items = parse_items(entries[header_lines:], delimiter, split_pattern, key_pattern)
         if not items:
             print('ERROR: No items to select from.', file=sys.stderr)
@@ -846,7 +880,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
             key, title = items[choice]
             display = title + ('  (' + key + ')' if args.show_keys and key != title else '')
             if prompt:
-                term.write(theme.paint('title', prompt) + ' ')
+                term.write(paint_prompt(theme, prompt) + ' ')
             term.write(theme.paint('result', display) + '\r\n')
             term.flush()
             if args.returns == 'title':
@@ -867,7 +901,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
             if not line:
                 line = args.default
             head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
-            term.write(head + theme.paint('result', line) + '\r\n')
+            term.write(head + line + '\r\n')
             term.flush()
             result = line
     except KeyboardInterrupt:
@@ -907,7 +941,7 @@ def main():
         )
 
     parser = argparse.ArgumentParser(description=description, epilog=epilog)
-    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode, "Enter input:" for a single line mode and "Select an item:" in select mode; an empty value shows no prompt at all')
+    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode, "Enter input:" for a single line mode and "Choose:" in select mode (no prompt when --header-lines is given); an empty value shows no prompt at all')
     parser.add_argument('--prompt-char', '-c', type=str, help='Custom prompt character, defaults to "> " for multiple line mode, "" for a single line mode and "' + POINTER + '" (the pointer) in select mode')
     parser.add_argument('--single-line', '-s', action='store_true', help='Read a single line from stdin, without the prompt char')
     parser.add_argument('--protected', '-P', action='store_true', help='Prompt for a secret')
@@ -919,7 +953,8 @@ def main():
     parser.add_argument('--key-regex', dest='key_regex', type=str, help='Take the item key from the first match of this regular expression (capture group 1 when there is one) and keep the whole item as the title, e.g. "^\\S+" to return the first column of a table row')
     parser.add_argument('--return', dest='returns', choices=['key', 'title', 'index', 'number'], default='key', help='What select mode prints: the item key (default), its title, its 0-based index or its 1-based number')
     parser.add_argument('--show-keys', action='store_true', help='Show the item keys next to the titles in select mode')
-    parser.add_argument('--header-lines', dest='header_lines', type=int, default=0, help='Select mode only: treat the first n items as a header, printed above the list, aligned with the item titles and not selectable')
+    parser.add_argument('--header-lines', dest='header_lines', type=int, default=0, help='Select mode only: treat the first n items as a header, printed above the list, aligned with the item titles and not selectable; suppresses the default prompt')
+    parser.add_argument('--no-header-uppercase', dest='no_header_uppercase', action='store_true', help='Keep the header lines as they are instead of upper-casing them')
     parser.add_argument('--ignore-case', action='store_true', help='Match completion candidates case-insensitively')
     parser.add_argument('--substring', action='store_true', help='Match completion candidates anywhere instead of at the start')
     parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode')
@@ -998,8 +1033,8 @@ def main():
     if (prompt_select or prompt_complete) and (prompt_protected or args.single_line):
         print('ERROR: --select and --complete cannot be combined with --protected or --single-line.', file=sys.stderr)
         exit(1)
-    if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines):
-        print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return and --header-lines can only be used in select mode.', file=sys.stderr)
+    if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines or args.no_header_uppercase):
+        print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return, --header-lines and --no-header-uppercase can only be used in select mode.', file=sys.stderr)
         exit(1)
     if len([option for option in (args.delimiter, args.delimiter_regex, args.key_regex) if option is not None]) > 1:
         print('ERROR: --delimiter, --delimiter-regex and --key-regex are mutually exclusive.', file=sys.stderr)
@@ -1021,7 +1056,8 @@ def main():
     # falls back to the default
     if prompt is None:
         if prompt_select:
-            prompt = 'Select an item:'
+            # a header already labels the list, so it needs no prompt on top
+            prompt = '' if args.header_lines else 'Choose:'
         elif prompt_single_line or prompt_complete:
             prompt = 'Enter input:'
         else:
@@ -1060,9 +1096,9 @@ def main():
             if prompt_protected:
                 line = getpass.getpass(prompt=prompt_display + end)
             else:
-                line = read_line(theme, prompt_default)
+                line = input_with_default(prompt_default)
         except KeyboardInterrupt:
-            print(theme.reset())
+            print('')
             exit(130)
         if prompt_exit_code_pattern:
             if not line:
@@ -1080,11 +1116,11 @@ def main():
                 if prompt_protected:
                     line = getpass.getpass(prompt=prompt_char_display)
                 else:
-                    line = read_line(theme, prompt_default)
+                    line = input_with_default(prompt_default)
                     # use default only once
                     prompt_default = ''
             except KeyboardInterrupt:
-                print(theme.reset())
+                print('')
                 exit(130)
             except EOFError:
                 break

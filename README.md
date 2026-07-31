@@ -1497,11 +1497,11 @@ reminder --add
 ### `prompt`
 Reads input from the terminal in one of four modes: multi-line (collecting lines until Ctrl-D), single-line, list selection (`--select`), or single-line input with completion (`--complete`), with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
 
-**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--ignore-case] [--substring] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
+**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
 
 | Argument / Flag | Description |
 |---|---|
-| `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line) or `Enter input:` (single-line, completion mode) or `Select an item:` (select mode). |
+| `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line), `Enter input:` (single-line, completion mode) or `Choose:` (select mode, and nothing at all when `--header-lines` is given). An empty value (`-p ''`) shows no prompt in any mode. |
 | `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
 | `-s, --single-line` | Read a single line (no prompt character shown). |
 | `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
@@ -1513,7 +1513,8 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--key-regex <regex>` | Select mode only: takes the key from the first match of this regular expression (capture group 1 when the pattern has one) and keeps the whole item as the title, e.g. `^\S+` to display a full table row but return its first column. Mutually exclusive with `--delimiter` and `--delimiter-regex`. |
 | `--return key\|title\|index\|number` | Select mode only: print the item's key (default), its title, its 0-based index or its 1-based number. |
 | `--show-keys` | Select mode only: show the item keys next to the titles. |
-| `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. |
+| `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. Header lines are upper-cased (see `--no-header-uppercase`). Since the header already labels the list, the default `Choose:` prompt is suppressed (pass `-p` to get one anyway). |
+| `--no-header-uppercase` | Select mode only: print the `--header-lines` header as given instead of upper-casing it. |
 | `--ignore-case` | Completion mode only: match candidates case-insensitively. |
 | `--substring` | Completion mode only: match candidates anywhere instead of at the start (disables the inline suggestion). |
 | `--prefill <text>` | Completion mode only: pre-filled, editable input text. |
@@ -1525,10 +1526,13 @@ All modes draw their prompt on stderr (select and completion mode fall back to `
 
 | Element | Variable |
 |---|---|
-| Prompt text, select mode items | `COLOR_TEXT_BOLD`, `COLOR_TEXT_DEFAULT` |
-| Typed input (echoed while typing), accepted answer | `COLOR_TEXT_DEFAULT`, `COLOR_TEXT_SUCCESS` |
-| `(default)` hint, key hints, inline completion suggestion | `COLOR_TEXT_FADED` |
-| Prompt character (`> `) and pointer (`❯`), highlighted row | `COLOR_TEXT_INFO` + `COLOR_SELECTION_BACKGROUND` |
+| Question text, prompt character (`> `), pointer (`❯`) | `COLOR_TEXT_INFO` (bold) |
+| Highlighted select mode row | `COLOR_TEXT_INFO` on `COLOR_SELECTION_BACKGROUND` |
+| Typed input | never styled — plain terminal text |
+| Instruction prompts, i.e. fully parenthesized ones like `(Press Ctrl-D when done)` | `COLOR_TEXT_FADED` |
+| `[y/N]` style options and the trailing colon, `(default)` hint, key hints, inline completion suggestion | `COLOR_TEXT_FADED` |
+| The default choice inside `[y/N]` (the upper-case one) | `COLOR_TEXT_DEFAULT` |
+| Select mode items, the selected item echoed after Enter | `COLOR_TEXT_DEFAULT`, `COLOR_TEXT_SUCCESS` |
 | Item numbers, item keys | `COLOR_TEXT_NUMERIC`, `COLOR_TEXT_MUTED` |
 | `--header-lines` header | `COLOR_TABLE_HEADER` |
 
