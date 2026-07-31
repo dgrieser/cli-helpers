@@ -20,6 +20,8 @@ ELLIPSIS = '…'
 TAB_WIDTH = 4
 SEPARATOR = ' · '
 ESCAPE_TIMEOUT = 0.05
+# CSI sequences, the only escapes a caller is likely to hand in with a prompt
+ANSI_PATTERN = re.compile(r'\033\[[0-9;:?]*[ -/]*[@-~]')
 
 STYLES = {
     'bold': '1',
@@ -154,14 +156,45 @@ def ansi(spec):
     return '\033[' + ';'.join(codes) + 'm'
 
 
+def strip_ansi(text):
+    return ANSI_PATTERN.sub('', text)
+
+
+def visible_length(text):
+    # escape sequences take up no columns, so the cursor math and the layout
+    # have to measure what ends up on screen, not what is in the string
+    return len(strip_ansi(text))
+
+
+def pad(text, width):
+    return text + ' ' * max(0, width - visible_length(text))
+
+
 def truncate(text, width):
     if width <= 0:
         return ''
-    if len(text) <= width:
+    if visible_length(text) <= width:
         return text
     if width == 1:
         return ELLIPSIS
-    return text[:width - 1] + ELLIPSIS
+    if '\033' not in text:
+        return text[:width - 1] + ELLIPSIS
+    # spend the budget on the visible characters only and close the styling
+    # off where the text is cut, so no half escape sequence survives
+    limit = width - 1
+    result = ''
+    visible = 0
+    index = 0
+    while index < len(text) and visible < limit:
+        match = ANSI_PATTERN.match(text, index)
+        if match:
+            result += match.group(0)
+            index = match.end()
+            continue
+        result += text[index]
+        visible += 1
+        index += 1
+    return result + RESET + ELLIPSIS
 
 
 def colors_enabled(stream):
@@ -611,7 +644,7 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
         lines.append(paint_prompt(theme, truncate(prompt, width)))
     count = len(items)
     number_width = len(str(count))
-    marker_width = len(pointer) + 1
+    marker_width = visible_length(pointer) + 1
     # indent the header so its columns line up with the item titles below it
     header_indent = ' ' * (marker_width + number_width + 2)
     for line in header:
@@ -626,7 +659,7 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
         text = truncate(title, available - len(suffix))
         if selected:
             row = marker + number + '  ' + text + suffix
-            lines.append(theme.paint('selected', row.ljust(width)))
+            lines.append(theme.paint('selected', pad(row, width)))
         else:
             row = marker + theme.paint('number', number) + '  ' + theme.paint('item', text)
             if suffix:
@@ -700,9 +733,10 @@ def render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset,
     if prompt:
         frame.append(paint_prompt(theme, truncate(prompt, width)))
     char_display = paint_prompt_char(theme, prompt_char)
-    available = max(1, width - len(prompt_char))
+    char_width = visible_length(prompt_char)
+    available = max(1, width - char_width)
     cursor_line = len(frame)
-    cursor_col = len(prompt_char)
+    cursor_col = char_width
     for index in range(offset, min(offset + view, len(lines))):
         # tabs are kept in the buffer but drawn expanded, so the column math
         # matches what the terminal shows
@@ -710,7 +744,7 @@ def render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset,
         if index == row:
             cursor_line = len(frame)
             visible, cursor_offset = scroll_line(expanded, len(lines[index][:col].expandtabs(TAB_WIDTH)), available)
-            cursor_col = len(prompt_char) + cursor_offset
+            cursor_col = char_width + cursor_offset
         else:
             visible = truncate(expanded, available)
         frame.append(char_display + visible)
@@ -833,7 +867,7 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_la
             marker = (POINTER + ' ') if selected else ' ' * marker_width
             candidate = truncate(menu_labels[position], width - marker_width)
             if selected:
-                lines.append(theme.paint('selected', (marker + candidate).ljust(width)))
+                lines.append(theme.paint('selected', pad(marker + candidate, width)))
             else:
                 lines.append(marker + theme.paint('item', candidate))
         hint = SEPARATOR.join(['↑/↓ choose', 'tab next', 'enter accept', 'esc close'])
@@ -846,8 +880,10 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_la
 def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True):
     renderer = Renderer(term)
     head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
-    head_width = len(prompt) + 1 if prompt else 0
-    head_width += len(prompt_char)
+    # the head is what the terminal shows, so a caller that colored the prompt
+    # itself must not push the cursor to the right by the escapes it contains
+    head_width = visible_length(prompt) + 1 if prompt else 0
+    head_width += visible_length(prompt_char)
     text = prefill
     cursor = len(text)
     menu = None
@@ -1450,7 +1486,7 @@ def main():
         if args.default and not any(lines):
             lines = args.default.split('\n')
 
-        print('\r' + ' ' * len(prompt_char) + '\r', end='', file=sys.stderr)
+        print('\r' + ' ' * visible_length(prompt_char) + '\r', end='', file=sys.stderr)
         print('\n'.join(lines))
 
 if __name__ == '__main__':
