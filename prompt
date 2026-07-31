@@ -513,6 +513,46 @@ def unique(values):
     return result
 
 
+def path_label(candidate):
+    # only the component being completed is shown in the menu, the shared
+    # directory prefix would just be truncated away
+    trimmed = candidate[:-1] if candidate.endswith('/') else candidate
+    name = trimmed.rsplit('/', 1)[-1]
+    return name + '/' if candidate.endswith('/') else name
+
+
+def path_candidates(text, dirs_only=False, limit=1000):
+    # Completes one path component at a time: directories come back with a
+    # trailing slash, so the next completion descends into them.
+    separator = text.rfind('/')
+    if separator < 0:
+        base = ''
+        partial = text
+    else:
+        base = text[:separator + 1]
+        partial = text[separator + 1:]
+    directory = os.path.expanduser(base) if base else '.'
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    candidates = []
+    for name in names:
+        if partial:
+            if not name.startswith(partial):
+                continue
+        elif name.startswith('.'):
+            # hidden entries only show up once a dot was typed
+            continue
+        is_dir = os.path.isdir(os.path.join(directory, name))
+        if dirs_only and not is_dir:
+            continue
+        candidates.append(base + name + ('/' if is_dir else ''))
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
 def match_candidates(text, candidates, ignore_case=False, substring=False):
     if not text:
         return list(candidates)
@@ -754,7 +794,7 @@ def run_multiline(term, theme, prompt, prompt_char, max_height):
             desired_col = col
 
 
-def render_complete(theme, width, head, head_width, text, cursor, ghost, menu, menu_index, view):
+def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_labels, menu_index, view):
     available = max(1, width - head_width)
     start = 0
     if len(text) + len(ghost) > available:
@@ -766,15 +806,15 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu, m
         ghost = ghost[:max(0, available - len(visible))]
     lines = [head + visible + (theme.paint('ghost', ghost) if ghost else '')]
     cursor_col = head_width + (cursor - start)
-    if menu:
-        count = len(menu)
+    if menu_labels:
+        count = len(menu_labels)
         view = max(1, min(view, count))
         offset = visible_window(menu_index, count, view)
         marker_width = len(POINTER) + 1
         for position in range(offset, min(offset + view, count)):
             selected = position == menu_index
             marker = (POINTER + ' ') if selected else ' ' * marker_width
-            candidate = truncate(menu[position], width - marker_width)
+            candidate = truncate(menu_labels[position], width - marker_width)
             if selected:
                 lines.append(theme.paint('selected', (marker + candidate).ljust(width)))
             else:
@@ -786,7 +826,7 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu, m
     return lines, cursor_col
 
 
-def run_complete(term, theme, prompt, prompt_display, prompt_char, candidates, prefill, ignore_case, substring, max_height):
+def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None):
     renderer = Renderer(term)
     head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
     head_width = len(prompt) + 1 if prompt else 0
@@ -798,7 +838,9 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, candidates, p
     menu_base = ''
 
     def matches_for(value):
-        return match_candidates(value, candidates, ignore_case, substring)
+        # the provider may look up candidates for the current input, which is
+        # what lets path completion descend into directories
+        return match_candidates(value, provider(value), ignore_case, substring)
 
     def ghost_for(value):
         if substring or menu or not value or cursor != len(value):
@@ -817,7 +859,8 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, candidates, p
         width, rows = term.size()
         width = max(20, width - 1)
         view = max_height if max_height > 0 else max(1, rows - 3)
-        lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu, menu_index, view)
+        menu_labels = [label(entry) for entry in menu] if (menu and label) else menu
+        lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu_labels, menu_index, view)
         renderer.draw(lines, cursor_line=0, cursor_col=cursor_col)
         key, char = term.read_key()
 
@@ -1022,8 +1065,14 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
             if index is None:
                 print('ERROR: --default "' + args.default + '" matches no item.', file=sys.stderr)
                 exit(1)
+    elif args.files or args.dirs:
+        dirs_only = args.dirs
+        provider = lambda text: path_candidates(text, dirs_only)
+        menu_label = path_label
     else:
         candidates = unique(entries)
+        provider = lambda text: candidates
+        menu_label = None
 
     old_settings = raw_mode(term.in_fd)
     result = None
@@ -1051,7 +1100,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
                 result = key
         else:
             prompt_display = paint_prompt(theme, prompt_base, args.default)
-            line = run_complete(term, theme, prompt, prompt_display, prompt_char, candidates, args.prefill, args.ignore_case, args.substring, height)
+            line = run_complete(term, theme, prompt, prompt_display, prompt_char, provider, args.prefill, args.ignore_case, args.substring, height, menu_label)
             if line is None:
                 term.write(theme.paint('hint', 'Abort.') + '\r\n')
                 term.flush()
@@ -1115,7 +1164,9 @@ def main():
     parser.add_argument('--no-header-uppercase', dest='no_header_uppercase', action='store_true', help='Keep the header lines as they are instead of upper-casing them')
     parser.add_argument('--ignore-case', action='store_true', help='Match completion candidates case-insensitively')
     parser.add_argument('--substring', action='store_true', help='Match completion candidates anywhere instead of at the start')
-    parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode')
+    parser.add_argument('--files', action='store_true', help='Complete against file and directory names instead of a candidate list; completing a directory appends a slash, so the next completion descends into it')
+    parser.add_argument('--dirs', action='store_true', help='Like --files, but offers directories only')
+    parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode (defaults to the current directory in the --files and --dirs modes)')
     parser.add_argument('--height', type=int, help='Maximum number of list rows shown at once (default: fit the terminal)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
@@ -1184,6 +1235,20 @@ def main():
     elif bin_name == 'prompt-complete':
         # the positional arguments are the candidates, so the prompt stays as given
         prompt_complete = True
+    elif bin_name == 'prompt-file':
+        prompt_complete = True
+        args.files = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        elif prompt is None:
+            prompt = 'Enter file:'
+    elif bin_name == 'prompt-folder':
+        prompt_complete = True
+        args.dirs = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        elif prompt is None:
+            prompt = 'Enter directory:'
 
     if prompt_select and prompt_complete:
         print('ERROR: --select and --complete are mutually exclusive.', file=sys.stderr)
@@ -1200,9 +1265,15 @@ def main():
     if args.header_lines < 0:
         print('ERROR: --header-lines must not be negative.', file=sys.stderr)
         exit(1)
-    if not prompt_complete and (args.prefill or args.ignore_case or args.substring):
-        print('ERROR: --prefill, --ignore-case and --substring can only be used in completion mode.', file=sys.stderr)
+    if not prompt_complete and (args.prefill or args.ignore_case or args.substring or args.files or args.dirs):
+        print('ERROR: --prefill, --ignore-case, --substring, --files and --dirs can only be used in completion mode.', file=sys.stderr)
         exit(1)
+    if args.files and args.dirs:
+        print('ERROR: --files and --dirs are mutually exclusive.', file=sys.stderr)
+        exit(1)
+    if (args.files or args.dirs) and not args.prefill:
+        # start out in the current directory, so completion has somewhere to descend from
+        args.prefill = os.getcwd().rstrip('/') + '/'
     if args.height is not None and args.height < 1:
         print('ERROR: --height must be a positive number.', file=sys.stderr)
         exit(1)
