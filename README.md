@@ -625,6 +625,7 @@ echo -e "hi" | color-parse red
 | `color-text-muted` / `print-text-muted` | `COLOR_TEXT_MUTED` | Muted/de-emphasized text. |
 | `color-text-faded` / `print-text-faded` | `COLOR_TEXT_FADED` | Faded text. |
 | `color-text-info` / `print-text-info` | `COLOR_TEXT_INFO` | Informational text. |
+| `color-text-code` / `print-text-code` | `COLOR_TEXT_CODE` | Inline code snippet, as [glow](https://github.com/charmbracelet/glow) renders `` `code` `` (`203:bg=236`). Used by [prompt](#prompt) for quoted spans. |
 | `color-text-success[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_SUCCESS[_LIGHT\|_STRONG]` | Success text, three intensities. |
 | `color-text-warning[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_WARNING[_LIGHT\|_STRONG]` | Warning text, three intensities. |
 | `color-text-error[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_ERROR[_LIGHT\|_STRONG]` | Error text, three intensities. |
@@ -1537,6 +1538,9 @@ All modes draw their prompt on stderr (select and completion mode fall back to `
 | Select mode items, the selected item echoed after Enter | `COLOR_TEXT_DEFAULT`, `COLOR_TEXT_SUCCESS` |
 | Item numbers, item keys | `COLOR_TEXT_NUMERIC`, `COLOR_TEXT_MUTED` |
 | `--header-lines` header | `COLOR_TABLE_HEADER` |
+| Quoted spans in the question text, e.g. the branch name in `Create branch "chore/bump-deps"?` | `COLOR_TEXT_CODE` (`203` on `236`, i.e. how [glow](https://github.com/charmbracelet/glow) renders `` `code` ``) |
+
+Spans wrapped in `"`, `'` or `` ` `` are drawn as inline code snippets: the quotes become the padding of the highlighted block, so the prompt keeps its width. The quote has to open after a space or an opening bracket and close before a space or punctuation, so an apostrophe in `the user's file` is left alone.
 
 Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
 

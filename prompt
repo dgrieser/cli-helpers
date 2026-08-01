@@ -22,6 +22,10 @@ SEPARATOR = ' · '
 ESCAPE_TIMEOUT = 0.05
 # CSI sequences, the only escapes a caller is likely to hand in with a prompt
 ANSI_PATTERN = re.compile(r'\033\[[0-9;:?]*[ -/]*[@-~]')
+# A quoted (or backticked) span inside a prompt reads as an inline code snippet.
+# The quote has to open after a space or an opening bracket and close before a
+# space or punctuation, so an apostrophe in "the user's file" is left alone.
+CODE_PATTERN = re.compile(r'(?<![^\s([{<])(["\'`])(?!\s)((?:(?!\1).)+?)(?<!\s)\1(?![^\s)\]}>,.;:!?])')
 
 STYLES = {
     'bold': '1',
@@ -75,6 +79,8 @@ THEME_DEFAULTS = {
     'COLOR_TEXT_NUMERIC': '245',
     'COLOR_TEXT_SUCCESS': '40',
     'COLOR_TEXT_ERROR': '160:bold',
+    # glow renders `code` in 203 on 236, padded with a space on either side
+    'COLOR_TEXT_CODE': '203:bg=236',
     'COLOR_TABLE_HEADER': '250:bold',
     'COLOR_SELECTION_BACKGROUND': '0',
 }
@@ -227,6 +233,7 @@ class Theme:
             'ghost': self.spec('COLOR_TEXT_FADED'),
             'result': self.spec('COLOR_TEXT_SUCCESS'),
             'error': self.spec('COLOR_TEXT_ERROR'),
+            'code': self.spec('COLOR_TEXT_CODE'),
             'pointer': highlight,
             'selected': self.combine(highlight, 'bg=' + selection if selection else ''),
         }
@@ -511,6 +518,26 @@ def paint_options(theme, options):
     return result
 
 
+def paint_code_spans(theme, role, text):
+    # Quoted spans are drawn like glow draws `code`: the quotes themselves become
+    # the space padding of the snippet, so the prompt keeps the width of the text
+    # the caller handed in and the cursor math downstream stays correct.
+    if not theme.enabled or not text:
+        return theme.paint(role, text)
+    code = ansi(theme.roles.get('code', ''))
+    if not code:
+        return theme.paint(role, text)
+    result = ''
+    position = 0
+    for match in CODE_PATTERN.finditer(text):
+        result += theme.paint(role, text[position:match.start()])
+        result += code + ' ' + match.group(2) + ' ' + RESET
+        position = match.end()
+    if not position:
+        return theme.paint(role, text)
+    return result + theme.paint(role, text[position:])
+
+
 def paint_prompt(theme, prompt, default=''):
     # only the question itself is emphasized; the "[y/N]" options, the
     # "(default)" hint and the trailing colon stay muted
@@ -522,7 +549,7 @@ def paint_prompt(theme, prompt, default=''):
         # a fully parenthesized prompt is an instruction, not a question, e.g.
         # the multi-line mode's "(Press Ctrl-D when done)"
         role = 'hint' if text.startswith('(') and text.endswith(')') else 'title'
-        parts.append(theme.paint(role, text))
+        parts.append(paint_code_spans(theme, role, text))
     if default:
         parts.append(' ' + theme.paint('hint', '(' + default + ')'))
     if options:
