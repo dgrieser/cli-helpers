@@ -74,7 +74,18 @@ else
     done
 fi
 
-baseline_procs=$(pstree -Tp ${pid} | grep -o '([0-9]*)' | wc -l)
+# a command is running when one of the shells inside the launcher window has
+# children of its own; only the shells own a pty, helper processes terminator
+# spawns for itself (e.g. the glycin image sandbox, which comes and goes on its
+# own schedule) do not and must not be counted
+launcher_command_running() {
+    local shell
+    for shell in $(ps -o pid=,tty= --ppid ${pid} 2>/dev/null | awk '$2 ~ /^pts\// { print $1 }'); do
+        [ -n "$(pgrep -P "${shell}" 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
 counter=0
 interval=0.5
 ignore_active=0
@@ -102,7 +113,7 @@ while true; do
     [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "${launcher_window}" ]] && counter=0
 
     # running process in launcher resets the counter
-    [ $(pstree -Tp ${pid} | grep -o '([0-9]*)' | wc -l) -gt ${baseline_procs} ] && counter=0
+    launcher_command_running && counter=0
 
     # otherwise exit launcher after max_seconds
     (( $(echo "${counter} >= ${max_seconds}" | bc -l) )) && kill ${pid} && exit 0
