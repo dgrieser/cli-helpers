@@ -520,7 +520,9 @@ codex-session --last
 ```
 
 ### `aish`
-Edits or creates a file or command using an AI CLI tool inside a temporary git repository, runs a syntax check, shows a diff, and optionally applies the changes back to the original file (using sudo when needed). The CLI to run is picked with completion over `codex`, `claude` and `opencode` (default `claude`), and any other command can be typed instead.
+Edits or creates a file or command using an AI CLI tool, runs a syntax check, and shows a diff. The CLI to run is picked with completion over `codex`, `claude` and `opencode` (default `claude`), and any other command can be typed instead.
+
+Symlinks are resolved first. If the resulting file lives inside a git repository, the AI CLI is started in that repository and edits the file in place — no temporary repository is created and nothing has to be copied back. Change detection compares `HEAD` and `git status --porcelain` against the state from before the run, so a repository that was already dirty is not mistaken for changes made by the agent. Otherwise the file is copied into a temporary git repository (together with `bash-cli-instructions.md`) and copied back to the original location after the changes have been confirmed, using sudo when the target folder is not writable.
 
 **Usage:** `aish [OPTIONS] COMMAND`
 

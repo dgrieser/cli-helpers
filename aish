@@ -12,6 +12,11 @@ usage: ${APP_NAME} [OPTIONS] COMMAND
 
 Edit or create a file or command using ai (sudo if needed).
 
+Symlinks are resolved. If the resulting file lives inside a git
+repository, the coding agent is started in that repository and edits
+the file in place. Otherwise the file is copied into a temporary git
+repository and copied back after the changes have been confirmed.
+
     COMMAND     The command or file to edit.
                 Commands are found via which or
                 are searched for in /usr/local/bin
@@ -102,28 +107,49 @@ fi
 # check if text based file
 [ -f "${file}" ] && [ "$(file -b -i "${file}" | grep -c "^text/")" -lt 0 ] && fail "${file} is not a text based file"
 
+# follow symlinks to the file that actually has to be edited
+real_file="${file}"
+[ -e "${file}" ] && real_file="$(realpath "${file}")"
+
+# if the real file is tracked inside a git repo, edit it in place instead of a temp repo
+repo_root=""
+[ -f "${real_file}" ] && repo_root="$(git -C "$(dirname "${real_file}")" rev-parse --show-toplevel 2>/dev/null)"
+
 echo "Editing ${file}"
+[ "${real_file}" != "${file}" ] && echo "Symlink resolved to ${real_file}"
 
-# check if parent folder is writable by user
-if [ -w "$(dirname ${file})" ]; then
-    sudo=""
+if [ -n "${repo_root}" ]; then
+    in_repo=1
+    edit_file="${real_file}"
+    echo "File is inside git repo ${repo_root}, editing in place"
+    [ ! -w "${real_file}" ] && error "${real_file} is not writable, the coding agent may not be able to change it"
+    cd "${repo_root}"
+    head_before="$(git rev-parse HEAD 2>/dev/null)"
+    status_before="$(git status --porcelain)"
 else
-    sudo="sudo "
+    in_repo=0
+
+    # check if parent folder is writable by user
+    if [ -w "$(dirname ${file})" ]; then
+        sudo=""
+    else
+        sudo="sudo "
+    fi
+
+    local_file="$(basename "${file}")"
+    tmp_repo="$(mktemp -d "${TMPDIR:-/tmp}/${local_file}-git-$(date +%s)-XXXX")"
+    edit_file="${tmp_repo}/${local_file}"
+    trap "${RM_CMD} -rf ${tmp_repo}" EXIT
+
+    cd "${tmp_repo}"
+    git init
+
+    [ -f "${file}" ] && cp "${file}" "${edit_file}" || touch "${edit_file}"
+    chmod +x "${edit_file}"
+    cp "${HOME}/Dokumente/instructions/bash-cli-instructions.md" "${tmp_repo}"/.
+    git add .
+    git commit -m "Initial commit of ${local_file}"
 fi
-
-local_file="$(basename "${file}")"
-tmp_repo="$(mktemp -d "${TMPDIR:-/tmp}/${local_file}-git-$(date +%s)-XXXX")"
-local_file_path="${tmp_repo}/${local_file}"
-trap "${RM_CMD} -rf ${tmp_repo}" EXIT
-
-cd "${tmp_repo}"
-git init
-
-[ -f "${file}" ] && cp "${file}" "${local_file_path}" || touch "${local_file_path}"
-chmod +x "${local_file_path}"
-cp "${HOME}/Dokumente/instructions/bash-cli-instructions.md" "${tmp_repo}"/.
-git add .
-git commit -m "Initial commit of ${local_file}"
 
 echo
 cli=$(prompt-complete -p "Choose CLI to use:" -d "${DEFAULT_CLI}" ${CLI_CHOICES})
@@ -132,15 +158,22 @@ cli=$(prompt-complete -p "Choose CLI to use:" -d "${DEFAULT_CLI}" ${CLI_CHOICES}
 ${cli}
 
 # check if changes have been made, either uncommitted, staged, or committed
-untracked="$(git ls-files --others --exclude-standard)"
-unstaged="$(git diff --name-only)"
-staged="$(git --no-pager diff --cached --name-only)"
-[ -z "${untracked}" ] && [ -z "${unstaged}" ] && [ -z "${staged}" ] && echo && abort "No changes have been made."
+if [ "${in_repo}" -eq 1 ]; then
+    # the repo may have been dirty before, so compare against the state from before the run
+    head_after="$(git rev-parse HEAD 2>/dev/null)"
+    status_after="$(git status --porcelain)"
+    [ "${head_before}" = "${head_after}" ] && [ "${status_before}" = "${status_after}" ] && echo && abort "No changes have been made."
+else
+    untracked="$(git ls-files --others --exclude-standard)"
+    unstaged="$(git diff --name-only)"
+    staged="$(git --no-pager diff --cached --name-only)"
+    [ -z "${untracked}" ] && [ -z "${unstaged}" ] && [ -z "${staged}" ] && echo && abort "No changes have been made."
+fi
 
 git-diff
 echo
 
-syntax-check "${local_file_path}"
+syntax-check "${edit_file}"
 
 echo
 
@@ -150,13 +183,19 @@ case "${exit_code}" in
     0) exec "${APP_PATH}" "${original_args[@]}" ;;
 esac
 
+# changes inside an existing repo are already in place, nothing to copy back
+if [ "${in_repo}" -eq 1 ]; then
+    echo "Changes are already applied to ${real_file} in ${repo_root}"
+    exit 0
+fi
+
 prompt-yes-no "Apply changes to ${file}?"; exit_code=$?
 case "${exit_code}" in
     0) ;;
     *) abort "Changes not applied." ;;
 esac
 
-${sudo}cp "${local_file_path}" "${file}"
+${sudo}cp "${edit_file}" "${file}"
 echo "Copied ${local_file} to ${file}"
 
 if [ ! -x "${file}" ]; then
