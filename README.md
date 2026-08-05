@@ -500,6 +500,7 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `-l, --last` | Print the latest session. |
 | `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
 | `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 10); cannot be combined with `--limit`. |
+| `-c, --current-directory` | Only list sessions whose recorded working directory is the current directory. |
 | `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
 | `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
@@ -511,7 +512,9 @@ By default, the interactive listing includes sessions active within the last 10 
 
 Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
 
-The picker binds `/` to prompt for a case-insensitive message search, `enter` to print rendered Markdown, `alt-enter` to print raw Markdown, `ctrl-c` to copy raw Markdown to the clipboard, `ctrl-x` to resume the session, `ctrl-r` to refresh the session list and preview, and `esc` to exit. Empty input or aborting the search prompt returns to the unfiltered picker. In an interactive search view, `backspace` also returns to the unfiltered picker. Search state, clipboard confirmation, and the exact resume command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal. `shift-enter` is unavailable because fzf does not expose it as a distinct key.
+The picker binds `/` to prompt for a case-insensitive message search, `enter` to print rendered Markdown, `alt-enter` to print raw Markdown, `ctrl-c` to copy raw Markdown to the clipboard, `tab` to toggle between all folders and the current folder, `ctrl-f` to fork, `ctrl-x` to resume the session, `ctrl-r` to refresh the session list and preview, and `esc` to exit. The `tab` header description reflects the scope it will switch to, and toggling preserves active message searches and fzf filters. Empty input or aborting the search prompt returns to the unfiltered picker. In an interactive search view, `backspace` also returns to the unfiltered picker. Search state, clipboard confirmation, and the exact resume or fork command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal.
+
+Fork prompts for the target agent with completion over `claude` and `codex`, defaulting to the session's current agent. Same-agent forks use the CLI's native fork support (`codex fork` or Claude's `--fork-session`). Cross-agent forks include the complete rendered conversation context and launch the target in the original working directory. Claude can open directly at an empty prompt with the context injected as additional system instructions. Codex receives the context as an initial wait-for-the-user prompt; unusually large transcripts are loaded from a temporary file to avoid command-line size limits. `shift-enter` is unavailable because fzf does not expose it as a distinct key.
 
 **Examples:**
 ```bash
@@ -519,6 +522,7 @@ agent-session
 agent-session --print
 agent-session --last
 agent-session --days 7
+agent-session --current-directory
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
 claude-session -n 20 --igrep "docker compose"

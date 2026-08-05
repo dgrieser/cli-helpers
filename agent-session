@@ -12,6 +12,7 @@ initial_batch_size=20
 fzf_text_max_length=30
 print_title_max_length=50
 print_prompt_max_length=60
+fork_prompt_max_bytes=100000
 all_agents="claude codex"
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 script_folder="$(dirname "${script_path}")"
@@ -42,6 +43,8 @@ Options:
     -l, --last          Print the latest session
     -n, --limit LIMIT   Limit sessions by count instead of age
     -d, --days DAYS     Only list sessions active within DAYS (default: 10)
+    -c, --current-directory
+                        Only list sessions from the current directory
     -p, --print         Print the session table instead of opening the picker
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
@@ -57,6 +60,8 @@ Interactive keys:
     enter               Print rendered Markdown
     alt-enter           Print raw Markdown
     ctrl-c              Copy raw Markdown to the clipboard
+    tab                 Toggle sessions from the current directory only
+    ctrl-f              Fork the session, optionally with another agent
     ctrl-x              Resume the session in its original directory
     ctrl-r              Refresh sessions
     esc                 Exit
@@ -295,13 +300,24 @@ session_cwd() {
 
     case "${agent}" in
         claude)
-            filter='map(select(.cwd))[0].cwd // ""'
+            filter='first(inputs | select(.cwd? != null) | .cwd) // ""'
             ;;
         codex)
-            filter='map(select(.type == "session_meta"))[0].payload.cwd // ""'
+            filter='first(inputs | select(.type == "session_meta") | .payload.cwd) // ""'
             ;;
     esac
-    jq -r -s "${filter}" "${filepath}"
+    jq -rn "${filter}" "${filepath}"
+}
+
+session_is_in_directory() {
+    local agent="${1}"
+    local filepath="${2}"
+    local directory="${3}"
+    local session_directory
+
+    session_directory="$(session_cwd "${agent}" "${filepath}")"
+    [ -n "${session_directory}" ] || return 1
+    [ "$(realpath -m -- "${session_directory}")" = "${directory}" ]
 }
 
 # One line per message, whitespace collapsed, so that patterns spanning line
@@ -469,6 +485,7 @@ fzf_list_command() {
     fi
 
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
+    [ "${current_directory_only}" -eq 1 ] && arguments+=(--current-directory)
     [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
     [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
 
@@ -486,14 +503,21 @@ fzf_browse_command() {
     local argument
     local quoted
     local arguments=()
+    local command_current_directory_only="${current_directory_only}"
 
     [ "${action}" = "search" ] && arguments+=(--fzf-search)
+    if [ "${action}" = "toggle-directory" ]; then
+        command_current_directory_only=$((1 - current_directory_only))
+        [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
+        [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
+    fi
     if [ -n "${limit}" ]; then
         arguments+=(--limit "${limit}")
     else
         arguments+=(--days "${days}")
     fi
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
+    [ "${command_current_directory_only}" -eq 1 ] && arguments+=(--current-directory)
     [ "${verbose}" -eq 1 ] && arguments+=(--verbose)
 
     printf -v command '%q' "${script_path}"
@@ -534,6 +558,24 @@ raw_session_file() {
     jq -rs "${jq_filter}" "${filepath}"
 }
 
+create_fork_context() {
+    local agent="${1}"
+    local filepath="${2}"
+    local context_file
+
+    context_file="$(mktemp --suffix=.md "${TMPDIR:-/tmp}/agent-session-fork.XXXXXX")" \
+        || fail "Failed to create temporary fork context"
+    if ! {
+        printf 'User wants to continue a previous %s session. This is the complete context:\n\n---\n\n' "${agent}"
+        raw_session_file "${agent}" "${filepath}"
+        printf '\n\n---\n\nDo nothing for now. Wait for the next user prompt.\n'
+    } > "${context_file}"; then
+        rm -f -- "${context_file}"
+        fail "Failed to create fork context"
+    fi
+    printf '%s' "${context_file}"
+}
+
 fzf_action() {
     local action="${1}"
     local agent="${2}"
@@ -542,6 +584,12 @@ fzf_action() {
     local session_id
     local preview_width
     local resume_command
+    local target_agent
+    local context_file
+    local context_size
+    local fork_prompt
+    local fork_command
+    local cleanup_command
 
     case "${agent}" in
         claude | codex)
@@ -588,6 +636,69 @@ fzf_action() {
                     printf -v resume_command 'cd -- %q && codex resume %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${session_id}"
                     muted "${resume_command}"
                     exec codex resume "${session_id}" </dev/tty >/dev/tty 2>&1
+                    ;;
+            esac
+            ;;
+        fork)
+            command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
+            target_agent="$(prompt-complete \
+                --prompt "Fork with: " \
+                --default "${agent}" \
+                claude codex </dev/tty)" || exit 0
+            case "${target_agent}" in
+                claude | codex)
+                    ;;
+                *)
+                    fail "Unknown fork agent: ${target_agent}"
+                    ;;
+            esac
+            command -v "${target_agent}" >/dev/null 2>&1 || fail "${target_agent} not found"
+
+            cwd="$(session_cwd "${agent}" "${filepath}")"
+            [ -n "${cwd}" ] || fail "Session has no working directory"
+            [ -d "${cwd}" ] || fail "Session directory not found: ${cwd}"
+            cd -- "${cwd}" || fail "Cannot enter session directory: ${cwd}"
+
+            if [ "${target_agent}" = "${agent}" ]; then
+                session_id="$(session_id_of "${agent}" "${filepath}")"
+                case "${agent}" in
+                    claude)
+                        printf -v fork_command 'cd -- %q && claude --resume %q --fork-session </dev/tty >/dev/tty 2>&1' "${cwd}" "${session_id}"
+                        muted "${fork_command}"
+                        exec claude --resume "${session_id}" --fork-session </dev/tty >/dev/tty 2>&1
+                        ;;
+                    codex)
+                        printf -v fork_command 'cd -- %q && codex fork -C %q %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${session_id}"
+                        muted "${fork_command}"
+                        exec codex fork -C "${cwd}" "${session_id}" </dev/tty >/dev/tty 2>&1
+                        ;;
+                esac
+            fi
+
+            context_file="$(create_fork_context "${agent}" "${filepath}")"
+            printf -v cleanup_command 'rm -f -- %q' "${context_file}"
+            # The trap deliberately captures the exact generated filename now.
+            # shellcheck disable=SC2064
+            trap "${cleanup_command}" EXIT
+            case "${target_agent}" in
+                claude)
+                    printf -v fork_command 'cd -- %q && claude --append-system-prompt-file %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${context_file}"
+                    muted "${fork_command}"
+                    claude --append-system-prompt-file "${context_file}" </dev/tty >/dev/tty 2>&1
+                    ;;
+                codex)
+                    context_size="$(wc -c < "${context_file}")"
+                    if [ "${context_size}" -le "${fork_prompt_max_bytes}" ]; then
+                        fork_prompt="$(< "${context_file}")"
+                        # This is the muted command display; expansion happens when copied and run.
+                        # shellcheck disable=SC2016
+                        printf -v fork_command 'cd -- %q && codex -C %q "$(< %q)" </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${context_file}"
+                    else
+                        printf -v fork_prompt 'User wants to continue a previous %s session. Read the complete context from %s. Do nothing else for now. Wait for the next user prompt.' "${agent}" "${context_file}"
+                        printf -v fork_command 'cd -- %q && codex -C %q %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${fork_prompt}"
+                    fi
+                    muted "${fork_command}"
+                    codex -C "${cwd}" "${fork_prompt}" </dev/tty >/dev/tty 2>&1
                     ;;
             esac
             ;;
@@ -670,7 +781,10 @@ browse_sessions() {
     local list_command
     local search_command
     local reset_command
+    local toggle_directory_command
+    local directory_key_description
     local key_descriptions
+    local fzf_query_arguments=()
     local search_bindings=()
 
     [ -x "${fzf_with_header}" ] || fzf_with_header="$(command -v fzf-with-header)"
@@ -683,11 +797,19 @@ browse_sessions() {
     list_command="$(fzf_list_command all)"
     search_command="$(fzf_browse_command search)"
     reset_command="$(fzf_browse_command all)"
+    toggle_directory_command="$(fzf_browse_command toggle-directory)"
+    toggle_directory_command+=" --fzf-query {q}"
     preview_command="${script_command} --fzf-action preview {2} {3}"
-    key_descriptions="/:search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,ctrl-x:resume,ctrl-r:refresh,esc:exit"
+    [ -n "${fzf_query}" ] && fzf_query_arguments+=(--query "${fzf_query}")
+    if [ "${current_directory_only}" -eq 1 ]; then
+        directory_key_description="show all folders"
+    else
+        directory_key_description="current folder only"
+    fi
+    key_descriptions="/:search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:${directory_key_description},ctrl-f:fork,ctrl-x:resume,ctrl-r:refresh,esc:exit"
     search_bindings=(--bind "/:become(${search_command})")
     if [ -n "${igrep_pattern}" ]; then
-        key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,ctrl-x:resume,ctrl-r:refresh,esc:exit"
+        key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:${directory_key_description},ctrl-f:fork,ctrl-x:resume,ctrl-r:refresh,esc:exit"
         search_bindings+=(--bind "backspace:become(${reset_command})")
     fi
     "${fzf_with_header}" \
@@ -698,6 +820,7 @@ browse_sessions() {
         --key-descriptions "${key_descriptions}" \
         -- \
         --no-multi \
+        "${fzf_query_arguments[@]}" \
         --preview "${preview_command}" \
         --preview-window 'right,60%,wrap' \
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
@@ -705,6 +828,8 @@ browse_sessions() {
         --bind "enter:become(${script_command} --fzf-action markdown {2} {3})" \
         --bind "alt-enter:become(${script_command} --fzf-action raw {2} {3})" \
         --bind "ctrl-c:become(${script_command} --fzf-action clipboard {2} {3})" \
+        --bind "tab:become(${toggle_directory_command})" \
+        --bind "ctrl-f:become(${script_command} --fzf-action fork {2} {3})" \
         --bind "ctrl-x:become(${script_command} --fzf-action resume {2} {3})" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
         --bind "esc:abort"
@@ -746,7 +871,7 @@ completion() {
         esac
     done
 
-    echo "-h --help -a --agent -l --last -n --limit -d --days -p --print -g --grep -i --igrep -r --raw --verbose"
+    echo "-h --help -a --agent -l --last -n --limit -d --days -c --current-directory -p --print -g --grep -i --igrep -r --raw --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -772,6 +897,7 @@ fzf_action_filepath=""
 fzf_list=0
 fzf_batch=""
 fzf_search=0
+fzf_query=""
 grep_pattern=""
 igrep_pattern=""
 last=0
@@ -779,6 +905,8 @@ limit=""
 limit_explicit=0
 days=10
 days_explicit=0
+current_directory_only=0
+current_directory="$(pwd -P)"
 print=0
 raw=0
 verbose=0
@@ -815,6 +943,11 @@ while [ "${#}" -gt 0 ]; do
         --fzf-search)
             fzf_search=1
             ;;
+        --fzf-query)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-query"
+            fzf_query="${1}"
+            ;;
         -a | --agent)
             shift
             [ "${#}" -gt 0 ] || fail "Missing argument for --agent"
@@ -848,6 +981,9 @@ while [ "${#}" -gt 0 ]; do
             [[ "${days}" =~ ^[0-9]+$ ]] || fail "Invalid days: ${days}"
             [ "${days}" -gt 0 ] || fail "Invalid days: ${days}"
             days_explicit=1
+            ;;
+        -c | --current-directory)
+            current_directory_only=1
             ;;
         -p | --print)
             print=1
@@ -903,6 +1039,8 @@ if [ "${fzf_search}" -eq 1 ]; then
     if [ -n "${search_term}" ]; then
         printf -v quoted_search_term '%q' "${search_term}"
         muted "Searching messages for ${quoted_search_term}"
+    elif [ "${current_directory_only}" -eq 1 ]; then
+        muted "Showing sessions in ${current_directory}"
     else
         muted "Showing all sessions"
     fi
@@ -980,7 +1118,19 @@ esac
 
 if [ "${last}" -eq 1 ]; then
     verbose "Finding latest session of: ${agents}..."
-    IFS=$'\t' read -r _ agent _ filepath < <(session_files | tail -n 1)
+    if [ "${current_directory_only}" -eq 0 ]; then
+        IFS=$'\t' read -r _ agent _ filepath < <(session_files | tail -n 1)
+    else
+        mapfile -t latest_session_lines < <(session_files)
+        filepath=""
+        for (( index=${#latest_session_lines[@]} - 1; index >= 0; index-- )); do
+            IFS=$'\t' read -r _ agent _ candidate_filepath <<< "${latest_session_lines[index]}"
+            if session_is_in_directory "${agent}" "${candidate_filepath}" "${current_directory}"; then
+                filepath="${candidate_filepath}"
+                break
+            fi
+        done
+    fi
     verbose "${agent} ${filepath}"
     [ -z "${filepath}" ] && fail "No sessions found"
     print_session_file "${agent}" "${filepath}"
@@ -989,6 +1139,10 @@ elif [ -n "${session_id}" ]; then
     matches=()
     while IFS=$'\t' read -r _ agent _ filepath; do
         [ -n "${filepath}" ] || continue
+        if [ "${current_directory_only}" -eq 1 ] \
+            && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
+            continue
+        fi
         case "$(session_id_of "${agent}" "${filepath}")" in
             *"${session_id}"*)
                 matches+=("${agent}"$'\t'"${filepath}")
@@ -1044,6 +1198,10 @@ else
     # age mode was already restricted while collecting session files.
     for (( index=${#session_lines[@]} - 1; index >= 0; index-- )); do
         IFS=$'\t' read -r agent mtime datetime filepath <<< "${session_lines[index]}"
+        if [ "${current_directory_only}" -eq 1 ] \
+            && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
+            continue
+        fi
         if [ -n "${filter_pattern}" ]; then
             [ -n "${prefilter_hits[${filepath}]+set}" ] || continue
             session_messages "${agent}" "${filepath}" \
