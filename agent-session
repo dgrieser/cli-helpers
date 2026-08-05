@@ -43,8 +43,8 @@ Options:
     -l, --last          Print the latest session
     -n, --limit LIMIT   Limit sessions by count instead of age
     -d, --days DAYS     Only list sessions active within DAYS (default: 10)
-    -c, --current-directory
-                        Only list sessions from the current directory
+    -A, --all-directories
+                        List sessions from all directories (default: current)
     -p, --print         Print the session table instead of opening the picker
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
@@ -485,7 +485,7 @@ fzf_list_command() {
     fi
 
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
-    [ "${current_directory_only}" -eq 1 ] && arguments+=(--current-directory)
+    [ "${current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
     [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
     [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
 
@@ -517,7 +517,7 @@ fzf_browse_command() {
         arguments+=(--days "${days}")
     fi
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
-    [ "${command_current_directory_only}" -eq 1 ] && arguments+=(--current-directory)
+    [ "${command_current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
     [ "${verbose}" -eq 1 ] && arguments+=(--verbose)
 
     printf -v command '%q' "${script_path}"
@@ -871,7 +871,7 @@ completion() {
         esac
     done
 
-    echo "-h --help -a --agent -l --last -n --limit -d --days -c --current-directory -p --print -g --grep -i --igrep -r --raw --verbose"
+    echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -g --grep -i --igrep -r --raw --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -905,7 +905,7 @@ limit=""
 limit_explicit=0
 days=10
 days_explicit=0
-current_directory_only=0
+current_directory_only=1
 current_directory="$(pwd -P)"
 print=0
 raw=0
@@ -982,8 +982,8 @@ while [ "${#}" -gt 0 ]; do
             [ "${days}" -gt 0 ] || fail "Invalid days: ${days}"
             days_explicit=1
             ;;
-        -c | --current-directory)
-            current_directory_only=1
+        -A | --all-directories)
+            current_directory_only=0
             ;;
         -p | --print)
             print=1

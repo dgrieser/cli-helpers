@@ -500,7 +500,7 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `-l, --last` | Print the latest session. |
 | `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
 | `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 10); cannot be combined with `--limit`. |
-| `-c, --current-directory` | Only list sessions whose recorded working directory is the current directory. |
+| `-A, --all-directories` | List sessions from all recorded working directories instead of only the current directory. |
 | `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
 | `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
@@ -508,7 +508,7 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
 | `--verbose` | Print verbose diagnostic output to stderr. |
 
-By default, the interactive listing includes sessions active within the last 10 days. `--days` changes that window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+By default, listings include sessions from the current directory active within the last 10 days. `--all-directories` includes every recorded working directory. `--days` changes the age window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
 
 Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
 
@@ -522,7 +522,7 @@ agent-session
 agent-session --print
 agent-session --last
 agent-session --days 7
-agent-session --current-directory
+agent-session --all-directories
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
 claude-session -n 20 --igrep "docker compose"
