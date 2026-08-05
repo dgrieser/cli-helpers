@@ -433,10 +433,25 @@ update_fzf() {
     local seconds="${3}"
     local remaining="${watch_delay}"
     local first=1
+    local idle=0
     rm -f "${watch_reset_file}"
     # fzf is started after this watcher, so give it a moment to open its port
     [ ${remaining} -eq 0 ] && sleep 1
     while true; do
+        # reloading stopped, but a manual refresh may bring the watched state
+        # back: wait for one and put the watching back on its interval - the
+        # condition is checked at the end of that interval, by which time the
+        # reload of the refresh has updated whatever it looks at
+        if [ ${idle} -eq 1 ]; then
+            while [ ! -e "${watch_reset_file}" ]; do
+                sleep 1
+            done
+            rm -f "${watch_reset_file}"
+            idle=0
+            remaining="${seconds}"
+            post_footer "${port}" "${seconds}s"
+            continue
+        fi
         # counted down in steps instead of one sleep, so a manual refresh can
         # restart the wait; the indicator only names the interval, so no redraw
         while [ ${remaining} -gt 0 ]; do
@@ -452,7 +467,8 @@ update_fzf() {
         # to keep going, so a state the command reports after that reload counts
         if [ ${first} -eq 0 ] && [ -n "${watch_while_cmd}" ] && ! ${watch_while_cmd} >/dev/null 2>&1; then
             post_footer "${port}" "off"
-            break
+            idle=1
+            continue
         fi
         reload_fzf "${cmd}" "${port}" || break
         # the delay only applies before the first reload

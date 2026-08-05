@@ -186,6 +186,24 @@ esac
 # changes inside an existing repo are already in place, nothing to copy back
 if [ "${in_repo}" -eq 1 ]; then
     echo "Changes are already applied to ${real_file} in ${repo_root}"
+    echo
+
+    branch="$(git branch --show-current)"
+    echo "Repository: ${repo_root}"
+    [ -n "${branch}" ] && echo "Branch: ${branch}"
+    echo
+    git -c color.status=always status --short --branch
+    echo
+
+    choice="$(prompt-select -p "What should happen with the repository?" -d n \
+        "n=Nothing" \
+        "p=Push changes" \
+        "b=Branch changes")"; exit_code=$?
+    [ "${exit_code}" -eq 130 ] && exit 0
+    case "${choice}" in
+        p) git-push ;;
+        b) git-change ;;
+    esac
     exit 0
 fi
 
