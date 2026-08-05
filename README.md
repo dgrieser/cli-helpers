@@ -488,31 +488,37 @@ serve-clip
 ## AI Helpers
 
 ### `agent-session`
-Lists and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. Sessions of both agents are listed together, sorted by last activity.
+Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, first prompt, and directory by last activity. The picker displays title and prompt in compact 30-character columns while retaining their complete values in hidden searchable fields; `--print` uses 50/60-character columns. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for legacy sessions. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on.
 
 **Usage:** `agent-session [OPTIONS] [SESSION]`
 
 | Argument / Flag | Description |
 |---|---|
-| `SESSION` | The ID of the session to print; omit to list all sessions instead. |
+| `SESSION` | The ID of the session to print; omit to browse sessions interactively. |
 | `-h, --help` | Show the help message and exit. |
 | `-a, --agent AGENT` | Only use sessions of `claude` or `codex` (default: both). |
 | `-l, --last` | Print the latest session. |
-| `-n, --limit LIMIT` | Limit the number of sessions shown in the listing (default: 50). |
+| `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
+| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 10); cannot be combined with `--limit`. |
+| `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
 | `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
 | `-r, --raw` | Print raw output instead of rendering it through `glow`. |
 | `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
-
-Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first until the limit is reached. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
 | `--verbose` | Print verbose diagnostic output to stderr. |
 
+By default, the interactive listing includes sessions active within the last 10 days. `--days` changes that window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+
 Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
+
+The picker binds `/` to prompt for a case-insensitive message search, `enter` to print rendered Markdown, `alt-enter` to print raw Markdown, `ctrl-c` to copy raw Markdown to the clipboard, `ctrl-x` to resume the session, `ctrl-r` to refresh the session list and preview, and `esc` to exit. Empty input or aborting the search prompt returns to the unfiltered picker. In an interactive search view, `backspace` also returns to the unfiltered picker. Search state, clipboard confirmation, and the exact resume command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal. `shift-enter` is unavailable because fzf does not expose it as a distinct key.
 
 **Examples:**
 ```bash
 agent-session
+agent-session --print
 agent-session --last
+agent-session --days 7
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
 claude-session -n 20 --igrep "docker compose"

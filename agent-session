@@ -4,24 +4,45 @@ APP_NAME="$(basename "${0}")"
 
 claude_session_folder="${HOME}/.claude/projects"
 codex_session_folder="${HOME}/.codex/sessions"
+codex_state_db="${HOME}/.codex/state_5.sqlite"
 codex_session_prefix="rollout-"
 session_ext="jsonl"
 directory_max_length=35
+initial_batch_size=20
+fzf_text_max_length=30
+print_title_max_length=50
+print_prompt_max_length=60
 all_agents="claude codex"
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+script_folder="$(dirname "${script_path}")"
+
+# Match the table palette used by the git pickers in dev-helpers.
+C_AGENT_CLAUDE=$'\033[38;5;141m'
+C_AGENT_CODEX=$'\033[38;5;40m'
+C_AGENT_OTHER=$'\033[38;5;208m'
+C_AGE_SHORT=$'\033[38;5;40;3m'
+C_AGE_LONG=$'\033[38;5;245m'
+C_DIRECTORY=$'\033[38;5;33m'
+C_TITLE=$'\033[38;5;250m'
+C_PROMPT=$'\033[38;5;110m'
+C_MUTED=$'\033[90m'
+C_RESET=$'\033[0m'
 
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [OPTIONS] [SESSION]
 
-Prints sessions of the claude and codex CLIs, user and agent messages
+Browses sessions of the claude and codex CLIs, user and agent messages
 
-SESSION   the ID of the session to print; omit to list sessions
+SESSION   the ID of the session to print; omit to browse sessions
 
 Options:
     -h, --help          Show this message
     -a, --agent AGENT   Only use sessions of AGENT (claude or codex; default: both)
     -l, --last          Print the latest session
-    -n, --limit LIMIT   Limit number of sessions to list (default: 50)
+    -n, --limit LIMIT   Limit sessions by count instead of age
+    -d, --days DAYS     Only list sessions active within DAYS (default: 10)
+    -p, --print         Print the session table instead of opening the picker
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
     -r, --raw           Raw output
@@ -29,6 +50,16 @@ Options:
     --verbose           Verbose output
 
 Called as claude-session or codex-session the matching agent is preselected.
+
+Interactive keys:
+    /                   Search messages case-insensitively
+    backspace           Clear an active interactive search
+    enter               Print rendered Markdown
+    alt-enter           Print raw Markdown
+    ctrl-c              Copy raw Markdown to the clipboard
+    ctrl-x              Resume the session in its original directory
+    ctrl-r              Refresh sessions
+    esc                 Exit
 EOF
     exit 1
 }
@@ -48,6 +79,10 @@ verbose() {
 fail() {
     error "${1}"
     exit 1
+}
+
+muted() {
+    printf '%s%s%s\n' "${C_MUTED}" "${1}" "${C_RESET}" 1>&2
 }
 
 truncate_middle() {
@@ -318,7 +353,7 @@ session_messages() {
     jq -rn "${filter}" "${filepath}" 2>/dev/null
 }
 
-session_summary() {
+session_prompt() {
     local agent="${1}"
     local filepath="${2}"
 
@@ -329,7 +364,144 @@ session_summary() {
         | (capture("<command-message>(?<message>.*?)</command-message>"; "n").message? // .)
         | gsub("<[^>]+>"; "")
         | gsub("^[[:space:]]+|[[:space:]]+$"; "")
-    ' "${filepath}" | head -1 | tr -s ' \t\n' ' '
+        | gsub("[[:space:]]+"; " ")
+    ' "${filepath}"
+}
+
+session_title() {
+    local agent="${1}"
+    local filepath="${2}"
+    local session_id
+    local title=""
+
+    case "${agent}" in
+        claude)
+            title="$(jq -r 'select(.type == "ai-title") | .aiTitle // empty' "${filepath}" 2>/dev/null | tail -1)"
+            ;;
+        codex)
+            session_id="$(session_id_of "${agent}" "${filepath}")"
+            if command -v sqlite3 >/dev/null 2>&1 \
+                && [ -r "${codex_state_db}" ] \
+                && [[ "${session_id}" =~ ^[[:alnum:]-]+$ ]]; then
+                title="$(sqlite3 "${codex_state_db}" \
+                    "SELECT COALESCE(NULLIF(name, ''), title) FROM threads WHERE id = '${session_id}' LIMIT 1;" \
+                    2>/dev/null)"
+            fi
+            ;;
+    esac
+
+    [ -n "${title}" ] || title="$(session_prompt "${agent}" "${filepath}")"
+    printf '%s' "${title}" | tr '\t\r\n' '   ' | tr -s ' '
+}
+
+agent_color() {
+    case "${1}" in
+        claude)
+            printf '%s' "${C_AGENT_CLAUDE}"
+            ;;
+        codex)
+            printf '%s' "${C_AGENT_CODEX}"
+            ;;
+        *)
+            printf '%s' "${C_AGENT_OTHER}"
+            ;;
+    esac
+}
+
+age_color() {
+    local mtime="${1%%.*}"
+    local now="${2}"
+
+    if [ $((now - mtime)) -lt 3600 ]; then
+        printf '%s' "${C_AGE_SHORT}"
+    else
+        printf '%s' "${C_AGE_LONG}"
+    fi
+}
+
+format_age() {
+    local mtime="${1%%.*}"
+    local now="${2}"
+    local elapsed=$((now - mtime))
+    local remaining="${elapsed}"
+    local units=(w d h m s)
+    local divisors=(604800 86400 3600 60 1)
+    local values=()
+    local age=""
+    local index
+    local part_count=0
+    local value
+
+    [ "${remaining}" -lt 1 ] && remaining=1
+    for divisor in "${divisors[@]}"; do
+        values+=( "$((remaining / divisor))" )
+        remaining=$((remaining % divisor))
+    done
+
+    # Increase precision for recent sessions; old sessions need fewer units.
+    [ "${elapsed}" -gt 60 ] && values[4]=0
+    [ "${elapsed}" -ge 7200 ] && values[3]=0
+    [ "${elapsed}" -ge 172800 ] && values[2]=0
+
+    for (( index=0; index<${#units[@]}; index++ )); do
+        value="${values[index]}"
+        [ "${value}" -eq 0 ] && continue
+        age+="${value}${units[index]}"
+        part_count=$((part_count + 1))
+        [ "${part_count}" -ge 2 ] && break
+    done
+    printf '%s' "${age:-1s}"
+}
+
+fzf_list_command() {
+    local scope="${1:-all}"
+    local command
+    local argument
+    local quoted
+    local arguments=(--fzf-list)
+
+    [ "${scope}" = "initial" ] && arguments+=(--fzf-batch "${initial_batch_size}")
+
+    if [ -n "${limit}" ]; then
+        arguments+=(--limit "${limit}")
+    else
+        arguments+=(--days "${days}")
+    fi
+
+    [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
+    [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
+    [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
+
+    printf -v command '%q' "${script_path}"
+    for argument in "${arguments[@]}"; do
+        printf -v quoted '%q' "${argument}"
+        command+=" ${quoted}"
+    done
+    printf '%s' "${command}"
+}
+
+fzf_browse_command() {
+    local action="${1:-all}"
+    local command
+    local argument
+    local quoted
+    local arguments=()
+
+    [ "${action}" = "search" ] && arguments+=(--fzf-search)
+    if [ -n "${limit}" ]; then
+        arguments+=(--limit "${limit}")
+    else
+        arguments+=(--days "${days}")
+    fi
+    [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
+    [ "${verbose}" -eq 1 ] && arguments+=(--verbose)
+
+    printf -v command '%q' "${script_path}"
+    for argument in "${arguments[@]}"; do
+        printf -v quoted '%q' "${argument}"
+        command+=" ${quoted}"
+    done
+    printf '%s' "${command}"
 }
 
 print_session_file() {
@@ -349,6 +521,195 @@ print_session_file() {
     [ "${raw}" -eq 0 ] && echo "${session_content}" | glow || echo "${session_content}"
 }
 
+raw_session_file() {
+    local agent="${1}"
+    local filepath="${2}"
+    local jq_filter
+
+    jq_filter="$(jq_messages "${agent}")"'
+        messages
+        | map("### \(.role)\n\n\(.text)")
+        | join("\n\n---\n\n")
+    '
+    jq -rs "${jq_filter}" "${filepath}"
+}
+
+fzf_action() {
+    local action="${1}"
+    local agent="${2}"
+    local filepath="${3}"
+    local cwd
+    local session_id
+    local preview_width
+    local resume_command
+
+    case "${agent}" in
+        claude | codex)
+            ;;
+        *)
+            fail "Unknown agent: ${agent}"
+            ;;
+    esac
+    [ -f "${filepath}" ] || fail "Session file not found: ${filepath}"
+
+    case "${action}" in
+        preview)
+            preview_width="${FZF_PREVIEW_COLUMNS:-80}"
+            raw_session_file "${agent}" "${filepath}" \
+                | COLORTERM=truecolor CLICOLOR_FORCE=1 \
+                    glow --style "${GLOW_STYLE:-dark}" --width "${preview_width}" 2>/dev/null
+            ;;
+        markdown)
+            raw_session_file "${agent}" "${filepath}" | glow
+            ;;
+        raw)
+            raw_session_file "${agent}" "${filepath}"
+            ;;
+        clipboard)
+            if raw_session_file "${agent}" "${filepath}" | clip; then
+                muted "Copied to clipboard"
+            else
+                fail "Failed to copy session to clipboard"
+            fi
+            ;;
+        resume)
+            cwd="$(session_cwd "${agent}" "${filepath}")"
+            [ -n "${cwd}" ] || fail "Session has no working directory"
+            [ -d "${cwd}" ] || fail "Session directory not found: ${cwd}"
+            session_id="$(session_id_of "${agent}" "${filepath}")"
+            cd -- "${cwd}" || fail "Cannot enter session directory: ${cwd}"
+            case "${agent}" in
+                claude)
+                    printf -v resume_command 'cd -- %q && claude --resume %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${session_id}"
+                    muted "${resume_command}"
+                    exec claude --resume "${session_id}" </dev/tty >/dev/tty 2>&1
+                    ;;
+                codex)
+                    printf -v resume_command 'cd -- %q && codex resume %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${session_id}"
+                    muted "${resume_command}"
+                    exec codex resume "${session_id}" </dev/tty >/dev/tty 2>&1
+                    ;;
+            esac
+            ;;
+        *)
+            fail "Unknown interactive action: ${action}"
+            ;;
+    esac
+}
+
+print_session_list() {
+    local table
+    local entry
+    local agent
+    local agent_color_code
+    local age_color_code
+    local age
+    local mtime
+    local now
+    local filepath
+    local cwd
+    local title
+    local prompt
+    local row_index
+    local formatted_row
+    local picker_rows
+    local full_titles=()
+    local full_prompts=()
+
+    now="$(date +%s)"
+    table="AGENT  AGE  TITLE  PROMPT  DIRECTORY"$'\n'
+    # Entries were collected newest first. fzf's default layout places the
+    # first row next to its prompt, keeping the latest session selected.
+    for entry in "${session_entries[@]}"; do
+        IFS=$'\t' read -r agent mtime _ filepath <<< "${entry}"
+        agent_color_code="$(agent_color "${agent}")"
+        age_color_code="$(age_color "${mtime}" "${now}")"
+        age="$(format_age "${mtime}" "${now}")"
+        cwd="$(format_cwd "$(session_cwd "${agent}" "${filepath}")")"
+        title="$(session_title "${agent}" "${filepath}")"
+        prompt="$(session_prompt "${agent}" "${filepath}")"
+        [ -n "${title}" ] || title="-"
+        [ -n "${prompt}" ] || prompt="-"
+        full_titles+=("${title}")
+        full_prompts+=("${prompt}")
+        if [ "${print}" -eq 1 ]; then
+            title="$(shorten_text "${title}" "${print_title_max_length}")"
+            prompt="$(shorten_text "${prompt}" "${print_prompt_max_length}")"
+        else
+            title="$(shorten_text "${title}" "${fzf_text_max_length}")"
+            prompt="$(shorten_text "${prompt}" "${fzf_text_max_length}")"
+        fi
+        [ -n "${cwd}" ] || cwd="-"
+        table+="${agent_color_code}${agent}${C_RESET}  ${age_color_code}${age}${C_RESET}  ${C_TITLE}${title}${C_RESET}  ${C_PROMPT}${prompt}${C_RESET}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
+    done
+
+    mapfile -t formatted_rows < <(printf '%s' "${table}" | k-format)
+
+    if [ "${print}" -eq 1 ]; then
+        printf '%s\n' "${formatted_rows[@]}"
+        return 0
+    fi
+
+    picker_rows="${formatted_rows[0]}"$'\tAGENT\tFILE\tFULL_TITLE\tFULL_PROMPT\n'
+    row_index=1
+    for entry in "${session_entries[@]}"; do
+        IFS=$'\t' read -r agent _ _ filepath <<< "${entry}"
+        formatted_row="${formatted_rows[row_index]}"
+        picker_rows+="${formatted_row}"$'\t'"${agent}"$'\t'"${filepath}"$'\t'"${full_titles[row_index-1]}"$'\t'"${full_prompts[row_index-1]}"$'\n'
+        row_index=$((row_index + 1))
+    done
+
+    printf '%s' "${picker_rows}"
+}
+
+browse_sessions() {
+    local fzf_with_header="${script_folder}/fzf-with-header"
+    local script_command
+    local preview_command
+    local initial_list_command
+    local list_command
+    local search_command
+    local reset_command
+    local key_descriptions
+    local search_bindings=()
+
+    [ -x "${fzf_with_header}" ] || fzf_with_header="$(command -v fzf-with-header)"
+    [ -n "${fzf_with_header}" ] || fail "fzf-with-header not found"
+    command -v glow >/dev/null 2>&1 || fail "glow not found"
+    command -v clip >/dev/null 2>&1 || fail "clip not found"
+
+    printf -v script_command '%q' "${script_path}"
+    initial_list_command="$(fzf_list_command initial)"
+    list_command="$(fzf_list_command all)"
+    search_command="$(fzf_browse_command search)"
+    reset_command="$(fzf_browse_command all)"
+    preview_command="${script_command} --fzf-action preview {2} {3}"
+    key_descriptions="/:search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,ctrl-x:resume,ctrl-r:refresh,esc:exit"
+    search_bindings=(--bind "/:become(${search_command})")
+    if [ -n "${igrep_pattern}" ]; then
+        key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,ctrl-x:resume,ctrl-r:refresh,esc:exit"
+        search_bindings+=(--bind "backspace:become(${reset_command})")
+    fi
+    "${fzf_with_header}" \
+        --command "${initial_list_command}" \
+        --columns 1 \
+        --filter-columns 1,4,5 \
+        --delimiter $'\t' \
+        --key-descriptions "${key_descriptions}" \
+        -- \
+        --no-multi \
+        --preview "${preview_command}" \
+        --preview-window 'right,60%,wrap' \
+        --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
+        "${search_bindings[@]}" \
+        --bind "enter:become(${script_command} --fzf-action markdown {2} {3})" \
+        --bind "alt-enter:become(${script_command} --fzf-action raw {2} {3})" \
+        --bind "ctrl-c:become(${script_command} --fzf-action clipboard {2} {3})" \
+        --bind "ctrl-x:become(${script_command} --fzf-action resume {2} {3})" \
+        --bind "ctrl-r:reload(${list_command})+refresh-preview" \
+        --bind "esc:abort"
+}
+
 completion() {
     local previous="${1}"
     local agent
@@ -361,7 +722,7 @@ completion() {
             echo "${all_agents}"
             return
             ;;
-        -n|--limit|-g|--grep|-i|--igrep)
+        -n|--limit|-d|--days|-g|--grep|-i|--igrep)
             return
             ;;
     esac
@@ -385,7 +746,7 @@ completion() {
         esac
     done
 
-    echo "-h --help -a --agent -l --last -n --limit -g --grep -i --igrep -r --raw --verbose"
+    echo "-h --help -a --agent -l --last -n --limit -d --days -p --print -g --grep -i --igrep -r --raw --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -405,10 +766,20 @@ case "${APP_NAME}" in
 esac
 
 session_id=""
+fzf_action_name=""
+fzf_action_agent=""
+fzf_action_filepath=""
+fzf_list=0
+fzf_batch=""
+fzf_search=0
 grep_pattern=""
 igrep_pattern=""
 last=0
-limit=50
+limit=""
+limit_explicit=0
+days=10
+days_explicit=0
+print=0
 raw=0
 verbose=0
 
@@ -421,6 +792,28 @@ while [ "${#}" -gt 0 ]; do
             shift
             completion "${@}"
             exit 0
+            ;;
+        --fzf-action)
+            shift
+            [ "${#}" -ge 3 ] || fail "Missing arguments for --fzf-action"
+            fzf_action_name="${1}"
+            fzf_action_agent="${2}"
+            fzf_action_filepath="${3}"
+            shift 2
+            ;;
+        --fzf-list)
+            fzf_list=1
+            ;;
+        --fzf-batch)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-batch"
+            [[ "${1}" =~ ^[0-9]+$ ]] || fail "Invalid fzf batch size: ${1}"
+            [ "${1}" -gt 0 ] || fail "Invalid fzf batch size: ${1}"
+            fzf_list=1
+            fzf_batch="${1}"
+            ;;
+        --fzf-search)
+            fzf_search=1
             ;;
         -a | --agent)
             shift
@@ -446,6 +839,18 @@ while [ "${#}" -gt 0 ]; do
             limit="${1}"
             [[ "${limit}" =~ ^[0-9]+$ ]] || fail "Invalid limit: ${limit}"
             [ "${limit}" -gt 0 ] || fail "Invalid limit: ${limit}"
+            limit_explicit=1
+            ;;
+        -d | --days)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --days"
+            days="${1}"
+            [[ "${days}" =~ ^[0-9]+$ ]] || fail "Invalid days: ${days}"
+            [ "${days}" -gt 0 ] || fail "Invalid days: ${days}"
+            days_explicit=1
+            ;;
+        -p | --print)
+            print=1
             ;;
         -g | --grep)
             shift
@@ -476,6 +881,32 @@ while [ "${#}" -gt 0 ]; do
     esac
     shift
 done
+
+if [ -n "${fzf_action_name}" ]; then
+    [ "${#}" -eq 0 ] || fail "Unexpected argument after --fzf-action"
+    fzf_action "${fzf_action_name}" "${fzf_action_agent}" "${fzf_action_filepath}"
+    exit 0
+fi
+
+if [ "${limit_explicit}" -eq 1 ] && [ "${days_explicit}" -eq 1 ]; then
+    fail "--limit and --days cannot be used together"
+fi
+
+[ "${limit_explicit}" -eq 1 ] && days=""
+
+if [ "${fzf_search}" -eq 1 ]; then
+    command -v prompt >/dev/null 2>&1 || fail "prompt not found"
+    search_term=""
+    search_term="$(prompt --complete --prompt "Search sessions:")" || search_term=""
+    grep_pattern=""
+    igrep_pattern="${search_term}"
+    if [ -n "${search_term}" ]; then
+        printf -v quoted_search_term '%q' "${search_term}"
+        muted "Searching messages for ${quoted_search_term}"
+    else
+        muted "Showing all sessions"
+    fi
+fi
 
 if [ "${last}" -eq 1 ] && [ -n "${session_id}" ]; then
     fail "--last cannot be used with SESSION"
@@ -571,13 +1002,28 @@ elif [ -n "${session_id}" ]; then
     print_session_file "${agent}" "${filepath}"
 else
     verbose "Listing sessions of: ${agents}..."
-    rows=""
+    if [ "${fzf_list}" -eq 0 ] && [ "${print}" -eq 0 ]; then
+        browse_sessions
+        exit 0
+    fi
+
+    cutoff_epoch=0
+    if [ -n "${days}" ]; then
+        cutoff_epoch=$(( $(date +%s) - days * 86400 ))
+    fi
+    list_limit="${limit}"
+    if [ -n "${fzf_batch}" ] \
+        && { [ -z "${list_limit}" ] || [ "${fzf_batch}" -lt "${list_limit}" ]; }; then
+        list_limit="${fzf_batch}"
+    fi
     session_entries=()
     session_lines=()
     session_paths=()
-    while IFS=$'\t' read -r _ agent datetime filepath; do
+    while IFS=$'\t' read -r mtime agent datetime filepath; do
         [ -n "${filepath}" ] || continue
-        session_lines+=("${agent}"$'\t'"${datetime}"$'\t'"${filepath}")
+        mtime_epoch="${mtime%%.*}"
+        [ "${cutoff_epoch}" -gt 0 ] && [ "${mtime_epoch}" -lt "${cutoff_epoch}" ] && continue
+        session_lines+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${filepath}")
         session_paths+=("${filepath}")
     done < <(session_files)
 
@@ -594,39 +1040,20 @@ else
         verbose "${#prefilter_hits[@]} session files to confirm..."
     fi
 
-    # Walked from the newest session backwards and stopped once the limit is
-    # reached, so only as many sessions as are listed have to be confirmed.
+    # Walk from the newest session backwards. Count mode stops at its limit;
+    # age mode was already restricted while collecting session files.
     for (( index=${#session_lines[@]} - 1; index >= 0; index-- )); do
-        IFS=$'\t' read -r agent datetime filepath <<< "${session_lines[index]}"
+        IFS=$'\t' read -r agent mtime datetime filepath <<< "${session_lines[index]}"
         if [ -n "${filter_pattern}" ]; then
             [ -n "${prefilter_hits[${filepath}]+set}" ] || continue
             session_messages "${agent}" "${filepath}" \
                 | grep "${verify_args[@]}" -- "${filter_pattern}" || continue
         fi
-        session_entries=("${agent}"$'\t'"${datetime}"$'\t'"${filepath}" "${session_entries[@]}")
-        [ "${#session_entries[@]}" -ge "${limit}" ] && break
+        session_entries+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${filepath}")
+        [ -n "${list_limit}" ] && [ "${#session_entries[@]}" -ge "${list_limit}" ] && break
     done
 
-    [ "${#session_entries[@]}" -eq 0 ] && fail "No sessions found"
-
-    # k-format renders datetimes as an age and prints nothing for an age of
-    # zero, so sessions written right now are clamped to one second ago.
-    latest_datetime="$(date -d '-1 second' '+%Y-%m-%dT%H:%M:%S')"
-
-    for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r agent datetime filepath <<< "${entry}"
-        datetime="${datetime%.*}"
-        [[ "${datetime}" > "${latest_datetime}" ]] && datetime="${latest_datetime}"
-        session_id="$(session_id_of "${agent}" "${filepath}")"
-        cwd="$(format_cwd "$(session_cwd "${agent}" "${filepath}")")"
-        summary="$(shorten_text "$(session_summary "${agent}" "${filepath}")" 60)"
-        # Empty cells would shift the remaining columns of the formatted table.
-        [ -n "${cwd}" ] || cwd="-"
-        [ -n "${summary}" ] || summary="-"
-        rows+="${agent}  ${session_id}  ${datetime}  ${cwd}  ${summary}\n"
-    done
-    verbose "echo -e 'AGENT  SESSION  DATETIME  DIRECTORY  SUMMARY\n\${rows}' | k-format"
-    echo -e "AGENT  SESSION  DATETIME  DIRECTORY  SUMMARY\n${rows}" | k-format
+    print_session_list
 fi
 
 exit 0
