@@ -469,6 +469,48 @@ format_age() {
     printf '%s' "${age:-1s}"
 }
 
+# the scope and the search of the picker can be changed while it is open, so they
+# live in a file instead of in the arguments of the command that lists the
+# sessions - that command is fixed once the picker runs, its output is not
+fzf_state_file=""
+
+write_fzf_state() {
+    {
+        printf 'current_directory_only=%q\n' "${current_directory_only}"
+        printf 'grep_pattern=%q\n' "${grep_pattern}"
+        printf 'igrep_pattern=%q\n' "${igrep_pattern}"
+    } > "${fzf_state_file}"
+}
+
+read_fzf_state() {
+    [ -f "${fzf_state_file}" ] || return 0
+    # shellcheck source=/dev/null
+    . "${fzf_state_file}"
+}
+
+# the prompt of the picker names what it currently shows, so the scope and the
+# search stay visible after they were changed
+print_fzf_prompt() {
+    local scope="all"
+
+    [ "${current_directory_only}" -eq 1 ] && scope="$(basename -- "${current_directory}")"
+    if [ -n "${igrep_pattern}" ]; then
+        printf '%s ~ %s> ' "${scope}" "${igrep_pattern}"
+    else
+        printf '%s> ' "${scope}"
+    fi
+}
+
+# backspace clears the search, but only while there is one to clear; without a
+# search it stays the key that erases the query
+print_fzf_clear_binding() {
+    if [ -n "${igrep_pattern}" ]; then
+        printf 'rebind(bspace)'
+    else
+        printf 'unbind(bspace)'
+    fi
+}
+
 fzf_list_command() {
     local scope="${1:-all}"
     local command
@@ -485,9 +527,13 @@ fzf_list_command() {
     fi
 
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
-    [ "${current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
-    [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
-    [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
+    if [ -n "${fzf_state_file}" ]; then
+        arguments+=(--fzf-state "${fzf_state_file}")
+    else
+        [ "${current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
+        [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
+        [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
+    fi
 
     printf -v command '%q' "${script_path}"
     for argument in "${arguments[@]}"; do
@@ -497,31 +543,17 @@ fzf_list_command() {
     printf '%s' "${command}"
 }
 
-fzf_browse_command() {
-    local action="${1:-all}"
+# a command that acts on the state of the open picker: it changes the state file
+# or reports from it, and the picker reloads afterwards
+fzf_state_command() {
     local command
     local argument
     local quoted
-    local arguments=()
-    local command_current_directory_only="${current_directory_only}"
-
-    [ "${action}" = "search" ] && arguments+=(--fzf-search)
-    if [ "${action}" = "toggle-directory" ]; then
-        command_current_directory_only=$((1 - current_directory_only))
-        [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
-        [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
-    fi
-    if [ -n "${limit}" ]; then
-        arguments+=(--limit "${limit}")
-    else
-        arguments+=(--days "${days}")
-    fi
-    [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
-    [ "${command_current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
-    [ "${verbose}" -eq 1 ] && arguments+=(--verbose)
 
     printf -v command '%q' "${script_path}"
-    for argument in "${arguments[@]}"; do
+    printf -v quoted '%q' "${fzf_state_file}"
+    command+=" --fzf-state ${quoted}"
+    for argument in "${@}"; do
         printf -v quoted '%q' "${argument}"
         command+=" ${quoted}"
     done
@@ -780,38 +812,48 @@ browse_sessions() {
     local initial_list_command
     local list_command
     local search_command
-    local reset_command
+    local clear_command
     local toggle_directory_command
-    local directory_key_description
+    local prompt_command
+    local clear_binding_command
+    local reload_actions
     local key_descriptions
     local fzf_query_arguments=()
-    local search_bindings=()
+    local start_bindings=()
 
     [ -x "${fzf_with_header}" ] || fzf_with_header="$(command -v fzf-with-header)"
     [ -n "${fzf_with_header}" ] || fail "fzf-with-header not found"
     command -v glow >/dev/null 2>&1 || fail "glow not found"
     command -v clip >/dev/null 2>&1 || fail "clip not found"
 
+    fzf_state_file="$(mktemp "${TMPDIR:-/tmp}/$(basename -- "${script_path}").state.XXXXXX")" \
+        || fail "Cannot create the state file of the picker"
+    trap 'rm -f "${fzf_state_file}"' EXIT
+    write_fzf_state
+
     printf -v script_command '%q' "${script_path}"
     initial_list_command="$(fzf_list_command initial)"
     list_command="$(fzf_list_command all)"
-    search_command="$(fzf_browse_command search)"
-    reset_command="$(fzf_browse_command all)"
-    toggle_directory_command="$(fzf_browse_command toggle-directory)"
-    toggle_directory_command+=" --fzf-query {q}"
+    search_command="$(fzf_state_command --fzf-search)"
+    clear_command="$(fzf_state_command --fzf-clear-search)"
+    toggle_directory_command="$(fzf_state_command --fzf-toggle-directory)"
+    prompt_command="$(fzf_state_command --fzf-prompt)"
+    clear_binding_command="$(fzf_state_command --fzf-clear-binding)"
     preview_command="${script_command} --fzf-action preview {2} {3}"
     [ -n "${fzf_query}" ] && fzf_query_arguments+=(--query "${fzf_query}")
-    if [ "${current_directory_only}" -eq 1 ]; then
-        directory_key_description="show all folders"
-    else
-        directory_key_description="current folder only"
-    fi
-    key_descriptions="/:search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:${directory_key_description},ctrl-f:fork,ctrl-x:resume,ctrl-r:refresh,esc:exit"
-    search_bindings=(--bind "/:become(${search_command})")
-    if [ -n "${igrep_pattern}" ]; then
-        key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:${directory_key_description},ctrl-f:fork,ctrl-x:resume,ctrl-r:refresh,esc:exit"
-        search_bindings+=(--bind "backspace:become(${reset_command})")
-    fi
+
+    # a changed scope or search shows the first batch again and loads the rest in
+    # the background, the way the picker started: the load binding does that, so
+    # it is bound again before the reload it reacts to
+    reload_actions="rebind(load)+reload-sync(${initial_list_command})"
+    reload_actions+="+transform-prompt(${prompt_command})"
+    reload_actions+="+transform(${clear_binding_command})"
+
+    key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:folder scope,ctrl-f:fork,ctrl-x:resume,ctrl-r:refresh,esc:exit"
+    # without a search there is nothing to clear, so backspace erases the query
+    # until a search sets it; the reload actions bind and unbind it from there on
+    [ -z "${igrep_pattern}" ] && start_bindings=(--bind "start:unbind(bspace)")
+
     "${fzf_with_header}" \
         --command "${initial_list_command}" \
         --columns 1 \
@@ -821,14 +863,17 @@ browse_sessions() {
         -- \
         --no-multi \
         "${fzf_query_arguments[@]}" \
+        --prompt "$(print_fzf_prompt)" \
         --preview "${preview_command}" \
         --preview-window 'right,60%,wrap' \
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
-        "${search_bindings[@]}" \
+        "${start_bindings[@]}" \
+        --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
+        --bind "bspace:execute-silent(${clear_command})+${reload_actions}" \
+        --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
         --bind "enter:become(${script_command} --fzf-action markdown {2} {3})" \
         --bind "alt-enter:become(${script_command} --fzf-action raw {2} {3})" \
         --bind "ctrl-c:become(${script_command} --fzf-action clipboard {2} {3})" \
-        --bind "tab:become(${toggle_directory_command})" \
         --bind "ctrl-f:become(${script_command} --fzf-action fork {2} {3})" \
         --bind "ctrl-x:become(${script_command} --fzf-action resume {2} {3})" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
@@ -897,6 +942,10 @@ fzf_action_filepath=""
 fzf_list=0
 fzf_batch=""
 fzf_search=0
+fzf_clear_search=0
+fzf_toggle_directory=0
+fzf_print_prompt=0
+fzf_print_clear_binding=0
 fzf_query=""
 grep_pattern=""
 igrep_pattern=""
@@ -942,6 +991,23 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --fzf-search)
             fzf_search=1
+            ;;
+        --fzf-clear-search)
+            fzf_clear_search=1
+            ;;
+        --fzf-toggle-directory)
+            fzf_toggle_directory=1
+            ;;
+        --fzf-prompt)
+            fzf_print_prompt=1
+            ;;
+        --fzf-clear-binding)
+            fzf_print_clear_binding=1
+            ;;
+        --fzf-state)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-state"
+            fzf_state_file="${1}"
             ;;
         --fzf-query)
             shift
@@ -1024,27 +1090,51 @@ if [ -n "${fzf_action_name}" ]; then
     exit 0
 fi
 
+# the scope and the search of the open picker come from its state file, not from
+# the arguments the list command was built with
+if [ -n "${fzf_state_file}" ]; then
+    read_fzf_state
+
+    if [ "${fzf_print_prompt}" -eq 1 ]; then
+        print_fzf_prompt
+        exit 0
+    fi
+    if [ "${fzf_print_clear_binding}" -eq 1 ]; then
+        print_fzf_clear_binding
+        exit 0
+    fi
+    if [ "${fzf_toggle_directory}" -eq 1 ]; then
+        current_directory_only=$((1 - current_directory_only))
+        write_fzf_state
+        exit 0
+    fi
+    if [ "${fzf_clear_search}" -eq 1 ]; then
+        grep_pattern=""
+        igrep_pattern=""
+        write_fzf_state
+        exit 0
+    fi
+    if [ "${fzf_search}" -eq 1 ]; then
+        command -v prompt >/dev/null 2>&1 || fail "prompt not found"
+        # an aborted prompt keeps the search that is already there
+        search_term="$(prompt --complete --prompt "Search sessions:" \
+            --prefill "${igrep_pattern}")" || search_term="${igrep_pattern}"
+        grep_pattern=""
+        igrep_pattern="${search_term}"
+        write_fzf_state
+        exit 0
+    fi
+elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_clear_binding}" -eq 1 ] \
+    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_clear_search}" -eq 1 ] \
+    || [ "${fzf_search}" -eq 1 ]; then
+    fail "The picker actions require --fzf-state"
+fi
+
 if [ "${limit_explicit}" -eq 1 ] && [ "${days_explicit}" -eq 1 ]; then
     fail "--limit and --days cannot be used together"
 fi
 
 [ "${limit_explicit}" -eq 1 ] && days=""
-
-if [ "${fzf_search}" -eq 1 ]; then
-    command -v prompt >/dev/null 2>&1 || fail "prompt not found"
-    search_term=""
-    search_term="$(prompt --complete --prompt "Search sessions:")" || search_term=""
-    grep_pattern=""
-    igrep_pattern="${search_term}"
-    if [ -n "${search_term}" ]; then
-        printf -v quoted_search_term '%q' "${search_term}"
-        muted "Searching messages for ${quoted_search_term}"
-    elif [ "${current_directory_only}" -eq 1 ]; then
-        muted "Showing sessions in ${current_directory}"
-    else
-        muted "Showing all sessions"
-    fi
-fi
 
 if [ "${last}" -eq 1 ] && [ -n "${session_id}" ]; then
     fail "--last cannot be used with SESSION"
