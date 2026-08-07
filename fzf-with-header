@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -14,7 +14,12 @@ C_RESET=$'\033[0m'
 
 cmd=""
 key_cmd=""
+# keys handled inside the running fzf instead of ending it: silently or with the
+# terminal handed over, each of them with or without a reload of the list
 reload_keys=""
+exec_reload_keys=""
+silent_keys=""
+exec_keys=""
 msg_file=""
 declare -A key_desc
 key_desc_order=()
@@ -72,6 +77,21 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             reload_keys="${1}"
             ;;
+        --exec-reload-keys)
+            shift
+            [ -z "${1}" ] && usage
+            exec_reload_keys="${1}"
+            ;;
+        --silent-keys)
+            shift
+            [ -z "${1}" ] && usage
+            silent_keys="${1}"
+            ;;
+        --exec-keys)
+            shift
+            [ -z "${1}" ] && usage
+            exec_keys="${1}"
+            ;;
         --watch)
             shift
             [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
@@ -118,15 +138,16 @@ fi
 
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
-[ -n "${reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: --reload-keys requires --command" 1>&2 && usage
-[ -n "${reload_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: --reload-keys requires --key-command" 1>&2 && usage
+inline_keys="${reload_keys}${exec_reload_keys}${silent_keys}${exec_keys}"
+[ -n "${inline_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: keys handled inside fzf require --key-command" 1>&2 && usage
+[ -n "${reload_keys}${exec_reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: reloading keys require --command" 1>&2 && usage
 
 # a manual refresh signals the watcher through this file to restart its timer
 [ ${watch_seconds} -gt 0 ] && watch_reset_file="${TMPDIR:-/tmp}/fzf-with-header-refresh.$$"
 
-# a reload key runs its command inside fzf, so whatever it writes to stderr is
+# a silent key runs its command inside fzf, so whatever it writes to stderr is
 # collected here instead of the screen and shown as a message above the header
-[ -n "${reload_keys}" ] && msg_file="${TMPDIR:-/tmp}/fzf-with-header-message.$$"
+[ -n "${inline_keys}" ] && msg_file="${TMPDIR:-/tmp}/fzf-with-header-message.$$"
 
 if [ ${reverse} -eq 1 ]; then
     [ -n "${args}" ] && args="${args} "    
@@ -268,23 +289,34 @@ if [ "${has_preview}" -eq 1 ]; then
     mapped_keys="shift ←/→"$'\t'"wrap"$'\n'"${mapped_keys}"
 fi
 
-# --reload-keys: run the key command inside the running fzf and reload the list
-# afterwards, instead of letting fzf exit on the key and restarting it below.
-# The bindings are built further down, once the width a message may use is known.
-reload_key_list=()
-if [ -n "${reload_keys}" ]; then
-    while read -r reload_key; do
-        [ -z "${reload_key}" ] && continue
-        if printf '%s\n' "${used_keys}" | grep -qxF -- "${reload_key}"; then
-            echo "ERROR: --reload-keys key '${reload_key}' is already bound (--bind/--expect)" 1>&2
+# keys handled inside the running fzf instead of letting it exit on them and
+# starting it again below. The bindings are built further down, once the width a
+# message may use is known.
+inline_specs=()
+collect_inline_keys() {
+    local keys="${1}"
+    local mode="${2}"
+    local do_reload="${3}"
+    local key
+
+    [ -z "${keys}" ] && return 0
+    while read -r key; do
+        [ -z "${key}" ] && continue
+        if printf '%s\n' "${used_keys}" | grep -qxF -- "${key}"; then
+            echo "ERROR: key '${key}' is handled inside fzf and bound as well (--bind/--expect)" 1>&2
             exit 1
         fi
-        used_keys="${used_keys}"$'\n'"${reload_key}"
-        reload_key_list+=("${reload_key}")
+        used_keys="${used_keys}"$'\n'"${key}"
+        inline_specs+=("${key}"$'\t'"${mode}"$'\t'"${do_reload}")
         # a caller without --key-descriptions still gets the key into the footer
-        [ "${#key_desc_order[@]}" -eq 0 ] && mapped_keys="${mapped_keys}"$'\n'"${reload_key}"$'\t'
-    done < <(split_key_spec "${reload_keys}")
-fi
+        [ "${#key_desc_order[@]}" -eq 0 ] && mapped_keys="${mapped_keys}"$'\n'"${key}"$'\t'
+    done < <(split_key_spec "${keys}")
+}
+
+collect_inline_keys "${reload_keys}" silent 1
+collect_inline_keys "${exec_reload_keys}" exec 1
+collect_inline_keys "${silent_keys}" silent 0
+collect_inline_keys "${exec_keys}" exec 0
 
 # any --command view can be reloaded on demand; leave the key alone if the
 # caller already uses it for something else
@@ -328,19 +360,41 @@ if [ "${has_preview}" -eq 1 ]; then
 fi
 [ "${max_line_width}" -lt 10 ] && max_line_width=10
 
-# the reload bindings: run the key command, hand it the same payload an --expect
-# exit would have produced (key on the first line, selected line on the second),
-# then reload the list in place. fzf's stdout is the command substitution around
-# it, so the key command must not write there; whatever it puts on stderr is
-# shown above the header until the next key wipes it. fzf keeps the cursor on its
-# index across a reload, so it is put back on the first entry to end up where a
-# restart of fzf would have left it.
-reload_bind_args=()
-for reload_key in "${reload_key_list[@]}"; do
-    action="execute-silent(${key_cmd} \"\$(printf '%s\n%s' '${reload_key}' {})\" >/dev/null 2>'${msg_file}')"
-    action="${action}+reload-sync(${cmd})+first"
-    action="${action}+transform-header:m=\$(tail -n 3 '${msg_file}' 2>/dev/null); [ -n \"\${m}\" ] && printf '%s\n' \"\${m}\" | fold -s -w ${max_line_width} | awk '{printf \"\033[31m%s\033[0m\n\", \$0}'"
-    reload_bind_args+=(--bind "${reload_key}:${action}")
+# the bindings for the keys handled inside fzf: run the key command with the same
+# payload an --expect exit would have produced (the key on the first line, the
+# selected line on the second), then reload the list if the key changed anything.
+#
+# A silent key keeps the screen, so its stderr is collected and shown above the
+# header until the next key wipes it; an exec key gets the terminal handed over
+# and shows whatever it wants itself. fzf's stdout is the command substitution
+# around it, so a silent key command must not write there.
+#
+# fzf keeps the cursor on its index across a reload and fires the load event
+# again, so the cursor is put back on the first entry unless the caller positions
+# it on load itself.
+inline_bind_args=()
+cursor_action="+first"
+printf '%s\n' "${used_keys}" | grep -qxF -- "load" && cursor_action=""
+show_message="transform-header:m=\$(tail -n 3 '${msg_file}' 2>/dev/null); [ -n \"\${m}\" ] && printf '%s\n' \"\${m}\" | fold -s -w ${max_line_width} | awk '{printf \"\033[31m%s\033[0m\n\", \$0}'"
+for spec in "${inline_specs[@]}"; do
+    IFS=$'\t' read -r inline_key inline_mode inline_reload <<< "${spec}"
+    payload="\"\$(printf '%s\n%s' '${inline_key}' {})\""
+    if [ "${inline_mode}" == "exec" ]; then
+        # the terminal is handed over, so stdout goes to it as well: fzf would
+        # pass on its own, which is the command substitution around it, and a
+        # command that pages only when it talks to a terminal would not page
+        # (the message of a previous key is gone once the screen was handed over)
+        action="execute(${key_cmd} ${payload} >/dev/tty; : > '${msg_file}')"
+    else
+        action="execute-silent(${key_cmd} ${payload} >/dev/null 2>'${msg_file}')"
+    fi
+    if [ "${inline_reload}" -eq 1 ]; then
+        action="${action}+reload-sync(${cmd})${cursor_action}"
+        # the list is up to date now, so the watcher restarts its interval
+        [ -n "${watch_reset_file}" ] && action="${action}+execute-silent(touch '${watch_reset_file}')"
+    fi
+    action="${action}+${show_message}"
+    inline_bind_args+=(--bind "${inline_key}:${action}")
 done
 
 # with --watch the key list is led by a "↻ <n>s" indicator naming the reload
@@ -564,6 +618,8 @@ cleanup() {
 trap cleanup EXIT
 
 while true; do
+    # a message left over from the previous round must not reappear
+    [ -n "${msg_file}" ] && : > "${msg_file}"
     if [ -n "${cmd}" ]; then
         # a fresh listen port per round, so restarts after a key command do not
         # reuse the port of an fzf that is already gone
@@ -579,16 +635,14 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        # a message left over from the previous round must not reappear
-        [ -n "${msg_file}" ] && : > "${msg_file}"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" "${reload_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
