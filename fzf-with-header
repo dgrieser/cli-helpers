@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -14,6 +14,8 @@ C_RESET=$'\033[0m'
 
 cmd=""
 key_cmd=""
+reload_keys=""
+msg_file=""
 declare -A key_desc
 key_desc_order=()
 args=""
@@ -65,6 +67,11 @@ while [ $# -gt 0 ]; do
                 key_desc_order+=("${desc_pair%%:*}")
             done
             ;;
+        --reload-keys)
+            shift
+            [ -z "${1}" ] && usage
+            reload_keys="${1}"
+            ;;
         --watch)
             shift
             [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
@@ -111,9 +118,15 @@ fi
 
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
+[ -n "${reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: --reload-keys requires --command" 1>&2 && usage
+[ -n "${reload_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: --reload-keys requires --key-command" 1>&2 && usage
 
 # a manual refresh signals the watcher through this file to restart its timer
 [ ${watch_seconds} -gt 0 ] && watch_reset_file="${TMPDIR:-/tmp}/fzf-with-header-refresh.$$"
+
+# a reload key runs its command inside fzf, so whatever it writes to stderr is
+# collected here instead of the screen and shown as a message above the header
+[ -n "${reload_keys}" ] && msg_file="${TMPDIR:-/tmp}/fzf-with-header-message.$$"
 
 if [ ${reverse} -eq 1 ]; then
     [ -n "${args}" ] && args="${args} "    
@@ -255,6 +268,24 @@ if [ "${has_preview}" -eq 1 ]; then
     mapped_keys="shift ←/→"$'\t'"wrap"$'\n'"${mapped_keys}"
 fi
 
+# --reload-keys: run the key command inside the running fzf and reload the list
+# afterwards, instead of letting fzf exit on the key and restarting it below.
+# The bindings are built further down, once the width a message may use is known.
+reload_key_list=()
+if [ -n "${reload_keys}" ]; then
+    while read -r reload_key; do
+        [ -z "${reload_key}" ] && continue
+        if printf '%s\n' "${used_keys}" | grep -qxF -- "${reload_key}"; then
+            echo "ERROR: --reload-keys key '${reload_key}' is already bound (--bind/--expect)" 1>&2
+            exit 1
+        fi
+        used_keys="${used_keys}"$'\n'"${reload_key}"
+        reload_key_list+=("${reload_key}")
+        # a caller without --key-descriptions still gets the key into the footer
+        [ "${#key_desc_order[@]}" -eq 0 ] && mapped_keys="${mapped_keys}"$'\n'"${reload_key}"$'\t'
+    done < <(split_key_spec "${reload_keys}")
+fi
+
 # any --command view can be reloaded on demand; leave the key alone if the
 # caller already uses it for something else
 refresh_bind_args=()
@@ -296,6 +327,21 @@ if [ "${has_preview}" -eq 1 ]; then
     esac
 fi
 [ "${max_line_width}" -lt 10 ] && max_line_width=10
+
+# the reload bindings: run the key command, hand it the same payload an --expect
+# exit would have produced (key on the first line, selected line on the second),
+# then reload the list in place. fzf's stdout is the command substitution around
+# it, so the key command must not write there; whatever it puts on stderr is
+# shown above the header until the next key wipes it. fzf keeps the cursor on its
+# index across a reload, so it is put back on the first entry to end up where a
+# restart of fzf would have left it.
+reload_bind_args=()
+for reload_key in "${reload_key_list[@]}"; do
+    action="execute-silent(${key_cmd} \"\$(printf '%s\n%s' '${reload_key}' {})\" >/dev/null 2>'${msg_file}')"
+    action="${action}+reload-sync(${cmd})+first"
+    action="${action}+transform-header:m=\$(tail -n 3 '${msg_file}' 2>/dev/null); [ -n \"\${m}\" ] && printf '%s\n' \"\${m}\" | fold -s -w ${max_line_width} | awk '{printf \"\033[31m%s\033[0m\n\", \$0}'"
+    reload_bind_args+=(--bind "${reload_key}:${action}")
+done
 
 # with --watch the key list is led by a "↻ <n>s" indicator naming the reload
 # interval; reserve its widest form so the wrapping stays put when it changes
@@ -509,7 +555,13 @@ stop_watcher() {
     watcher_pid=""
 }
 
-trap stop_watcher EXIT
+cleanup() {
+    stop_watcher
+    [ -n "${msg_file}" ] && rm -f "${msg_file}"
+    return 0
+}
+
+trap cleanup EXIT
 
 while true; do
     if [ -n "${cmd}" ]; then
@@ -527,7 +579,9 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        # a message left over from the previous round must not reappear
+        [ -n "${msg_file}" ] && : > "${msg_file}"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" "${reload_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"

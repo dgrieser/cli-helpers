@@ -1745,13 +1745,14 @@ key="$(readkey | tail -n1)"
 ### `fzf-with-header`
 A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, and dispatching the selection to a key command. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed at the top, wrapped to the terminal width; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name. The key list shrinks on short terminals so the list keeps at least three rows: it is packed into fewer lines with the keys that no longer fit dropped behind a `…`, and once not even one line is left it is hidden completely.
 
-**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
+**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]`
 
 | Argument / Flag | Description |
 |---|---|
 | `--command <command>` | Command whose output is piped into `fzf`; enables `--print-query` and is required for `--watch`. Binds `ctrl-r` to reload the output on demand (skipped if `ctrl-r` is already bound or described by the caller). |
 | `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. |
 | `--key-descriptions <key>:<description>,...` | When given, only these keys are shown at the top, with these descriptions and in this order (inferred keys are suppressed). Useful for `--expect` keys, whose effect lives in the `--key-command`. |
+| `--reload-keys <key>,...` | Keys that run the `--key-command` inside the running `fzf` and reload the list afterwards, instead of ending `fzf` and starting it again (requires `--command` and `--key-command`). The key command is handed the same payload an `--expect` exit would have produced - the key on the first line, the selected line on the second - so a key moves from `--expect` to `--reload-keys` without changing the key command. Its exit code is ignored; whatever it writes to stderr is shown in red above the header, wrapped to the list width, until the next key press. The key command must not write to stdout. The list is reloaded with `reload-sync` and the cursor is put back on the first entry, so the view ends up where a restart of `fzf` would have left it. Keys that hand the terminal to a pager or an editor, or that end the picker, belong in `--expect`. Fails if a key is also bound through `--bind`/`--expect`. |
 | `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). A leading `↻ <n>s` indicator in the key list names the current reload interval (the delay until the first reload, then the interval); `ctrl-r` restarts the interval. |
 | `--watch-delay <seconds>` | Delay before the first reload (default: 2). |
 | `--watch-while <command>` | Keep reloading only while this command exits successfully; it is checked after each reload interval, so the first reload always happens. Lets a view stop refreshing once whatever it watches reached a final state (requires `--watch`). The indicator switches to `↻ off` once reloading stopped; a manual `ctrl-r` refresh puts the watching back on its interval (indicator back to `↻ <n>s`), so if the reload of that refresh brought the watched state back the reloading continues, otherwise it stops again after one interval. |
@@ -1769,6 +1770,7 @@ fzf-with-header --command "list-builds" --watch 5 --watch-delay 3 --watch-while 
 fzf-with-header --command "cat data.tsv" --columns 1,3 --delimiter $'\t'
 fzf-with-header docker -- --height=40%
 fzf-with-header --key-command handle-key --key-descriptions "ctrl-x:delete entry,ctrl-r:refresh" -- --expect=ctrl-x,ctrl-r
+fzf-with-header --command "list-items" --key-command handle-key --reload-keys "alt-d,alt-r" --key-descriptions "alt-d:delete,alt-r:reset,enter:pick" -- --expect=enter
 ```
 
 ---
