@@ -111,7 +111,10 @@ extension-zip:
 	cd "$(EXTENSION_DIR)" && zip -r "$(EXTENSION_ZIP)" .
 
 install-gnome-extension: extension-zip
-	gnome-extensions install --force "$(EXTENSION_ZIP)"
+	gnome-extensions install --force "$(EXTENSION_ZIP)"; \
+	status=$$?; \
+	rm -f "$(EXTENSION_ZIP)"; \
+	exit $$status
 
 install-completions:
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
