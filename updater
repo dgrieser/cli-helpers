@@ -781,18 +781,6 @@ software-360-helm() {
 }
 
 software-370-wezterm() {
-    # The fury.io repository only carries the 2024 stable build, nightly is
-    # published as a rolling tag with per-distribution packages on GitHub.
-    local legacy_wezterm_repo_path="/etc/apt/sources.list.d/wezterm.list"
-    if grep -qF "apt.fury.io/wez" "${legacy_wezterm_repo_path}" 2>/dev/null; then
-        if [ "${dry_run}" -eq 1 ]; then
-            echo "Would remove obsolete WezTerm repository ${legacy_wezterm_repo_path}" 1>&2
-        else
-            verbose "${SUDO} rm -f ${legacy_wezterm_repo_path}"
-            ${SUDO} rm -f "${legacy_wezterm_repo_path}" || return 1
-        fi
-    fi
-
     local wezterm_distribution
     case "${OS_RELEASE_ID}" in
         ubuntu)
