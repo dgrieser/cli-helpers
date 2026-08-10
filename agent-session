@@ -436,49 +436,21 @@ agent_color() {
     esac
 }
 
-age_color() {
-    local mtime="${1%%.*}"
-    local now="${2}"
+# All ages of a listing come from a single toage call - one call per session
+# would start a Python interpreter per row - and against one reference point, so
+# the column stays consistent while it is built. The precision shrinks as a
+# session gets older: seconds only below a minute, minutes below two hours,
+# hours below two days. The colors of the column are handed over as well, so a
+# recent session comes back highlighted and an old one faded.
+format_ages() {
+    local now="${1}"
+    shift
 
-    if [ $((now - mtime)) -lt 3600 ]; then
-        printf '%s' "${C_AGE_SHORT}"
-    else
-        printf '%s' "${C_AGE_LONG}"
-    fi
-}
-
-format_age() {
-    local mtime="${1%%.*}"
-    local now="${2}"
-    local elapsed=$((now - mtime))
-    local remaining="${elapsed}"
-    local units=(w d h m s)
-    local divisors=(604800 86400 3600 60 1)
-    local values=()
-    local age=""
-    local index
-    local part_count=0
-    local value
-
-    [ "${remaining}" -lt 1 ] && remaining=1
-    for divisor in "${divisors[@]}"; do
-        values+=( "$((remaining / divisor))" )
-        remaining=$((remaining % divisor))
-    done
-
-    # Increase precision for recent sessions; old sessions need fewer units.
-    [ "${elapsed}" -gt 60 ] && values[4]=0
-    [ "${elapsed}" -ge 7200 ] && values[3]=0
-    [ "${elapsed}" -ge 172800 ] && values[2]=0
-
-    for (( index=0; index<${#units[@]}; index++ )); do
-        value="${values[index]}"
-        [ "${value}" -eq 0 ] && continue
-        age+="${value}${units[index]}"
-        part_count=$((part_count + 1))
-        [ "${part_count}" -ge 2 ] && break
-    done
-    printf '%s' "${age:-1s}"
+    [ "${#}" -gt 0 ] || return 0
+    toage --units wdhms --min 1s \
+          --drop-seconds 1m --drop-minutes 2h --drop-hours 2d \
+          --color "1h=${C_AGE_SHORT}" --color "${C_AGE_LONG}" \
+          --now "${now}" -- "${@}"
 }
 
 # the scope and the search of the picker can be changed while it is open, so they
@@ -798,9 +770,11 @@ print_session_list() {
     local entry
     local agent
     local agent_color_code
-    local age_color_code
     local age
+    local age_index=0
+    local ages=()
     local mtime
+    local mtimes=()
     local now
     local filepath
     local cwd
@@ -825,13 +799,19 @@ print_session_list() {
     table="AGENT  AGE  TITLE"
     [ "${prompt_column}" -eq 1 ] && table+="  PROMPT"
     table+="  DIRECTORY"$'\n'
+    for entry in "${session_entries[@]}"; do
+        IFS=$'\t' read -r _ mtime _ <<< "${entry}"
+        mtimes+=("${mtime}")
+    done
+    command -v toage >/dev/null 2>&1 || fail "toage not found"
+    mapfile -t ages < <(format_ages "${now}" "${mtimes[@]}")
     # Entries were collected newest first. fzf's default layout places the
     # first row next to its prompt, keeping the latest session selected.
     for entry in "${session_entries[@]}"; do
         IFS=$'\t' read -r agent mtime _ filepath <<< "${entry}"
         agent_color_code="$(agent_color "${agent}")"
-        age_color_code="$(age_color "${mtime}" "${now}")"
-        age="$(format_age "${mtime}" "${now}")"
+        age="${ages[age_index]:-}"
+        age_index=$((age_index + 1))
         cwd="$(format_cwd "$(session_cwd "${agent}" "${filepath}")")"
         prompt="$(session_prompt "${agent}" "${filepath}")"
         title="$(session_title "${agent}" "${filepath}" "${prompt}")"
@@ -852,7 +832,7 @@ print_session_list() {
             prompt_cell="  ${C_PROMPT}${prompt}${C_RESET}"
         fi
         [ -n "${cwd}" ] || cwd="-"
-        table+="${agent_color_code}${agent}${C_RESET}  ${age_color_code}${age}${C_RESET}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
+        table+="${agent_color_code}${agent}${C_RESET}  ${age}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
     done
 
     mapfile -t formatted_rows < <(printf '%s' "${table}" | k-format)

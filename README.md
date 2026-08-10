@@ -12,7 +12,7 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 
 ## Installation
 
-The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland.
+The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `/etc/profile.d/python.sh` puts on `PYTHONPATH`, so other tools can import them instead of piping through them.
 
 ```bash
 make list                     # show targets and the full command list
@@ -23,7 +23,7 @@ sudo make uninstall           # remove installed files
 make list-install             # show install destinations
 ```
 
-Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`.  
+Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`, `PYTHONDIR=...`.  
 set `ENABLE_GNOME_EXTENSION=0` to skip the GNOME extension step.
 
 ## Contents
@@ -488,7 +488,7 @@ serve-clip
 ## AI Helpers
 
 ### `agent-session`
-Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, and directory by last activity. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for sessions without one, so the prompt gets no column of its own by default; it stays a hidden searchable field of the picker and its width goes to the title, which is displayed in a 50-character column. `--prompt-column` shows the prompt as a column as well, which shortens the title column to 30 characters; `--print` uses 50/60-character columns. The complete title and prompt are kept in hidden fields, so a search matches them in full. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on.
+Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, and directory by last activity. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for sessions without one, so the prompt gets no column of its own by default; it stays a hidden searchable field of the picker and its width goes to the title, which is displayed in a 50-character column. `--prompt-column` shows the prompt as a column as well, which shortens the title column to 30 characters; `--print` uses 50/60-character columns. The complete title and prompt are kept in hidden fields, so a search matches them in full. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward; all ages of a listing are rendered and colored by one `toage` call against the same reference point, which gets the two colors of the column handed over. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on.
 
 **Usage:** `agent-session [OPTIONS] [SESSION]`
 
@@ -1062,6 +1062,39 @@ Parses a German abbreviated month/year string (the kind Excel produces, e.g. `Mr
 ```bash
 parse-excel-date "Mrz 24"
 parse-excel-date Jan 25
+```
+
+### `toage`
+Turns timestamps into compact, human readable ages: `5d`, `2h13m`, `47s`. Without arguments it works as a filter and replaces every ISO 8601 timestamp found on stdin by its age, which is what the table output of other tools is piped through. With `TIME` arguments, or with `--lines`, it prints one age per line instead, so a whole column can be rendered by a single call. The precision can shrink as a span grows: `--drop-seconds`, `--drop-minutes` and `--drop-hours` name the span from which on that unit is left out. Weeks are opt-in, so days keep accumulating (`41d3h`) unless `--units wdhms` is given (`5w6d`). It is installed as a command and as the importable `toage` Python module (`toage()`, `format_span()`), which is how `k-format` renders its age column.
+
+**Usage:** `toage [OPTIONS] [TIME ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `TIME` | ISO 8601 timestamp or epoch seconds to print the age of, one age per line; omit to filter stdin. |
+| `-h, --help` | Show the help message and exit. |
+| `-n, --now TIME` | Reference point instead of the current time, so a batch of ages stays consistent. |
+| `-U, --units UNITS` | Units that may appear, largest first; a unit left out rolls into the next smaller one (default: `dhms`). |
+| `-u, --max-units N` | Print at most `N` units, `0` for all (default: 2). |
+| `--drop-seconds SPAN` | Leave out seconds from `SPAN` on, `never` to always keep them (default: `1h`). |
+| `--drop-minutes SPAN` | Leave out minutes from `SPAN` on (default: `never`). |
+| `--drop-hours SPAN` | Leave out hours from `SPAN` on (default: `never`). |
+| `-m, --min SPAN` | Shortest span to report, so anything younger is still printed as `SPAN` instead of as nothing (default: `0`, which prints nothing). |
+| `-c, --color RULE` | Color spans below `SPAN`, as `SPAN=COLOR` or as a plain `COLOR` for every span; repeatable, the first matching rule wins. |
+| `-l, --lines` | Read one timestamp or epoch per line from stdin instead of scanning lines for timestamps. |
+
+Spans are written as `90`, `90s`, `2h` or `1d12h`. A timestamp without an offset is read as local time, and one in the future has no age.
+
+Coloring keeps the palette with the caller: `COLOR` is an escape sequence, its written `\033[36m` form, or bare SGR codes like `38;5;6`, and the age is wrapped in it followed by a reset. Rules are checked in the order they are given, so the smallest span comes first and a rule without a span is the fallback for everything above it - one call can therefore highlight a recent age and fade an old one. An empty age stays uncolored.
+
+**Examples:**
+```bash
+git log --pretty=format:'%h %cI %s' | toage
+git log --pretty=format:'%h %cI %s' | toage --color '\033[38;5;6m'
+toage 2026-08-10T09:00:00Z 1754812345
+toage --units wdhms --min 1s --drop-seconds 1m --drop-minutes 2h --drop-hours 2d 1754812345
+toage --color '1h=38;5;40;3' --color '38;5;245' 1754812345
+find . -maxdepth 1 -printf '%T@\n' | toage --lines
 ```
 
 ### `file-ext`

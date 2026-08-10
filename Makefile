@@ -3,6 +3,8 @@ DESTDIR ?=
 
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/cli-helpers
+# /etc/profile.d/python.sh puts this directory on PYTHONPATH
+PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
 COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
 COMPLETION := bash_completion/cli-helpers
 ENABLE_GNOME_EXTENSION ?= 1
@@ -13,6 +15,10 @@ EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge
+# commands that are also importable Python modules: they get installed a second
+# time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
+# piping through them
+MODULES := toage
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
@@ -38,7 +44,7 @@ update:
 	./updater $(UPDATE_ARGS)
 
 install:
-	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"; do \
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
 		[ -d "$$dir" ] || mkdir -p "$$dir"; \
 	done
 	for script in $(SCRIPTS); do \
@@ -47,6 +53,10 @@ install:
 	done
 	for shared in $(SHARED); do \
 		install -m 0755 "$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	for module in $(MODULES); do \
+		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
 	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
 	$(MAKE) install-gnome-extension
@@ -67,7 +77,7 @@ install:
 	fi
 
 install-links:
-	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"; do \
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
 		[ -d "$$dir" ] || mkdir -p "$$dir"; \
 	done
 	for script in $(SCRIPTS); do \
@@ -75,6 +85,10 @@ install-links:
 	done
 	for shared in $(SHARED); do \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	for module in $(MODULES); do \
+		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
 	$(MAKE) install-gnome-extension
 	$(MAKE) install-completions-links
@@ -129,6 +143,10 @@ uninstall:
 		rm -f "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
 	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
+	for module in $(MODULES); do \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
+	done
 	for name in $(SCRIPTS) $(LINKS); do \
 		target="$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
 		case "$$([ -L "$$target" ] && readlink "$$target")" in \
@@ -143,6 +161,8 @@ list-install:
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 	@printf 'Shared -> %s\n' "$(DESTDIR)$(LIBDIR)"
 	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
+	@printf 'Python modules -> %s\n' "$(DESTDIR)$(PYTHONDIR)"
+	@printf '%s\n' $(MODULES) | sed 's#^#  #;s#$$#.py#'
 	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
 	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
 	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"
