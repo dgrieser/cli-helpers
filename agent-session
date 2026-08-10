@@ -10,6 +10,8 @@ session_ext="jsonl"
 directory_max_length=35
 initial_batch_size=20
 fzf_text_max_length=30
+# without the prompt column the title gets the width the prompt would have used
+fzf_title_max_length=50
 print_title_max_length=50
 print_prompt_max_length=60
 fork_prompt_max_bytes=100000
@@ -46,6 +48,8 @@ Options:
     -A, --all-directories
                         List sessions from all directories (default: current)
     -p, --print         Print the session table instead of opening the picker
+    -P, --prompt-column Show the first prompt as a column of its own; without it
+                        the prompt stays searchable in the picker
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
     -r, --raw           Raw output
@@ -385,9 +389,13 @@ session_prompt() {
     ' "${filepath}"
 }
 
+# The generated title of the session; the first prompt stands in for sessions
+# without one. A caller that has the prompt already hands it over, so it is not
+# read from the session file a second time.
 session_title() {
     local agent="${1}"
     local filepath="${2}"
+    local fallback="${3-}"
     local session_id
     local title=""
 
@@ -407,7 +415,10 @@ session_title() {
             ;;
     esac
 
-    [ -n "${title}" ] || title="$(session_prompt "${agent}" "${filepath}")"
+    if [ -z "${title}" ]; then
+        [ -n "${fallback}" ] || fallback="$(session_prompt "${agent}" "${filepath}")"
+        title="${fallback}"
+    fi
     printf '%s' "${title}" | tr '\t\r\n' '   ' | tr -s ' '
 }
 
@@ -528,6 +539,7 @@ fzf_list_command() {
     fi
 
     [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
+    [ "${prompt_column}" -eq 1 ] && arguments+=(--prompt-column)
     if [ -n "${fzf_state_file}" ]; then
         arguments+=(--fzf-state "${fzf_state_file}")
     else
@@ -797,11 +809,22 @@ print_session_list() {
     local row_index
     local formatted_row
     local picker_rows
+    local title_max_length
+    local prompt_cell
     local full_titles=()
     local full_prompts=()
 
     now="$(date +%s)"
-    table="AGENT  AGE  TITLE  PROMPT  DIRECTORY"$'\n'
+    if [ "${print}" -eq 1 ]; then
+        title_max_length="${print_title_max_length}"
+    elif [ "${prompt_column}" -eq 1 ]; then
+        title_max_length="${fzf_text_max_length}"
+    else
+        title_max_length="${fzf_title_max_length}"
+    fi
+    table="AGENT  AGE  TITLE"
+    [ "${prompt_column}" -eq 1 ] && table+="  PROMPT"
+    table+="  DIRECTORY"$'\n'
     # Entries were collected newest first. fzf's default layout places the
     # first row next to its prompt, keeping the latest session selected.
     for entry in "${session_entries[@]}"; do
@@ -810,21 +833,26 @@ print_session_list() {
         age_color_code="$(age_color "${mtime}" "${now}")"
         age="$(format_age "${mtime}" "${now}")"
         cwd="$(format_cwd "$(session_cwd "${agent}" "${filepath}")")"
-        title="$(session_title "${agent}" "${filepath}")"
         prompt="$(session_prompt "${agent}" "${filepath}")"
+        title="$(session_title "${agent}" "${filepath}" "${prompt}")"
         [ -n "${title}" ] || title="-"
         [ -n "${prompt}" ] || prompt="-"
         full_titles+=("${title}")
         full_prompts+=("${prompt}")
-        if [ "${print}" -eq 1 ]; then
-            title="$(shorten_text "${title}" "${print_title_max_length}")"
-            prompt="$(shorten_text "${prompt}" "${print_prompt_max_length}")"
-        else
-            title="$(shorten_text "${title}" "${fzf_text_max_length}")"
-            prompt="$(shorten_text "${prompt}" "${fzf_text_max_length}")"
+        title="$(shorten_text "${title}" "${title_max_length}")"
+        # the prompt is kept as a hidden field of the picker either way, so
+        # without its column it stays searchable but takes no width
+        prompt_cell=""
+        if [ "${prompt_column}" -eq 1 ]; then
+            if [ "${print}" -eq 1 ]; then
+                prompt="$(shorten_text "${prompt}" "${print_prompt_max_length}")"
+            else
+                prompt="$(shorten_text "${prompt}" "${fzf_text_max_length}")"
+            fi
+            prompt_cell="  ${C_PROMPT}${prompt}${C_RESET}"
         fi
         [ -n "${cwd}" ] || cwd="-"
-        table+="${agent_color_code}${agent}${C_RESET}  ${age_color_code}${age}${C_RESET}  ${C_TITLE}${title}${C_RESET}  ${C_PROMPT}${prompt}${C_RESET}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
+        table+="${agent_color_code}${agent}${C_RESET}  ${age_color_code}${age}${C_RESET}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
     done
 
     mapfile -t formatted_rows < <(printf '%s' "${table}" | k-format)
@@ -958,7 +986,7 @@ completion() {
         esac
     done
 
-    echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -g --grep -i --igrep -r --raw --verbose"
+    echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -P --prompt-column -g --grep -i --igrep -r --raw --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -999,6 +1027,7 @@ days_explicit=0
 current_directory_only=1
 current_directory="$(pwd -P)"
 print=0
+prompt_column=0
 raw=0
 verbose=0
 
@@ -1095,6 +1124,9 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -p | --print)
             print=1
+            ;;
+        -P | --prompt-column)
+            prompt_column=1
             ;;
         -g | --grep)
             shift

@@ -488,7 +488,7 @@ serve-clip
 ## AI Helpers
 
 ### `agent-session`
-Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, first prompt, and directory by last activity. The picker displays title and prompt in compact 30-character columns while retaining their complete values in hidden searchable fields; `--print` uses 50/60-character columns. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for legacy sessions. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on.
+Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, and directory by last activity. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for sessions without one, so the prompt gets no column of its own by default; it stays a hidden searchable field of the picker and its width goes to the title, which is displayed in a 50-character column. `--prompt-column` shows the prompt as a column as well, which shortens the title column to 30 characters; `--print` uses 50/60-character columns. The complete title and prompt are kept in hidden fields, so a search matches them in full. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on.
 
 **Usage:** `agent-session [OPTIONS] [SESSION]`
 
@@ -502,6 +502,7 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 10); cannot be combined with `--limit`. |
 | `-A, --all-directories` | List sessions from all recorded working directories instead of only the current directory. |
 | `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
+| `-P, --prompt-column` | Show the first prompt as a column of its own; without it the prompt stays searchable in the picker. |
 | `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
 | `-r, --raw` | Print raw output instead of rendering it through `glow`. |
@@ -527,6 +528,7 @@ agent-session --print
 agent-session --last
 agent-session --days 7
 agent-session --all-directories
+agent-session --prompt-column
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
 claude-session -n 20 --igrep "docker compose"
