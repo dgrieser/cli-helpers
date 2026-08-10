@@ -780,7 +780,37 @@ software-360-helm() {
         && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
 }
 
-software-370-wezterm() { apt_add_with_repo "wezterm" "https://apt.fury.io/wez" "*" "*" "https://apt.fury.io/wez/gpg.key"; }
+software-370-wezterm() {
+    # The fury.io repository only carries the 2024 stable build, nightly is
+    # published as a rolling tag with per-distribution packages on GitHub.
+    local legacy_wezterm_repo_path="/etc/apt/sources.list.d/wezterm.list"
+    if grep -qF "apt.fury.io/wez" "${legacy_wezterm_repo_path}" 2>/dev/null; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would remove obsolete WezTerm repository ${legacy_wezterm_repo_path}" 1>&2
+        else
+            verbose "${SUDO} rm -f ${legacy_wezterm_repo_path}"
+            ${SUDO} rm -f "${legacy_wezterm_repo_path}" || return 1
+        fi
+    fi
+
+    local wezterm_distribution
+    case "${OS_RELEASE_ID}" in
+        ubuntu)
+            wezterm_distribution="Ubuntu${OS_RELEASE_VERSION_ID}"
+            ;;
+        debian)
+            wezterm_distribution="Debian${OS_RELEASE_VERSION_ID}"
+            ;;
+        *)
+            error "No WezTerm nightly package for distribution: ${OS_RELEASE_ID:-unknown}"
+            return 1
+            ;;
+    esac
+
+    install_git_release "https://github.com/wez/wezterm" \
+        --release "nightly" \
+        --pattern "wezterm-nightly.${wezterm_distribution}.deb"
+}
 software-380-dive() { install_git_release "https://github.com/wagoodman/dive"; }
 software-390-kubecolor() { install_git_release "https://github.com/kubecolor/kubecolor"; }
 
