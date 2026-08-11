@@ -101,7 +101,7 @@ fi
 if [ ! -x "${file}" ]; then
     ${sudo}chmod +x "${file}"
 fi
-vim_args+=("-c" "startinsert")
+#vim_args+=("-c" "startinsert")
 
 # check for swap file
 if [ -f "${swp_file}" ]; then
