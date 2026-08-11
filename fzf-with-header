@@ -34,6 +34,7 @@ watch_reset_file=""
 refresh_key="ctrl-r"
 reverse=1
 print_query=0
+preview_toggle_key="ctrl-p"
 fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
 
 while [ $# -gt 0 ]; do
@@ -282,13 +283,6 @@ if [ "${#key_desc_order[@]}" -gt 0 ]; then
     done
 fi
 
-# the preview-wrap bindings are always added, so they belong in the footer
-# whenever there is a preview window - including the --key-descriptions case,
-# which rebuilds the list from the caller's keys alone
-if [ "${has_preview}" -eq 1 ]; then
-    mapped_keys="shift ←/→"$'\t'"wrap"$'\n'"${mapped_keys}"
-fi
-
 # keys handled inside the running fzf instead of letting it exit on them and
 # starting it again below. The bindings are built further down, once the width a
 # message may use is known.
@@ -317,6 +311,20 @@ collect_inline_keys "${reload_keys}" silent 1
 collect_inline_keys "${exec_reload_keys}" exec 1
 collect_inline_keys "${silent_keys}" silent 0
 collect_inline_keys "${exec_keys}" exec 0
+
+# the preview-wrap bindings are always added, so they belong in the footer
+# whenever there is a preview window - including the --key-descriptions case,
+# which rebuilds the list from the caller's keys alone. The preview is toggled
+# on top of that, unless the caller uses that key for something else
+preview_toggle_bind_args=()
+if [ "${has_preview}" -eq 1 ]; then
+    if ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_toggle_key}"; then
+        preview_toggle_bind_args=(--bind "${preview_toggle_key}:toggle-preview")
+        used_keys="${used_keys}"$'\n'"${preview_toggle_key}"
+        mapped_keys="${preview_toggle_key}"$'\t'"preview"$'\n'"${mapped_keys}"
+    fi
+    mapped_keys="shift ←/→"$'\t'"wrap"$'\n'"${mapped_keys}"
+fi
 
 # any --command view can be reloaded on demand; leave the key alone if the
 # caller already uses it for something else
@@ -635,14 +643,14 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${preview_toggle_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
