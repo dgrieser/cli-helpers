@@ -41,6 +41,10 @@ refresh_key="ctrl-r"
 reverse=1
 print_query=0
 preview_toggle_key="ctrl-p"
+preview_width_key="ctrl-g"
+# the widths ctrl-g offers on top of the one the caller asked for, which the
+# cycle ends on again
+preview_widths="70 85 40"
 fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
 
 while [ $# -gt 0 ]; do
@@ -385,7 +389,23 @@ collect_inline_keys "${exec_keys}" exec 0
 # which rebuilds the list from the caller's keys alone. The preview is toggled
 # on top of that, unless the caller uses that key for something else
 preview_toggle_bind_args=()
+preview_width_bind_args=()
 if [ "${has_preview}" -eq 1 ]; then
+    # the width is cycled by one binding: fzf walks through the specs of a
+    # change-preview-window separated by "|", and the empty one at the end is the
+    # window the caller asked for, with whatever else it had in it
+    if ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_width_key}"; then
+        width_spec=""
+        for preview_width in ${preview_widths}; do
+            [ "${preview_size_pct}" -eq 1 ] && [ "${preview_width}" == "${preview_size}" ] && continue
+            width_spec="${width_spec}${width_spec:+|}${preview_pos},${preview_width}%"
+        done
+        if [ -n "${width_spec}" ]; then
+            preview_width_bind_args=(--bind "${preview_width_key}:change-preview-window(${width_spec}|)")
+            used_keys="${used_keys}"$'\n'"${preview_width_key}"
+            mapped_keys="${preview_width_key}"$'\t'"width"$'\n'"${mapped_keys}"
+        fi
+    fi
     if ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_toggle_key}"; then
         preview_toggle_bind_args=(--bind "${preview_toggle_key}:toggle-preview")
         used_keys="${used_keys}"$'\n'"${preview_toggle_key}"
@@ -792,14 +812,14 @@ while true; do
             update_fzf "${cmd}" "${port}" "${watch_seconds}" &
             watcher_pid=$!
         fi
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
