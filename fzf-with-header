@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -21,6 +21,9 @@ exec_reload_keys=""
 silent_keys=""
 exec_keys=""
 msg_file=""
+# a command whose output leads the footer, in front of the watch indicator: for
+# a caller that has a state of its own to name there
+footer_prefix_cmd=""
 declare -A key_desc
 key_desc_order=()
 args=""
@@ -29,6 +32,9 @@ delimiter='  +'
 watch_seconds=0
 watch_delay=2
 watch_while_cmd=""
+# a command naming the seconds between two reloads, asked again while watching:
+# for a caller whose view changes into one that is worth watching less often
+watch_interval_cmd=""
 watcher_pid=""
 watch_reset_file=""
 refresh_key="ctrl-r"
@@ -93,6 +99,11 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             exec_keys="${1}"
             ;;
+        --footer-prefix)
+            shift
+            [ -z "${1}" ] && usage
+            footer_prefix_cmd="${1}"
+            ;;
         --watch)
             shift
             [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
@@ -107,6 +118,11 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             watch_while_cmd="${1}"
+            ;;
+        --watch-interval-command)
+            shift
+            [ -z "${1}" ] && usage
+            watch_interval_cmd="${1}"
             ;;
         --delimiter)
             shift
@@ -139,12 +155,17 @@ fi
 
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
+[ -n "${watch_interval_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-interval-command requires --watch" 1>&2 && usage
 inline_keys="${reload_keys}${exec_reload_keys}${silent_keys}${exec_keys}"
 [ -n "${inline_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: keys handled inside fzf require --key-command" 1>&2 && usage
 [ -n "${reload_keys}${exec_reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: reloading keys require --command" 1>&2 && usage
 
 # a manual refresh signals the watcher through this file to restart its timer
 [ ${watch_seconds} -gt 0 ] && watch_reset_file="${TMPDIR:-/tmp}/fzf-with-header-refresh.$$"
+# the same file put into the environment of everything started from inside fzf:
+# a key command that ended whatever --watch-while waits for can touch it to put
+# the watching back on its interval, instead of the user having to press ctrl-r
+[ -n "${watch_reset_file}" ] && export FZF_WITH_HEADER_WATCH_RESET="${watch_reset_file}"
 
 # a silent key runs its command inside fzf, so whatever it writes to stderr is
 # collected here instead of the screen and shown as a message above the header
@@ -414,10 +435,29 @@ if [ ${watch_seconds} -gt 0 ]; then
     watch_indicator=1
     ind_text="${watch_seconds}s"
     [ ${watch_delay} -gt ${watch_seconds} ] && ind_text="${watch_delay}s"
+    # an interval command may name a wider one right away; a later change simply
+    # rewraps the footer
+    if [ -n "${watch_interval_cmd}" ]; then
+        watch_interval_start="$(${watch_interval_cmd} 2>/dev/null)"
+        [[ "${watch_interval_start}" =~ ^[0-9]+$ ]] &&
+            [ ${#watch_interval_start} -gt $(( ${#ind_text} - 1 )) ] && ind_text="${watch_interval_start}s"
+    fi
     ind_width=$(( 2 + ${#ind_text} ))
     # "↻ off" is shown once watching stopped
     [ ${ind_width} -lt 5 ] && ind_width=5
 fi
+
+# a footer prefix leads the indicator, so both take their room out of the first
+# footer line; the width is measured on what the command prints right now, with
+# its colors stripped, and a later prefix of another width simply wraps as it
+# comes out
+prefix_width=0
+if [ -n "${footer_prefix_cmd}" ]; then
+    footer_prefix_text="$(${footer_prefix_cmd} 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+    [ -n "${footer_prefix_text}" ] && prefix_width=$(( ${#footer_prefix_text} + 3 ))
+fi
+# what leads the keys of the footer: the prefix, the indicator, or both
+lead_width=$(( ind_width + prefix_width ))
 
 # how many footer lines the terminal can spare
 term_lines="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)"
@@ -472,7 +512,7 @@ done <<< "${mapped_keys}"
 # behind a "…"
 pack_keys_header() {
     local max_lines="${1}"
-    local i lines=1 line_width=${ind_width} entry_width limit
+    local i lines=1 line_width=${lead_width} entry_width limit
     keys_header=""
     footer_ind_sep=""
     for (( i = 0; i < ${#entry_texts[@]}; i++ )); do
@@ -480,12 +520,12 @@ pack_keys_header() {
         # the last line still has to fit the "…" marker
         limit=${max_line_width}
         [ ${lines} -ge ${max_lines} ] && limit=$(( max_line_width - 2 ))
-        if [ -z "${keys_header}" ] && [ ${ind_width} -eq 0 ]; then
+        if [ -z "${keys_header}" ] && [ ${lead_width} -eq 0 ]; then
             keys_header="${entry_texts[i]}"
             line_width=${entry_width}
         elif [ $((line_width + 3 + entry_width)) -le ${limit} ]; then
             if [ -z "${keys_header}" ]; then
-                # the indicator holds the first slot of the line
+                # the prefix or the indicator holds the first slot of the line
                 footer_ind_sep=" · "
                 keys_header="${entry_texts[i]}"
             else
@@ -502,7 +542,7 @@ pack_keys_header() {
             line_width=${entry_width}
             lines=$((lines + 1))
         else
-            [ -z "${keys_header}" ] && [ ${ind_width} -gt 0 ] && footer_ind_sep=" "
+            [ -z "${keys_header}" ] && [ ${lead_width} -gt 0 ] && footer_ind_sep=" "
             keys_header="${keys_header}${C_HELP}…"
             break
         fi
@@ -518,13 +558,29 @@ else
     pack_keys_header ${max_footer_lines}
 fi
 
-build_footer() {
+# everything of the footer but the prefix, which is asked for separately because
+# it is the one part that changes without the footer being rebuilt here
+build_footer_rest() {
     local indicator="${1}"
-    if [ ${watch_indicator} -eq 0 ] || [ -z "${indicator}" ]; then
+    local lead=""
+
+    if [ ${watch_indicator} -eq 1 ] && [ -n "${indicator}" ]; then
+        # the prefix took the first slot, so the indicator follows it
+        [ -n "${footer_prefix_cmd}" ] && lead="${C_HELP} · "
+        lead="${lead}${C_HELP}↻ ${indicator}"
+    fi
+    if [ -z "${lead}" ] && [ -z "${footer_prefix_cmd}" ]; then
         printf '%s' "${keys_header}${C_RESET}"
     else
-        printf '%s' "${C_HELP}↻ ${indicator}${footer_ind_sep}${keys_header}${C_RESET}"
+        printf '%s' "${lead}${footer_ind_sep}${keys_header}${C_RESET}"
     fi
+}
+
+build_footer() {
+    local indicator="${1}"
+
+    [ -n "${footer_prefix_cmd}" ] && printf '%s' "$(${footer_prefix_cmd} 2>/dev/null)"
+    build_footer_rest "${indicator}"
 }
 
 # until the first reload the wait is the delay, afterwards the interval
@@ -535,9 +591,24 @@ else
 fi
 
 footer_args=()
-if [ ${footer_enabled} -eq 1 ] && { [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ]; }; then
+if [ ${footer_enabled} -eq 1 ] && { [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ] || [ -n "${footer_prefix_cmd}" ]; }; then
     [ ${watch_indicator} -eq 0 ] && initial_indicator=""
     footer_args=(--footer "$(build_footer "${initial_indicator}")")
+fi
+
+# A prefix names something the caller changes while the picker runs, so waiting
+# for the next watch interval to show it would be too late. Every reload fires
+# the load event, and every key that changes the prefix reloads, so the footer is
+# put together again there: the prefix is asked for anew and the rest is read
+# back from a file the watcher keeps up to date - it is the only part that
+# changes without a reload.
+footer_refresh_bind_args=()
+footer_rest_file=""
+if [ -n "${footer_prefix_cmd}" ] && [ ${footer_enabled} -eq 1 ] && [ -n "${cmd}" ] &&
+   ! printf '%s\n' "${used_keys}" | grep -qxF -- "load"; then
+    footer_rest_file="${TMPDIR:-/tmp}/fzf-with-header-footer.$$"
+    build_footer_rest "${initial_indicator}" > "${footer_rest_file}"
+    footer_refresh_bind_args=(--bind "load:transform-footer(printf '%s%s' \"\$(${footer_prefix_cmd})\" \"\$(cat '${footer_rest_file}')\")")
 fi
 
 update_fzf() {
@@ -575,6 +646,17 @@ update_fzf() {
                 rm -f "${watch_reset_file}"
                 remaining="${seconds}"
             fi
+            # an interval named while the wait is running counts from here, so a
+            # view that just became a slow one is not reloaded once more first
+            if [ -n "${watch_interval_cmd}" ]; then
+                new_seconds="$(${watch_interval_cmd} 2>/dev/null)"
+                if [[ "${new_seconds}" =~ ^[0-9]+$ ]] && [ "${new_seconds}" -gt 0 ] &&
+                   [ "${new_seconds}" -ne "${seconds}" ]; then
+                    seconds="${new_seconds}"
+                    remaining="${seconds}"
+                    post_footer "${port}" "${seconds}s"
+                fi
+            fi
         done
         # the first reload always happens; the condition only decides whether
         # to keep going, so a state the command reports after that reload counts
@@ -584,8 +666,12 @@ update_fzf() {
             continue
         fi
         reload_fzf "${cmd}" "${port}" || break
-        # the delay only applies before the first reload
+        # the delay only applies before the first reload; a footer prefix is
+        # posted after every reload instead, because only the command behind it
+        # knows whether it still says the same
         if [ ${first} -eq 1 ] && [ "${initial_indicator}" != "${seconds}s" ]; then
+            post_footer "${port}" "${seconds}s"
+        elif [ -n "${footer_prefix_cmd}" ]; then
             post_footer "${port}" "${seconds}s"
         fi
         first=0
@@ -598,6 +684,9 @@ post_footer() {
     local indicator="${2}"
     # no footer was shown in the first place
     [ ${footer_enabled} -eq 0 ] && return 0
+    # the load event puts the footer together again from this file, so it has to
+    # know the indicator the watcher is showing right now
+    [ -n "${footer_rest_file}" ] && build_footer_rest "${indicator}" > "${footer_rest_file}"
     # --data-binary keeps the newlines of a wrapped footer intact
     curl -XPOST 127.0.0.1:${port} --data-binary "change-footer($(build_footer "${indicator}"))" &> /dev/null
     return 0
@@ -620,6 +709,7 @@ stop_watcher() {
 cleanup() {
     stop_watcher
     [ -n "${msg_file}" ] && rm -f "${msg_file}"
+    [ -n "${footer_rest_file}" ] && rm -f "${footer_rest_file}"
     return 0
 }
 
@@ -643,7 +733,7 @@ while true; do
         fi
         cmd_result="$(${cmd})"
         header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
