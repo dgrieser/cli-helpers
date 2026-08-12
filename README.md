@@ -1794,7 +1794,7 @@ They differ in two things: whether the key command gets the terminal handed over
 
 | Argument / Flag | Description |
 |---|---|
-| `--command <command>` | Command whose output is piped into `fzf`; enables `--print-query` and is required for `--watch`. Binds `ctrl-r` to reload the output on demand (skipped if `ctrl-r` is already bound or described by the caller). |
+| `--command <command>` | Command whose output the list is made of; enables `--print-query` and is required for `--watch`. `fzf` opens first and runs the command itself on its `start` event, so the picker (header, footer, prompt) is on the screen while a slow command is still running instead of after it. Binds `ctrl-r` to reload the output on demand (skipped if `ctrl-r` is already bound or described by the caller). A `start:` binding of the caller is not replaced by that: it is taken out of the `--bind` arguments and run right after the reload. |
 | `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. |
 | `--key-descriptions <key>:<description>,...` | When given, only these keys are shown at the top, with these descriptions and in this order (inferred keys are suppressed). Useful for `--expect` keys, whose effect lives in the `--key-command`. |
 | `--reload-keys <key>,...` | Keys that run the `--key-command` inside the running `fzf` and reload the list afterwards, instead of ending `fzf` and starting it again (requires `--command` and `--key-command`). For a key that changes what the list shows without needing the screen. |

@@ -253,6 +253,53 @@ parse_height() {
     [[ "${spec}" =~ ^[0-9]+%?$ ]] && height_spec="${spec}"
 }
 
+# The list is loaded by fzf itself (see the start binding further down), so the
+# caller's own start actions have to join that one binding instead of replacing
+# it: they are taken out of their --bind arguments here and put back together
+# with the reload below. Everything else is passed on untouched.
+caller_args=("$@")
+passthrough_args=()
+caller_start_actions=""
+arg_index=0
+while [ ${arg_index} -lt ${#caller_args[@]} ]; do
+    bind_arg="${caller_args[arg_index]}"
+    bind_spec=""
+    bind_style=""
+    case "${bind_arg}" in
+        --bind=*)
+            bind_spec="${bind_arg#--bind=}"
+            bind_style="inline"
+            ;;
+        --bind)
+            bind_spec="${caller_args[arg_index + 1]}"
+            bind_style="pair"
+            ;;
+    esac
+    if [ -n "${bind_spec}" ]; then
+        kept_spec=""
+        while read -r bind_entry; do
+            [ -z "${bind_entry}" ] && continue
+            if [[ "${bind_entry}" == start:* ]]; then
+                caller_start_actions="${caller_start_actions:+${caller_start_actions}+}${bind_entry#start:}"
+            else
+                kept_spec="${kept_spec:+${kept_spec},}${bind_entry}"
+            fi
+        done < <(split_key_spec "${bind_spec}")
+        if [ -n "${kept_spec}" ]; then
+            if [ "${bind_style}" == "inline" ]; then
+                passthrough_args+=("--bind=${kept_spec}")
+            else
+                passthrough_args+=(--bind "${kept_spec}")
+            fi
+        fi
+        [ "${bind_style}" == "pair" ] && arg_index=$(( arg_index + 1 ))
+    else
+        passthrough_args+=("${bind_arg}")
+    fi
+    arg_index=$(( arg_index + 1 ))
+done
+set -- "${passthrough_args[@]}"
+
 mapped_keys=""
 used_keys=""
 has_preview=0
@@ -590,6 +637,18 @@ else
     initial_indicator="${watch_seconds}s"
 fi
 
+# fzf is started with nothing to show and fetches the list on its start event, so
+# the picker is on the screen while the command is still running instead of after
+# it. Whatever the caller wanted to do on start follows the reload.
+start_bind_args=()
+if [ -n "${cmd}" ]; then
+    start_action="reload(${cmd})"
+    [ -n "${caller_start_actions}" ] && start_action="${start_action}+${caller_start_actions}"
+    start_bind_args=(--bind "start:${start_action}")
+elif [ -n "${caller_start_actions}" ]; then
+    start_bind_args=(--bind "start:${caller_start_actions}")
+fi
+
 footer_args=()
 if [ ${footer_enabled} -eq 1 ] && { [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ] || [ -n "${footer_prefix_cmd}" ]; }; then
     [ ${watch_indicator} -eq 0 ] && initial_indicator=""
@@ -731,16 +790,14 @@ while true; do
             update_fzf "${cmd}" "${port}" "${watch_seconds}" &
             watcher_pid=$!
         fi
-        cmd_result="$(${cmd})"
-        header="$(echo "${cmd_result}" | head -n 1)"
-        result="$(echo "${cmd_result}" | fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${preview_toggle_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${inline_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
     fi
 
     if [ -n "${key_cmd}" ]; then
