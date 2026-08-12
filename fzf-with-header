@@ -619,7 +619,9 @@ build_footer_rest() {
     if [ -z "${lead}" ] && [ -z "${footer_prefix_cmd}" ]; then
         printf '%s' "${keys_header}${C_RESET}"
     else
-        printf '%s' "${lead}${footer_ind_sep}${keys_header}${C_RESET}"
+        # the separator carries the color of the descriptions, so a prefix that
+        # ends its own colors does not leave it in whatever comes next
+        printf '%s' "${lead}${C_HELP}${footer_ind_sep}${keys_header}${C_RESET}"
     fi
 }
 
