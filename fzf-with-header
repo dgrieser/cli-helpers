@@ -803,7 +803,10 @@ while true; do
     if [ -n "${key_cmd}" ]; then
         # TODO actually store last command exec and pipe back into fzf
         # TODO OR at least add saved header as argument, maybe split key, result and header as individual arguments
-        ${key_cmd} "${result}"
+        # the query is what the list was narrowed down to when the key was
+        # pressed, so a key command that wants to show what was on the screen
+        # can filter by it the same way
+        FZF_WITH_HEADER_QUERY="${query}" ${key_cmd} "${result}"
         exit_code=$?
         case "${exit_code}" in
             1)
