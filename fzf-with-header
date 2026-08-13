@@ -811,7 +811,17 @@ for spec in "${inline_specs[@]}"; do
         action="execute-silent(${answer_env}${key_cmd} ${payload} >/dev/null 2>'${msg_file}')"
     fi
     if [ "${inline_reload}" -eq 1 ]; then
-        action="${action}+reload-sync(${cmd})${cursor_action}"
+        # A picking key had the candidates in the place of the list, so the list
+        # coming back is not a newer version of what is on the screen but something
+        # else entirely: it is loaded the way a list is loaded at the start, which
+        # empties the screen at once, instead of replacing the rows only once they
+        # are all there - a row of the candidates must not be taken for one of the
+        # list in the meantime.
+        if [ "${ask_kind[${inline_key}]}" == "pick" ]; then
+            action="${action}+reload(${cmd})${cursor_action}"
+        else
+            action="${action}+reload-sync(${cmd})${cursor_action}"
+        fi
         # the list is up to date now, so the watcher restarts its interval
         [ -n "${watch_reset_file}" ] && action="${action}+execute-silent(touch '${watch_reset_file}')"
         # the row under the cursor may be another one, or say something else
@@ -1120,12 +1130,16 @@ if [ -n "${ask_prefix}" ]; then
             # caller's own command puts it back the way it was.
             ask_open_action="${ask_open_action}+enable-search+transform-query(cat '${ask_prefill_file}')+change-ghost()"
             [ -n "${caller_preview_cmd}" ] && ask_open_action="${ask_open_action}+change-preview()"
-            ask_open_action="${ask_open_action}+reload-sync(${ask_pick_cmd[${ask_key}]})+first"
+            # the candidates are loaded the way a list is loaded at the start, so
+            # the rows of the list are gone the moment the question is there: an
+            # answer given before the candidates arrived is the text that was typed
+            # and never a row of what the picker showed before
+            ask_open_action="${ask_open_action}+reload(${ask_pick_cmd[${ask_key}]})+first"
             [ -n "${caller_preview_cmd}" ] &&
                 ask_restore_extra["${ask_key}"]="$(action_arg change-preview "${caller_preview_cmd}")"
             # coming back means the caller's list again, and a preview built from
             # the row of it the cursor ends up on
-            ask_close_actions="reload-sync(${cmd})+first"
+            ask_close_actions="reload(${cmd})+first"
             [ "${has_preview}" -eq 1 ] && ask_close_actions="${ask_close_actions}+refresh-preview"
             ask_close_cancel["${ask_key}"]="${ask_close_actions}"
             # a key that reloads brings the list back itself, after its command ran
@@ -1269,6 +1283,9 @@ post_footer() {
     # an answered question puts the footer back from this file, so it holds what
     # the footer says while no question is open
     [ -n "${ask_footer_file}" ] && build_footer "${indicator}" > "${ask_footer_file}"
+    # the footer of an open question names the keys that answer it, and the file
+    # above is what puts this one back once it is answered
+    [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ] && return 0
     # --data-binary keeps the newlines of a wrapped footer intact
     curl -XPOST 127.0.0.1:${port} --data-binary "change-footer($(build_footer "${indicator}"))" &> /dev/null
     return 0
@@ -1277,7 +1294,15 @@ post_footer() {
 reload_fzf() {
     local cmd="${1}"
     local port="${2}"
-    curl -XPOST 127.0.0.1:${port} -d "reload(${cmd})" &> /dev/null
+    local payload="reload(${cmd})"
+
+    # A question may be opened while this reload is on its way, and taking the
+    # candidates of a picking key away under it would answer it with a row of the
+    # list instead. Whether one is open is therefore decided by fzf itself, after
+    # everything the key that opened it did, so there is no moment in between.
+    [ -n "${ask_state_file}" ] &&
+        payload="transform:[ -e '${ask_state_file}' ] || printf '%s' $(shell_quote "${payload}")"
+    curl -XPOST 127.0.0.1:${port} --data-binary "${payload}" &> /dev/null
     return ${?}
 }
 
