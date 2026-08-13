@@ -46,7 +46,10 @@ args=""
 query=""
 delimiter='  +'
 watch_seconds=0
-watch_delay=2
+# the wait before the first reload: unset means the one of --watch, so the first
+# reload comes no sooner than every one after it. A caller wanting the first list
+# earlier or later than the interval names --watch-delay itself
+watch_delay=""
 watch_while_cmd=""
 # a command naming the seconds between two reloads, asked again while watching:
 # for a caller whose view changes into one that is worth watching less often
@@ -350,6 +353,8 @@ fi
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
 [ -n "${watch_interval_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-interval-command requires --watch" 1>&2 && usage
+# no delay was named, so the first reload waits what every one after it waits
+[ -z "${watch_delay}" ] && watch_delay="${watch_seconds}"
 inline_keys="${reload_keys}${exec_reload_keys}${silent_keys}${exec_keys}"
 [ -n "${inline_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: keys handled inside fzf require --key-command" 1>&2 && usage
 [ -n "${reload_keys}${exec_reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: reloading keys require --command" 1>&2 && usage
