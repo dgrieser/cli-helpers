@@ -102,11 +102,30 @@ ask_route() {
     local answer="${2}"
     local line="${3}"
     local config="${FZF_WITH_HEADER_ASK_CONFIG}"
-    local key kind actions search submit
+    local key kind actions search submit pending
 
     { [ -z "${config}" ] || [ ! -s "${config}" ]; } && return 0
     # shellcheck source=/dev/null
     . "${config}"
+
+    # A list was emptied and the one that takes its place is named in this file.
+    # Loading it here instead of in the binding that emptied it is what lets fzf
+    # draw the empty list first: a load already on its way keeps the rows that were
+    # there before on the screen until it is through, and a picked answer must not
+    # be looked for among them.
+    if [ "${mode}" == "load" ]; then
+        if [ -s "${ask_pending}" ]; then
+            pending="$(cat "${ask_pending}")"
+            rm -f "${ask_pending}"
+            printf '%s' "reload(${pending})+first"
+            return 0
+        fi
+        # a question is open, and what a caller draws from this event would take
+        # the hint that names the keys answering it off the footer
+        [ -e "${ask_state}" ] && return 0
+        printf '%s' "${ask_load_actions}"
+        return 0
+    fi
 
     # nothing is being asked: the keys do what they do for the caller
     if [ ! -e "${ask_state}" ]; then
@@ -118,6 +137,9 @@ ask_route() {
     key="$(cat "${ask_state}" 2>/dev/null)"
     rm -f "${ask_state}"
     kind="${ask_kinds[${key}]}"
+    # the candidates are on the screen, so the list that comes back is the caller's
+    # own one again: whichever action below empties the list picks it up from here
+    [ "${kind}" == "pick" ] && printf '%s' "${ask_list_cmd}" > "${ask_pending}"
     # a candidate list is answered with the row the cursor is on; a query that
     # matches nothing is taken as it was typed, so a value the list does not
     # offer can be given as well
@@ -376,6 +398,7 @@ done
 # what the picker looked like before the question, so it can be put back.
 ask_prefix=""
 ask_state_file=""
+ask_pending_file=""
 ask_footer_file=""
 if [ "${#ask_keys[@]}" -gt 0 ]; then
     ask_prefix="${TMPDIR:-/tmp}/fzf-with-header-ask.$$"
@@ -388,6 +411,7 @@ if [ "${#ask_keys[@]}" -gt 0 ]; then
     ask_prompt_file="${ask_prefix}.prompt"
     ask_ghost_file="${ask_prefix}.ghost"
     ask_search_file="${ask_prefix}.search"
+    ask_pending_file="${ask_prefix}.pending"
     ask_hint_file="${ask_prefix}.hint"
     ask_config_file="${ask_prefix}.config"
 fi
@@ -490,6 +514,7 @@ passthrough_args=()
 caller_start_actions=""
 caller_enter_actions=""
 caller_esc_actions=""
+caller_load_actions=""
 ask_expect_keys=""
 ask_taken_spec=""
 arg_index=0
@@ -532,6 +557,9 @@ while [ ${arg_index} -lt ${#caller_args[@]} ]; do
                 ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
             elif [ "${#ask_keys[@]}" -gt 0 ] && [[ "${bind_entry}" == esc:* || "${bind_entry}" == escape:* ]]; then
                 caller_esc_actions="${caller_esc_actions:+${caller_esc_actions}+}${bind_entry#*:}"
+                ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
+            elif [ "${#ask_keys[@]}" -gt 0 ] && [[ "${bind_entry}" == load:* ]]; then
+                caller_load_actions="${caller_load_actions:+${caller_load_actions}+}${bind_entry#load:}"
                 ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
             else
                 kept_spec="${kept_spec:+${kept_spec},}${bind_entry}"
@@ -813,12 +841,11 @@ for spec in "${inline_specs[@]}"; do
     if [ "${inline_reload}" -eq 1 ]; then
         # A picking key had the candidates in the place of the list, so the list
         # coming back is not a newer version of what is on the screen but something
-        # else entirely: it is loaded the way a list is loaded at the start, which
-        # empties the screen at once, instead of replacing the rows only once they
-        # are all there - a row of the candidates must not be taken for one of the
-        # list in the meantime.
+        # else entirely: the list is emptied here and loaded by the load event that
+        # empties it, instead of replacing the rows only once they are all there - a
+        # row of the candidates must not be taken for one of the list in between.
         if [ "${ask_kind[${inline_key}]}" == "pick" ]; then
-            action="${action}+reload(${cmd})${cursor_action}"
+            action="${action}+reload-sync(true)${cursor_action}"
         else
             action="${action}+reload-sync(${cmd})${cursor_action}"
         fi
@@ -1068,19 +1095,13 @@ if [ -n "${ask_prefix}" ]; then
     while read -r ask_used_key; do
         [ -z "${ask_used_key}" ] && continue
         case "${ask_used_key}" in
-            enter|return|esc|escape|start|focus|zero|one|multi|jump*|click*|scroll*)
+            enter|return|esc|escape|load|start|focus|zero|one|multi|jump*|click*|scroll*)
                 continue
                 ;;
         esac
         [[ ",${ask_unbind_keys}," == *",${ask_used_key},"* ]] && continue
         ask_unbind_keys="${ask_unbind_keys:+${ask_unbind_keys},}${ask_used_key}"
     done <<< "${used_keys}"
-    # the footer of a load event is put together here, not by the caller, so that
-    # binding is not in the keys above
-    if [ "${#footer_refresh_bind_args[@]}" -gt 0 ] && [[ ",${ask_unbind_keys}," != *",load,"* ]]; then
-        ask_unbind_keys="${ask_unbind_keys:+${ask_unbind_keys},}load"
-    fi
-
     ask_restore_actions="transform-prompt(cat '${ask_prompt_file}')+transform-ghost(cat '${ask_ghost_file}')+transform-query(cat '${ask_query_file}')"
     [ -n "${ask_footer_file}" ] && ask_restore_actions="${ask_restore_actions}+transform-footer(cat '${ask_footer_file}')"
     [ -n "${ask_unbind_keys}" ] && ask_restore_actions="${ask_restore_actions}+rebind(${ask_unbind_keys})"
@@ -1091,31 +1112,53 @@ if [ -n "${ask_prefix}" ]; then
         ask_prompt_text="${ask_question[${ask_key}]}"
         [ "${ask_kind[${ask_key}]}" == "confirm" ] && ask_prompt_text="${ask_prompt_text} [y/N]"
         ask_prompt_text="${ask_prompt_text} "
-        # the question and the text the input starts with are written out by fzf
-        # itself, so both can name what is under the cursor with the placeholders
-        # of a binding, e.g. "Delete {1}?"
+        # What the question is asked on is written away in two steps, because fzf
+        # skips a command carrying a placeholder while nothing is matched: with an
+        # empty list the first of them still runs, so the question is asked there as
+        # well, on nothing instead of on a row.
         ask_open_body="printf '%s' $(shell_quote "${ask_key}") > '${ask_state_file}'"
-        ask_open_body="${ask_open_body}; printf '%s' {} > '${ask_line_file}'"
+        ask_open_body="${ask_open_body}; : > '${ask_line_file}'"
         ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_QUERY}\" > '${ask_query_file}'"
         ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_PROMPT}\" > '${ask_prompt_file}'"
         ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_GHOST}\" > '${ask_ghost_file}'"
         ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_INPUT_STATE}\" > '${ask_search_file}'"
+        # the candidates are picked up by the load event of the emptied list below
+        [ "${ask_kind[${ask_key}]}" == "pick" ] &&
+            ask_open_body="${ask_open_body}; printf '%s' $(shell_quote "${ask_pick_cmd[${ask_key}]}") > '${ask_pending_file}'"
+        # the question and the text the input starts with may name what is under the
+        # cursor with the placeholders of a binding, e.g. "Delete {1}?", which is
+        # what puts them into the second step
+        ask_open_row_body=""
+        ask_question_text=""
         if [ -n "${ask_question_cmd[${ask_key}]+x}" ]; then
             # a question naming a state the keys change has to be asked for anew
             # every time it is put on the screen; what it prints is the question as
             # it is, colors and trailing space included
-            ask_open_body="${ask_open_body}; printf '%s' \"\$(${ask_question_cmd[${ask_key}]})\" > '${ask_question_file}'"
+            ask_question_text="printf '%s' \"\$(${ask_question_cmd[${ask_key}]})\" > '${ask_question_file}'"
             [ "${ask_kind[${ask_key}]}" == "confirm" ] &&
-                ask_open_body="${ask_open_body}; printf '%s' ' [y/N] ' >> '${ask_question_file}'"
+                ask_question_text="${ask_question_text}; printf '%s' ' [y/N] ' >> '${ask_question_file}'"
         else
-            ask_open_body="${ask_open_body}; printf '%s' $(shell_quote "${ask_prompt_text}") > '${ask_question_file}'"
+            ask_question_text="printf '%s' $(shell_quote "${ask_prompt_text}") > '${ask_question_file}'"
+        fi
+        if [[ "${ask_question_text}" == *'{'*'}'* ]]; then
+            # a question about a row has nothing to say about one that is not there,
+            # so what is left of it without the placeholders is asked instead
+            ask_open_body="${ask_open_body}; printf '%s' $(shell_quote "$(sed 's/{[^}]*}//g' <<< "${ask_prompt_text}")") > '${ask_question_file}'"
+            ask_open_row_body="${ask_question_text}"
+        else
+            ask_open_body="${ask_open_body}; ${ask_question_text}"
         fi
         if [ -n "${ask_prefill[${ask_key}]+x}" ]; then
-            ask_open_body="${ask_open_body}; { ${ask_prefill[${ask_key}]}; } > '${ask_prefill_file}' 2>/dev/null"
+            ask_open_body="${ask_open_body}; : > '${ask_prefill_file}'"
+            ask_open_row_body="${ask_open_row_body:+${ask_open_row_body}; }{ ${ask_prefill[${ask_key}]}; } > '${ask_prefill_file}' 2>/dev/null"
         else
             ask_open_body="${ask_open_body}; : > '${ask_prefill_file}'"
         fi
         ask_open_action="$(action_arg execute-silent "${ask_open_body}")"
+        # the row the question is asked about: no row, nothing to write, and the
+        # files above hold what the first step left for that case
+        ask_open_row_body="printf '%s' {} > '${ask_line_file}'${ask_open_row_body:+; ${ask_open_row_body}}"
+        ask_open_action="${ask_open_action}+$(action_arg execute-silent "${ask_open_row_body}")"
         # the keys go first, so nothing the rest of this binding sets off, e.g. the
         # load event of the candidates below, runs anything of the caller
         [ -n "${ask_unbind_keys}" ] && ask_open_action="${ask_open_action}+unbind(${ask_unbind_keys})"
@@ -1130,19 +1173,20 @@ if [ -n "${ask_prefix}" ]; then
             # caller's own command puts it back the way it was.
             ask_open_action="${ask_open_action}+enable-search+transform-query(cat '${ask_prefill_file}')+change-ghost()"
             [ -n "${caller_preview_cmd}" ] && ask_open_action="${ask_open_action}+change-preview()"
-            # the candidates are loaded the way a list is loaded at the start, so
-            # the rows of the list are gone the moment the question is there: an
-            # answer given before the candidates arrived is the text that was typed
-            # and never a row of what the picker showed before
-            ask_open_action="${ask_open_action}+reload(${ask_pick_cmd[${ask_key}]})+first"
+            # The list is emptied right here and the candidates are loaded by the
+            # load event that empties it: the rows of the list are off the screen the
+            # moment the question is there, and an answer given before the candidates
+            # arrived is the text that was typed and never a row of what the picker
+            # showed before.
+            ask_open_action="${ask_open_action}+reload-sync(true)+first"
             [ -n "${caller_preview_cmd}" ] &&
                 ask_restore_extra["${ask_key}"]="$(action_arg change-preview "${caller_preview_cmd}")"
-            # coming back means the caller's list again, and a preview built from
-            # the row of it the cursor ends up on
-            ask_close_actions="reload(${cmd})+first"
+            # coming back means the caller's list again, emptied and loaded the same
+            # way, and a preview built from the row of it the cursor ends up on
+            ask_close_actions="reload-sync(true)+first"
             [ "${has_preview}" -eq 1 ] && ask_close_actions="${ask_close_actions}+refresh-preview"
             ask_close_cancel["${ask_key}"]="${ask_close_actions}"
-            # a key that reloads brings the list back itself, after its command ran
+            # a key that reloads empties the list itself, after its command ran
             [ "${ask_reload[${ask_key}]}" == "1" ] || ask_close_submit["${ask_key}"]="${ask_close_actions}"
         else
             # the answer replaces the query, so the search is switched off: the
@@ -1159,13 +1203,27 @@ if [ -n "${ask_prefix}" ]; then
     ask_router_bind_args=(
         --bind "enter:transform:${ask_self_arg} --ask-route submit {q} {}"
         --bind "esc:transform:${ask_self_arg} --ask-route cancel"
+        --bind "load:transform:${ask_self_arg} --ask-route load"
     )
+    # what the load event does while no question is open: the footer of a caller
+    # with a prefix, which the router prints instead of the binding built above,
+    # and whatever the caller had on that event
+    ask_load_actions=""
+    if [ "${#footer_refresh_bind_args[@]}" -gt 0 ]; then
+        ask_load_actions="${footer_refresh_bind_args[1]#load:}"
+        footer_refresh_bind_args=()
+    fi
+    [ -n "${caller_load_actions}" ] &&
+        ask_load_actions="${ask_load_actions:+${ask_load_actions}+}${caller_load_actions}"
 
     # everything the router has to know, so the bindings above stay plain text
     {
         printf 'ask_state=%q\n' "${ask_state_file}"
         printf 'ask_answer=%q\n' "${ask_answer_file}"
         printf 'ask_search=%q\n' "${ask_search_file}"
+        printf 'ask_pending=%q\n' "${ask_pending_file}"
+        printf 'ask_list_cmd=%q\n' "${cmd}"
+        printf 'ask_load_actions=%q\n' "${ask_load_actions}"
         printf 'ask_restore=%q\n' "${ask_restore_actions}"
         printf 'ask_enter_actions=%q\n' "${ask_enter_actions}"
         printf 'ask_esc_actions=%q\n' "${ask_esc_actions}"
@@ -1328,7 +1386,7 @@ while true; do
     [ -n "${msg_file}" ] && : > "${msg_file}"
     # a question of the previous round was answered by ending fzf, so the round
     # after it starts on the list again instead of on that question
-    [ -n "${ask_state_file}" ] && rm -f "${ask_state_file}"
+    [ -n "${ask_state_file}" ] && rm -f "${ask_state_file}" "${ask_pending_file}"
     if [ -n "${cmd}" ]; then
         # a fresh listen port per round, so restarts after a key command do not
         # reuse the port of an fzf that is already gone
