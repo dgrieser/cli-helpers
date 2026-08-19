@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--ask-keep-keys <key>,...] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -37,6 +37,12 @@ declare -A ask_close_cancel
 declare -A ask_restore_extra
 declare -A ask_reload
 ask_keys=()
+# the keys of the caller that keep working while a question is open: every other
+# one of them is dead for as long as it is asked, because a key that relists or
+# changes what is listed would take the candidates away from the question. A key
+# that knows about the question itself - one that walks its candidates - says so
+# with this
+ask_keep_keys=""
 # a command naming the prompt, asked again after every key handled inside fzf:
 # for a caller whose prompt names a state its keys change
 prompt_cmd=""
@@ -220,6 +226,11 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             reload_keys="${1}"
+            ;;
+        --ask-keep-keys)
+            shift
+            [ -z "${1}" ] && usage
+            ask_keep_keys="${1}"
             ;;
         --exec-reload-keys)
             shift
@@ -1104,6 +1115,8 @@ if [ -n "${ask_prefix}" ]; then
                 continue
                 ;;
         esac
+        # a key the caller named as one of the question's own
+        [[ ",${ask_keep_keys}," == *",${ask_used_key},"* ]] && continue
         [[ ",${ask_unbind_keys}," == *",${ask_used_key},"* ]] && continue
         ask_unbind_keys="${ask_unbind_keys:+${ask_unbind_keys},}${ask_used_key}"
     done <<< "${used_keys}"

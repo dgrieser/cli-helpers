@@ -669,7 +669,7 @@ software-090-code() { apt_upgrade "code"; }
 software-100-kubectl-mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
 software-110-powerline-fonts() { install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"; }
 software-120-nickpit() { install_git_release "https://github.com/dgrieser/nickpit"; }
-
+software-121-mittwald-outlook-bridge() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
 software-130-slack() {
     # jessie is the only supported version
     apt_add_with_list_file "slack-desktop" \
