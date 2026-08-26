@@ -1,0 +1,227 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+# Commands OpenCode ships itself, they have no file below a command directory.
+BUILTIN_COMMANDS="init review"
+
+
+function usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [COMMAND [ARGUMENTS...]]
+
+Runs a slash command or a prompt in a new OpenCode session.
+
+    COMMAND
+        Slash command to run, with or without a leading '/'
+
+    ARGUMENTS
+        Arguments handed to the slash command as \$ARGUMENTS
+
+    Options:
+        -h, --help          Display this help and exit
+
+        -c, --command       Slash command to run, same as COMMAND
+
+        -p, --prompt        Prompt to submit instead of a slash command
+
+        -C, --dir           Directory to start OpenCode in
+                            Default: git root of the working directory,
+                            the working directory otherwise
+
+        -l, --list-commands List the available slash commands and exit
+
+        -v, --verbose       Print the OpenCode command line
+
+        --bash-completion   Print completion candidates and exit
+EOF
+    exit 1
+}
+
+function error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+function warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+function fail() {
+    error "${1}"
+    exit 1
+}
+
+function verbose() {
+    [ "${verbose}" -eq 1 ] && echo "+ ${1}" 1>&2
+}
+
+# Directories OpenCode reads slash commands from, in the order it looks them up.
+# Both the singular and the plural spelling are used, and every .opencode of a
+# parent directory contributes its commands as well.
+function command_directories() {
+    local directory="${1}"
+    local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    local candidate=""
+
+    for candidate in "${config_home}/opencode/command" "${config_home}/opencode/commands"; do
+        [ -d "${candidate}" ] && echo "${candidate}"
+    done
+
+    while [ -n "${directory}" ]; do
+        for candidate in "${directory}/.opencode/command" "${directory}/.opencode/commands"; do
+            [ -d "${candidate}" ] && echo "${candidate}"
+        done
+        [ "${directory}" = "/" ] && break
+        directory="$(dirname "${directory}")"
+    done
+}
+
+# A command is named after its file below a command directory, so a command in
+# a subdirectory is called with that path as a prefix.
+function list_commands() {
+    local directory="${1}"
+    local command_directory=""
+
+    {
+        printf '%s\n' ${BUILTIN_COMMANDS}
+        while IFS= read -r command_directory; do
+            find "${command_directory}" -type f -name '*.md' -printf '%P\n' 2>/dev/null \
+                | sed 's/\.md$//'
+        done < <(command_directories "${directory}")
+    } | sort -u
+}
+
+function completion() {
+    local previous="${1}"
+    local directory=""
+    local argument=""
+    local next_is_directory=0
+
+    case "${previous}" in
+        -C|--dir|-p|--prompt)
+            # Directories are left to the default filename completion,
+            # prompts are free text.
+            return
+            ;;
+    esac
+    shift
+
+    for argument in "${@}"; do
+        if [ "${next_is_directory}" -eq 1 ]; then
+            directory="${argument}"
+            next_is_directory=0
+            continue
+        fi
+        case "${argument}" in
+            -C|--dir)
+                next_is_directory=1
+                ;;
+        esac
+    done
+
+    [ -z "${directory}" ] && directory="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "${directory}" ] && directory="${PWD}"
+
+    echo "-h --help -c --command -p --prompt -C --dir -l --list-commands -v --verbose --bash-completion"
+    [ -d "${directory}" ] && list_commands "${directory}"
+}
+
+mode=""
+command_name=""
+prompt=""
+directory=""
+list=0
+verbose=0
+arguments=()
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            shift
+            completion "${@}"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -v|--verbose)
+            verbose=1
+            ;;
+        -l|--list-commands)
+            list=1
+            ;;
+        -C|--dir)
+            shift
+            [ -z "${1}" ] && usage
+            directory="${1}"
+            ;;
+        -p|--prompt)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${mode}" ] && fail "Only one command or prompt can be run."
+            mode="prompt"
+            prompt="${1}"
+            ;;
+        -c|--command)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${mode}" ] && fail "Only one command or prompt can be run."
+            mode="command"
+            command_name="${1}"
+            # The rest belongs to the command, so it may contain options.
+            shift
+            arguments+=("${@}")
+            break
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            [ -n "${mode}" ] && fail "Only one command or prompt can be run."
+            mode="command"
+            command_name="${1}"
+            shift
+            arguments+=("${@}")
+            break
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${directory}" ]; then
+    directory="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "${directory}" ] && directory="${PWD}"
+fi
+[ ! -d "${directory}" ] && fail "Directory does not exist: ${directory}"
+
+if [ "${list}" -eq 1 ]; then
+    list_commands "${directory}"
+    exit 0
+fi
+
+[ -z "${mode}" ] && usage
+
+command -v opencode >/dev/null 2>&1 || fail "Command not found: opencode"
+
+text=""
+case "${mode}" in
+    command)
+        command_name="${command_name#/}"
+        [ -z "${command_name}" ] && fail "Empty command name."
+        # Commands of a plugin or a skill are not found here, so an unknown
+        # name is only reported and still handed to OpenCode.
+        list_commands "${directory}" | grep -qxF "${command_name}" \
+            || warning "Unknown slash command: ${command_name}"
+        text="/${command_name}"
+        [ "${#arguments[@]}" -gt 0 ] && text="${text} ${arguments[*]}"
+        ;;
+    prompt)
+        text="${prompt}"
+        ;;
+esac
+
+cd "${directory}" || fail "Cannot change to directory: ${directory}"
+
+verbose "opencode --prompt '${text}'"
+exec opencode --prompt "${text}"

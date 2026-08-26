@@ -1,0 +1,179 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+APP_ID="${SCREENSHOT_APP_ID:-be.alexandervanhee.gradia}"
+OBJECT_PATH="/${APP_ID//.//}"
+UNIT="screenshot-autoclose"
+IDLE="${SCREENSHOT_IDLE:-300}"
+POLL="${SCREENSHOT_POLL:-15}"
+STARTUP="${SCREENSHOT_STARTUP:-120}"
+autoclose=1
+mode="capture"
+
+usage() {
+    echo "Usage: $(basename "${0}") [--idle <seconds>] [--poll <seconds>] [--startup <seconds>] [--no-autoclose]"
+    echo "       $(basename "${0}") --close"
+    echo "       $(basename "${0}") --watch [--idle <seconds>] [--poll <seconds>] [--startup <seconds>]"
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+require_seconds() {
+    [[ "${1}" =~ ^[0-9]+$ ]] || usage
+}
+
+app_running() {
+    flatpak ps --columns=application 2>/dev/null | grep -qx "${APP_ID}"
+}
+
+app_windows() {
+    window-by-class "${APP_ID}" 2>/dev/null
+}
+
+app_has_window() {
+    [ -n "$(app_windows)" ]
+}
+
+app_focused() {
+    local active
+    active="$(window-active 2>/dev/null)" || return 1
+    [ -n "${active}" ] || return 1
+    grep -qxF "${active}" <<<"$(app_windows)"
+}
+
+close_app() {
+    # ask the app to quit itself, kill the sandbox if it does not go away
+    gdbus call --session --dest "${APP_ID}" --object-path "${OBJECT_PATH}" \
+        --method org.gtk.Actions.Activate quit '[]' '{}' >/dev/null 2>&1
+
+    local i
+    for i in 1 2 3 4 5; do
+        app_running || return 0
+        sleep 1
+    done
+
+    flatpak kill "${APP_ID}" >/dev/null 2>&1
+}
+
+# Watch the editor window and close it once it has been unfocused for too long.
+# The idle counter resets whenever the window has focus, so an editing session
+# stays alive as long as it is being used.
+watch_app() {
+    local waited=0 idle=0
+
+    # an interactive capture has no window yet, so wait for one before the
+    # idle clock starts
+    until app_has_window; do
+        [ "${waited}" -ge "${STARTUP}" ] && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    while app_running && app_has_window; do
+        if app_focused; then
+            idle=0
+        else
+            idle=$((idle + POLL))
+            [ "${idle}" -ge "${IDLE}" ] && break
+        fi
+        sleep "${POLL}"
+    done
+
+    app_running && close_app
+    return 0
+}
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "--idle"
+            echo "--poll"
+            echo "--startup"
+            echo "--no-autoclose"
+            echo "--close"
+            echo "--watch"
+            echo "--help"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --idle)
+            shift
+            require_seconds "${1:-}"
+            IDLE="${1}"
+            ;;
+        --poll)
+            shift
+            require_seconds "${1:-}"
+            POLL="${1}"
+            ;;
+        --startup)
+            shift
+            require_seconds "${1:-}"
+            STARTUP="${1}"
+            ;;
+        --no-autoclose)
+            autoclose=0
+            ;;
+        --close)
+            mode="close"
+            ;;
+        --watch)
+            mode="watch"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+cli_helpers_require_command flatpak flatpak || exit 1
+
+case "${mode}" in
+    close)
+        close_app
+        exit 0
+        ;;
+    watch)
+        watch_app
+        exit 0
+        ;;
+esac
+
+flatpak info "${APP_ID}" >/dev/null 2>&1 || fail "Flatpak app '${APP_ID}' is not installed."
+
+if [ "${autoclose}" -eq 1 ]; then
+    if cli_helpers_is_wayland && ! command -v window-active >/dev/null 2>&1; then
+        error "'window-active' not found, taking screenshot without auto-close."
+    else
+        # (re)start the watchdog for this capture
+        systemctl --user stop "${UNIT}.service" >/dev/null 2>&1
+        systemd-run --user --quiet --collect --unit="${UNIT}" \
+            --setenv="SCREENSHOT_APP_ID=${APP_ID}" \
+            --setenv="SCREENSHOT_IDLE=${IDLE}" \
+            --setenv="SCREENSHOT_POLL=${POLL}" \
+            --setenv="SCREENSHOT_STARTUP=${STARTUP}" \
+            --setenv="PATH=${PATH}" \
+            "$(realpath "${0}")" --watch ||
+            error "Could not start the auto-close watchdog."
+    fi
+fi
+
+exec flatpak run "${APP_ID}" --screenshot=INTERACTIVE

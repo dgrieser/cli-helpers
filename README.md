@@ -585,6 +585,37 @@ codex-chat --print-history
 ### `codex-session`
 Symlink to [`agent-session`](#agent-session) that only uses sessions of the Codex CLI.
 
+### `opencode-run`
+Starts an interactive OpenCode session that immediately runs a slash command or submits a prompt, so a command like `lintfix` can be kicked off from the shell and then be watched and worked with in the TUI.
+
+The session starts in the git root of the working directory unless `--dir` names a directory, which is what makes the tool usable from any subdirectory of a repository. A command name is accepted with or without its leading `/`, and everything after it is handed to the command as `$ARGUMENTS`, so options of the command itself are passed through instead of being parsed. Command names are looked up in the directories OpenCode reads them from — `command` and `commands` below `${XDG_CONFIG_HOME:-~/.config}/opencode` and below the `.opencode` of the start directory and each of its parents — plus the built-in `init` and `review`. A command in a subdirectory of a command directory is named with that path as a prefix (`group/nested`). A name that is not found is only reported as a warning and still handed to OpenCode, because commands provided by a plugin or a skill do not exist as a file.
+
+**Usage:** `opencode-run [OPTIONS] [COMMAND [ARGUMENTS...]]`
+
+| Argument / Flag | Description |
+|---|---|
+| `COMMAND` | The slash command to run, with or without a leading `/`. |
+| `ARGUMENTS...` | Arguments handed to the slash command as `$ARGUMENTS`; everything after `COMMAND` is taken verbatim. |
+| `-h, --help` | Show the help message and exit. |
+| `-c, --command NAME` | The slash command to run; same as the positional `COMMAND`. |
+| `-p, --prompt TEXT` | Submit `TEXT` as a prompt instead of running a slash command. |
+| `-C, --dir DIR` | Start OpenCode in `DIR`; defaults to the git root of the working directory, the working directory otherwise. |
+| `-l, --list-commands` | List the available slash commands and exit. |
+| `-v, --verbose` | Print the OpenCode command line to stderr. |
+| `--bash-completion` | Output shell-completion candidates (flags plus the available slash command names). |
+
+A command and a prompt are mutually exclusive. The completion of `--dir` falls back to filename completion, and a prompt is not completed at all.
+
+**Examples:**
+```bash
+opencode-run lintfix
+opencode-run --command lintfix
+opencode-run /review branch
+opencode-run --prompt 'Run make lint, fix legitimate errors, and show the diff.'
+opencode-run -C ~/src/my-project lintfix
+opencode-run --list-commands
+```
+
 ### `vish`
 Edits or creates a file or command in vim (using sudo when needed), making new files executable bash scripts, handling vim swap-file recovery, and running a syntax check on save with the option to re-edit.
 
@@ -2376,6 +2407,31 @@ Interactive keys: `q/a`, `w/s`, `e/d` raise/lower red, green, blue gamma; `TAB` 
 screen-color --list
 screen-color HDMI-1
 screen-color --load night
+```
+
+### `screenshot`
+Takes an interactive screenshot with the Gradia Flatpak editor and starts a watchdog that closes the editor once its window has been unfocused for a while, so forgotten screenshot windows do not pile up. The idle counter resets whenever the editor window has focus, and the watchdog runs as the transient `screenshot-autoclose` systemd user service.
+
+**Usage:** `screenshot [--idle <seconds>] [--poll <seconds>] [--startup <seconds>] [--no-autoclose]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--idle <seconds>` | Unfocused time before the editor is closed. Defaults to `300`. |
+| `--poll <seconds>` | Interval between focus checks. Defaults to `15`. |
+| `--startup <seconds>` | How long to wait for the editor window to appear after the capture before giving up on the watchdog. Defaults to `120`. |
+| `--no-autoclose` | Take the screenshot without starting the watchdog. |
+| `--close` | Close a running editor right away (quit via DBus, `flatpak kill` as fallback) and exit. |
+| `--watch` | Run only the watchdog against an already running editor; used internally by the systemd user service. |
+| `-h, --help` | Show the usage message. |
+
+Environment: `SCREENSHOT_APP_ID` (Flatpak app ID, defaults to `be.alexandervanhee.gradia`), `SCREENSHOT_IDLE`, `SCREENSHOT_POLL` and `SCREENSHOT_STARTUP` set the same values as the corresponding flags.
+
+**Examples:**
+```bash
+screenshot
+screenshot --idle 60
+screenshot --no-autoclose
+screenshot --close
 ```
 
 ### `xorwayland`
