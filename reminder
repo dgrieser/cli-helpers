@@ -31,7 +31,7 @@ Active reminders are *.md files. Marking one as done renames it to
 <name>.md_<timestamp> so it drops out of every listing without being lost.
 
 The display order of active reminders is kept in ${ORDER_FILE} and applied to
-every listing (--print included). Reminders missing from that file (e.g. added
+every listing (--print/--list included). Reminders missing from that file (e.g. added
 from outside this tool) sort on top, newest-modified first. The order file is
 rewritten whenever a change is actually applied.
 
@@ -42,8 +42,8 @@ esc or Ctrl+C exit with the real reminders untouched. Tab switches between the
 open (active) and done (completed) views; both list newest-modified first.
 
 Options:
-  --print               Render all reminders with glow and exit
-  --add                 Open an editor to write a new reminder and exit
+  -p, --print, --list   Render all reminders with glow and exit
+  -a, --add             Open an editor to write a new reminder and exit
   -h, --help            Show this help message and exit
 
 Edit-mode keys:
@@ -93,7 +93,7 @@ list_files_by_mtime() {
 #   1. files NOT listed in ORDER_FILE first, newest-modified first
 #   2. then files listed in ORDER_FILE, in that order, skipping any that no
 #      longer exist.
-# This is the single source of truth for ordering used by --print and edit mode.
+# This is the single source of truth for ordering used by --print/--list and edit mode.
 list_files_ordered() {
     local f base line
     declare -A in_order=()
@@ -343,7 +343,7 @@ read_key() {
 
 # Resolve the glow style to render previews with into the global GLOW_STYLE.
 # Honors $REMINDER_GLOW_STYLE, then the "style" key in glow.yml, else "dark".
-# (--print's glow writes to a tty so it already picks up glow.yml on its own;
+# (--print/--list's glow writes to a tty so it already picks up glow.yml on its own;
 # the preview pipes glow into a substitution, which strips style + colour, so it
 # must pass the style explicitly.)
 resolve_glow_style() {
@@ -940,12 +940,12 @@ while [ "${#}" -gt 0 ]; do
         -h|--help)
             usage
             ;;
-        --print)
-            [ "${mode}" != "edit" ] && fail "Only one of --print or --add may be given"
+        -p|--print|--list)
+            [ "${mode}" != "edit" ] && fail "Only one of --print/--list or --add may be given"
             mode="print"
             ;;
-        --add)
-            [ "${mode}" != "edit" ] && fail "Only one of --print or --add may be given"
+        -a|--add)
+            [ "${mode}" != "edit" ] && fail "Only one of --print/--list or --add may be given"
             mode="add"
             ;;
         -*)

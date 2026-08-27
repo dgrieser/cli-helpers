@@ -1560,8 +1560,8 @@ An interactive terminal tool for managing Markdown reminders stored in `~/.cache
 
 | Argument / Flag | Description |
 |---|---|
-| `--print` | Render all active reminders with `glow` and exit. |
-| `--add` | Open an editor to compose a single new reminder, save it, and exit. |
+| `-p, --print, --list` | Render all active reminders with `glow` and exit. |
+| `-a, --add` | Open an editor to compose a single new reminder, save it, and exit. |
 | `-h, --help` | Show the help message and exit. |
 
 Default edit-mode keybindings: `↑`/`↓` (or `k`/`j`) move between reminders; `tab` switches open/done views; `shift+↑`/`shift+↓` scroll the preview; `space` toggles done; `o` enters reorder mode (open view); `e` edits in vim; `n` adds a new reminder; `enter` saves all staged changes; `esc` backs out / aborts (prompting to discard if anything is staged).
@@ -1569,8 +1569,8 @@ Default edit-mode keybindings: `↑`/`↓` (or `k`/`j`) move between reminders; 
 **Examples:**
 ```bash
 reminder
-reminder --print
-reminder --add
+reminder --print   # or --list / -p
+reminder --add     # or -a
 ```
 
 ---
