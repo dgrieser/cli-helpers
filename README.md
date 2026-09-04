@@ -499,7 +499,7 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `-a, --agent AGENT` | Only use sessions of `claude` or `codex` (default: both). |
 | `-l, --last` | Print the latest session. |
 | `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
-| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 10); cannot be combined with `--limit`. |
+| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 60); cannot be combined with `--limit`. |
 | `-A, --all-directories` | List sessions from all recorded working directories instead of only the current directory. |
 | `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
 | `-P, --prompt-column` | Show the first prompt as a column of its own; without it the prompt stays searchable in the picker. |
@@ -509,17 +509,19 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
 | `--verbose` | Print verbose diagnostic output to stderr. |
 
-By default, listings include sessions from the current directory active within the last 10 days. `--all-directories` includes every recorded working directory. `--days` changes the age window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+By default, listings include sessions from the current directory active within the last 60 days. `--all-directories` includes every recorded working directory. `--days` changes the age window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
 
 Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
 
-The picker binds `/` to prompt for a case-insensitive message search, `enter` to print rendered Markdown, `alt-enter` to print raw Markdown, `ctrl-c` to copy raw Markdown to the clipboard, `tab` to toggle between all folders and the current folder, `ctrl-f` to fork, `ctrl-x` to resume the session in its own directory, `alt-x` to continue it in the current directory, `ctrl-r` to refresh the session list and preview, and `esc` to exit.
+The picker binds `/` to prompt for a case-insensitive message search, `enter` to use the selected session, `tab` to toggle between all folders and the current folder, `ctrl-a` to walk the agent filter, `ctrl-r` to refresh the session list and preview, `esc` to clear an active search and to exit without one, and `ctrl-c` to exit.
 
-`alt-x` continues a session of another folder in the one the picker was started from, which is what browsing all folders is usually for. Both CLIs look a session up in the project of their working directory, so this only continues the session itself where the agent can be told which directory to work in: `codex resume -C DIR ID` does that, and a session of the current folder resumes natively anyway. For a claude session of another folder the conversation is handed to a fresh session in the current directory as context, the same way a fork into another agent works.
+`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were, so a wrong turn costs one key and not a restart. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print`. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` - both of them, also where they are the same folder, so the keys of the question stay put - and `...`, which asks for one with directory completion under the prompt `Folder:`; then for the agent, with completion over `claude` and `codex` and the session's own as the default. `Print` asks for `Markdown` or `Raw`. Every answered question stays on screen, so the way through them reads back as `Continue session: Fork` / `Fork in: ~/workspace/tool (session)` / `Fork with: codex`.
 
-Searching and switching the folder scope happen inside the running picker instead of it being closed and opened again: the scope and the search live in a state file the list command reads, so a key only changes that file and reloads the list - showing the newest 20 sessions again and loading the rest in the background, the way the picker started. The prompt names what is shown, the folder of the current directory or `all` in the color of the directory column, followed by `~ PATTERN` in the color of the title column while a search is active, and then the arrow of the picker in its own color; so the scope and the search stay visible, while the fzf filter and the cursor are kept as they are. The search prompt is pre-filled with the active pattern, so it can be edited or emptied to clear the search; an aborted prompt keeps it. `backspace` clears the search as well, but only while there is one - without a search it stays the key that erases the fzf filter. The clipboard confirmation and the exact resume or fork command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal.
+The questions are asked while the picker is still running: `enter` hands the terminal over for them and leaves their answers in a file, and the picker turns that file into what it does next - the action once there are answers, nothing at all while there are none. That is what lets `esc` fall back into a picker that was never closed.
 
-Fork prompts for the target agent with completion over `claude` and `codex`, defaulting to the session's current agent. Same-agent forks use the CLI's native fork support (`codex fork` or Claude's `--fork-session`). Cross-agent forks include the complete rendered conversation context and launch the target in the original working directory. Claude can open directly at an empty prompt with the context injected as additional system instructions. Codex receives the context as an initial wait-for-the-user prompt; unusually large transcripts are loaded from a temporary file to avoid command-line size limits. `shift-enter` is unavailable because fzf does not expose it as a distinct key.
+Searching, switching the folder scope and filtering by agent happen inside the running picker instead of it being closed and opened again: all three live in a state file the list command reads, so a key only changes that file and reloads the list - showing the newest 20 sessions again and loading the rest in the background, the way the picker started. They combine, so a search stays in place while the agent filter walks over it and the other way round. `ctrl-a` walks that filter over both agents, `claude` only and `codex` only, starting from whatever the invocation selected, so `claude-session` reaches the codex sessions as well. The prompt names what is shown: the agent in its own color while one is selected, then the folder of the current directory or `all` in the color of the directory column, followed by `~ PATTERN` in the color of the title column while a search is active, and then the arrow of the picker in its own color; so the filter, the scope and the search stay visible, while the fzf filter and the cursor are kept as they are. The search prompt is pre-filled with the active pattern, so it can be edited or emptied to clear the search; an aborted prompt keeps it. `esc` clears the search as well, but only while there is one - without a search it leaves the picker. It decides that from the same state file: the key hands the actions of a cleared search to a command that either clears and answers with them, or answers with the exit. The clipboard confirmation and the exact resume or fork command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal.
+
+A fork takes the shortest route to the chosen folder that the CLIs allow. With the same agent the native fork support is used where it reaches: `codex fork -C DIR ID` forks in any directory because codex takes the working root as an argument, `claude --resume ID --fork-session` only in the folder the session was recorded in, because claude looks a session up in the project of its working directory. Everything else - the other agent, or a claude session forked into another folder - starts a fresh session with the complete rendered conversation handed over as its first prompt, `claude PROMPT` or `codex -C DIR PROMPT`. A transcript over 100000 bytes stays in its temporary file and the prompt tells the agent to read it, so no command line grows too large.
 
 **Examples:**
 ```bash
@@ -1605,6 +1607,7 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--prefill <text>` | Pre-filled, editable input text for single-line, completion and multi-line mode. Wins over `-d`, which then keeps its `(default)` hint and stays the fallback for an emptied input. Not valid with `--protected` or in select mode. |
 | `--height <n>` | Maximum number of list rows shown at once; defaults to what fits the terminal. |
 | `--no-color` | Disable colored output (also honored: `NO_COLOR`, `TERM=dumb`, non-terminal output). |
+| `--no-abort-message` | Leave the terminal as it was when the prompt is aborted, instead of noting the abort on a line of its own. For a caller that asks the next question in its place, e.g. one whose `esc` steps back to the question before. |
 | `<items ...>` | Select/completion mode only: the list items or completion candidates. Lines piped on stdin are appended to them. |
 
 All modes draw their prompt on stderr (select and completion mode fall back to `/dev/tty` when stderr is redirected) and print the result to stdout. Colors come from the same `COLOR_*` variables the [color-parse](#color-parse) family uses and are dropped automatically when the output is not a terminal, when `--no-color` is given, or when `NO_COLOR` is set or `TERM` is empty/`dumb`:
@@ -2158,6 +2161,66 @@ cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 ## Window and Display Management
 
 These tools work on both X11 (via `xdotool`/`wmctrl`/`xrandr`) and Wayland/GNOME (via the bundled `cli-helpers-window-bridge` GNOME Shell extension installed by `make install`).
+
+### `browser-router`
+Acts as the default browser and decides per URL where it opens. Regular URLs go to the normal browser, while URLs belonging to an interactive authentication flow open in a small chromeless window that stays above other windows (see `browser-2fa-window`), so a login prompt started from the command line cannot get lost behind the browser window.
+
+A URL counts as an authentication URL when it is a loopback URL on one of the authentication ports, a loopback URL on one of the probe ports that answers with a redirect to an authorization endpoint, or a URL on one of the authentication hosts whose path matches the authentication path pattern.
+
+The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
+
+Register it as the default browser with `xdg-settings set default-web-browser browser-router.desktop`. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well.
+
+**Usage:** `browser-router [OPTIONS] [URL ...]`
+
+**Options:**
+- `-a`, `--auth` — treat every URL as an authentication URL
+- `-r`, `--regular` — treat every URL as a regular URL
+- `-d`, `--dry-run` — print the routing decision without opening anything
+- `-n`, `--no-probe` — never probe loopback URLs
+- `-h`, `--help` — show the help message and exit
+
+**Configuration:** `~/.config/cli-helpers/browser-router.conf`, overridden by the environment:
+- `BROWSER_ROUTER_BROWSER` — regular browser command (default `google-chrome`)
+- `BROWSER_ROUTER_AUTH_COMMAND` — command opening authentication URLs (default `browser-2fa-window`)
+- `BROWSER_ROUTER_AUTH_PORTS` — loopback ports counting as authentication (default `47823 47824`)
+- `BROWSER_ROUTER_PROBE_PORTS` — loopback ports decided by a probe (default `8000 18000`)
+- `BROWSER_ROUTER_PROBE_TIMEOUT` — probe timeout in seconds (default `1`)
+- `BROWSER_ROUTER_AUTH_HOSTS` — hosts counting as authentication
+- `BROWSER_ROUTER_AUTH_PATH_REGEX` — path pattern for authentication hosts
+- `BROWSER_ROUTER_AUTH_REDIRECT_REGEX` — redirect pattern accepted by the probe
+- `BROWSER_ROUTER_LOG` — log file for routing decisions
+
+**Examples:**
+```bash
+browser-router --dry-run http://localhost:8000 https://example.com
+browser-router https://example.com
+kubectl oidc-login get-token --browser-command=browser-router ...
+```
+
+### `browser-2fa-window`
+Opens a URL in a small chromeless browser window that stays above other windows, meant for interactive authentication (2FA/OIDC) prompts. The window uses the regular browser profile, so an existing single sign-on session is reused.
+
+The window is opened with the browser's `--app` mode, which leaves out the tab strip and the address bar. On X11 the browser applies the geometry itself; on Wayland the window is moved and resized through the window bridge afterwards, which needs a GNOME Shell restart after the extension has been updated.
+
+**Usage:** `browser-2fa-window [OPTIONS] URL`
+
+**Options:**
+- `-s`, `--size WIDTHxHEIGHT` — window size (default `520x780`)
+- `-p`, `--position POSITION` — window position as `X,Y`, or `center`, `pointer`, `active` (default `center`)
+- `-b`, `--browser BROWSER` — browser command to use (default `google-chrome`)
+- `-t`, `--timeout SECONDS` — how long to wait for the window to appear (default `10`)
+- `--no-above` — do not keep the window above other windows
+- `-q`, `--quiet` — do not print the window ID
+- `-h`, `--help` — show the help message and exit
+
+**Environment:** `CLI_HELPERS_2FA_BROWSER`, `CLI_HELPERS_2FA_SIZE`, `CLI_HELPERS_2FA_POSITION` and `CLI_HELPERS_2FA_TIMEOUT` change the defaults.
+
+**Examples:**
+```bash
+browser-2fa-window http://localhost:8000
+browser-2fa-window --size 480x720 --position pointer https://auth.example.com/realms/master/protocol/openid-connect/auth
+```
 
 ### `window-active`
 Prints the window ID of the currently focused (active) window, on both Wayland and X11.

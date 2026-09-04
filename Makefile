@@ -7,6 +7,10 @@ LIBDIR ?= $(PREFIX)/lib/cli-helpers
 PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
 COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
 COMPLETION := bash_completion/cli-helpers
+# desktop entries are per-user, like the GNOME extension
+DESKTOPDIR ?= $(HOME)/.local/share/applications
+DESKTOPSRCDIR := desktop
+DESKTOPS := browser-router.desktop
 ENABLE_GNOME_EXTENSION ?= 1
 UPDATE_ARGS ?=
 
@@ -24,7 +28,7 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list update install install-links extension-zip install-gnome-extension install-completions install-completions-links uninstall list-install
+.PHONY: list update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
@@ -34,6 +38,7 @@ list:
 	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
+	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
 	@printf '  sudo make uninstall           Remove installed files\n'
@@ -61,6 +66,7 @@ install:
 	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
 	$(MAKE) install-gnome-extension
 	$(MAKE) install-completions
+	$(MAKE) install-desktop
 	for link in $(LINKS); do \
 		target="$$(readlink "$$link")"; \
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
@@ -92,6 +98,7 @@ install-links:
 	done
 	$(MAKE) install-gnome-extension
 	$(MAKE) install-completions-links
+	$(MAKE) install-desktop-links
 	for link in $(LINKS); do \
 		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
@@ -138,6 +145,25 @@ install-completions-links:
 		ln -sfn "$(REPO_DIR)/$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
 	done
 
+install-desktop:
+	[ -d "$(DESTDIR)$(DESKTOPDIR)" ] || mkdir -p "$(DESTDIR)$(DESKTOPDIR)"
+	for entry in $(DESKTOPS); do \
+		install -m 0644 "$(DESKTOPSRCDIR)/$$entry" "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+		sed -i 's#/usr/local/bin#$(BINDIR)#g' "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
+
+install-desktop-links:
+	[ -d "$(DESTDIR)$(DESKTOPDIR)" ] || mkdir -p "$(DESTDIR)$(DESKTOPDIR)"
+	for entry in $(DESKTOPS); do \
+		ln -sfn "$(REPO_DIR)/$(DESKTOPSRCDIR)/$$entry" "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
+
 uninstall:
 	for script in $(SCRIPTS) $(LINKS); do \
 		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
@@ -157,6 +183,12 @@ uninstall:
 		esac; \
 	done
 	rm -f "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
+	for entry in $(DESKTOPS); do \
+		rm -f "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
 	gnome-extensions uninstall "$(EXTENSION_UUID)" || true
 
 list-install:
@@ -169,3 +201,5 @@ list-install:
 	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
 	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
 	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"
+	@printf 'Desktop entries -> %s\n' "$(DESTDIR)$(DESKTOPDIR)"
+	@printf '%s\n' $(DESKTOPS) | sed 's#^#  $(DESKTOPSRCDIR)/#'

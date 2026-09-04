@@ -9,7 +9,7 @@ EXTENSION_UUID="cli-helpers-window-bridge@dgrieser.de"
 EXTENSION_DIR="${CLI_HELPERS_EXTENSION_DIR:-/usr/local/share/gnome-shell/extensions/${EXTENSION_UUID}}"
 
 usage() {
-    echo "usage: $(basename "${0}") <list|active|focus|pointer-monitor|active-monitor|set-above> [argument]" 1>&2
+    echo "usage: $(basename "${0}") <list|active|focus|pointer-monitor|active-monitor|set-above|set-geometry> [argument ...]" 1>&2
     exit 1
 }
 
@@ -71,6 +71,10 @@ case "${1}" in
     set-above)
         [ "$#" -eq 2 ] || usage
         call_bridge SetWindowAbove "${2}" >/dev/null
+        ;;
+    set-geometry)
+        [ "$#" -eq 6 ] || usage
+        call_bridge SetWindowGeometry "${2}" "${3}" "${4}" "${5}" "${6}" >/dev/null
         ;;
     *)
         usage

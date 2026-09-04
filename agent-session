@@ -44,7 +44,7 @@ Options:
     -a, --agent AGENT   Only use sessions of AGENT (claude or codex; default: both)
     -l, --last          Print the latest session
     -n, --limit LIMIT   Limit sessions by count instead of age
-    -d, --days DAYS     Only list sessions active within DAYS (default: 10)
+    -d, --days DAYS     Only list sessions active within DAYS (default: 60)
     -A, --all-directories
                         List sessions from all directories (default: current)
     -p, --print         Print the session table instead of opening the picker
@@ -60,16 +60,19 @@ Called as claude-session or codex-session the matching agent is preselected.
 
 Interactive keys:
     /                   Search messages case-insensitively
-    backspace           Clear an active interactive search
-    enter               Print rendered Markdown
-    alt-enter           Print raw Markdown
-    ctrl-c              Copy raw Markdown to the clipboard
+    enter               Use the session: asks what is to happen with it
     tab                 Toggle sessions from the current directory only
-    ctrl-f              Fork the session, optionally with another agent
-    ctrl-x              Resume the session in its original directory
-    alt-x               Continue the session in the current directory
+    ctrl-a              Walk the agent filter: both, claude only, codex only
     ctrl-r              Refresh sessions
-    esc                 Exit
+    esc                 Clear an active search, exit without one
+    ctrl-c              Exit
+
+Asked for the selected session, esc stepping back one question and out of
+the first one into the picker again:
+    Resume              Resume the session in its original directory
+    Fork                Continue it, asking for the folder and the agent
+    Copy                Copy raw Markdown to the clipboard
+    Print               Print it, asking for rendered Markdown or raw
 EOF
     exit 1
 }
@@ -154,13 +157,19 @@ shorten_text() {
     echo "${text:0:$((max_length - 3))}..."
 }
 
-format_cwd() {
-    local cwd="${1}"
+display_path() {
+    local path="${1}"
     local home_display="~"
 
-    [ "${cwd}" = "${HOME}" ] && cwd="${home_display}"
-    [[ "${cwd}" == "${HOME}/"* ]] && cwd="${home_display}/${cwd#"${HOME}/"}"
-    shorten_path "${cwd}" "${directory_max_length}"
+    [ "${path}" = "${HOME}" ] && path="${home_display}"
+    [[ "${path}" == "${HOME}/"* ]] && path="${home_display}/${path#"${HOME}/"}"
+    printf '%s' "${path}"
+}
+
+format_cwd() {
+    local cwd="${1}"
+
+    shorten_path "$(display_path "${cwd}")" "${directory_max_length}"
 }
 
 # Common jq snippets. Both agents end up with a list of {role, text} objects,
@@ -457,9 +466,11 @@ format_ages() {
 # live in a file instead of in the arguments of the command that lists the
 # sessions - that command is fixed once the picker runs, its output is not
 fzf_state_file=""
+fzf_answer_file=""
 
 write_fzf_state() {
     {
+        printf 'agents=%q\n' "${agents}"
         printf 'current_directory_only=%q\n' "${current_directory_only}"
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'igrep_pattern=%q\n' "${igrep_pattern}"
@@ -472,27 +483,51 @@ read_fzf_state() {
     . "${fzf_state_file}"
 }
 
-# the prompt of the picker names what it currently shows, so the scope and the
-# search stay visible after they were changed. The scope and the search carry the
-# colors of the columns they name; the arrow that follows them is left alone, so
-# it keeps the prompt color of the picker.
+# the prompt of the picker names what it currently shows, so the agent filter,
+# the scope and the search stay visible after they were changed. Each of them
+# carries the color of the column it names - the agent the color of its own
+# agent - and only both agents go unnamed, that being what the scope word "all"
+# would read as twice. The arrow that follows them is left alone, so it keeps the
+# prompt color of the picker.
 print_fzf_prompt() {
     local scope="all"
 
+    [ "${agents}" != "${all_agents}" ] \
+        && printf '%s%s%s ' "$(agent_color "${agents}")" "${agents}" "${C_RESET}"
     [ "${current_directory_only}" -eq 1 ] && scope="$(basename -- "${current_directory}")"
     printf '%s%s%s' "${C_DIRECTORY}" "${scope}" "${C_RESET}"
     [ -n "${igrep_pattern}" ] && printf '%s ~ %s%s' "${C_TITLE}" "${igrep_pattern}" "${C_RESET}"
     printf ' > '
 }
 
-# backspace clears the search, but only while there is one to clear; without a
-# search it stays the key that erases the query
-print_fzf_clear_binding() {
-    if [ -n "${igrep_pattern}" ]; then
-        printf 'rebind(bspace)'
-    else
-        printf 'unbind(bspace)'
+# esc clears an active search and leaves the picker without one. The clearing
+# happens here, so the actions handed back only have to bring the list and the
+# prompt in line with the state that was just written.
+print_fzf_escape() {
+    if [ -z "${grep_pattern}" ] && [ -z "${igrep_pattern}" ]; then
+        printf 'abort'
+        return
     fi
+    grep_pattern=""
+    igrep_pattern=""
+    write_fzf_state
+    printf '%s' "${fzf_escape_actions}"
+}
+
+# the agent filter walks both agents -> claude -> codex and around again, so one
+# key reaches every listing without a direction to remember
+cycle_fzf_agents() {
+    case "${agents}" in
+        claude)
+            agents="codex"
+            ;;
+        codex)
+            agents="${all_agents}"
+            ;;
+        *)
+            agents="claude"
+            ;;
+    esac
 }
 
 fzf_list_command() {
@@ -510,11 +545,11 @@ fzf_list_command() {
         arguments+=(--days "${days}")
     fi
 
-    [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
     [ "${prompt_column}" -eq 1 ] && arguments+=(--prompt-column)
     if [ -n "${fzf_state_file}" ]; then
         arguments+=(--fzf-state "${fzf_state_file}")
     else
+        [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
         [ "${current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
         [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
         [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
@@ -603,9 +638,11 @@ resume_session() {
 }
 
 # Continue the conversation in a fresh session of the target agent, with the
-# rendered conversation handed over as its context. That is how a fork into
-# another agent works, and how a session of another folder is continued in this
-# one when the agent cannot be told where to look for it.
+# rendered conversation handed over as its first prompt. That is how a fork into
+# another agent works, and how a claude session of another folder is continued
+# in this one, where the agent cannot be told where to look for it. Neither CLI
+# takes a conversation as a file, so a transcript too large for a command line
+# stays in its file and the agent is told to read it.
 continue_with_context() {
     local agent="${1}"
     local target_agent="${2}"
@@ -614,31 +651,36 @@ continue_with_context() {
     local context_file
     local context_size
     local fork_prompt
+    local fork_prompt_display
     local fork_command
     local cleanup_command
 
+    cd -- "${cwd}" || fail "Cannot enter directory: ${cwd}"
     context_file="$(create_fork_context "${agent}" "${filepath}")"
     printf -v cleanup_command 'rm -f -- %q' "${context_file}"
     # The trap deliberately captures the exact generated filename now.
     # shellcheck disable=SC2064
     trap "${cleanup_command}" EXIT
+
+    context_size="$(wc -c < "${context_file}")"
+    if [ "${context_size}" -le "${fork_prompt_max_bytes}" ]; then
+        fork_prompt="$(< "${context_file}")"
+        # This is the muted command display; expansion happens when copied and run.
+        # shellcheck disable=SC2016
+        printf -v fork_prompt_display '"$(< %q)"' "${context_file}"
+    else
+        printf -v fork_prompt 'User wants to continue a previous %s session. Read the complete context from %s. Do nothing else for now. Wait for the next user prompt.' "${agent}" "${context_file}"
+        printf -v fork_prompt_display '%q' "${fork_prompt}"
+    fi
+
     case "${target_agent}" in
         claude)
-            printf -v fork_command 'cd -- %q && claude --append-system-prompt-file %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${context_file}"
+            printf -v fork_command 'cd -- %q && claude %s </dev/tty >/dev/tty 2>&1' "${cwd}" "${fork_prompt_display}"
             muted "${fork_command}"
-            claude --append-system-prompt-file "${context_file}" </dev/tty >/dev/tty 2>&1
+            claude "${fork_prompt}" </dev/tty >/dev/tty 2>&1
             ;;
         codex)
-            context_size="$(wc -c < "${context_file}")"
-            if [ "${context_size}" -le "${fork_prompt_max_bytes}" ]; then
-                fork_prompt="$(< "${context_file}")"
-                # This is the muted command display; expansion happens when copied and run.
-                # shellcheck disable=SC2016
-                printf -v fork_command 'cd -- %q && codex -C %q "$(< %q)" </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${context_file}"
-            else
-                printf -v fork_prompt 'User wants to continue a previous %s session. Read the complete context from %s. Do nothing else for now. Wait for the next user prompt.' "${agent}" "${context_file}"
-                printf -v fork_command 'cd -- %q && codex -C %q %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${fork_prompt}"
-            fi
+            printf -v fork_command 'cd -- %q && codex -C %q %s </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${fork_prompt_display}"
             muted "${fork_command}"
             codex -C "${cwd}" "${fork_prompt}" </dev/tty >/dev/tty 2>&1
             ;;
@@ -663,6 +705,220 @@ create_fork_context() {
     printf '%s' "${context_file}"
 }
 
+ask_session_action() {
+    prompt-select --prompt "Continue session:" --no-abort-message \
+        "resume=Resume" \
+        "fork=Fork" \
+        "clipboard=Copy" \
+        "print=Print" \
+        </dev/tty
+}
+
+# The fork picks its working root before its agent, so the folder of the picker
+# and the folder of the session are one key each and any other one is typed with
+# completion. Both are listed even where they are the same folder, so the keys of
+# the question stay where they are from session to session.
+ask_fork_directory() {
+    local session_directory="${1}"
+    local entries=()
+    local choice
+
+    entries+=("here=$(display_path "${current_directory}") (current)")
+    [ -n "${session_directory}" ] \
+        && entries+=("session=$(display_path "${session_directory}") (session)")
+    entries+=("other=...")
+
+    choice="$(prompt-select --prompt "Fork in:" --no-abort-message \
+        "${entries[@]}" </dev/tty)" || return 1
+    case "${choice}" in
+        here)
+            printf '%s' "${current_directory}"
+            ;;
+        session)
+            printf '%s' "${session_directory}"
+            ;;
+        other)
+            choice="$(prompt-folder --prompt "Folder:" --no-abort-message </dev/tty)" || return 1
+            [ -n "${choice}" ] || return 1
+            printf '%s' "$(realpath -m -- "${choice}")"
+            ;;
+    esac
+}
+
+ask_fork_agent() {
+    local agent="${1}"
+    local choice
+
+    choice="$(prompt-complete --prompt "Fork with:" --default "${agent}" \
+        --no-abort-message claude codex </dev/tty)" || return 1
+    case "${choice}" in
+        claude | codex)
+            printf '%s' "${choice}"
+            ;;
+        *)
+            fail "Unknown fork agent: ${choice}"
+            ;;
+    esac
+}
+
+ask_print_format() {
+    prompt-select --prompt "Print:" --no-abort-message \
+        "markdown=Markdown" \
+        "raw=Raw" \
+        </dev/tty
+}
+
+# What is to happen with the selected session is asked while the picker is still
+# open, in as many steps as the answer needs, and the answers are left in a file
+# for the action that runs once the picker is gone. Esc steps back to the
+# question before it; out of the first one it answers nothing, which is what
+# leaves the picker as it was.
+session_ask() {
+    local agent="${1}"
+    local filepath="${2}"
+    local step="action"
+    local action=""
+    local directory=""
+    local target_agent=""
+    local format=""
+    local session_directory
+
+    command -v prompt-select >/dev/null 2>&1 || fail "prompt-select not found"
+    command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
+    command -v prompt-folder >/dev/null 2>&1 || fail "prompt-folder not found"
+    : > "${fzf_answer_file}" || fail "Cannot write the answers of the picker"
+    session_directory="$(session_cwd "${agent}" "${filepath}")"
+
+    while true; do
+        case "${step}" in
+            action)
+                action="$(ask_session_action)" || return 0
+                case "${action}" in
+                    resume | clipboard)
+                        break
+                        ;;
+                    fork)
+                        step="directory"
+                        ;;
+                    print)
+                        step="format"
+                        ;;
+                    *)
+                        fail "Unknown session action: ${action}"
+                        ;;
+                esac
+                ;;
+            directory)
+                if directory="$(ask_fork_directory "${session_directory}")"; then
+                    step="agent"
+                else
+                    step="action"
+                fi
+                ;;
+            agent)
+                if target_agent="$(ask_fork_agent "${agent}")"; then
+                    break
+                else
+                    step="directory"
+                fi
+                ;;
+            format)
+                if format="$(ask_print_format)"; then
+                    break
+                else
+                    step="action"
+                fi
+                ;;
+        esac
+    done
+
+    {
+        printf 'answered_action=%q\n' "${action}"
+        printf 'answered_format=%q\n' "${format}"
+        printf 'answered_directory=%q\n' "${directory}"
+        printf 'answered_agent=%q\n' "${target_agent}"
+    } > "${fzf_answer_file}"
+}
+
+# an unanswered question leaves the file empty, so there is nothing to become
+print_fzf_become() {
+    local agent="${1}"
+    local filepath="${2}"
+
+    [ -s "${fzf_answer_file}" ] || return 0
+    printf 'become(%s --fzf-answers %q --fzf-action run %q %q)' \
+        "${script_path}" "${fzf_answer_file}" "${agent}" "${filepath}"
+}
+
+session_run() {
+    local agent="${1}"
+    local filepath="${2}"
+    local answered_action=""
+    local answered_format=""
+    local answered_directory=""
+    local answered_agent=""
+
+    [ -s "${fzf_answer_file}" ] || return 0
+    # shellcheck source=/dev/null
+    . "${fzf_answer_file}"
+    case "${answered_action}" in
+        resume | clipboard)
+            fzf_action "${answered_action}" "${agent}" "${filepath}"
+            ;;
+        print)
+            fzf_action "${answered_format}" "${agent}" "${filepath}"
+            ;;
+        fork)
+            fork_session "${agent}" "${filepath}" "${answered_agent}" "${answered_directory}"
+            ;;
+        *)
+            fail "Unknown session action: ${answered_action}"
+            ;;
+    esac
+}
+
+# Continue the session in the chosen folder, taking the shortest route the CLIs
+# allow: codex takes the working root as an argument and forks natively wherever
+# it is started, claude looks a session up in the project of the working
+# directory and forks natively only in the folder the session was recorded in.
+# Everything else - the other agent, or a claude session of another folder -
+# starts fresh with the conversation handed over as context.
+fork_session() {
+    local agent="${1}"
+    local filepath="${2}"
+    local target_agent="${3}"
+    local directory="${4}"
+    local cwd
+    local session_id
+    local fork_command
+
+    command -v "${target_agent}" >/dev/null 2>&1 || fail "${target_agent} not found"
+    [ -d "${directory}" ] || fail "Directory not found: ${directory}"
+
+    cwd="$(session_cwd "${agent}" "${filepath}")"
+    cd -- "${directory}" || fail "Cannot enter directory: ${directory}"
+
+    if [ "${target_agent}" = "${agent}" ]; then
+        session_id="$(session_id_of "${agent}" "${filepath}")"
+        case "${agent}" in
+            claude)
+                if [ "${cwd}" = "${directory}" ]; then
+                    printf -v fork_command 'cd -- %q && claude --resume %q --fork-session </dev/tty >/dev/tty 2>&1' "${directory}" "${session_id}"
+                    muted "${fork_command}"
+                    exec claude --resume "${session_id}" --fork-session </dev/tty >/dev/tty 2>&1
+                fi
+                ;;
+            codex)
+                printf -v fork_command 'cd -- %q && codex fork -C %q %q </dev/tty >/dev/tty 2>&1' "${directory}" "${directory}" "${session_id}"
+                muted "${fork_command}"
+                exec codex fork -C "${directory}" "${session_id}" </dev/tty >/dev/tty 2>&1
+                ;;
+        esac
+    fi
+
+    continue_with_context "${agent}" "${target_agent}" "${filepath}" "${directory}"
+}
+
 fzf_action() {
     local action="${1}"
     local agent="${2}"
@@ -670,7 +926,6 @@ fzf_action() {
     local cwd
     local session_id
     local preview_width
-    local target_agent
 
     case "${agent}" in
         claude | codex)
@@ -682,6 +937,18 @@ fzf_action() {
     [ -f "${filepath}" ] || fail "Session file not found: ${filepath}"
 
     case "${action}" in
+        ask)
+            [ -n "${fzf_answer_file}" ] || fail "The picker questions require --fzf-answers"
+            session_ask "${agent}" "${filepath}"
+            ;;
+        become)
+            [ -n "${fzf_answer_file}" ] || fail "The picker questions require --fzf-answers"
+            print_fzf_become "${agent}" "${filepath}"
+            ;;
+        run)
+            [ -n "${fzf_answer_file}" ] || fail "The picker questions require --fzf-answers"
+            session_run "${agent}" "${filepath}"
+            ;;
         preview)
             preview_width="${FZF_PREVIEW_COLUMNS:-80}"
             raw_session_file "${agent}" "${filepath}" \
@@ -706,58 +973,6 @@ fzf_action() {
             [ -n "${cwd}" ] || fail "Session has no working directory"
             [ -d "${cwd}" ] || fail "Session directory not found: ${cwd}"
             resume_session "${agent}" "${filepath}" "${cwd}"
-            ;;
-        continue-here)
-            command -v "${agent}" >/dev/null 2>&1 || fail "${agent} not found"
-            cwd="$(session_cwd "${agent}" "${filepath}")"
-            [ -d "${current_directory}" ] || fail "Directory not found: ${current_directory}"
-            # A session of this folder is continued as it is, and codex takes the
-            # working root as an argument, so it continues as well. claude looks a
-            # session up in the project of the working directory, so a session of
-            # another folder is handed to a fresh session here as context.
-            if [ "${cwd}" = "${current_directory}" ] || [ "${agent}" = "codex" ]; then
-                resume_session "${agent}" "${filepath}" "${current_directory}"
-            fi
-            cd -- "${current_directory}" || fail "Cannot enter directory: ${current_directory}"
-            continue_with_context "${agent}" "${agent}" "${filepath}" "${current_directory}"
-            ;;
-        fork)
-            command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
-            target_agent="$(prompt-complete \
-                --prompt "Fork with:" \
-                --default "${agent}" \
-                claude codex </dev/tty)" || exit 0
-            case "${target_agent}" in
-                claude | codex)
-                    ;;
-                *)
-                    fail "Unknown fork agent: ${target_agent}"
-                    ;;
-            esac
-            command -v "${target_agent}" >/dev/null 2>&1 || fail "${target_agent} not found"
-
-            cwd="$(session_cwd "${agent}" "${filepath}")"
-            [ -n "${cwd}" ] || fail "Session has no working directory"
-            [ -d "${cwd}" ] || fail "Session directory not found: ${cwd}"
-            cd -- "${cwd}" || fail "Cannot enter session directory: ${cwd}"
-
-            if [ "${target_agent}" = "${agent}" ]; then
-                session_id="$(session_id_of "${agent}" "${filepath}")"
-                case "${agent}" in
-                    claude)
-                        printf -v fork_command 'cd -- %q && claude --resume %q --fork-session </dev/tty >/dev/tty 2>&1' "${cwd}" "${session_id}"
-                        muted "${fork_command}"
-                        exec claude --resume "${session_id}" --fork-session </dev/tty >/dev/tty 2>&1
-                        ;;
-                    codex)
-                        printf -v fork_command 'cd -- %q && codex fork -C %q %q </dev/tty >/dev/tty 2>&1' "${cwd}" "${cwd}" "${session_id}"
-                        muted "${fork_command}"
-                        exec codex fork -C "${cwd}" "${session_id}" </dev/tty >/dev/tty 2>&1
-                        ;;
-                esac
-            fi
-
-            continue_with_context "${agent}" "${target_agent}" "${filepath}" "${cwd}"
             ;;
         *)
             fail "Unknown interactive action: ${action}"
@@ -861,14 +1076,16 @@ browse_sessions() {
     local initial_list_command
     local list_command
     local search_command
-    local clear_command
+    local escape_command
+    local ask_command
+    local become_command
     local toggle_directory_command
+    local cycle_agent_command
     local prompt_command
-    local clear_binding_command
     local reload_actions
     local key_descriptions
+    local answer_file_argument
     local fzf_query_arguments=()
-    local start_bindings=()
 
     [ -x "${fzf_with_header}" ] || fzf_with_header="$(command -v fzf-with-header)"
     [ -n "${fzf_with_header}" ] || fail "fzf-with-header not found"
@@ -877,18 +1094,24 @@ browse_sessions() {
 
     fzf_state_file="$(mktemp "${TMPDIR:-/tmp}/$(basename -- "${script_path}").state.XXXXXX")" \
         || fail "Cannot create the state file of the picker"
-    trap 'rm -f "${fzf_state_file}"' EXIT
+    # the questions of a selected session are asked while the picker is still
+    # open, so their answers are left here for the action that follows them
+    fzf_answer_file="$(mktemp "${TMPDIR:-/tmp}/$(basename -- "${script_path}").answers.XXXXXX")" \
+        || fail "Cannot create the answers file of the picker"
+    trap 'rm -f "${fzf_state_file}" "${fzf_answer_file}"' EXIT
     write_fzf_state
 
     printf -v script_command '%q' "${script_path}"
     initial_list_command="$(fzf_list_command initial)"
     list_command="$(fzf_list_command all)"
     search_command="$(fzf_state_command --fzf-search)"
-    clear_command="$(fzf_state_command --fzf-clear-search)"
     toggle_directory_command="$(fzf_state_command --fzf-toggle-directory)"
+    cycle_agent_command="$(fzf_state_command --fzf-cycle-agent)"
     prompt_command="$(fzf_state_command --fzf-prompt)"
-    clear_binding_command="$(fzf_state_command --fzf-clear-binding)"
     preview_command="${script_command} --fzf-action preview {2} {3}"
+    printf -v answer_file_argument '%q' "${fzf_answer_file}"
+    ask_command="${script_command} --fzf-answers ${answer_file_argument} --fzf-action ask {2} {3}"
+    become_command="${script_command} --fzf-answers ${answer_file_argument} --fzf-action become {2} {3}"
     [ -n "${fzf_query}" ] && fzf_query_arguments+=(--query "${fzf_query}")
 
     # a changed scope or search shows the first batch again and loads the rest in
@@ -896,12 +1119,15 @@ browse_sessions() {
     # it is bound again before the reload it reacts to
     reload_actions="rebind(load)+reload-sync(${initial_list_command})"
     reload_actions+="+transform-prompt(${prompt_command})"
-    reload_actions+="+transform(${clear_binding_command})"
 
-    key_descriptions="/:search,backspace:clear search,enter:print markdown,alt-enter:print raw,ctrl-c:copy raw,tab:folder scope,ctrl-f:fork,ctrl-x:resume,alt-x:continue here,ctrl-r:refresh,esc:exit"
-    # without a search there is nothing to clear, so backspace erases the query
-    # until a search sets it; the reload actions bind and unbind it from there on
-    [ -z "${igrep_pattern}" ] && start_bindings=(--bind "start:unbind(bspace)")
+    # esc decides between clearing the search and leaving, so it hands the
+    # actions of a cleared search over and gets back the one that applies. Its
+    # binding spells the command out after a colon instead of in parentheses,
+    # because the actions handed over carry parentheses of their own and fzf
+    # ends a parenthesized argument on the first one that closes.
+    escape_command="$(fzf_state_command --fzf-escape "${reload_actions}")"
+
+    key_descriptions="/:search,enter:use,tab:folder scope,ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
 
     "${fzf_with_header}" \
         --command "${initial_list_command}" \
@@ -916,18 +1142,13 @@ browse_sessions() {
         --preview "${preview_command}" \
         --preview-window 'right,60%,wrap' \
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
-        "${start_bindings[@]}" \
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
-        --bind "bspace:execute-silent(${clear_command})+${reload_actions}" \
         --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
-        --bind "enter:become(${script_command} --fzf-action markdown {2} {3})" \
-        --bind "alt-enter:become(${script_command} --fzf-action raw {2} {3})" \
-        --bind "ctrl-c:become(${script_command} --fzf-action clipboard {2} {3})" \
-        --bind "ctrl-f:become(${script_command} --fzf-action fork {2} {3})" \
-        --bind "ctrl-x:become(${script_command} --fzf-action resume {2} {3})" \
-        --bind "alt-x:become(${script_command} --fzf-action continue-here {2} {3})" \
+        --bind "ctrl-a:execute-silent(${cycle_agent_command})+${reload_actions}" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
-        --bind "esc:abort"
+        --bind "esc:transform:${escape_command}" \
+        --bind "ctrl-c:abort" \
+        --bind "enter:execute(${ask_command})+transform:${become_command}"
 }
 
 completion() {
@@ -992,10 +1213,11 @@ fzf_action_filepath=""
 fzf_list=0
 fzf_batch=""
 fzf_search=0
-fzf_clear_search=0
 fzf_toggle_directory=0
+fzf_cycle_agent=0
 fzf_print_prompt=0
-fzf_print_clear_binding=0
+fzf_print_escape=0
+fzf_escape_actions=""
 fzf_query=""
 grep_pattern=""
 igrep_pattern=""
@@ -1043,22 +1265,30 @@ while [ "${#}" -gt 0 ]; do
         --fzf-search)
             fzf_search=1
             ;;
-        --fzf-clear-search)
-            fzf_clear_search=1
-            ;;
         --fzf-toggle-directory)
             fzf_toggle_directory=1
+            ;;
+        --fzf-cycle-agent)
+            fzf_cycle_agent=1
             ;;
         --fzf-prompt)
             fzf_print_prompt=1
             ;;
-        --fzf-clear-binding)
-            fzf_print_clear_binding=1
+        --fzf-escape)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-escape"
+            fzf_print_escape=1
+            fzf_escape_actions="${1}"
             ;;
         --fzf-state)
             shift
             [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-state"
             fzf_state_file="${1}"
+            ;;
+        --fzf-answers)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-answers"
+            fzf_answer_file="${1}"
             ;;
         --fzf-query)
             shift
@@ -1153,8 +1383,8 @@ if [ -n "${fzf_state_file}" ]; then
         print_fzf_prompt
         exit 0
     fi
-    if [ "${fzf_print_clear_binding}" -eq 1 ]; then
-        print_fzf_clear_binding
+    if [ "${fzf_print_escape}" -eq 1 ]; then
+        print_fzf_escape
         exit 0
     fi
     if [ "${fzf_toggle_directory}" -eq 1 ]; then
@@ -1162,9 +1392,8 @@ if [ -n "${fzf_state_file}" ]; then
         write_fzf_state
         exit 0
     fi
-    if [ "${fzf_clear_search}" -eq 1 ]; then
-        grep_pattern=""
-        igrep_pattern=""
+    if [ "${fzf_cycle_agent}" -eq 1 ]; then
+        cycle_fzf_agents
         write_fzf_state
         exit 0
     fi
@@ -1178,8 +1407,8 @@ if [ -n "${fzf_state_file}" ]; then
         write_fzf_state
         exit 0
     fi
-elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_clear_binding}" -eq 1 ] \
-    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_clear_search}" -eq 1 ] \
+elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_escape}" -eq 1 ] \
+    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_cycle_agent}" -eq 1 ] \
     || [ "${fzf_search}" -eq 1 ]; then
     fail "The picker actions require --fzf-state"
 fi

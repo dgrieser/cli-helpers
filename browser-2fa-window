@@ -1,0 +1,327 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] URL
+
+Open URL in a small chromeless browser window that stays on top of other
+windows. Intended for interactive authentication (2FA/OIDC) flows started
+from the command line, so the login prompt does not get lost behind the
+regular browser window.
+
+The window uses the regular browser profile, so an existing single sign-on
+session is reused.
+
+Options:
+  -s, --size WIDTHxHEIGHT  Window size (default ${DEFAULT_SIZE})
+  -p, --position POSITION  Window position as X,Y, or one of 'center',
+                           'pointer', 'active' (default ${DEFAULT_POSITION})
+  -b, --browser BROWSER    Browser command to use (default ${DEFAULT_BROWSER})
+  -t, --timeout SECONDS    How long to wait for the window to appear
+                           (default ${DEFAULT_TIMEOUT})
+      --no-above           Do not keep the window above other windows
+  -q, --quiet              Do not print the window id
+  -h, --help               Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+resolve_helper() {
+    local name="${1}"
+
+    if [ -x "${SCRIPT_DIR}/${name}" ]; then
+        echo "${SCRIPT_DIR}/${name}"
+        return 0
+    fi
+    command -v "${name}" 2>/dev/null
+}
+
+window_ids() {
+    if cli_helpers_is_wayland; then
+        cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import sys
+
+for window in json.load(sys.stdin):
+    print(window.get("id", ""))
+'
+    else
+        wmctrl -l | awk '{print $1}'
+    fi
+}
+
+new_browser_window() {
+    local known="${1}"
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import sys
+
+known = set(sys.argv[1].split())
+candidates = [
+    window for window in json.load(sys.stdin)
+    if window.get("id", "") not in known
+]
+for window in candidates:
+    if window.get("wm_class", "").startswith("chrome-"):
+        print(window["id"])
+        break
+else:
+    if candidates:
+        print(candidates[-1]["id"])
+' "${known}"
+    else
+        wmctrl -l | awk -v known=" ${known} " '{ if (index(known, " " $1 " ") == 0) print $1 }' | tail -n 1
+    fi
+}
+
+monitor_token() {
+    local position="${1}" token="" focused_helper mode
+
+    if cli_helpers_is_wayland; then
+        case "${position}" in
+            pointer)
+                token="$(cli_helpers_gnome_window_bridge pointer-monitor 2>/dev/null)"
+                ;;
+            active)
+                token="$(cli_helpers_gnome_window_bridge active-monitor 2>/dev/null)"
+                ;;
+            *)
+                token="$(cli_helpers_gnome_window_bridge active-monitor 2>/dev/null)"
+                [ -z "${token}" ] && token="$(cli_helpers_gnome_window_bridge pointer-monitor 2>/dev/null)"
+                ;;
+        esac
+        echo "${token}"
+        return 0
+    fi
+
+    focused_helper="$(resolve_helper window-screen-focused)"
+    [ -z "${focused_helper}" ] && return 1
+    case "${position}" in
+        pointer)
+            mode="--mouse"
+            ;;
+        active)
+            mode="--window"
+            ;;
+        *)
+            mode=""
+            ;;
+    esac
+    "${focused_helper}" ${mode} 2>/dev/null
+}
+
+monitor_geometry() {
+    local token="${1}" geometry_helper geometry
+
+    [ -z "${token}" ] && return 1
+
+    # The window bridge reports monitor coordinates when the connector name is
+    # not available, which the display configuration can resolve.
+    if [[ "${token}" =~ ^(-?[0-9]+),(-?[0-9]+)$ ]]; then
+        geometry="$(cli_helpers_gnome_display_config list --geometry 2>/dev/null | \
+            awk -v x="${BASH_REMATCH[1]}" -v y="${BASH_REMATCH[2]}" \
+                '$2 == x && $3 == y { print $4 "x" $5 "+" $2 "+" $3; exit }')"
+        [ -z "${geometry}" ] && return 1
+        echo "${geometry}"
+        return 0
+    fi
+
+    geometry_helper="$(resolve_helper window-screen-geometry)"
+    [ -z "${geometry_helper}" ] && return 1
+    geometry="$("${geometry_helper}" --raw "${token}" 2>/dev/null)"
+    [ -z "${geometry}" ] && return 1
+    echo "${geometry}"
+}
+
+DEFAULT_BROWSER="${CLI_HELPERS_2FA_BROWSER:-google-chrome}"
+DEFAULT_SIZE="${CLI_HELPERS_2FA_SIZE:-520x780}"
+DEFAULT_POSITION="${CLI_HELPERS_2FA_POSITION:-center}"
+DEFAULT_TIMEOUT="${CLI_HELPERS_2FA_TIMEOUT:-10}"
+
+browser="${DEFAULT_BROWSER}"
+size="${DEFAULT_SIZE}"
+position="${DEFAULT_POSITION}"
+timeout="${DEFAULT_TIMEOUT}"
+above=1
+quiet=0
+url=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -s|--size)
+            shift
+            [ -z "${1}" ] && usage
+            size="${1}"
+            ;;
+        -p|--position)
+            shift
+            [ -z "${1}" ] && usage
+            position="${1}"
+            ;;
+        -b|--browser)
+            shift
+            [ -z "${1}" ] && usage
+            browser="${1}"
+            ;;
+        -t|--timeout)
+            shift
+            [ -z "${1}" ] && usage
+            timeout="${1}"
+            ;;
+        --no-above)
+            above=0
+            ;;
+        -q|--quiet)
+            quiet=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -z "${url}" ]; then
+                url="${1}"
+            else
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${url}" ] && usage
+
+case "${url}" in
+    http://*|https://*|file://*)
+        ;;
+    *)
+        fail "Unsupported URL: ${url}"
+        ;;
+esac
+
+if [[ ! "${size}" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    fail "Invalid size (expected WIDTHxHEIGHT): ${size}"
+fi
+width="${BASH_REMATCH[1]}"
+height="${BASH_REMATCH[2]}"
+
+case "${position}" in
+    center|pointer|active)
+        ;;
+    *)
+        if [[ ! "${position}" =~ ^(-?[0-9]+),(-?[0-9]+)$ ]]; then
+            fail "Invalid position (expected X,Y or center|pointer|active): ${position}"
+        fi
+        ;;
+esac
+
+if [[ ! "${timeout}" =~ ^[0-9]+$ ]]; then
+    fail "Invalid timeout (expected seconds): ${timeout}"
+fi
+
+command -v "${browser}" >/dev/null 2>&1 || fail "Browser command not found: ${browser}"
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+else
+    cli_helpers_require_command wmctrl wmctrl || exit 1
+fi
+
+# Determine the target position before the window shows up, so it can be moved
+# in one step once it is there.
+x=""
+y=""
+if [[ "${position}" =~ ^(-?[0-9]+),(-?[0-9]+)$ ]]; then
+    x="${BASH_REMATCH[1]}"
+    y="${BASH_REMATCH[2]}"
+else
+    geometry=""
+    if geometry="$(monitor_geometry "$(monitor_token "${position}")")" && \
+        [[ "${geometry}" =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+        monitor_width="${BASH_REMATCH[1]}"
+        monitor_height="${BASH_REMATCH[2]}"
+        monitor_x="${BASH_REMATCH[3]}"
+        monitor_y="${BASH_REMATCH[4]}"
+        x=$((monitor_x + (monitor_width - width) / 2))
+        y=$((monitor_y + (monitor_height - height) / 2))
+        [ "${x}" -lt "${monitor_x}" ] && x="${monitor_x}"
+        [ "${y}" -lt "${monitor_y}" ] && y="${monitor_y}"
+    else
+        warning "Could not determine monitor geometry, leaving window position to the window manager"
+    fi
+fi
+
+known_windows="$(window_ids | tr '\n' ' ')"
+
+# --app gives a window without tab strip and address bar. The geometry flags are
+# honored on X11 only; on Wayland the window is moved and resized afterwards.
+browser_options=(--app="${url}" --window-size="${width},${height}")
+if [ -n "${x}" ] && [ -n "${y}" ]; then
+    browser_options+=(--window-position="${x},${y}")
+fi
+"${browser}" "${browser_options[@]}" >/dev/null 2>&1 &
+
+window_id=""
+deadline=$((SECONDS + timeout))
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+    window_id="$(new_browser_window "${known_windows}")"
+    [ -n "${window_id}" ] && break
+    sleep 0.2
+done
+
+if [ -z "${window_id}" ]; then
+    fail "No browser window appeared within ${timeout} seconds"
+fi
+
+if cli_helpers_is_wayland; then
+    if [ -n "${x}" ] && [ -n "${y}" ]; then
+        cli_helpers_gnome_window_bridge set-geometry "${window_id}" "${x}" "${y}" "${width}" "${height}" >/dev/null 2>&1 || \
+            warning "Could not resize the window. The window bridge extension needs a GNOME Shell restart to pick up set-geometry."
+    fi
+    if [ "${above}" -eq 1 ]; then
+        cli_helpers_gnome_window_bridge set-above "${window_id}" >/dev/null 2>&1 || \
+            warning "Could not keep the window above other windows"
+    fi
+    cli_helpers_gnome_window_bridge focus "${window_id}" >/dev/null 2>&1
+else
+    if [ -n "${x}" ] && [ -n "${y}" ]; then
+        wmctrl -i -r "${window_id}" -e "0,${x},${y},${width},${height}" || \
+            warning "Could not resize the window"
+    fi
+    if [ "${above}" -eq 1 ]; then
+        wmctrl -i -r "${window_id}" -b add,above || \
+            warning "Could not keep the window above other windows"
+    fi
+    wmctrl -i -a "${window_id}" >/dev/null 2>&1
+fi
+
+[ "${quiet}" -eq 0 ] && echo "${window_id}"
+exit 0

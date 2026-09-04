@@ -1118,8 +1118,9 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
     head, _ = build_head(theme, prompt, prompt_display, prompt_char)
     if line is None:
         # Ctrl-D on an empty line
-        term.write(theme.paint('hint', 'Abort.') + '\r\n')
-        term.flush()
+        if not args.no_abort_message:
+            term.write(theme.paint('hint', 'Abort.') + '\r\n')
+            term.flush()
         term.close()
         exit(1)
     if not line:
@@ -1219,8 +1220,9 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
         if select_mode:
             choice = run_select(term, theme, prompt, header, items, prompt_char, index, args.show_keys, height)
             if choice is None:
-                term.write(theme.paint('hint', 'Abort.') + '\r\n')
-                term.flush()
+                if not args.no_abort_message:
+                    term.write(theme.paint('hint', 'Abort.') + '\r\n')
+                    term.flush()
                 exit(1)
             key, title = items[choice]
             display = title + ('  (' + key + ')' if args.show_keys and key != title else '')
@@ -1240,8 +1242,9 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
             prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
             line = run_complete(term, theme, prompt, prompt_display, prompt_char, provider, args.prefill, args.ignore_case, args.substring, height, menu_label)
             if line is None:
-                term.write(theme.paint('hint', 'Abort.') + '\r\n')
-                term.flush()
+                if not args.no_abort_message:
+                    term.write(theme.paint('hint', 'Abort.') + '\r\n')
+                    term.flush()
                 exit(1)
             if not line:
                 line = args.default
@@ -1307,6 +1310,7 @@ def main():
     parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode and multiple line mode (defaults to the current directory in the --files and --dirs modes)')
     parser.add_argument('--height', type=int, help='Maximum number of list rows shown at once (default: fit the terminal)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--no-abort-message', dest='no_abort_message', action='store_true', help='Leave the terminal as it was when the prompt is aborted, instead of noting the abort on a line of its own; for a caller that asks the next question in its place')
     parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
     args = parser.parse_args()
 

@@ -1,0 +1,315 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [URL ...]
+
+Open URLs in the regular browser, except interactive authentication
+(2FA/OIDC) URLs, which are opened in a small chromeless window that stays
+above other windows (see browser-2fa-window).
+
+Register this command as the default browser so that URLs opened by other
+programs, for example 'kubectl oidc-login', are routed through it.
+
+A URL counts as an authentication URL when it is
+
+  * a loopback URL on one of the authentication ports
+    (${DEFAULT_AUTH_PORTS}),
+  * a loopback URL on one of the probe ports (${DEFAULT_PROBE_PORTS}) that
+    answers with a redirect to an authorization endpoint. These are the
+    ports kubelogin listens on by default, and they are shared with
+    ordinary development servers, so the redirect decides, or
+  * a URL on one of the authentication hosts
+    (${DEFAULT_AUTH_HOSTS})
+    whose path matches the authentication path pattern.
+
+Options:
+  -a, --auth            Treat every URL as an authentication URL
+  -r, --regular         Treat every URL as a regular URL
+  -d, --dry-run         Print the routing decision without opening anything
+  -n, --no-probe        Never probe loopback URLs
+  -h, --help            Show this help message and exit
+
+Configuration file:
+  ${DEFAULT_CONF_FILE}
+
+Configuration variables (environment overrides the file):
+  BROWSER_ROUTER_BROWSER           Regular browser command
+  BROWSER_ROUTER_AUTH_COMMAND      Command opening authentication URLs
+  BROWSER_ROUTER_AUTH_PORTS        Loopback ports counting as authentication
+  BROWSER_ROUTER_PROBE_PORTS       Loopback ports decided by a probe
+  BROWSER_ROUTER_PROBE_TIMEOUT     Probe timeout in seconds
+  BROWSER_ROUTER_AUTH_HOSTS        Hosts counting as authentication
+  BROWSER_ROUTER_AUTH_PATH_REGEX   Path pattern for authentication hosts
+  BROWSER_ROUTER_AUTH_REDIRECT_REGEX  Redirect pattern accepted by the probe
+  BROWSER_ROUTER_LOG               Log file for routing decisions
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+log() {
+    [ -n "${BROWSER_ROUTER_LOG}" ] || return 0
+    printf '%s %s\n' "$(date -Is)" "${1}" >>"${BROWSER_ROUTER_LOG}" 2>/dev/null
+}
+
+resolve_command() {
+    local name="${1}"
+
+    case "${name}" in
+        /*)
+            echo "${name}"
+            return 0
+            ;;
+    esac
+    if [ -x "${SCRIPT_DIR}/${name}" ]; then
+        echo "${SCRIPT_DIR}/${name}"
+        return 0
+    fi
+    command -v "${name}" 2>/dev/null
+}
+
+url_host() {
+    local url="${1}" rest hostport host
+
+    rest="${url#*://}"
+    hostport="${rest%%[/?#]*}"
+    host="${hostport##*@}"
+    case "${host}" in
+        \[*\]*)
+            host="${host%%\]*}]"
+            ;;
+        *:*)
+            host="${host%%:*}"
+            ;;
+    esac
+    echo "${host}" | tr '[:upper:]' '[:lower:]'
+}
+
+url_port() {
+    local url="${1}" rest hostport port
+
+    rest="${url#*://}"
+    hostport="${rest%%[/?#]*}"
+    hostport="${hostport##*@}"
+    case "${hostport}" in
+        \[*\]:*)
+            port="${hostport##*]:}"
+            ;;
+        \[*\])
+            port=""
+            ;;
+        *:*)
+            port="${hostport##*:}"
+            ;;
+        *)
+            port=""
+            ;;
+    esac
+    echo "${port}"
+}
+
+url_path() {
+    local url="${1}" rest hostport path
+
+    rest="${url#*://}"
+    hostport="${rest%%[/?#]*}"
+    path="${rest#"${hostport}"}"
+    path="${path%%[?#]*}"
+    [ -z "${path}" ] && path="/"
+    echo "${path}"
+}
+
+# kubelogin serves a redirect to the authorization endpoint on its loopback
+# port. Asking for that redirect separates it from an ordinary development
+# server on the same port.
+probe_auth_redirect() {
+    local url="${1}" redirect
+
+    [ "${probe}" -eq 1 ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    redirect="$(curl -s -o /dev/null \
+        --max-time "${BROWSER_ROUTER_PROBE_TIMEOUT}" \
+        --write-out '%{redirect_url}' \
+        "${url}" 2>/dev/null)" || return 1
+    [ -z "${redirect}" ] && return 1
+    [[ "${redirect}" =~ ${BROWSER_ROUTER_AUTH_REDIRECT_REGEX} ]]
+}
+
+is_auth_url() {
+    local url="${1}" host port path candidate
+
+    case "${url}" in
+        http://*|https://*)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    host="$(url_host "${url}")"
+    port="$(url_port "${url}")"
+    path="$(url_path "${url}")"
+
+    case "${host}" in
+        localhost|127.0.0.1|\[::1\])
+            for candidate in ${BROWSER_ROUTER_AUTH_PORTS}; do
+                [ "${port}" = "${candidate}" ] && return 0
+            done
+            # Only the bare entry point is probed, so nothing with a path or a
+            # query is ever requested twice.
+            if [ "${path}" = "/" ] && [ "${url}" = "${url%%[?#]*}" ]; then
+                for candidate in ${BROWSER_ROUTER_PROBE_PORTS}; do
+                    if [ "${port}" = "${candidate}" ] && probe_auth_redirect "${url}"; then
+                        return 0
+                    fi
+                done
+            fi
+            ;;
+    esac
+
+    for candidate in ${BROWSER_ROUTER_AUTH_HOSTS}; do
+        if [ "${host}" = "${candidate}" ] && \
+            [[ "${path}" =~ ${BROWSER_ROUTER_AUTH_PATH_REGEX} ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+DEFAULT_AUTH_PORTS="47823 47824"
+DEFAULT_PROBE_PORTS="8000 18000"
+DEFAULT_AUTH_HOSTS="auth.mittwald.it auth.mittwald.m3-dev.services"
+DEFAULT_AUTH_PATH_REGEX="(/protocol/openid-connect/auth|/realms/[^/]+/login-actions/)"
+DEFAULT_AUTH_REDIRECT_REGEX="(/protocol/openid-connect/auth|[?&]response_type=code)"
+DEFAULT_CONF_FILE="${CLI_HELPERS_BROWSER_ROUTER_CONF:-${XDG_CONFIG_HOME:-${HOME}/.config}/cli-helpers/browser-router.conf}"
+
+if [ -f "${DEFAULT_CONF_FILE}" ]; then
+    . "${DEFAULT_CONF_FILE}"
+fi
+
+BROWSER_ROUTER_BROWSER="${BROWSER_ROUTER_BROWSER:-google-chrome}"
+BROWSER_ROUTER_AUTH_COMMAND="${BROWSER_ROUTER_AUTH_COMMAND:-browser-2fa-window}"
+BROWSER_ROUTER_AUTH_PORTS="${BROWSER_ROUTER_AUTH_PORTS:-${DEFAULT_AUTH_PORTS}}"
+BROWSER_ROUTER_PROBE_PORTS="${BROWSER_ROUTER_PROBE_PORTS:-${DEFAULT_PROBE_PORTS}}"
+BROWSER_ROUTER_PROBE_TIMEOUT="${BROWSER_ROUTER_PROBE_TIMEOUT:-1}"
+BROWSER_ROUTER_AUTH_HOSTS="${BROWSER_ROUTER_AUTH_HOSTS:-${DEFAULT_AUTH_HOSTS}}"
+BROWSER_ROUTER_AUTH_PATH_REGEX="${BROWSER_ROUTER_AUTH_PATH_REGEX:-${DEFAULT_AUTH_PATH_REGEX}}"
+BROWSER_ROUTER_AUTH_REDIRECT_REGEX="${BROWSER_ROUTER_AUTH_REDIRECT_REGEX:-${DEFAULT_AUTH_REDIRECT_REGEX}}"
+BROWSER_ROUTER_LOG="${BROWSER_ROUTER_LOG:-}"
+
+force_auth=0
+force_regular=0
+dry_run=0
+probe=1
+urls=()
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -a|--auth)
+            force_auth=1
+            ;;
+        -r|--regular)
+            force_regular=1
+            ;;
+        -d|--dry-run)
+            dry_run=1
+            ;;
+        -n|--no-probe)
+            probe=0
+            ;;
+        --)
+            shift
+            while [ "${#}" -gt 0 ]; do
+                urls+=("${1}")
+                shift
+            done
+            break
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            urls+=("${1}")
+            ;;
+    esac
+    shift
+done
+
+if [ "${force_auth}" -eq 1 ] && [ "${force_regular}" -eq 1 ]; then
+    fail "--auth and --regular are mutually exclusive"
+fi
+
+browser="$(resolve_command "${BROWSER_ROUTER_BROWSER}")"
+[ -z "${browser}" ] && fail "Browser command not found: ${BROWSER_ROUTER_BROWSER}"
+auth_command="$(resolve_command "${BROWSER_ROUTER_AUTH_COMMAND}")"
+auth_options=(--quiet)
+if [ -z "${auth_command}" ]; then
+    warning "Authentication command not found: ${BROWSER_ROUTER_AUTH_COMMAND}, using ${BROWSER_ROUTER_BROWSER}"
+    auth_command="${browser}"
+    auth_options=()
+fi
+
+# Without a URL there is nothing to decide: the browser was started as an
+# application, not as a URL handler.
+if [ "${#urls[@]}" -eq 0 ]; then
+    log "browser (no url)"
+    [ "${dry_run}" -eq 1 ] && exit 0
+    exec "${browser}"
+fi
+
+auth_urls=()
+regular_urls=()
+for url in "${urls[@]}"; do
+    if [ "${force_regular}" -eq 1 ]; then
+        regular_urls+=("${url}")
+    elif [ "${force_auth}" -eq 1 ] || is_auth_url "${url}"; then
+        auth_urls+=("${url}")
+    else
+        regular_urls+=("${url}")
+    fi
+done
+
+status=0
+
+for url in "${auth_urls[@]}"; do
+    log "auth ${url}"
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "auth ${url}"
+        continue
+    fi
+    "${auth_command}" "${auth_options[@]}" "${url}" || status=1
+done
+
+if [ "${#regular_urls[@]}" -gt 0 ]; then
+    for url in "${regular_urls[@]}"; do
+        log "browser ${url}"
+        [ "${dry_run}" -eq 1 ] && echo "browser ${url}"
+    done
+    if [ "${dry_run}" -eq 0 ]; then
+        "${browser}" "${regular_urls[@]}" || status=1
+    fi
+fi
+
+exit "${status}"

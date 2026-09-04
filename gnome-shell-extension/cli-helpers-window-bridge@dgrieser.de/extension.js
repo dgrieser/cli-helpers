@@ -45,6 +45,14 @@ const IFACE_XML = `
       <arg type="s" direction="in" name="window_id"/>
       <arg type="b" direction="out" name="set"/>
     </method>
+    <method name="SetWindowGeometry">
+      <arg type="s" direction="in" name="window_id"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="b" direction="out" name="set"/>
+    </method>
   </interface>
 </node>`;
 
@@ -187,6 +195,19 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         if (!window)
             return false;
         window.make_above();
+        return true;
+    }
+
+    SetWindowGeometry(id, x, y, width, height) {
+        const window = this._findWindow(id);
+        if (!window)
+            return false;
+
+        if (window.is_fullscreen())
+            window.unmake_fullscreen();
+        if (window.get_maximized())
+            window.unmaximize(Meta.MaximizeFlags.BOTH);
+        window.move_resize_frame(true, x, y, width, height);
         return true;
     }
 }
