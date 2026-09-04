@@ -680,7 +680,7 @@ def visible_window(index, count, view):
     return offset
 
 
-def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys):
+def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys, cycling=False):
     lines = []
     if prompt:
         lines.append(paint_prompt(theme, truncate(prompt, width)))
@@ -710,6 +710,8 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
     hints = ['↑/↓ move']
     if count > 1:
         hints.append('1-9 jump')
+    if cycling:
+        hints.append('tab cycle')
     hints.append('enter select')
     hints.append('esc abort')
     hint = SEPARATOR.join(hints)
@@ -719,18 +721,23 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
     return lines
 
 
-def run_select(term, theme, prompt, header, items, pointer, index, show_keys, max_height):
+# The rows the cursor walks through are not the items themselves: a cycle group
+# collapses several items into one row, which shows the one it is currently on.
+# selection says which that is per row, and tab moves it.
+def run_select(term, theme, prompt, header, items, rows, selection, pointer, index, show_keys, max_height):
     renderer = Renderer(term)
-    count = len(items)
+    count = len(rows)
+    cycling = any(len(row) > 1 for row in rows)
     term.write(HIDE_CURSOR)
     try:
         while True:
-            width, rows = term.size()
+            width, screen_rows = term.size()
             width = max(20, width - 1)
-            view = max_height if max_height > 0 else max(1, rows - 3 - len(header))
+            view = max_height if max_height > 0 else max(1, screen_rows - 3 - len(header))
             view = max(1, min(view, count))
             offset = visible_window(index, count, view)
-            renderer.draw(render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys))
+            shown = [items[row[selection[position]]] for position, row in enumerate(rows)]
+            renderer.draw(render_select(theme, width, prompt, header, shown, pointer, index, offset, view, show_keys, cycling))
             key, char = term.read_key()
             if key == 'ctrl-c':
                 renderer.clear()
@@ -741,7 +748,10 @@ def run_select(term, theme, prompt, header, items, pointer, index, show_keys, ma
             if key == 'enter':
                 renderer.clear()
                 return index
-            if key == 'up' or (key == 'char' and char == 'k'):
+            if key in ('tab', 'backtab') and len(rows[index]) > 1:
+                step = 1 if key == 'tab' else -1
+                selection[index] = (selection[index] + step) % len(rows[index])
+            elif key == 'up' or (key == 'char' and char == 'k'):
                 index = (index - 1) % count
             elif key == 'down' or (key == 'char' and char == 'j'):
                 index = (index + 1) % count
@@ -1078,6 +1088,39 @@ def default_index(items, default):
     return None
 
 
+# The items of a --cycle group share one row: it sits where the first of them
+# was, so the list keeps the order it was given in, and returns whichever of them
+# it currently shows. Everything else stays a row of its own.
+def cycle_rows(items, specs):
+    grouped = {}
+    for spec in specs or []:
+        members = []
+        for name in [part.strip() for part in spec.split('|')]:
+            if not name:
+                continue
+            position = default_index(items, name)
+            if position is None:
+                print('ERROR: --cycle "' + spec + '" names no item: ' + name, file=sys.stderr)
+                exit(1)
+            if position in grouped or position in members:
+                print('ERROR: --cycle "' + spec + '" uses the item "' + name + '" twice.', file=sys.stderr)
+                exit(1)
+            members.append(position)
+        if len(members) < 2:
+            print('ERROR: --cycle "' + spec + '" needs at least two items.', file=sys.stderr)
+            exit(1)
+        for position in members:
+            grouped[position] = members
+    rows = []
+    for position in range(len(items)):
+        members = grouped.get(position)
+        if members is None:
+            rows.append([position])
+        elif members[0] == position:
+            rows.append(members)
+    return rows
+
+
 def input_with_default(default=''):
     result = input()
     if not result:
@@ -1198,12 +1241,17 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
         if not items:
             print('ERROR: No items to select from.', file=sys.stderr)
             exit(1)
+        rows = cycle_rows(items, args.cycle)
+        selection = [0] * len(rows)
         index = 0
         if args.default:
-            index = default_index(items, args.default)
-            if index is None:
+            position = default_index(items, args.default)
+            if position is None:
                 print('ERROR: --default "' + args.default + '" matches no item.', file=sys.stderr)
                 exit(1)
+            # the row of the default starts on it, a cycling one included
+            index = next(row for row, members in enumerate(rows) if position in members)
+            selection[index] = rows[index].index(position)
     elif args.files or args.dirs:
         dirs_only = args.dirs
         provider = lambda text: path_candidates(text, dirs_only)
@@ -1218,13 +1266,14 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
     interrupted = False
     try:
         if select_mode:
-            choice = run_select(term, theme, prompt, header, items, prompt_char, index, args.show_keys, height)
+            choice = run_select(term, theme, prompt, header, items, rows, selection, prompt_char, index, args.show_keys, height)
             if choice is None:
                 if not args.no_abort_message:
                     term.write(theme.paint('hint', 'Abort.') + '\r\n')
                     term.flush()
                 exit(1)
-            key, title = items[choice]
+            chosen = rows[choice][selection[choice]]
+            key, title = items[chosen]
             display = title + ('  (' + key + ')' if args.show_keys and key != title else '')
             if prompt:
                 term.write(paint_prompt(theme, prompt) + ' ')
@@ -1233,9 +1282,9 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
             if args.returns == 'title':
                 result = title
             elif args.returns == 'index':
-                result = str(choice)
+                result = str(chosen)
             elif args.returns == 'number':
-                result = str(choice + 1)
+                result = str(chosen + 1)
             else:
                 result = key
         else:
@@ -1301,6 +1350,7 @@ def main():
     parser.add_argument('--key-regex', dest='key_regex', type=str, help='Take the item key from the first match of this regular expression (capture group 1 when there is one) and keep the whole item as the title, e.g. "^\\S+" to return the first column of a table row')
     parser.add_argument('--return', dest='returns', choices=['key', 'title', 'index', 'number'], default='key', help='What select mode prints: the item key (default), its title, its 0-based index or its 1-based number')
     parser.add_argument('--show-keys', action='store_true', help='Show the item keys next to the titles in select mode')
+    parser.add_argument('--cycle', action='append', default=[], metavar='KEY|KEY[|KEY...]', help='Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long; the row sits where the first of its items was and selecting it returns the one it currently shows. Items are named by key, title or number; repeatable for several groups')
     parser.add_argument('--header-lines', dest='header_lines', type=int, default=0, help='Select mode only: treat the first n items as a header, printed above the list, aligned with the item titles and not selectable; suppresses the default prompt')
     parser.add_argument('--no-header-uppercase', dest='no_header_uppercase', action='store_true', help='Keep the header lines as they are instead of upper-casing them')
     parser.add_argument('--ignore-case', action='store_true', help='Match completion candidates case-insensitively')
@@ -1398,8 +1448,8 @@ def main():
     if (prompt_select or prompt_complete) and (prompt_protected or args.single_line):
         print('ERROR: --select and --complete cannot be combined with --protected or --single-line.', file=sys.stderr)
         exit(1)
-    if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines or args.no_header_uppercase):
-        print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return, --header-lines and --no-header-uppercase can only be used in select mode.', file=sys.stderr)
+    if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines or args.no_header_uppercase or args.cycle):
+        print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return, --header-lines, --no-header-uppercase and --cycle can only be used in select mode.', file=sys.stderr)
         exit(1)
     if len([option for option in (args.delimiter, args.delimiter_regex, args.key_regex) if option is not None]) > 1:
         print('ERROR: --delimiter, --delimiter-regex and --key-regex are mutually exclusive.', file=sys.stderr)

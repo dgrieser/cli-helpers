@@ -76,6 +76,9 @@ the first one into the picker again:
     Fork                Continue it, asking for the folder and the agent
     Copy                Copy raw Markdown to the clipboard
     Print               Print it, asking for rendered Markdown or raw
+
+Copy and Print each share their row with a last message variant, tab
+(shift-tab backwards) walking over the two of them.
 EOF
     exit 1
 }
@@ -630,13 +633,18 @@ print_session_file() {
     [ "${raw}" -eq 0 ] && echo "${session_content}" | glow || echo "${session_content}"
 }
 
+# The conversation as Markdown; with the last flag set only its last message,
+# which is what the "last message" answers of the picker ask for.
 raw_session_file() {
     local agent="${1}"
     local filepath="${2}"
+    local last="${3:-0}"
+    local selection="messages"
     local jq_filter
 
+    [ "${last}" -eq 1 ] && selection="messages | [last // empty]"
     jq_filter="$(jq_messages "${agent}")"'
-        messages
+        '"${selection}"'
         | map("### \(.role)\n\n\(.text)")
         | join("\n\n---\n\n")
     '
@@ -738,12 +746,19 @@ create_fork_context() {
     printf '%s' "${context_file}"
 }
 
+# Copying and printing come in a whole-conversation and a last-message variant
+# each, and the two of them share one row of the question: tab walks over the
+# variants, so the question stays four lines long.
 ask_session_action() {
     prompt-select --prompt "Continue session:" --no-abort-message \
+        --cycle "clipboard|clipboard-last" \
+        --cycle "print|print-last" \
         "resume=Resume" \
         "fork=Fork" \
         "clipboard=Copy" \
+        "clipboard-last=Copy last message" \
         "print=Print" \
+        "print-last=Print last message" \
         </dev/tty
 }
 
@@ -860,13 +875,13 @@ session_ask() {
             action)
                 action="$(ask_session_action)" || return 0
                 case "${action}" in
-                    resume | clipboard)
+                    resume | clipboard | clipboard-last)
                         break
                         ;;
                     fork)
                         step="directory"
                         ;;
-                    print)
+                    print | print-last)
                         step="format"
                         ;;
                     *)
@@ -928,11 +943,14 @@ session_run() {
     # shellcheck source=/dev/null
     . "${fzf_answer_file}"
     case "${answered_action}" in
-        resume | clipboard)
+        resume | clipboard | clipboard-last)
             fzf_action "${answered_action}" "${agent}" "${filepath}"
             ;;
         print)
             fzf_action "${answered_format}" "${agent}" "${filepath}"
+            ;;
+        print-last)
+            fzf_action "${answered_format}-last" "${agent}" "${filepath}"
             ;;
         fork)
             fork_session "${agent}" "${filepath}" "${answered_agent}" "${answered_directory}"
@@ -989,9 +1007,20 @@ fzf_action() {
     local action="${1}"
     local agent="${2}"
     local filepath="${3}"
+    local last_message=0
+    local content
     local cwd
     local session_id
     local preview_width
+
+    # the last-message variants of copying and printing are the same actions on
+    # the last message instead of the whole conversation
+    case "${action}" in
+        *-last)
+            last_message=1
+            action="${action%-last}"
+            ;;
+    esac
 
     case "${agent}" in
         claude | codex)
@@ -1022,14 +1051,20 @@ fzf_action() {
                     glow --style "${GLOW_STYLE:-dark}" --width "${preview_width}" 2>/dev/null
             ;;
         markdown)
-            raw_session_file "${agent}" "${filepath}" | glow
+            raw_session_file "${agent}" "${filepath}" "${last_message}" | glow
             ;;
         raw)
-            raw_session_file "${agent}" "${filepath}"
+            raw_session_file "${agent}" "${filepath}" "${last_message}"
             ;;
         clipboard)
-            if raw_session_file "${agent}" "${filepath}" | clip; then
-                muted "Copied to clipboard"
+            content="$(raw_session_file "${agent}" "${filepath}" "${last_message}")"
+            [ -n "${content}" ] || fail "Session has no messages"
+            if printf '%s\n' "${content}" | clip; then
+                if [ "${last_message}" -eq 1 ]; then
+                    muted "Copied the last message to clipboard"
+                else
+                    muted "Copied to clipboard"
+                fi
             else
                 fail "Failed to copy session to clipboard"
             fi

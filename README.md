@@ -519,7 +519,7 @@ Called as `claude-session` or `codex-session` (symlinks) the matching agent is p
 
 The picker binds `/` to prompt for a case-insensitive message search, `enter` to use the selected session, `tab` to toggle between all folders and the current folder, `ctrl-a` to walk the agent filter, `ctrl-r` to refresh the session list and preview, `esc` to clear an active search and to exit without one, and `ctrl-c` to exit.
 
-`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were, so a wrong turn costs one key and not a restart. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print`. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` - both of them, also where they are the same folder, so the keys of the question stay put - and `...`, which asks for one with directory completion under the prompt `Folder:`; then for the agent, with completion over `claude` and `codex` and the session's own as the default. `Print` asks for `Markdown` or `Raw`. Every answered question stays on screen, so the way through them reads back as `Continue session: Fork` / `Fork in: ~/workspace/tool (session)` / `Fork with: codex`.
+`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were, so a wrong turn costs one key and not a restart. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print`, the last two of them sharing their row with `Copy last message` and `Print last message`: `tab` (`shift-tab` backwards) walks over the two variants of a row, so the question stays four lines long and every answer keeps its place. The last message variants act on the last message of the conversation instead of the whole transcript. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` - both of them, also where they are the same folder, so the keys of the question stay put - and `...`, which asks for one with directory completion under the prompt `Folder:`; then for the agent, with completion over `claude` and `codex` and the session's own as the default. `Print` and `Print last message` ask for `Markdown` or `Raw`. Every answered question stays on screen, so the way through them reads back as `Continue session: Fork` / `Fork in: ~/workspace/tool (session)` / `Fork with: codex`.
 
 The questions are asked while the picker is still running: `enter` hands the terminal over for them and leaves their answers in a file, and the picker turns that file into what it does next - the action once there are answers, nothing at all while there are none. That is what lets `esc` fall back into a picker that was never closed.
 
@@ -1606,6 +1606,7 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--key-regex <regex>` | Select mode only: takes the key from the first match of this regular expression (capture group 1 when the pattern has one) and keeps the whole item as the title, e.g. `^\S+` to display a full table row but return its first column. Mutually exclusive with `--delimiter` and `--delimiter-regex`. |
 | `--return key\|title\|index\|number` | Select mode only: print the item's key (default), its title, its 0-based index or its 1-based number. |
 | `--show-keys` | Select mode only: show the item keys next to the titles. |
+| `--cycle <key>\|<key>[\|...]` | Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long instead of taking a row each. The row sits where the first of its items was, and selecting it returns the item it currently shows (`--return index`/`number` stay the item's own position in the input). Items are named by key, title or number; repeatable for several groups. |
 | `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. Header lines are upper-cased (see `--no-header-uppercase`). Since the header already labels the list, the default `Choose:` prompt is suppressed (pass `-p` to get one anyway). |
 | `--no-header-uppercase` | Select mode only: print the `--header-lines` header as given instead of upper-casing it. |
 | `--ignore-case` | Completion mode only: match candidates case-insensitively. |
@@ -1677,6 +1678,7 @@ Pasting works as expected: a pasted `\r\n` counts as one line break rather than 
 | PageUp / PageDown | Move by one screen. |
 | Home / `g`, End / `G` | Jump to the first / last entry. |
 | `1`…`9`, `0` | Jump to that entry (`0` is the tenth). |
+| Tab / Shift-Tab | On a `--cycle` row, show its next / previous item; elsewhere ignored. |
 | Enter | Select the highlighted entry and print it. |
 | Esc, `q` | Abort (exit 1). |
 | Ctrl-C | Abort (exit 130). |
@@ -1732,6 +1734,7 @@ kubectl get pods -o name | prompt-select -p "Pod:" --delimiter ''
 kubectl get pods | prompt-select -p "Pod:" --delimiter '' --header-lines 1
 id="$(docker ps | prompt-select -p "Container:" --key-regex '^\S+' --header-lines 1)"
 sha="$(git log --oneline -20 | prompt-select -p "Commit:" --delimiter-regex '\s+')"
+action="$(prompt-select --cycle 'review|approve|merge' "review=Approve + Merge" "approve=Approve" "merge=Merge" "diff=Diff")"
 branch="$(git branch --format '%(refname:short)' | prompt-complete -p "Branch:")"
 host="$(prompt-complete --ignore-case -p "Host:" web-01 web-02 db-01)"
 config="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
