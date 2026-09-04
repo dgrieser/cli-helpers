@@ -724,7 +724,7 @@ fzf_action() {
         fork)
             command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
             target_agent="$(prompt-complete \
-                --prompt "Fork with: " \
+                --prompt "Fork with:" \
                 --default "${agent}" \
                 claude codex </dev/tty)" || exit 0
             case "${target_agent}" in

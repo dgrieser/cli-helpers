@@ -566,6 +566,21 @@ def paint_prompt_char(theme, prompt_char):
     return theme.paint('pointer', stripped) + prompt_char[len(stripped):]
 
 
+def build_head(theme, prompt, prompt_display, prompt_char):
+    # What the terminal actually shows in front of the input, and how wide that
+    # is. The width is measured on the painted prompt, not on the string the
+    # caller handed in: the "(default)" hint only sits in the painted one, so
+    # measuring the other string moves the cursor away from the text. A prompt
+    # that already ends in a space brings its own separator.
+    head = ''
+    if prompt:
+        head = prompt_display
+        if not strip_ansi(prompt_display).endswith(' '):
+            head += ' '
+    head += paint_prompt_char(theme, prompt_char)
+    return head, visible_length(head)
+
+
 def compile_pattern(pattern, option):
     if pattern is None:
         return None
@@ -906,11 +921,7 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_la
 
 def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True):
     renderer = Renderer(term)
-    head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
-    # the head is what the terminal shows, so a caller that colored the prompt
-    # itself must not push the cursor to the right by the escapes it contains
-    head_width = visible_length(prompt) + 1 if prompt else 0
-    head_width += visible_length(prompt_char)
+    head, head_width = build_head(theme, prompt, prompt_display, prompt_char)
     text = prefill
     cursor = len(text)
     menu = None
@@ -1104,7 +1115,7 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
         term.close()
         exit(130)
 
-    head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
+    head, _ = build_head(theme, prompt, prompt_display, prompt_char)
     if line is None:
         # Ctrl-D on an empty line
         term.write(theme.paint('hint', 'Abort.') + '\r\n')
@@ -1234,7 +1245,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
                 exit(1)
             if not line:
                 line = args.default
-            head = (prompt_display + ' ' if prompt else '') + paint_prompt_char(theme, prompt_char)
+            head, _ = build_head(theme, prompt, prompt_display, prompt_char)
             term.write(head + line + '\r\n')
             term.flush()
             result = line
@@ -1445,6 +1456,7 @@ def main():
     # hint next to the prompt
     args.default_hint = '' if prompt_default and args.prefill == prompt_default else prompt_default
     if args.default_hint and prompt and not prompt_select:
+        prompt = prompt.rstrip()
         if prompt[-1] == ':': prompt = prompt[:-1]
         prompt = prompt + ' (' + args.default_hint + '):'
 
