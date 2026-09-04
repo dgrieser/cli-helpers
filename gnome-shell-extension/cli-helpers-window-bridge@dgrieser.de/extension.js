@@ -56,12 +56,77 @@ const IFACE_XML = `
   </interface>
 </node>`;
 
+// Shell monitor objects carry no connector name of their own on current GNOME
+// versions, so ask Mutter for it and only fall back to coordinates when even
+// that stays silent.
+function connectorForMonitorIndex(index) {
+    let manager = null;
+
+    try {
+        manager = global.backend?.get_monitor_manager?.() ?? null;
+        // GNOME Shell before 45 reached the backend through Meta.
+        if (!manager && typeof Meta.get_backend === 'function')
+            manager = Meta.get_backend()?.get_monitor_manager?.() ?? null;
+    } catch (error) {
+        manager = null;
+    }
+    if (!manager)
+        return '';
+
+    // Mutter maps a connector to the same monitor index the shell uses, so this
+    // needs no assumption about the order of the monitor list.
+    try {
+        if (typeof manager.get_monitor_for_connector === 'function') {
+            for (const monitor of manager.get_monitors?.() ?? []) {
+                const connector = monitor.get_connector?.();
+                if (!connector)
+                    continue;
+                if (manager.get_monitor_for_connector(connector) === index)
+                    return connector;
+            }
+        }
+    } catch (error) {
+        // fall through to the remaining strategies
+    }
+
+    // Logical monitors are numbered like the shell indexes them.
+    try {
+        for (const logicalMonitor of manager.get_logical_monitors?.() ?? []) {
+            if (logicalMonitor.get_number?.() !== index)
+                continue;
+            for (const monitor of logicalMonitor.get_monitors?.() ?? []) {
+                const connector = monitor.get_connector?.();
+                if (connector)
+                    return connector;
+            }
+        }
+    } catch (error) {
+        // fall through to the remaining strategies
+    }
+
+    // Last resort: the flat list of active monitors, in index order.
+    try {
+        const monitors = (manager.get_monitors?.() ?? [])
+            .filter(monitor => monitor.is_active?.() ?? true);
+        const connector = monitors[index]?.get_connector?.();
+        if (connector)
+            return connector;
+    } catch (error) {
+        // fall through to the coordinate fallback
+    }
+
+    return '';
+}
+
 function monitorName(index) {
     const monitor = Main.layoutManager.monitors[index];
     if (!monitor)
         return '';
 
-    return monitor.connector || monitor.name || `${monitor.x},${monitor.y}`;
+    return monitor.connector ||
+        monitor.name ||
+        connectorForMonitorIndex(index) ||
+        `${monitor.x},${monitor.y}`;
 }
 
 function windowId(window) {
