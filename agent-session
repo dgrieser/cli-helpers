@@ -53,6 +53,9 @@ Options:
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
     -r, --raw           Raw output
+    --resume SESSION    Resume the session with SESSION in its directory
+    --fork SESSION      Fork the session with SESSION, asking for the folder
+                        and the agent
     --bash-completion   Print completion candidates and exit
     --verbose           Verbose output
 
@@ -332,6 +335,36 @@ session_is_in_directory() {
     session_directory="$(session_cwd "${agent}" "${filepath}")"
     [ -n "${session_directory}" ] || return 1
     [ "$(realpath -m -- "${session_directory}")" = "${directory}" ]
+}
+
+# Finds the one session an ID or a part of one refers to, leaving its agent and
+# its file in session_match_agent and session_match_filepath. Sessions outside
+# the current directory are only looked at where all_directories is 1.
+find_session() {
+    local wanted="${1}"
+    local all_directories="${2}"
+    local agent
+    local filepath
+    local matches=()
+
+    session_match_agent=""
+    session_match_filepath=""
+    while IFS=$'\t' read -r _ agent _ filepath; do
+        [ -n "${filepath}" ] || continue
+        if [ "${all_directories}" -eq 0 ] \
+            && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
+            continue
+        fi
+        case "$(session_id_of "${agent}" "${filepath}")" in
+            *"${wanted}"*)
+                matches+=("${agent}"$'\t'"${filepath}")
+                ;;
+        esac
+    done < <(session_files)
+    [ "${#matches[@]}" -eq 0 ] && fail "No such session: ${wanted}"
+    [ "${#matches[@]}" -gt 1 ] && fail "Multiple matches for session: ${wanted}"
+    IFS=$'\t' read -r session_match_agent session_match_filepath <<< "${matches[0]}"
+    verbose "${session_match_agent} ${session_match_filepath}"
 }
 
 # One line per message, whitespace collapsed, so that patterns spanning line
@@ -761,6 +794,39 @@ ask_fork_agent() {
     esac
 }
 
+# The questions of a fork asked outside the picker, esc stepping back one
+# question and out of the first one without forking anything.
+ask_fork() {
+    local agent="${1}"
+    local filepath="${2}"
+    local step="directory"
+    local directory=""
+    local target_agent=""
+    local session_directory
+
+    command -v prompt-select >/dev/null 2>&1 || fail "prompt-select not found"
+    command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
+    command -v prompt-folder >/dev/null 2>&1 || fail "prompt-folder not found"
+    session_directory="$(session_cwd "${agent}" "${filepath}")"
+
+    while true; do
+        case "${step}" in
+            directory)
+                directory="$(ask_fork_directory "${session_directory}")" || return 0
+                step="agent"
+                ;;
+            agent)
+                if target_agent="$(ask_fork_agent "${agent}")"; then
+                    break
+                fi
+                step="directory"
+                ;;
+        esac
+    done
+
+    fork_session "${agent}" "${filepath}" "${target_agent}" "${directory}"
+}
+
 ask_print_format() {
     prompt-select --prompt "Print:" --no-abort-message \
         "markdown=Markdown" \
@@ -1157,6 +1223,7 @@ completion() {
     local filepath
     local argument
     local agent_argument=0
+    local ids_only=0
 
     case "${previous}" in
         -a|--agent)
@@ -1165,6 +1232,9 @@ completion() {
             ;;
         -n|--limit|-d|--days|-g|--grep|-i|--igrep)
             return
+            ;;
+        --resume|--fork)
+            ids_only=1
             ;;
     esac
     shift
@@ -1187,7 +1257,8 @@ completion() {
         esac
     done
 
-    echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -P --prompt-column -g --grep -i --igrep -r --raw --verbose"
+    [ "${ids_only}" -eq 0 ] \
+        && echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -P --prompt-column -g --grep -i --igrep -r --raw --resume --fork --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -1207,6 +1278,10 @@ case "${APP_NAME}" in
 esac
 
 session_id=""
+resume_id=""
+fork_id=""
+session_match_agent=""
+session_match_filepath=""
 fzf_action_name=""
 fzf_action_agent=""
 fzf_action_filepath=""
@@ -1312,6 +1387,18 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -l | --last)
             last=1
+            ;;
+        --resume)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --resume"
+            resume_id="${1}"
+            [ -n "${resume_id}" ] || fail "Missing argument for --resume"
+            ;;
+        --fork)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fork"
+            fork_id="${1}"
+            [ -n "${fork_id}" ] || fail "Missing argument for --fork"
             ;;
         -n | --limit)
             shift
@@ -1419,6 +1506,28 @@ fi
 
 [ "${limit_explicit}" -eq 1 ] && days=""
 
+# Both go straight to what the picker asks for once a session is selected, so
+# they take the place of the session argument and of everything that lists.
+direct_option=""
+direct_session_id=""
+if [ -n "${resume_id}" ] && [ -n "${fork_id}" ]; then
+    fail "--resume and --fork cannot be used together"
+elif [ -n "${resume_id}" ]; then
+    direct_option="--resume"
+    direct_session_id="${resume_id}"
+elif [ -n "${fork_id}" ]; then
+    direct_option="--fork"
+    direct_session_id="${fork_id}"
+fi
+
+if [ -n "${direct_option}" ]; then
+    [ -n "${session_id}" ] && fail "${direct_option} cannot be used with SESSION"
+    [ "${last}" -eq 1 ] && fail "${direct_option} cannot be used with --last"
+    [ -n "${grep_pattern}" ] && fail "${direct_option} cannot be used with --grep"
+    [ -n "${igrep_pattern}" ] && fail "${direct_option} cannot be used with --igrep"
+    [ "${print}" -eq 1 ] && fail "${direct_option} cannot be used with --print"
+fi
+
 if [ "${last}" -eq 1 ] && [ -n "${session_id}" ]; then
     fail "--last cannot be used with SESSION"
 fi
@@ -1489,7 +1598,20 @@ case "${filter_pattern}" in
         ;;
 esac
 
-if [ "${last}" -eq 1 ]; then
+if [ -n "${direct_option}" ]; then
+    # the session is named, so it is looked for wherever it was recorded and
+    # both actions enter its folder themselves
+    verbose "Finding session with session_id=${direct_session_id} in: ${agents}..."
+    find_session "${direct_session_id}" 1
+    case "${direct_option}" in
+        --resume)
+            fzf_action resume "${session_match_agent}" "${session_match_filepath}"
+            ;;
+        --fork)
+            ask_fork "${session_match_agent}" "${session_match_filepath}"
+            ;;
+    esac
+elif [ "${last}" -eq 1 ]; then
     verbose "Finding latest session of: ${agents}..."
     if [ "${current_directory_only}" -eq 0 ]; then
         IFS=$'\t' read -r _ agent _ filepath < <(session_files | tail -n 1)
@@ -1509,24 +1631,8 @@ if [ "${last}" -eq 1 ]; then
     print_session_file "${agent}" "${filepath}"
 elif [ -n "${session_id}" ]; then
     verbose "Finding session with session_id=${session_id} in: ${agents}..."
-    matches=()
-    while IFS=$'\t' read -r _ agent _ filepath; do
-        [ -n "${filepath}" ] || continue
-        if [ "${current_directory_only}" -eq 1 ] \
-            && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
-            continue
-        fi
-        case "$(session_id_of "${agent}" "${filepath}")" in
-            *"${session_id}"*)
-                matches+=("${agent}"$'\t'"${filepath}")
-                ;;
-        esac
-    done < <(session_files)
-    [ "${#matches[@]}" -eq 0 ] && fail "No such session: ${session_id}"
-    [ "${#matches[@]}" -gt 1 ] && fail "Multiple matches for session: ${session_id}"
-    IFS=$'\t' read -r agent filepath <<< "${matches[0]}"
-    verbose "${agent} ${filepath}"
-    print_session_file "${agent}" "${filepath}"
+    find_session "${session_id}" "$(( 1 - current_directory_only ))"
+    print_session_file "${session_match_agent}" "${session_match_filepath}"
 else
     verbose "Listing sessions of: ${agents}..."
     if [ "${fzf_list}" -eq 0 ] && [ "${print}" -eq 0 ]; then

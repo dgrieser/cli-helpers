@@ -506,10 +506,14 @@ Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`
 | `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
 | `-r, --raw` | Print raw output instead of rendering it through `glow`. |
+| `--resume SESSION` | Resume the session with the given ID right away, in the directory it was recorded in. |
+| `--fork SESSION` | Fork the session with the given ID right away, asking for the working root and the agent. |
 | `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
 | `--verbose` | Print verbose diagnostic output to stderr. |
 
 By default, listings include sessions from the current directory active within the last 60 days. `--all-directories` includes every recorded working directory. `--days` changes the age window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+
+`--resume` and `--fork` take a session ID and go straight to what `enter` would reach in the picker, without listing anything: `--resume` continues the session in the folder it was recorded in, `--fork` asks for the working root and the agent the way the picker does and then forks. Both look the session up in every recorded working directory, because they enter its folder themselves, and both take a part of an ID as well, as long as it matches one session only. Neither combines with `SESSION`, `--last`, `--grep`, `--igrep` or `--print`, and they do not combine with each other.
 
 Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
 
@@ -533,6 +537,8 @@ agent-session --all-directories
 agent-session --prompt-column
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
+agent-session --resume 3f9a1c2b-abcd-1234-ef56-7890abcdef12
+agent-session --fork 3f9a1c2b
 claude-session -n 20 --igrep "docker compose"
 codex-session --last
 ```
