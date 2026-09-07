@@ -40,9 +40,55 @@ import argcomplete
 #   - Uses the same environment variable lookup as the matching "color-" symlink (e.g. "COLOR_TEXT_MUTED")
 #   - Behaves the same as symlink mode, but always appends a newline.
 #
+# When the environment variable of a symlink is not set, a built-in default spec is used (see
+# THEME_DEFAULTS below), so the aliases keep working outside a themed shell. A "-light" or "-strong"
+# variant additionally falls back to its base variable when that one is themed, e.g. an unset
+# COLOR_TEXT_SUCCESS_STRONG with COLOR_TEXT_SUCCESS="green" yields "green:bold".
+#
 # Use `--help` to display this usage message.
 
 RESET = "\033[0m"
+
+# Fallback specs used when the COLOR_* environment variable of a symlink is unset, so the
+# color-*/print-* aliases still produce sane output outside a themed shell. The values shared with
+# `prompt` (see its THEME_DEFAULTS) are kept identical, so both tools render the same theme.
+# The "-light" variants are a lighter shade of their base color, the "-strong" ones add bold.
+THEME_DEFAULTS = {
+    'COLOR_TEXT_DEFAULT': '255',
+    'COLOR_TEXT_BOLD': '255:bold',
+    'COLOR_TEXT_ITALIC': '255:italic',
+    'COLOR_TEXT_MUTED': '43:italic',
+    'COLOR_TEXT_FADED': '245',
+    'COLOR_TEXT_INFO': '141',
+    # glow renders `code` in 203 on 236, padded with a space on either side
+    'COLOR_TEXT_CODE': '203:bg=236',
+    'COLOR_TEXT_SUCCESS': '40',
+    'COLOR_TEXT_SUCCESS_LIGHT': '77',
+    'COLOR_TEXT_SUCCESS_STRONG': '40:bold',
+    'COLOR_TEXT_WARNING': '214',
+    'COLOR_TEXT_WARNING_LIGHT': '221',
+    'COLOR_TEXT_WARNING_STRONG': '214:bold',
+    'COLOR_TEXT_ERROR': '160:bold',
+    'COLOR_TEXT_ERROR_LIGHT': '203',
+    'COLOR_TEXT_ERROR_STRONG': '196:bold',
+    'COLOR_TEXT_NUMERIC': '245',
+    'COLOR_TEXT_NUMERIC_LIGHT': '250',
+    'COLOR_TEXT_NUMERIC_STRONG': '245:bold',
+    'COLOR_TABLE_HEADER': '250:bold',
+    # Table columns fade out from left to right
+    'COLOR_TABLE_COLUMN_1': '255',
+    'COLOR_TABLE_COLUMN_2': '252',
+    'COLOR_TABLE_COLUMN_3': '250',
+    'COLOR_TABLE_COLUMN_4': '248',
+    'COLOR_TABLE_COLUMN_5': '245',
+    'COLOR_TABLE_COLUMN_6': '243',
+}
+
+# Suffixes of the intensity variants, mapped to the spec parts appended to the base color
+VARIANT_SUFFIXES = {
+    '_LIGHT': '',
+    '_STRONG': 'bold',
+}
 
 STYLES = {
     'bold': '1',
@@ -263,6 +309,29 @@ def build_ansi(codes):
     return "\033[" + ";".join(codes) + "m"
 
 
+def resolve_color_spec(env_var):
+    """Return the color spec for a symlink's environment variable, or None if there is none.
+
+    Lookup order:
+      1) the environment variable itself
+      2) for "-light"/"-strong" variants, the base variable (with "bold" added for "-strong"),
+         so theming just COLOR_TEXT_SUCCESS also covers its variants
+      3) the built-in default of THEME_DEFAULTS
+    """
+    spec = os.environ.get(env_var)
+    if spec is not None:
+        return spec
+
+    for suffix, extra in VARIANT_SUFFIXES.items():
+        if env_var.endswith(suffix):
+            base = os.environ.get(env_var[:-len(suffix)])
+            if base is not None:
+                return f"{base}:{extra}" if extra else base
+            break
+
+    return THEME_DEFAULTS.get(env_var)
+
+
 def main():
     newline_flags = ('-n', '--newline')
 
@@ -280,11 +349,11 @@ def main():
             force_newline = True
 
         env_var = lookup_name.upper().replace('-', '_')
-        color_spec = os.environ.get(env_var)
+        color_spec = resolve_color_spec(env_var)
 
         if color_spec is None:
-            # No environment variable set for this symlink
-            print(f"Environment variable {env_var} not set.", file=sys.stderr)
+            # No environment variable set for this symlink and no default known for it
+            print(f"Environment variable {env_var} not set and no default available.", file=sys.stderr)
             sys.exit(1)
 
         # The rest of the arguments are treated as text, except newline flags.

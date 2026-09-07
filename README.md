@@ -669,26 +669,34 @@ echo -e "hi" | color-parse red
 ```
 
 #### Symlink alias family
-`color-parse` changes behavior based on the name it is invoked as (`argv[0]`). When invoked through a symlink, it derives an environment-variable name from the link name (uppercased, dashes → underscores) and uses that variable's value as the color spec; if unset, it errors out.
+`color-parse` changes behavior based on the name it is invoked as (`argv[0]`). When invoked through a symlink, it derives an environment-variable name from the link name (uppercased, dashes → underscores) and uses that variable's value as the color spec. If the variable is unset, the built-in default of that alias is used (see the table below), so the aliases keep working outside a themed shell; only a symlink with neither a variable nor a known default errors out.
 
 - `color-*` aliases look up the matching `COLOR_*` variable (e.g. `color-text-muted` reads `$COLOR_TEXT_MUTED`) and emit codes + text **without** a forced trailing newline.
 - `print-*` aliases map to the same `COLOR_*` variable but **always append** a trailing newline.
 
-| Alias family | Environment variable(s) | Purpose |
-|---|---|---|
-| `color-text-default` / `print-text-default` | `COLOR_TEXT_DEFAULT` | Default body text style. |
-| `color-text-bold` / `print-text-bold` | `COLOR_TEXT_BOLD` | Bold text. |
-| `color-text-italic` / `print-text-italic` | `COLOR_TEXT_ITALIC` | Italic text. |
-| `color-text-muted` / `print-text-muted` | `COLOR_TEXT_MUTED` | Muted/de-emphasized text. |
-| `color-text-faded` / `print-text-faded` | `COLOR_TEXT_FADED` | Faded text. |
-| `color-text-info` / `print-text-info` | `COLOR_TEXT_INFO` | Informational text. |
-| `color-text-code` / `print-text-code` | `COLOR_TEXT_CODE` | Inline code snippet, as [glow](https://github.com/charmbracelet/glow) renders `` `code` `` (`203:bg=236`). Used by [prompt](#prompt) for quoted spans. |
-| `color-text-success[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_SUCCESS[_LIGHT\|_STRONG]` | Success text, three intensities. |
-| `color-text-warning[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_WARNING[_LIGHT\|_STRONG]` | Warning text, three intensities. |
-| `color-text-error[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_ERROR[_LIGHT\|_STRONG]` | Error text, three intensities. |
-| `color-text-numeric[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_NUMERIC[_LIGHT\|_STRONG]` | Numeric value text, three intensities. |
-| `color-table-header` / `print-table-header` | `COLOR_TABLE_HEADER` | Table header styling. |
-| `color-table-column-1`…`-6` / `print-table-column-1`…`-6` | `COLOR_TABLE_COLUMN_1`…`_6` | Per-column table cell styling. |
+The spec of an alias is resolved in this order:
+
+1. its own `COLOR_*` environment variable,
+2. for the `-light` / `-strong` variants, the base variable of the family — `-strong` appends `bold` to it, so setting only `COLOR_TEXT_SUCCESS=green` makes `color-text-success-strong` render `green:bold`,
+3. the built-in default.
+
+| Alias family | Environment variable(s) | Default | Purpose |
+|---|---|---|---|
+| `color-text-default` / `print-text-default` | `COLOR_TEXT_DEFAULT` | `255` | Default body text style. |
+| `color-text-bold` / `print-text-bold` | `COLOR_TEXT_BOLD` | `255:bold` | Bold text. |
+| `color-text-italic` / `print-text-italic` | `COLOR_TEXT_ITALIC` | `255:italic` | Italic text. |
+| `color-text-muted` / `print-text-muted` | `COLOR_TEXT_MUTED` | `43:italic` | Muted/de-emphasized text. |
+| `color-text-faded` / `print-text-faded` | `COLOR_TEXT_FADED` | `245` | Faded text. |
+| `color-text-info` / `print-text-info` | `COLOR_TEXT_INFO` | `141` | Informational text. |
+| `color-text-code` / `print-text-code` | `COLOR_TEXT_CODE` | `203:bg=236` | Inline code snippet, as [glow](https://github.com/charmbracelet/glow) renders `` `code` `` (`203:bg=236`). Used by [prompt](#prompt) for quoted spans. |
+| `color-text-success[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_SUCCESS[_LIGHT\|_STRONG]` | `40` / `77` / `40:bold` | Success text, three intensities. |
+| `color-text-warning[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_WARNING[_LIGHT\|_STRONG]` | `214` / `221` / `214:bold` | Warning text, three intensities. |
+| `color-text-error[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_ERROR[_LIGHT\|_STRONG]` | `160:bold` / `203` / `196:bold` | Error text, three intensities. |
+| `color-text-numeric[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_NUMERIC[_LIGHT\|_STRONG]` | `245` / `250` / `245:bold` | Numeric value text, three intensities. |
+| `color-table-header` / `print-table-header` | `COLOR_TABLE_HEADER` | `250:bold` | Table header styling. |
+| `color-table-column-1`…`-6` / `print-table-column-1`…`-6` | `COLOR_TABLE_COLUMN_1`…`_6` | `255` / `252` / `250` / `248` / `245` / `243` | Per-column table cell styling, fading out from left to right. |
+
+The defaults shared with [prompt](#prompt) use the same values there, so both tools render the same theme when nothing is set.
 
 ### `color-clear`
 Strips ANSI escape sequences (colors, styles, cursor codes) from text read on stdin, writing the cleaned text to stdout.
