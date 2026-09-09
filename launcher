@@ -56,9 +56,13 @@ rm -rf "${EXIT_FILE}"
 if cli_helpers_is_wayland; then
     attempts=1
     while true; do
-        win_id="$(window-by-title "${name}" 2>/dev/null)"
+        win_id="$(window-by-title "${name}" 2>/dev/null | head -n 1)"
         if [ -n "${win_id}" ]; then
             cli_helpers_gnome_window_bridge set-above "${win_id}"
+            # the window manager may have denied the fresh window focus, and
+            # with it the raise, while another always-on-top window was in
+            # front, so claim both explicitly once the launcher is above
+            window-focus "${win_id}"
             break
         fi
         ((attempts++))
@@ -72,6 +76,7 @@ else
         sleep 0.5
         [ "${attempts}" -gt 10 ] && break
     done
+    window-focus-by-class "${bin_name}" >/dev/null 2>&1
 fi
 
 # a command is running when one of the shells inside the launcher window has

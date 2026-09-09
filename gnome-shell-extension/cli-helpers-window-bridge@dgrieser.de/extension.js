@@ -133,6 +133,35 @@ function windowId(window) {
     return String(window.get_id());
 }
 
+// A D-Bus call carries no input event, so the shell's current event time is
+// usually 0. Mutter treats that as "older than the last user interaction" and
+// answers an activation request with a demands-attention flag instead of focus,
+// so ask the display for a fresh timestamp whenever no event time is available.
+function currentTime() {
+    const time = global.get_current_time();
+    if (time !== 0)
+        return time;
+
+    try {
+        return global.display.get_current_time_roundtrip();
+    } catch (error) {
+        return 0;
+    }
+}
+
+// make_above() only moves a window into the "above" layer, it does not restack
+// it inside that layer, so a window that is already kept on top (a browser with
+// "Always on Top", for example) stays in front of it. Raising afterwards puts
+// the window at the top of its own layer.
+function raiseWindow(window) {
+    const workspace = window.get_workspace();
+    if (workspace && typeof window.raise_and_make_recent_on_workspace === 'function') {
+        window.raise_and_make_recent_on_workspace(workspace);
+        return;
+    }
+    window.raise();
+}
+
 function serializeWindow(window) {
     const frame = window.get_frame_rect();
     const workspace = window.get_workspace();
@@ -209,7 +238,9 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         if (!window)
             return false;
 
-        Main.activateWindow(window, global.get_current_time());
+        Main.activateWindow(window, currentTime());
+        window.unset_demands_attention();
+        raiseWindow(window);
         return true;
     }
 
@@ -260,6 +291,7 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         if (!window)
             return false;
         window.make_above();
+        raiseWindow(window);
         return true;
     }
 
