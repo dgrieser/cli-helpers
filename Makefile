@@ -11,7 +11,10 @@ COMPLETION := bash_completion/cli-helpers
 DESKTOPDIR ?= $(HOME)/.local/share/applications
 DESKTOPSRCDIR := desktop
 DESKTOPS := browser-router.desktop
-ENABLE_GNOME_EXTENSION ?= 1
+# GNOME extension steps are skipped automatically when no GNOME Shell is
+# present; set ENABLE_GNOME_EXTENSION=1 to force them anyway
+HAVE_GNOME := $(shell command -v gnome-extensions >/dev/null 2>&1 && command -v gnome-shell >/dev/null 2>&1 && echo 1 || echo 0)
+ENABLE_GNOME_EXTENSION ?= $(HAVE_GNOME)
 UPDATE_ARGS ?=
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
@@ -36,7 +39,7 @@ list:
 	@printf '  make list-install             Show install destinations and installed files\n'
 	@printf '  make extension-zip            Package the GNOME extension\n'
 	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
-	@printf '  make install-gnome-extension  Install the packaged GNOME extension\n'
+	@printf '  make install-gnome-extension  Install the packaged GNOME extension (skipped without GNOME)\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
 	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
@@ -117,11 +120,17 @@ extension-zip:
 	rm -f "$(EXTENSION_ZIP)"
 	cd "$(EXTENSION_DIR)" && zip -r "$(EXTENSION_ZIP)" .
 
-install-gnome-extension: extension-zip
-	gnome-extensions install --force "$(EXTENSION_ZIP)"; \
-	status=$$?; \
-	rm -f "$(EXTENSION_ZIP)"; \
-	exit $$status
+# the zip is only built when the extension is actually going to be installed,
+# so non-GNOME systems need neither gnome-extensions nor zip
+install-gnome-extension: $(if $(filter 0,$(ENABLE_GNOME_EXTENSION)),,extension-zip)
+	if [ "$(ENABLE_GNOME_EXTENSION)" = "0" ]; then \
+		echo "Skipping GNOME extension install."; \
+	else \
+		gnome-extensions install --force "$(EXTENSION_ZIP)"; \
+		status=$$?; \
+		rm -f "$(EXTENSION_ZIP)"; \
+		exit $$status; \
+	fi
 
 install-completions:
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
@@ -189,7 +198,9 @@ uninstall:
 	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
 		update-desktop-database "$(DESKTOPDIR)" || true; \
 	fi
-	gnome-extensions uninstall "$(EXTENSION_UUID)" || true
+	if [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+		gnome-extensions uninstall "$(EXTENSION_UUID)" || true; \
+	fi
 
 list-install:
 	@printf 'Scripts -> %s\n' "$(DESTDIR)$(BINDIR)"
@@ -198,7 +209,11 @@ list-install:
 	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
 	@printf 'Python modules -> %s\n' "$(DESTDIR)$(PYTHONDIR)"
 	@printf '%s\n' $(MODULES) | sed 's#^#  #;s#$$#.py#'
+ifeq ($(ENABLE_GNOME_EXTENSION),0)
+	@printf 'GNOME extension -> skipped\n'
+else
 	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
+endif
 	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
 	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"
 	@printf 'Desktop entries -> %s\n' "$(DESTDIR)$(DESKTOPDIR)"

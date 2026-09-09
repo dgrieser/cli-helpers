@@ -24,7 +24,9 @@ make list-install             # show install destinations
 ```
 
 Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`, `PYTHONDIR=...`.  
-set `ENABLE_GNOME_EXTENSION=0` to skip the GNOME extension step.
+The GNOME extension steps (packaging, installing, enabling) are skipped automatically when no GNOME Shell is
+detected, so the install works unchanged on non-GNOME systems; set `ENABLE_GNOME_EXTENSION=0` to skip them on a
+GNOME system too, or `ENABLE_GNOME_EXTENSION=1` to force them.
 
 ## Contents
 
