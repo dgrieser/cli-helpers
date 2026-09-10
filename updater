@@ -686,7 +686,7 @@ software-160-yq() { install_git_release "https://github.com/mikefarah/yq" --bina
 software-170-gitlab_trackr() { install_git_release "https://github.com/BjarneSeger/gitlab_trackr"; }
 software-180-nexus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-190-snaxus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
-software-191-swctl() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*"; }
+software-191-swctl() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
 software-200-boodschapper() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
 
