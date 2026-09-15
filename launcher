@@ -19,17 +19,21 @@ window_x=300
 window_y=${dock_height}
 screen_scale=1
 
-# center horizontally on the focused screen (fall back to primary)
-#for screen in "$(window-screen-focused 2>/dev/null)" "$(window-screen-focused --primary 2>/dev/null)"; do
-#    [ -z "${screen}" ] && continue
-#    mapfile -t screen_geom < <(window-screen-geometry "${screen}" 2>/dev/null)
-#    screen_width="${screen_geom[0]}"
-#    screen_x="${screen_geom[2]}"
-#    if [[ "${screen_width}" =~ ^[0-9]+$ ]] && [ "${screen_width}" -gt "${window_width}" ]; then
-#        window_x=$(( ${screen_x:-0} + (screen_width - window_width) / 2 ))
-#        break
-#    fi
-#done
+# center horizontally on the focused screen (fall back to primary); mutter
+# places a window without a position next to whatever window already sits on
+# the monitor, so the launcher has to name its own spot
+for screen in "$(window-screen-focused 2>/dev/null)" "$(window-screen-focused --primary 2>/dev/null)"; do
+    [ -z "${screen}" ] && continue
+    mapfile -t screen_geom < <(window-screen-geometry "${screen}" 2>/dev/null)
+    screen_width="${screen_geom[0]}"
+    screen_x="${screen_geom[2]}"
+    screen_y="${screen_geom[3]}"
+    if [[ "${screen_width}" =~ ^[0-9]+$ ]] && [ "${screen_width}" -gt "${window_width}" ]; then
+        window_x=$(( ${screen_x:-0} + (screen_width - window_width) / 2 ))
+        window_y=$(( ${screen_y:-0} + dock_height ))
+        break
+    fi
+done
 
 
 pid=$(pidof -x "${bin_path}")
@@ -44,7 +48,7 @@ if [ "${pid}" != "$$" ]; then
 fi
 
 terminator_args=("-g" "${config_path}" "--no-dbus" "--title=${name}")
-#terminator_args+=("--geometry=${window_width}x${window_height}+${window_x}+${window_y}")
+terminator_args+=("--geometry=${window_width}x${window_height}+${window_x}+${window_y}")
 
 echo "+ terminator ${terminator_args[*]}" >&2
 TERM_SIMPLE="▶ " terminator "${terminator_args[@]}" &
@@ -59,6 +63,10 @@ if cli_helpers_is_wayland; then
         win_id="$(window-by-title "${name}" 2>/dev/null | head -n 1)"
         if [ -n "${win_id}" ]; then
             cli_helpers_gnome_window_bridge set-above "${win_id}"
+            # wayland clients cannot position themselves, so --geometry only
+            # carries the size here and the compositor has to do the placing
+            cli_helpers_gnome_window_bridge set-geometry "${win_id}" \
+                "${window_x}" "${window_y}" "${window_width}" "${window_height}"
             # the window manager may have denied the fresh window focus, and
             # with it the raise, while another always-on-top window was in
             # front, so claim both explicitly once the launcher is above

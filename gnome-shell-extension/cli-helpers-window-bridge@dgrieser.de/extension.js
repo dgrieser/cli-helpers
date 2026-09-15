@@ -162,6 +162,16 @@ function raiseWindow(window) {
     window.raise();
 }
 
+// Mutter dropped meta_window_get_maximized() after GNOME 47, so ask the
+// current API first and keep the old call for older shells.
+function windowIsMaximized(window) {
+    if (typeof window.is_maximized === 'function')
+        return window.is_maximized();
+    if (typeof window.get_maximized === 'function')
+        return window.get_maximized() !== 0;
+    return !!(window.maximized_horizontally || window.maximized_vertically);
+}
+
 function serializeWindow(window) {
     const frame = window.get_frame_rect();
     const workspace = window.get_workspace();
@@ -302,7 +312,7 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
 
         if (window.is_fullscreen())
             window.unmake_fullscreen();
-        if (window.get_maximized())
+        if (windowIsMaximized(window))
             window.unmaximize(Meta.MaximizeFlags.BOTH);
         window.move_resize_frame(true, x, y, width, height);
         return true;
