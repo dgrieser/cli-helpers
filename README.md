@@ -682,6 +682,7 @@ echo -e "hi" | color-parse red
 | `color-text-bold` / `print-text-bold` | `COLOR_TEXT_BOLD` | Bold text. |
 | `color-text-italic` / `print-text-italic` | `COLOR_TEXT_ITALIC` | Italic text. |
 | `color-text-muted` / `print-text-muted` | `COLOR_TEXT_MUTED` | Muted/de-emphasized text. |
+| `color-text-muted-faded` / `print-text-muted-faded` | `COLOR_TEXT_MUTED_FADED` | Muted text, faded down a step. |
 | `color-text-faded` / `print-text-faded` | `COLOR_TEXT_FADED` | Faded text. |
 | `color-text-info` / `print-text-info` | `COLOR_TEXT_INFO` | Informational text. |
 | `color-text-code` / `print-text-code` | `COLOR_TEXT_CODE` | Inline code snippet, as [glow](https://github.com/charmbracelet/glow) renders `` `code` `` (`203:bg=236`). Used by [prompt](#prompt) for quoted spans. |

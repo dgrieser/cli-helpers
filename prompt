@@ -73,7 +73,8 @@ COLOR_MAP = {
 THEME_DEFAULTS = {
     'COLOR_TEXT_DEFAULT': '255',
     'COLOR_TEXT_BOLD': '255:bold',
-    'COLOR_TEXT_MUTED': '43:italic',
+    'COLOR_TEXT_MUTED': '183:italic',
+    'COLOR_TEXT_MUTED_FADED': '245:italic',
     'COLOR_TEXT_FADED': '245',
     'COLOR_TEXT_INFO': '141',
     'COLOR_TEXT_NUMERIC': '245',
