@@ -14,6 +14,7 @@ C_RESET=$'\033[0m'
 
 cmd=""
 key_cmd=""
+fzf_rc=0
 # keys handled inside the running fzf instead of ending it: silently or with the
 # terminal handed over, each of them with or without a reload of the list
 reload_keys=""
@@ -1419,6 +1420,7 @@ while true; do
             watcher_pid=$!
         fi
         result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
+        fzf_rc=$?
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
             query="$(echo "${result}" | head -n 1)"
@@ -1426,6 +1428,14 @@ while true; do
         fi
     else
         result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        fzf_rc=$?
+    fi
+
+    # ctrl-c, and anything else that kills fzf, leaves neither a key nor a row:
+    # the picker is gone, so the run ends here instead of handing that emptiness
+    # to the key command, which has no key to act on
+    if [ "${fzf_rc}" -ge 130 ] || { [ -n "${key_cmd}" ] && [ -z "${result}" ]; }; then
+        exit 130
     fi
 
     if [ -n "${key_cmd}" ]; then

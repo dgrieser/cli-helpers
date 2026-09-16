@@ -16,6 +16,11 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
         -p, --pattern       Pattern of the artifact to install
                             Default: *linux*64*
 
+        -x, --exclude       Pattern of artifacts to exclude. Neither gh nor
+                            glab can exclude, so this is applied after the
+                            download and to the files inside an archive.
+                            May be given multiple times.
+
         -r, --release       Release tag to install
                             Default: latest release
 
@@ -55,7 +60,7 @@ function completion() {
     local skip_next=0
 
     if [ "${previous}" != "-r" ] && [ "${previous}" != "--release" ]; then
-        echo "-h --help -p --pattern -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
+        echo "-h --help -p --pattern -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
         return
     fi
     shift
@@ -68,7 +73,7 @@ function completion() {
             continue
         fi
         case "${argument}" in
-            -p|--pattern|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
+            -p|--pattern|-x|--exclude|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
                 skip_next=1
                 ;;
             -*)
@@ -190,10 +195,43 @@ function find_readme() {
     echo "${files}" | grep -i 'readme' | awk '{ print length(), $0 }' | sort -n | cut -d' ' -f2- | head -n 1
 }
 
+function matches_exclude() {
+    local file="${1}"
+    local basename_file
+    local pattern
+    [ ${#EXCLUDES[@]} -eq 0 ] && return 1
+    basename_file="$(basename "${file}")"
+    for pattern in "${EXCLUDES[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "${file}" == ${pattern} ]] && return 0
+        # shellcheck disable=SC2053
+        [[ "${basename_file}" == ${pattern} ]] && return 0
+    done
+    return 1
+}
+
+function filter_excluded_patterns() {
+    local list="${1}"
+    local filtered=""
+    local file
+    [ ${#EXCLUDES[@]} -eq 0 ] && echo "${list}" && return 0
+    while IFS= read -r file; do
+        [ -z "${file}" ] && continue
+        matches_exclude "${file}" && continue
+        if [ -z "${filtered}" ]; then
+            filtered="${file}"
+        else
+            filtered="${filtered}"$'\n'"${file}"
+        fi
+    done <<< "${list}"
+    echo "${filtered}"
+}
+
 function filter_excluded_artifacts() {
     local artifacts="${1}"
     local filtered=""
     local excluded_name
+    local artifact
     while IFS= read -r artifact; do
         [ -z "${artifact}" ] && continue
         excluded_name="$(basename "${artifact}")"
@@ -202,6 +240,7 @@ function filter_excluded_artifacts() {
                 continue
                 ;;
         esac
+        matches_exclude "${artifact}" && continue
         if [ -z "${filtered}" ]; then
             filtered="${artifact}"
         else
@@ -838,6 +877,7 @@ fi
 YES=0
 DRY_RUN=0
 PATTERNS=()
+EXCLUDES=()
 RELEASE=""
 INSTALL_PATH="/usr/local/bin"
 BUNDLE=0
@@ -867,6 +907,11 @@ while [ $# -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             PATTERNS+=("${1}")
+            ;;
+        -x|--exclude)
+            shift
+            [ -z "${1}" ] && usage
+            EXCLUDES+=("${1}")
             ;;
         -r|--release)
             shift
@@ -938,9 +983,11 @@ tmpfolder=$(mktemp -d)
 trap cleanup EXIT
 
 
-release_description="latest release"
-[ -n "${RELEASE}" ] && release_description="release '${RELEASE}'"
-echo "Retrieving artifact from '${project}' (${release_description}) with patterns ${PATTERNS[*]}..." 1>&2
+release_description=""
+[ -n "${RELEASE}" ] && release_description=" (release '${RELEASE}')"
+exclude_description=""
+[ ${#EXCLUDES[@]} -gt 0 ] && exclude_description=", excluding ${EXCLUDES[*]}"
+echo "Retrieving artifact from '${project}'${release_description} with patterns ${PATTERNS[*]}${exclude_description}..." 1>&2
 
 if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     echo 1>&2
@@ -1001,6 +1048,10 @@ for pattern in "${PATTERNS[@]}"; do
     # shellcheck disable=SC2086
     artifact="${artifact}$(ls -1 "${tmpfolder}/"${pattern} 2> /dev/null)"
 done
+if [ ${#EXCLUDES[@]} -gt 0 ]; then
+    artifact="$(filter_excluded_patterns "${artifact}")"
+    [ -z "${artifact}" ] && error "All downloaded artifacts excluded by ${EXCLUDES[*]}"
+fi
 [ -z "${artifact}" ] && error "Artifact not found" && manual_download
 
 # sort reverse and make unique
