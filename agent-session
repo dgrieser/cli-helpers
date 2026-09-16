@@ -15,6 +15,19 @@ fzf_title_max_length=50
 print_title_max_length=50
 print_prompt_max_length=60
 fork_prompt_max_bytes=100000
+# jq's gsub walks a string again per match, so collapsing the whitespace of a
+# message of a few megabytes takes minutes. Only the beginning of a prompt is
+# ever shown or searched, so the text is cut down before a pattern touches it.
+prompt_scan_max_chars=8192
+cache_folder="${XDG_CACHE_HOME:-${HOME}/.cache}/agent-session"
+cache_max_lines=5000
+# Where codex has no name for a session it keeps its first message as the title,
+# which runs to megabytes. Fifty columns of it are ever shown, so the rest is
+# left in the database instead of being read into every listing.
+title_max_bytes=500
+# a separator the texts of a session cannot carry and that bash does not treat
+# as whitespace, so an empty field of a cached entry stays a field
+cache_separator=$'\037'
 all_agents="claude codex"
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 script_folder="$(dirname "${script_path}")"
@@ -30,6 +43,10 @@ C_TITLE=$'\033[38;5;250m'
 C_PROMPT=$'\033[38;5;110m'
 C_MUTED=$'\033[90m'
 C_RESET=$'\033[0m'
+declare -A agent_colors=(
+    [claude]="${C_AGENT_CLAUDE}"
+    [codex]="${C_AGENT_CODEX}"
+)
 
 usage() {
     cat <<EOF 1>&2
@@ -60,6 +77,11 @@ Options:
     --verbose           Verbose output
 
 Called as claude-session or codex-session the matching agent is preselected.
+
+The title, the first prompt and the directory of a session are cached in
+    ${cache_folder}
+keyed by the session file and read again as soon as that file changes. Removing
+the folder costs the next listing its speed and nothing else.
 
 Interactive keys:
     /                   Search messages case-insensitively
@@ -155,12 +177,24 @@ shorten_path() {
     truncate_middle "${shortened}" "${max_length}"
 }
 
-shorten_text() {
+# Leaves the shortened text in shortened_text. A listing shortens two texts per
+# row and a subshell per row is what that would cost otherwise.
+shortened_text=""
+
+set_shortened_text() {
     local text="${1}"
     local max_length="${2}"
 
-    [ "${#text}" -le "${max_length}" ] && echo "${text}" && return
-    echo "${text:0:$((max_length - 3))}..."
+    if [ "${#text}" -le "${max_length}" ]; then
+        shortened_text="${text}"
+    else
+        shortened_text="${text:0:$((max_length - 3))}..."
+    fi
+}
+
+shorten_text() {
+    set_shortened_text "${1}" "${2}"
+    echo "${shortened_text}"
 }
 
 display_path() {
@@ -259,8 +293,209 @@ session_folder() {
     esac
 }
 
-# Emits "<mtime epoch>\t<agent>\t<mtime datetime>\t<filepath>" per session file.
-# The modification time is the last activity of the session.
+# Claude keeps the sessions of a working directory in one folder, named after
+# that directory with everything that is not a letter or a digit turned into a
+# dash. The name does not give a directory back, but it rules every other
+# project out without a single session file being opened.
+claude_project_folder() {
+    local cwd="${1}"
+
+    printf '%s/%s' "${claude_session_folder}" "${cwd//[![:alnum:]]/-}"
+}
+
+# The name above is claude's to choose, so it is only trusted where it can be
+# seen to hold: a folder of this directory that is there says so by being there,
+# and where there is none, one session of another folder is asked. A claude that
+# named its folders differently one day would make the listing read the files
+# again, not drop every session of the directory.
+claude_current_folder=""
+claude_folder_checked=0
+
+claude_folder_rule_holds() {
+    local folder
+    local filepath
+
+    for folder in "${claude_session_folder}"/*/; do
+        [ -d "${folder}" ] || continue
+        for filepath in "${folder}"*.jsonl; do
+            [ -f "${filepath}" ] || continue
+            [ "$(claude_project_folder "$(session_cwd_from_file claude "${filepath}")")" \
+                = "${folder%/}" ]
+            return
+        done
+    done
+    return 1
+}
+
+ensure_claude_current_folder() {
+    [ "${claude_folder_checked}" -eq 1 ] && return 0
+    claude_folder_checked=1
+    claude_current_folder="$(claude_project_folder "${current_directory}")"
+    [ -d "${claude_current_folder}" ] && return 0
+    claude_folder_rule_holds || claude_current_folder=""
+}
+
+# realpath is a process of its own and the sessions of a listing share a handful
+# of working directories, so each of them is resolved once.
+declare -A resolved_directories=()
+resolved_directory=""
+
+resolve_directory() {
+    local path="${1}"
+
+    if [ -z "${resolved_directories[${path}]+set}" ]; then
+        resolved_directories["${path}"]="$(realpath -m -- "${path}")"
+    fi
+    resolved_directory="${resolved_directories[${path}]}"
+}
+
+# Codex keeps a row per session in its state database, the working directory and
+# the title among its columns. One query answers for all of them at once, where
+# reading the files would be one jq per session.
+declare -A codex_cwd_by_path=()
+declare -A codex_title_by_path=()
+codex_state_loaded=0
+
+load_codex_state() {
+    local path
+    local cwd
+    local title
+
+    [ "${codex_state_loaded}" -eq 1 ] && return 0
+    codex_state_loaded=1
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    [ -r "${codex_state_db}" ] || return 0
+    while IFS=$'\t' read -r path cwd title; do
+        [ -n "${path}" ] || continue
+        codex_cwd_by_path["${path}"]="${cwd}"
+        codex_title_by_path["${path}"]="${title}"
+    done < <(sqlite3 -readonly -separator $'\t' "${codex_state_db}" "
+        SELECT rollout_path,
+               replace(replace(replace(cwd, char(10), ' '), char(13), ' '), char(9), ' '),
+               substr(replace(replace(replace(COALESCE(NULLIF(name, ''), title), char(10), ' '), char(13), ' '), char(9), ' '), 1, ${title_max_bytes})
+        FROM threads;" 2>/dev/null)
+    warm_resolved_directories
+}
+
+# Every working directory a codex session names is resolved in one call, so that
+# the listing below does not start a realpath per directory it walks past.
+warm_resolved_directories() {
+    local -A seen=()
+    local -a paths=()
+    local path
+    local resolved
+    local index=0
+
+    for path in "${codex_cwd_by_path[@]}"; do
+        [ -n "${path}" ] || continue
+        [ -n "${seen[${path}]+set}" ] && continue
+        seen["${path}"]=1
+        paths+=("${path}")
+    done
+    [ "${#paths[@]}" -gt 0 ] || return 0
+    while IFS= read -r resolved; do
+        resolved_directories["${paths[index]}"]="${resolved}"
+        index=$((index + 1))
+    done < <(printf '%s\0' "${paths[@]}" | xargs -0 -r realpath -m -- 2>/dev/null)
+}
+
+# What a listing shows of a session - its working directory, its title and its
+# first prompt - is what reading the session file costs, and none of it changes
+# while the file does not. It is kept in a file of its own, keyed by the path of
+# the session and checked against its modification time and its size. That file
+# is a log: a new entry is appended and the last one of a path wins, and it is
+# rewritten once it has grown past what the sessions need.
+declare -A metadata_cache=()
+metadata_cache_file=""
+metadata_cache_lines=0
+metadata_cache_additions=()
+session_meta_cwd=""
+session_meta_title=""
+session_meta_prompt=""
+
+load_metadata_cache() {
+    local line
+    local filepath
+
+    metadata_cache_file="${cache_folder}/metadata.tsv"
+    [ -r "${metadata_cache_file}" ] || return 0
+    while IFS= read -r line; do
+        filepath="${line%%"${cache_separator}"*}"
+        [ -n "${filepath}" ] && [ "${filepath}" != "${line}" ] || continue
+        metadata_cache["${filepath}"]="${line#*"${cache_separator}"}"
+        metadata_cache_lines=$((metadata_cache_lines + 1))
+    done < "${metadata_cache_file}"
+}
+
+remember_session_metadata() {
+    local filepath="${1}"
+    local mtime="${2}"
+    local size="${3}"
+    local entry
+
+    entry="${mtime}${cache_separator}${size}"
+    entry+="${cache_separator}${session_meta_cwd//[$'\t\r\n\037']/ }"
+    entry+="${cache_separator}${session_meta_title//[$'\t\r\n\037']/ }"
+    entry+="${cache_separator}${session_meta_prompt//[$'\t\r\n\037']/ }"
+    metadata_cache["${filepath}"]="${entry}"
+    metadata_cache_additions+=("${filepath}${cache_separator}${entry}")
+}
+
+flush_metadata_cache() {
+    local filepath
+    local temp_file
+
+    [ -n "${metadata_cache_file}" ] || return 0
+    [ "${#metadata_cache_additions[@]}" -gt 0 ] || return 0
+    mkdir -p -- "${cache_folder}" 2>/dev/null || return 0
+    if [ $(( metadata_cache_lines + ${#metadata_cache_additions[@]} )) -le "${cache_max_lines}" ]; then
+        printf '%s\n' "${metadata_cache_additions[@]}" >> "${metadata_cache_file}"
+        metadata_cache_additions=()
+        return 0
+    fi
+    # The log has outgrown the sessions it describes, so it is written again
+    # from what is left of it: one entry per session, none for a file that is
+    # gone.
+    temp_file="$(mktemp "${metadata_cache_file}.XXXXXX")" || return 0
+    for filepath in "${!metadata_cache[@]}"; do
+        [ -f "${filepath}" ] || continue
+        printf '%s%s%s\n' "${filepath}" "${cache_separator}" "${metadata_cache[${filepath}]}"
+    done > "${temp_file}"
+    mv -f -- "${temp_file}" "${metadata_cache_file}" 2>/dev/null || rm -f -- "${temp_file}"
+    metadata_cache_additions=()
+}
+
+# Leaves what a listing shows of a session in session_meta_cwd,
+# session_meta_title and session_meta_prompt: from the cache where the file has
+# not changed since the entry was written, from the file itself otherwise.
+read_session_metadata() {
+    local agent="${1}"
+    local filepath="${2}"
+    local mtime="${3}"
+    local size="${4}"
+    local entry
+    local cached_mtime
+    local cached_size
+
+    entry="${metadata_cache[${filepath}]-}"
+    if [ -n "${entry}" ]; then
+        IFS="${cache_separator}" read -r cached_mtime cached_size \
+            session_meta_cwd session_meta_title session_meta_prompt <<< "${entry}"
+        if [ "${cached_mtime}" = "${mtime}" ] && [ "${cached_size}" = "${size}" ]; then
+            return 0
+        fi
+    fi
+
+    read_session_cwd "${agent}" "${filepath}"
+    session_meta_cwd="${session_directory_value}"
+    session_meta_prompt="$(session_prompt "${agent}" "${filepath}")"
+    session_meta_title="$(session_title "${agent}" "${filepath}" "${session_meta_prompt}")"
+    remember_session_metadata "${filepath}" "${mtime}" "${size}"
+}
+
+# Emits "<mtime epoch>\t<agent>\t<mtime datetime>\t<size>\t<filepath>" per
+# session file. The modification time is the last activity of the session, and
+# together with the size it says whether a cached entry still describes it.
 agent_session_files() {
     local agent="${1}"
     local folder
@@ -270,7 +505,7 @@ agent_session_files() {
     folder="$(session_folder "${agent}")"
     [ -d "${folder}" ] || return 0
 
-    find_format='%T@\t'"${agent}"'\t%TY-%Tm-%TdT%TH:%TM:%TS\t%p\n'
+    find_format='%T@\t'"${agent}"'\t%TY-%Tm-%TdT%TH:%TM:%TS\t%s\t%p\n'
     case "${agent}" in
         claude)
             find_args=( "${folder}" '-mindepth' '2' '-maxdepth' '2' '-name' "*.${session_ext}" )
@@ -313,7 +548,7 @@ session_id_of() {
     esac
 }
 
-session_cwd() {
+session_cwd_from_file() {
     local agent="${1}"
     local filepath="${2}"
     local filter
@@ -329,15 +564,48 @@ session_cwd() {
     jq -rn "${filter}" "${filepath}"
 }
 
+# Leaves the working directory of the session in session_directory_value, taken
+# from the state database of codex where that knows it, so that the file is only
+# opened where nothing else answers. It is a variable and not an echo, because
+# one process per session is what this is here to avoid.
+session_directory_value=""
+
+read_session_cwd() {
+    local agent="${1}"
+    local filepath="${2}"
+
+    if [ "${agent}" = "codex" ] && [ -n "${codex_cwd_by_path[${filepath}]+set}" ]; then
+        session_directory_value="${codex_cwd_by_path[${filepath}]}"
+        return 0
+    fi
+    session_directory_value="$(session_cwd_from_file "${agent}" "${filepath}")"
+}
+
+session_cwd() {
+    [ "${1}" = "codex" ] && load_codex_state
+    read_session_cwd "${1}" "${2}"
+    printf '%s' "${session_directory_value}"
+}
+
 session_is_in_directory() {
     local agent="${1}"
     local filepath="${2}"
     local directory="${3}"
-    local session_directory
 
-    session_directory="$(session_cwd "${agent}" "${filepath}")"
-    [ -n "${session_directory}" ] || return 1
-    [ "$(realpath -m -- "${session_directory}")" = "${directory}" ]
+    # The folder a claude session lies in already says which directory it can
+    # belong to, and says so without opening anything; the name being lossy, the
+    # session itself still has the last word.
+    [ "${agent}" = "claude" ] && ensure_claude_current_folder
+    if [ "${agent}" = "claude" ] && [ -n "${claude_current_folder}" ] \
+        && [ "${directory}" = "${current_directory}" ] \
+        && [[ "${filepath}" != "${claude_current_folder}/"* ]]; then
+        return 1
+    fi
+    read_session_cwd "${agent}" "${filepath}"
+    [ -n "${session_directory_value}" ] || return 1
+    [ "${session_directory_value}" = "${directory}" ] && return 0
+    resolve_directory "${session_directory_value}"
+    [ "${resolved_directory}" = "${directory}" ]
 }
 
 # Finds the one session an ID or a part of one refers to, leaving its agent and
@@ -352,7 +620,8 @@ find_session() {
 
     session_match_agent=""
     session_match_filepath=""
-    while IFS=$'\t' read -r _ agent _ filepath; do
+    load_codex_state
+    while IFS=$'\t' read -r _ agent _ _ filepath; do
         [ -n "${filepath}" ] || continue
         if [ "${all_directories}" -eq 0 ] \
             && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
@@ -372,7 +641,10 @@ find_session() {
 
 # One line per message, whitespace collapsed, so that patterns spanning line
 # breaks of a message still match. Streamed instead of slurped, so that a
-# reader stopping at the first match does not pay for the whole session.
+# reader stopping at the first match does not pay for the whole session, and the
+# collapsing is left to tr, which walks a message once where jq's gsub needs
+# minutes for one of a few megabytes. The messages are handed over separated by
+# SOH, which tr turns into the line breaks between them afterwards.
 # shellcheck disable=SC2016 # jq programs, no shell expansion wanted
 jq_claude_message_texts='
     def text_content:
@@ -384,7 +656,7 @@ jq_claude_message_texts='
     | select(.message.content? != null)
     | (.message.content | text_content)
     | select(length > 0)
-    | gsub("\\s+"; " ")
+    | (., "\u0001")
 '
 
 # shellcheck disable=SC2016 # jq programs, no shell expansion wanted
@@ -400,7 +672,7 @@ jq_codex_message_texts='
           | ([.content[]? | (.text // "")] | join(" "))
       end
     | select(length > 0)
-    | gsub("\\s+"; " ")
+    | (., "\u0001")
 '
 
 session_messages() {
@@ -416,22 +688,76 @@ session_messages() {
             filter="${jq_codex_message_texts}"
             ;;
     esac
-    jq -rn "${filter}" "${filepath}" 2>/dev/null
+    jq -jn "${filter}" "${filepath}" 2>/dev/null \
+        | tr -s '[:space:]' ' ' \
+        | tr '\001' '\n'
 }
 
+# What is made of the first prompt once it has been found, and the reason the
+# text is cut down before it: every pattern here is a gsub, and jq walks the
+# whole string again for each match it makes.
+# shellcheck disable=SC2016 # jq program, no shell expansion wanted
+jq_prompt_tail='
+    | (capture("<command-message>(?<message>.*?)</command-message>"; "n").message? // .)
+    | gsub("<[^>]+>"; "")
+    | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+    | gsub("[[:space:]]+"; " ")
+'
+
+# The first prompt of the session. Only the message it needs is read, the stream
+# stopping there instead of building every message of the session first.
 session_prompt() {
     local agent="${1}"
     local filepath="${2}"
+    local prompt
 
-    jq -rs "$(jq_messages "${agent}")"'
-        messages
-        | map(select(.role == "User"))
-        | .[0].text // ""
-        | (capture("<command-message>(?<message>.*?)</command-message>"; "n").message? // .)
-        | gsub("<[^>]+>"; "")
-        | gsub("^[[:space:]]+|[[:space:]]+$"; "")
-        | gsub("[[:space:]]+"; " ")
-    ' "${filepath}"
+    case "${agent}" in
+        claude)
+            jq -rn '
+                def text_content:
+                    if type == "string" then .
+                    elif type == "array" then [.[]? | select(.type == "text") | .text] | join("\n")
+                    else "" end;
+                first(
+                    inputs
+                    | select(.type == "user" and ((.isMeta // false) | not))
+                    | select(.message.content? != null)
+                    | (.message.content | text_content)
+                    | .[0:'"${prompt_scan_max_chars}"']
+                    | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+                    | select(length > 0)
+                    | select(test("^<command-name>|^<local-command-|^<tool_result>"; "n") | not)
+                ) // ""
+                '"${jq_prompt_tail}" "${filepath}" 2>/dev/null
+            ;;
+        codex)
+            prompt="$(jq -rn '
+                first(
+                    inputs
+                    | select(.type == "event_msg")
+                    | .payload
+                    | select(.type == "user_message")
+                    | (.message // "")
+                    | .[0:'"${prompt_scan_max_chars}"']
+                    | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+                    | select(length > 0)
+                    | select(test("^<environment_context>|^<user_instructions>|^<user_shell>"; "n") | not)
+                ) // ""
+                '"${jq_prompt_tail}" "${filepath}" 2>/dev/null)"
+            # Sessions of an older codex recorded their messages in a shape only
+            # the whole file tells apart from this one, so that shape is asked
+            # where the streamed one found nothing.
+            if [ -z "${prompt}" ]; then
+                prompt="$(jq -rs "${jq_codex_messages}"'
+                    messages
+                    | map(select(.role == "User"))
+                    | .[0].text // ""
+                    | .[0:'"${prompt_scan_max_chars}"']
+                    '"${jq_prompt_tail}" "${filepath}" 2>/dev/null)"
+            fi
+            printf '%s' "${prompt}"
+            ;;
+    esac
 }
 
 # The generated title of the session; the first prompt stands in for sessions
@@ -446,16 +772,25 @@ session_title() {
 
     case "${agent}" in
         claude)
-            title="$(jq -r 'select(.type == "ai-title") | .aiTitle // empty' "${filepath}" 2>/dev/null | tail -1)"
+            # grep picks the few lines that can carry a title out of a file of
+            # any size and jq only reads those; a line of a message quoting the
+            # marker drops out there.
+            title="$(grep -F '"type":"ai-title"' "${filepath}" 2>/dev/null \
+                | jq -rR 'fromjson? | select(.type == "ai-title") | .aiTitle // empty' 2>/dev/null \
+                | tail -1)"
             ;;
         codex)
-            session_id="$(session_id_of "${agent}" "${filepath}")"
-            if command -v sqlite3 >/dev/null 2>&1 \
-                && [ -r "${codex_state_db}" ] \
-                && [[ "${session_id}" =~ ^[[:alnum:]-]+$ ]]; then
-                title="$(sqlite3 "${codex_state_db}" \
-                    "SELECT COALESCE(NULLIF(name, ''), title) FROM threads WHERE id = '${session_id}' LIMIT 1;" \
-                    2>/dev/null)"
+            if [ -n "${codex_title_by_path[${filepath}]+set}" ]; then
+                title="${codex_title_by_path[${filepath}]}"
+            else
+                session_id="$(session_id_of "${agent}" "${filepath}")"
+                if command -v sqlite3 >/dev/null 2>&1 \
+                    && [ -r "${codex_state_db}" ] \
+                    && [[ "${session_id}" =~ ^[[:alnum:]-]+$ ]]; then
+                    title="$(sqlite3 -readonly "${codex_state_db}" \
+                        "SELECT substr(COALESCE(NULLIF(name, ''), title), 1, ${title_max_bytes}) FROM threads WHERE id = '${session_id}' LIMIT 1;" \
+                        2>/dev/null)"
+                fi
             fi
             ;;
     esac
@@ -468,17 +803,7 @@ session_title() {
 }
 
 agent_color() {
-    case "${1}" in
-        claude)
-            printf '%s' "${C_AGENT_CLAUDE}"
-            ;;
-        codex)
-            printf '%s' "${C_AGENT_CODEX}"
-            ;;
-        *)
-            printf '%s' "${C_AGENT_OTHER}"
-            ;;
-    esac
+    printf '%s' "${agent_colors[${1}]-${C_AGENT_OTHER}}"
 }
 
 # All ages of a listing come from a single toage call - one call per session
@@ -1092,6 +1417,7 @@ print_session_list() {
     local mtime
     local mtimes=()
     local now
+    local size
     local filepath
     local cwd
     local title
@@ -1103,6 +1429,7 @@ print_session_list() {
     local prompt_cell
     local full_titles=()
     local full_prompts=()
+    local -A formatted_cwds=()
 
     now="$(date +%s)"
     if [ "${print}" -eq 1 ]; then
@@ -1124,32 +1451,41 @@ print_session_list() {
     # Entries were collected newest first. fzf's default layout places the
     # first row next to its prompt, keeping the latest session selected.
     for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r agent mtime _ filepath <<< "${entry}"
-        agent_color_code="$(agent_color "${agent}")"
+        IFS=$'\t' read -r agent mtime _ size filepath <<< "${entry}"
+        agent_color_code="${agent_colors[${agent}]-${C_AGENT_OTHER}}"
         age="${ages[age_index]:-}"
         age_index=$((age_index + 1))
-        cwd="$(format_cwd "$(session_cwd "${agent}" "${filepath}")")"
-        prompt="$(session_prompt "${agent}" "${filepath}")"
-        title="$(session_title "${agent}" "${filepath}" "${prompt}")"
+        read_session_metadata "${agent}" "${filepath}" "${mtime}" "${size}"
+        # the sessions of a listing share their directories, so each of them is
+        # shortened once instead of once per row
+        if [ -z "${formatted_cwds[${session_meta_cwd}]+set}" ]; then
+            formatted_cwds["${session_meta_cwd}"]="$(format_cwd "${session_meta_cwd}")"
+        fi
+        cwd="${formatted_cwds[${session_meta_cwd}]}"
+        prompt="${session_meta_prompt}"
+        title="${session_meta_title}"
         [ -n "${title}" ] || title="-"
         [ -n "${prompt}" ] || prompt="-"
         full_titles+=("${title}")
         full_prompts+=("${prompt}")
-        title="$(shorten_text "${title}" "${title_max_length}")"
+        set_shortened_text "${title}" "${title_max_length}"
+        title="${shortened_text}"
         # the prompt is kept as a hidden field of the picker either way, so
         # without its column it stays searchable but takes no width
         prompt_cell=""
         if [ "${prompt_column}" -eq 1 ]; then
             if [ "${print}" -eq 1 ]; then
-                prompt="$(shorten_text "${prompt}" "${print_prompt_max_length}")"
+                set_shortened_text "${prompt}" "${print_prompt_max_length}"
             else
-                prompt="$(shorten_text "${prompt}" "${fzf_text_max_length}")"
+                set_shortened_text "${prompt}" "${fzf_text_max_length}"
             fi
+            prompt="${shortened_text}"
             prompt_cell="  ${C_PROMPT}${prompt}${C_RESET}"
         fi
         [ -n "${cwd}" ] || cwd="-"
         table+="${agent_color_code}${agent}${C_RESET}  ${age}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
     done
+    flush_metadata_cache
 
     mapfile -t formatted_rows < <(printf '%s' "${table}" | k-format)
 
@@ -1161,7 +1497,7 @@ print_session_list() {
     picker_rows="${formatted_rows[0]}"$'\tAGENT\tFILE\tFULL_TITLE\tFULL_PROMPT\n'
     row_index=1
     for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r agent _ _ filepath <<< "${entry}"
+        IFS=$'\t' read -r agent _ _ _ filepath <<< "${entry}"
         formatted_row="${formatted_rows[row_index]}"
         picker_rows+="${formatted_row}"$'\t'"${agent}"$'\t'"${filepath}"$'\t'"${full_titles[row_index-1]}"$'\t'"${full_prompts[row_index-1]}"$'\n'
         row_index=$((row_index + 1))
@@ -1295,7 +1631,7 @@ completion() {
     [ "${ids_only}" -eq 0 ] \
         && echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -P --prompt-column -g --grep -i --igrep -r --raw --resume --fork --verbose"
     for agent in ${agents}; do
-        while IFS=$'\t' read -r _ _ _ filepath; do
+        while IFS=$'\t' read -r _ _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
             session_id_of "${agent}" "${filepath}"
         done < <(agent_session_files "${agent}")
@@ -1648,13 +1984,14 @@ if [ -n "${direct_option}" ]; then
     esac
 elif [ "${last}" -eq 1 ]; then
     verbose "Finding latest session of: ${agents}..."
+    load_codex_state
     if [ "${current_directory_only}" -eq 0 ]; then
-        IFS=$'\t' read -r _ agent _ filepath < <(session_files | tail -n 1)
+        IFS=$'\t' read -r _ agent _ _ filepath < <(session_files | tail -n 1)
     else
         mapfile -t latest_session_lines < <(session_files)
         filepath=""
         for (( index=${#latest_session_lines[@]} - 1; index >= 0; index-- )); do
-            IFS=$'\t' read -r _ agent _ candidate_filepath <<< "${latest_session_lines[index]}"
+            IFS=$'\t' read -r _ agent _ _ candidate_filepath <<< "${latest_session_lines[index]}"
             if session_is_in_directory "${agent}" "${candidate_filepath}" "${current_directory}"; then
                 filepath="${candidate_filepath}"
                 break
@@ -1687,11 +2024,15 @@ else
     session_entries=()
     session_lines=()
     session_paths=()
-    while IFS=$'\t' read -r mtime agent datetime filepath; do
+    # the directory of a codex session and the title of one are columns of its
+    # state database, so one query stands in for opening every file
+    [[ " ${agents} " == *" codex "* ]] && load_codex_state
+    load_metadata_cache
+    while IFS=$'\t' read -r mtime agent datetime size filepath; do
         [ -n "${filepath}" ] || continue
         mtime_epoch="${mtime%%.*}"
         [ "${cutoff_epoch}" -gt 0 ] && [ "${mtime_epoch}" -lt "${cutoff_epoch}" ] && continue
-        session_lines+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${filepath}")
+        session_lines+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${size}"$'\t'"${filepath}")
         session_paths+=("${filepath}")
     done < <(session_files)
 
@@ -1711,7 +2052,7 @@ else
     # Walk from the newest session backwards. Count mode stops at its limit;
     # age mode was already restricted while collecting session files.
     for (( index=${#session_lines[@]} - 1; index >= 0; index-- )); do
-        IFS=$'\t' read -r agent mtime datetime filepath <<< "${session_lines[index]}"
+        IFS=$'\t' read -r agent mtime datetime size filepath <<< "${session_lines[index]}"
         if [ "${current_directory_only}" -eq 1 ] \
             && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
             continue
@@ -1721,7 +2062,7 @@ else
             session_messages "${agent}" "${filepath}" \
                 | grep "${verify_args[@]}" -- "${filter_pattern}" || continue
         fi
-        session_entries+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${filepath}")
+        session_entries+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${size}"$'\t'"${filepath}")
         [ -n "${list_limit}" ] && [ "${#session_entries[@]}" -ge "${list_limit}" ] && break
     done
 

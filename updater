@@ -714,7 +714,7 @@ software-290-trivy() {
 
 software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
-software-320-opencode() { install_git_release "https://github.com/anomalyco/opencode"; }
+software-320-opencode() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
 
 software-330-zoom() {
     require_cmd curl jq dpkg apt-get || return 1
