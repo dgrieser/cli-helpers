@@ -377,6 +377,66 @@ load_codex_state() {
     warm_resolved_directories
 }
 
+# The first prompt of a codex session is a column of its state database as well,
+# and it is the message the user actually typed - the session file starts with
+# what the harness wrapped around it, a review task or the instructions of the
+# repository, which is not what the session was about. Only the rows a listing
+# shows need one and the cache answers for most of them, so they are asked for
+# together instead of being loaded for every session there is.
+declare -A codex_prompt_by_path=()
+
+preload_codex_prompts() {
+    local entry
+    local agent
+    local mtime
+    local size
+    local filepath
+    local cached
+    local cached_mtime
+    local cached_size
+    local missing=()
+    local quoted
+    local list=""
+    local path
+    local prompt
+
+    [ "${codex_state_loaded}" -eq 1 ] || return 0
+    for entry in "${session_entries[@]}"; do
+        IFS=$'\t' read -r agent mtime _ size filepath <<< "${entry}"
+        [ "${agent}" = "codex" ] || continue
+        cached="${metadata_cache[${filepath}]-}"
+        if [ -n "${cached}" ]; then
+            IFS="${cache_separator}" read -r cached_mtime cached_size _ <<< "${cached}"
+            [ "${cached_mtime}" = "${mtime}" ] && [ "${cached_size}" = "${size}" ] && continue
+        fi
+        missing+=("${filepath}")
+    done
+    [ "${#missing[@]}" -gt 0 ] || return 0
+
+    for path in "${missing[@]}"; do
+        quoted="${path//\'/\'\'}"
+        list+="${list:+,}'${quoted}'"
+    done
+    # awk stands in for the patterns the prompt of a session file is put
+    # through: the tags of a wrapped prompt dropped and its whitespace
+    # collapsed, done once for the whole answer instead of once per row.
+    while IFS=$'\t' read -r path prompt; do
+        [ -n "${path}" ] || continue
+        codex_prompt_by_path["${path}"]="${prompt}"
+    done < <(sqlite3 -readonly -separator $'\t' "${codex_state_db}" "
+        SELECT rollout_path,
+               substr(replace(replace(replace(first_user_message, char(10), ' '), char(13), ' '), char(9), ' '), 1, ${prompt_scan_max_chars})
+        FROM threads
+        WHERE rollout_path IN (${list});" 2>/dev/null \
+        | awk -F'\t' 'BEGIN { OFS = "\t" } {
+            gsub(/<[^>]*>/, "", $2)
+            gsub(/ +/, " ", $2)
+            sub(/^ /, "", $2)
+            sub(/ $/, "", $2)
+            print
+        }')
+}
+
 # Every working directory a codex session names is resolved in one call, so that
 # the listing below does not start a realpath per directory it walks past.
 warm_resolved_directories() {
@@ -731,6 +791,14 @@ session_prompt() {
                 '"${jq_prompt_tail}" "${filepath}" 2>/dev/null
             ;;
         codex)
+            # What the user typed, where the state database has it. The session
+            # file only says what the harness sent first, which for a review or
+            # a session with repository instructions is not the prompt.
+            prompt="${codex_prompt_by_path[${filepath}]-}"
+            if [ -n "${prompt}" ]; then
+                printf '%s' "${prompt}"
+                return 0
+            fi
             prompt="$(jq -rn '
                 first(
                     inputs
@@ -1448,6 +1516,7 @@ print_session_list() {
     done
     command -v toage >/dev/null 2>&1 || fail "toage not found"
     mapfile -t ages < <(format_ages "${now}" "${mtimes[@]}")
+    preload_codex_prompts
     # Entries were collected newest first. fzf's default layout places the
     # first row next to its prompt, keeping the latest session selected.
     for entry in "${session_entries[@]}"; do
