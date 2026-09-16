@@ -313,9 +313,45 @@ function reduce_unsupported_artifacts() {
     echo "${reduced}"
 }
 
+function prefer_without() {
+    local marker="${1}"; shift
+    local list="${1}"; shift
+    local reduced
+    reduced="$(echo "${list}" | grep -vi "${marker}" || true)"
+    [ -n "${reduced}" ] && echo "${reduced}" && return 0
+    echo "${list}"
+    return 0
+}
+
+function prefer_with() {
+    local marker="${1}"; shift
+    local list="${1}"; shift
+    local reduced
+    reduced="$(echo "${list}" | grep -i "${marker}" || true)"
+    [ -n "${reduced}" ] && echo "${reduced}" && return 0
+    echo "${list}"
+    return 0
+}
+
 function prefer_gnu_over_musl() {
     local list="${1}"; shift
-    prefer_a_over_b "gnu" "musl" "${list}"
+    # Not every project spells the glibc build "gnu" (opencode ships
+    # *-linux-x64.tar.gz next to *-linux-x64-musl.tar.gz), so drop the musl
+    # variant whenever a non-musl sibling exists.
+    prefer_without "musl" "${list}"
+    return $?
+}
+
+function prefer_supported_cpu_variant() {
+    local list="${1}"; shift
+    # "baseline" builds (bun, opencode, ...) are the fallback for CPUs without
+    # modern SIMD. Take them only when this CPU lacks AVX2, or when the CPU
+    # cannot be inspected at all, since they run everywhere.
+    if grep -qm1 '\bavx2\b' /proc/cpuinfo 2>/dev/null; then
+        prefer_without "baseline" "${list}"
+    else
+        prefer_with "baseline" "${list}"
+    fi
     return $?
 }
 
@@ -341,6 +377,22 @@ function prefer_a_over_b() {
 
     echo "${list}"
     return 0
+}
+
+function arch_pattern() {
+    local parts=()
+    [ -n "${ARCH_UNAME}" ] && parts+=("${ARCH_UNAME}")
+    [ -n "${ARCH_DPKG}" ] && [ "${ARCH_DPKG}" != "${ARCH_UNAME}" ] && parts+=("${ARCH_DPKG}")
+    case "${ARCH_UNAME}|${ARCH_DPKG}" in
+        *x86_64*|*amd64*)
+            parts+=("x64")
+            ;;
+        *aarch64*|*arm64*)
+            parts+=("arm64" "aarch64")
+            ;;
+    esac
+    local IFS="|"
+    echo "${parts[*]}"
 }
 
 function archive_ls() {
@@ -1060,6 +1112,8 @@ artifact="$(echo "${artifact}" | sort -ur)"
 if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
     # remove unsupported artifacts early
     artifact_list="$(reduce_unsupported_artifacts "${artifact}")"
+    # os first: the arch filter alone would happily settle on a darwin build
+    artifact_list="$(prefer_linux_over_darwin "${artifact_list}")"
     best=""
     echo 1>&2
     echo "Found multiple artifacts matching ${PATTERNS[*]}:" 1>&2
@@ -1069,7 +1123,7 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
 
 
     # try filtering by architecture, original list stays intact
-    filtered="$(echo "${artifact_list}" | grep -E "(${ARCH_UNAME}|${ARCH_DPKG})")"
+    filtered="$(echo "${artifact_list}" | grep -E "($(arch_pattern))")"
     count=$(echo "${filtered}" | wc -l)
 
     if [ "${count}" -eq 1 ]; then
@@ -1088,7 +1142,7 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
     if [ -z "${best}" ]; then
         reduced_list="$(reduce_artifacts "${artifact_list}")"
         reduced_list="$(prefer_gnu_over_musl "${reduced_list}")"
-        reduced_list="$(prefer_linux_over_darwin "${reduced_list}")"
+        reduced_list="$(prefer_supported_cpu_variant "${reduced_list}")"
         if [ "$(echo "${reduced_list}" | wc -l)" -eq 1 ]; then
             best="${reduced_list}"
         else
