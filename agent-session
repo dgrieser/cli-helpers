@@ -56,6 +56,10 @@ declare -A live_symbols=(
     [waiting]='?'
     [open]=$'\u25cb'
 )
+# A cell of its own is what keeps the markers under each other; the column
+# formatter drops a cell that holds nothing, so a session nobody has open fills
+# it with a dot instead of a space.
+live_none_symbol=$'\u00b7'
 declare -A live_colors=(
     [working]="${C_LIVE_WORKING}"
     [waiting]="${C_LIVE_WAITING}"
@@ -655,10 +659,10 @@ codex_turn_state() {
     [ "${last}" = '"task_started"' ] && printf 'working' || printf 'open'
 }
 
-# The marker of a row, left in live_marker, and the words that make its state
-# searchable in the picker, left in live_words. The state word carries an @, so
-# that a query for it finds the sessions that are in that state and not the ones
-# that happen to say "working" in their title.
+# The marker cell of a row, left in live_marker, and the words that make its
+# state searchable in the picker, left in live_words. The state word carries an
+# @, so that a query for it finds the sessions that are in that state and not
+# the ones that happen to say "working" in their title.
 live_marker=""
 live_words=""
 
@@ -667,12 +671,12 @@ read_live_marker() {
     local filepath="${2}"
     local state
 
-    live_marker=""
+    live_marker="${C_MUTED}${live_none_symbol}${C_RESET}"
     live_words=""
     read_session_id "${agent}" "${filepath}"
     state="${live_state_by_id[${session_id_value}]-}"
     [ -n "${state}" ] || return 0
-    live_marker=" ${live_colors[${state}]}${live_symbols[${state}]}${C_RESET}"
+    live_marker="${live_colors[${state}]}${live_symbols[${state}]}${C_RESET}"
     live_words="@${state}${live_detail_by_id[${session_id_value}]:+ ${live_detail_by_id[${session_id_value}]}}"
 }
 
@@ -1666,7 +1670,7 @@ print_session_list() {
     else
         title_max_length="${fzf_title_max_length}"
     fi
-    table="AGENT  AGE  TITLE"
+    table="AGENT  ${C_MUTED}${live_none_symbol}${C_RESET}  AGE  TITLE"
     [ "${prompt_column}" -eq 1 ] && table+="  PROMPT"
     table+="  DIRECTORY"$'\n'
     for entry in "${session_entries[@]}"; do
@@ -1714,7 +1718,7 @@ print_session_list() {
             prompt_cell="  ${C_PROMPT}${prompt}${C_RESET}"
         fi
         [ -n "${cwd}" ] || cwd="-"
-        table+="${agent_color_code}${agent}${C_RESET}${live_marker}  ${age}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
+        table+="${agent_color_code}${agent}${C_RESET}  ${live_marker}  ${age}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
     done
     flush_metadata_cache
 
