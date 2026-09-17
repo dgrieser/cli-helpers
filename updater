@@ -859,20 +859,6 @@ software-370-wezterm() {
 }
 software-380-dive@dev@k8s() { install_git_release "https://github.com/wagoodman/dive"; }
 software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubecolor/kubecolor"; }
-
-software-400-mc@dev() {
-    # TODO: add proper version printing on dry-run
-    require_cmd curl || return 1
-    local mc_target_path="/usr/local/bin/mc"
-    [ "${dry_run}" -eq 1 ] && mc_target_path="/tmp/mc-dry-run"
-    ${SUDO} curl -sS -L https://dl.min.io/client/mc/release/linux-amd64/mc -o "${mc_target_path}" || return 1
-    ${SUDO} chmod +x "${mc_target_path}" || return 1
-    "${mc_target_path}" --version || return 1
-    if [ "${dry_run}" -eq 1 ]; then
-        ${SUDO} rm "${mc_target_path}"
-    fi
-}
-
 software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force; }
 software-430-codex@dev@agents() { npm_update @openai/codex; }
 software-440-kilocode@dev@agents() { npm_update @kilocode/cli; }
