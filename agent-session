@@ -117,7 +117,8 @@ the folder costs the next listing its speed and nothing else.
 Interactive keys:
     /                   Search messages case-insensitively
     enter               Use the session: asks what is to happen with it
-    tab                 Toggle sessions from the current directory only
+    tab                 Toggle sessions from the folder of the scope only
+    shift-tab, ctrl-s   Take that folder from the selected session
     ctrl-a              Walk the agent filter: both, claude only, codex only
     ctrl-r              Refresh sessions
     esc                 Clear an active search, exit without one
@@ -1063,6 +1064,7 @@ write_fzf_state() {
     {
         printf 'agents=%q\n' "${agents}"
         printf 'current_directory_only=%q\n' "${current_directory_only}"
+        printf 'current_directory=%q\n' "${current_directory}"
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'igrep_pattern=%q\n' "${igrep_pattern}"
     } > "${fzf_state_file}"
@@ -1119,6 +1121,24 @@ cycle_fzf_agents() {
             agents="claude"
             ;;
     esac
+}
+
+# The folder scope is narrowed to the folder of the selected session - shift-tab
+# next to the folder toggle of tab, ctrl-s for a terminal that keeps shift-tab to
+# itself. This is why the directory it filters by lives in the state file as
+# well: it does not have to stay the one the picker was started in. A session
+# whose directory is not recorded anywhere leaves the scope as it is.
+scope_fzf_session() {
+    local agent="${1}"
+    local filepath="${2}"
+    local directory
+
+    directory="$(session_cwd "${agent}" "${filepath}")"
+    [ -n "${directory}" ] || return 0
+    resolve_directory "${directory}"
+    current_directory="${resolved_directory}"
+    current_directory_only=1
+    write_fzf_state
 }
 
 fzf_list_command() {
@@ -1752,6 +1772,8 @@ browse_sessions() {
     local ask_command
     local become_command
     local toggle_directory_command
+    local scope_session_command
+    local state_file_argument
     local cycle_agent_command
     local prompt_command
     local reload_actions
@@ -1778,6 +1800,11 @@ browse_sessions() {
     list_command="$(fzf_list_command all)"
     search_command="$(fzf_state_command --fzf-search)"
     toggle_directory_command="$(fzf_state_command --fzf-toggle-directory)"
+    # the placeholders of the picker are filled in by fzf itself, so this one is
+    # spelled out instead of quoted along with the arguments around it
+    printf -v state_file_argument '%q' "${fzf_state_file}"
+    scope_session_command="${script_command} --fzf-state ${state_file_argument}"
+    scope_session_command+=" --fzf-scope-session {2} {3}"
     cycle_agent_command="$(fzf_state_command --fzf-cycle-agent)"
     prompt_command="$(fzf_state_command --fzf-prompt)"
     preview_command="${script_command} --fzf-action preview {2} {3}"
@@ -1799,7 +1826,9 @@ browse_sessions() {
     # ends a parenthesized argument on the first one that closes.
     escape_command="$(fzf_state_command --fzf-escape "${reload_actions}")"
 
-    key_descriptions="/:search,enter:use,tab:folder scope,ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
+    key_descriptions="/:search,enter:use,tab:folder scope"
+    key_descriptions+=",shift-tab/ctrl-s:session folder"
+    key_descriptions+=",ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
 
     "${fzf_with_header}" \
         --command "${initial_list_command}" \
@@ -1816,6 +1845,8 @@ browse_sessions() {
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
         --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
+        --bind "shift-tab:execute-silent(${scope_session_command})+${reload_actions}" \
+        --bind "ctrl-s:execute-silent(${scope_session_command})+${reload_actions}" \
         --bind "ctrl-a:execute-silent(${cycle_agent_command})+${reload_actions}" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
         --bind "esc:transform:${escape_command}" \
@@ -1895,6 +1926,9 @@ fzf_list=0
 fzf_batch=""
 fzf_search=0
 fzf_toggle_directory=0
+fzf_scope_session=0
+fzf_scope_agent=""
+fzf_scope_filepath=""
 fzf_cycle_agent=0
 fzf_print_prompt=0
 fzf_print_escape=0
@@ -1948,6 +1982,14 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --fzf-toggle-directory)
             fzf_toggle_directory=1
+            ;;
+        --fzf-scope-session)
+            shift
+            [ "${#}" -ge 2 ] || fail "Missing arguments for --fzf-scope-session"
+            fzf_scope_session=1
+            fzf_scope_agent="${1}"
+            fzf_scope_filepath="${2}"
+            shift
             ;;
         --fzf-cycle-agent)
             fzf_cycle_agent=1
@@ -2085,6 +2127,10 @@ if [ -n "${fzf_state_file}" ]; then
         write_fzf_state
         exit 0
     fi
+    if [ "${fzf_scope_session}" -eq 1 ]; then
+        scope_fzf_session "${fzf_scope_agent}" "${fzf_scope_filepath}"
+        exit 0
+    fi
     if [ "${fzf_cycle_agent}" -eq 1 ]; then
         cycle_fzf_agents
         write_fzf_state
@@ -2101,8 +2147,8 @@ if [ -n "${fzf_state_file}" ]; then
         exit 0
     fi
 elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_escape}" -eq 1 ] \
-    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_cycle_agent}" -eq 1 ] \
-    || [ "${fzf_search}" -eq 1 ]; then
+    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_scope_session}" -eq 1 ] \
+    || [ "${fzf_cycle_agent}" -eq 1 ] || [ "${fzf_search}" -eq 1 ]; then
     fail "The picker actions require --fzf-state"
 fi
 

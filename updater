@@ -7,9 +7,11 @@ UPDATE_MESSAGE="Running %PKGNAME% upgrade"
 [ -f /etc/os-release ] && source <(sed -E 's/^([A-Z0-9_]+)=/OS_RELEASE_\1=/' /etc/os-release)
 
 possible_install_types=()
+possible_groups=()
 software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
+declare -A group_members=()
 selected=""
 
 error() {
@@ -51,8 +53,9 @@ usage: ${APP_NAME} [OPTIONS] SOFTWARE ...
 
 Run ${APP_NAME} to update software.
 
-SOFTWARE         Software to update, all if omitted.
-                 Can be one of: $(echo "${possible_install_types[@]}" | tr ' ' ',')
+SOFTWARE         Software or group to update, all if omitted.
+                 Software: $(echo "${possible_install_types[@]}" | tr ' ' ',')
+                 Groups: $([ "${#possible_groups[@]}" -gt 0 ] && echo "${possible_groups[@]}" | tr ' ' ',' || echo "none")
 
 Options:
   -h, --help          display this help and exit
@@ -87,9 +90,49 @@ is_install_type_selected() {
     return 1
 }
 
+is_group() {
+    local item
+    for item in "${possible_groups[@]}"; do
+        [ "${item}" = "${1}" ] && return 0
+    done
+    return 1
+}
+
+is_group_member() {
+    local item
+    for item in ${group_members[${1}]}; do
+        [ "${item}" = "${2}" ] && return 0
+    done
+    return 1
+}
+
+select_install_type() {
+    local arg="${1,,}"
+    local member
+
+    if [ "${arg}" = "all" ]; then
+        selected_install_types=("${possible_install_types[@]}")
+        return 0
+    fi
+    # groups first: a name shared by a group and a software always covers that software
+    if is_group "${arg}"; then
+        for member in ${group_members[${arg}]}; do
+            is_install_type_selected "${member}" || selected_install_types+=("${member}")
+        done
+        return 0
+    fi
+    if is_install_type "${arg}"; then
+        is_install_type_selected "${arg}" || selected_install_types+=("${arg}")
+        return 0
+    fi
+    return 1
+}
+
 discover_software() {
     local declaration
     local disabled
+    local group
+    local groups
     local handler
     local name
     local order
@@ -99,9 +142,9 @@ discover_software() {
     while read -r declaration _ handler; do
         [ "${declaration}" = "declare" ] || continue
         disabled=0
-        if [[ "${handler}" =~ ^software-disabled-([0-9]+)-([a-z0-9][a-z0-9_-]*)$ ]]; then
+        if [[ "${handler}" =~ ^software-disabled-([0-9]+)-([a-z0-9][a-z0-9_-]*)((@[a-z0-9][a-z0-9_-]*)*)$ ]]; then
             disabled=1
-        elif [[ "${handler}" =~ ^software-([0-9]+)-([a-z0-9][a-z0-9_-]*)$ ]]; then
+        elif [[ "${handler}" =~ ^software-([0-9]+)-([a-z0-9][a-z0-9_-]*)((@[a-z0-9][a-z0-9_-]*)*)$ ]]; then
             :
         else
             # catch typos like software-500-Foo or software-abc-bar instead of skipping silently
@@ -111,12 +154,13 @@ discover_software() {
 
         order="$((10#${BASH_REMATCH[1]}))"
         name="${BASH_REMATCH[2]}"
-        entries+=("${order}"$'\t'"${name}"$'\t'"${handler}"$'\t'"${disabled}")
+        groups="${BASH_REMATCH[3]//@/ }"
+        entries+=("${order}"$'\t'"${name}"$'\t'"${handler}"$'\t'"${disabled}"$'\t'"${groups}")
     done < <(declare -F)
 
     [ "${#entries[@]}" -gt 0 ] || fail "No software handlers found"
 
-    while IFS=$'\t' read -r order name handler disabled; do
+    while IFS=$'\t' read -r order name handler disabled groups; do
         if [ -n "${software_handlers[${name}]+registered}" ]; then
             fail "Duplicate software name: ${name}"
         fi
@@ -127,7 +171,27 @@ discover_software() {
         software_handlers["${name}"]="${handler}"
         software_disabled["${name}"]="${disabled}"
         software_install_types+=("${name}")
+
+        for group in ${groups}; do
+            if [ -n "${group_members[${group}]+registered}" ]; then
+                group_members["${group}"]+=" ${name}"
+            else
+                group_members["${group}"]="${name}"
+            fi
+        done
     done < <(printf '%s\n' "${entries[@]}" | sort -n -k1,1)
+
+    if [ "${#group_members[@]}" -gt 0 ]; then
+        mapfile -t possible_groups < <(printf '%s\n' "${!group_members[@]}" | sort)
+    fi
+    for group in "${possible_groups[@]}"; do
+        [ "${group}" = "all" ] && fail "Reserved group name: all"
+        # a group may share its name with a software, but only if that software is a
+        # member of the group, so selecting the name is a superset and stays unambiguous
+        if [ -n "${software_handlers[${group}]+registered}" ] && ! is_group_member "${group}" "${group}"; then
+            fail "Group name conflicts with software name: ${group}"
+        fi
+    done
 
     mapfile -t possible_install_types < <(printf '%s\n' "${software_install_types[@]}" | sort)
 }
@@ -643,7 +707,12 @@ install_adb() {
 #   software-ORDER-NAME() { ...; }
 #   software-disabled-ORDER-NAME() { ...; }
 # ORDER controls execution order; NAME becomes the command-line software name.
-software-010-firmware() {
+# Append @GROUP for each group the software belongs to, repeat @ for more groups,
+# e.g. software-080-claude@dev@ai() { ...; } is updated by "claude", "dev" and "ai".
+# Group names are lowercase and "all" is reserved. A group may carry the name of a
+# software only if that software is a member of it (e.g. mw is both the mittwald CLI
+# and the group of all mittwald tools); "updater mw" then updates the whole group.
+software-010-firmware@base() {
     require_cmd fwupdmgr || return 1
     ${SUDO} fwupdmgr get-devices --force \
         && ${SUDO} fwupdmgr refresh --force \
@@ -654,22 +723,22 @@ software-010-firmware() {
     fi
 }
 
-software-020-apt() { apt_upgrade; }
-software-030-npm() { npm_update npm; }
-software-040-flatpak() { flatpak_update; }
-software-050-adb() { install_adb; }
+software-020-apt@base() { apt_upgrade; }
+software-030-npm@dev@base() { npm_update npm; }
+software-040-flatpak@base() { flatpak_update; }
+software-050-adb@dev() { install_adb; }
 
-software-060-chrome() {
+software-060-chrome@dev() {
     apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
 }
 
-software-070-mw() { npm_update @mittwald/cli; }
-software-080-claude() { curl_update "claude" "https://claude.ai/install.sh"; }
-software-090-code() { apt_upgrade "code"; }
-software-100-kubectl-mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
+software-070-mw@dev@mw() { npm_update @mittwald/cli; }
+software-080-claude@dev@agents() { curl_update "claude" "https://claude.ai/install.sh"; }
+software-090-code@dev() { apt_upgrade "code"; }
+software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
 software-110-powerline-fonts() { install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"; }
-software-120-nickpit() { install_git_release "https://github.com/dgrieser/nickpit"; }
-software-121-mittwald-outlook-bridge() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
+software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
+software-121-mittwald-outlook-bridge@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
 software-130-slack() {
     # jessie is the only supported version
     apt_add_with_list_file "slack-desktop" \
@@ -677,44 +746,32 @@ software-130-slack() {
         "https://packagecloud.io/slacktechnologies/slack/gpgkey"
 }
 
-software-140-rampart() {
-    install_from_git "https://github.com/peg/rampart.git" "bash" "-c" "make linux; mv rampart-linux /usr/local/bin/rampart; cd preload; make install"
-}
-
-software-150-gitlab-ci-local() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
-software-160-yq() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
-software-170-gitlab_trackr() { install_git_release "https://github.com/BjarneSeger/gitlab_trackr"; }
-software-180-nexus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
-software-190-snaxus-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
-software-191-swctl() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
-software-200-boodschapper() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
+software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
+software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
+software-170-gitlab_trackr@dev() { install_git_release "https://github.com/BjarneSeger/gitlab_trackr"; }
+software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
+software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
+software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
+software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
 
-software-220-antigravity() {
-    apt_add_with_repo "antigravity" \
-        "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/" \
-        "antigravity-debian" \
-        "main" \
-        "https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg"
-}
-
-software-230-zed() { curl_update "zed" "https://zed.dev/install.sh"; }
-software-240-hwatch() { install_git_release "https://github.com/blacknon/hwatch"; }
+software-230-zed@dev() { curl_update "zed" "https://zed.dev/install.sh"; }
+software-240-hwatch@dev() { install_git_release "https://github.com/blacknon/hwatch"; }
 software-250-gradia() { flatpak_update "be.alexandervanhee.gradia"; }
-software-260-lazygit() { install_git_release "https://github.com/jesseduffield/lazygit"; }
-software-270-viddy() { install_git_release "https://github.com/sachaos/viddy"; }
+software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
+software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
 software-280-spotify() {
     apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
 }
 
-software-290-trivy() {
+software-290-trivy@dev@k8s() {
     apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
 }
 
 software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
-software-320-opencode() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
+software-320-opencode@dev@agents() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
 
 software-330-zoom() {
     require_cmd curl jq dpkg apt-get || return 1
@@ -758,10 +815,10 @@ software-330-zoom() {
     LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${zoom_deb_file_path}"
 }
 
-software-340-glab() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
-software-350-gh() { apt_add_with_repo "gh" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"; }
+software-340-glab@dev() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
+software-350-gh@dev() { apt_add_with_repo "gh" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"; }
 
-software-360-helm() {
+software-360-helm@dev@k8s() {
     local legacy_helm_repo_path="/etc/apt/sources.list.d/helm-stable-debian.list"
     if grep -qF "baltocdn.com" "${legacy_helm_repo_path}" 2>/dev/null; then
         if [ "${dry_run}" -eq 1 ]; then
@@ -800,10 +857,10 @@ software-370-wezterm() {
         --release "nightly" \
         --pattern "wezterm-nightly.${wezterm_distribution}.deb"
 }
-software-380-dive() { install_git_release "https://github.com/wagoodman/dive"; }
-software-390-kubecolor() { install_git_release "https://github.com/kubecolor/kubecolor"; }
+software-380-dive@dev@k8s() { install_git_release "https://github.com/wagoodman/dive"; }
+software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubecolor/kubecolor"; }
 
-software-400-mc() {
+software-400-mc@dev() {
     # TODO: add proper version printing on dry-run
     require_cmd curl || return 1
     local mc_target_path="/usr/local/bin/mc"
@@ -816,12 +873,11 @@ software-400-mc() {
     fi
 }
 
-software-410-gemini() { npm_update @google/gemini-cli --force; }
-software-420-qwen() { npm_update @qwen-code/qwen-code --force; }
-software-430-codex() { npm_update @openai/codex; }
-software-440-kilocode() { npm_update @kilocode/cli; }
+software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force; }
+software-430-codex@dev@agents() { npm_update @openai/codex; }
+software-440-kilocode@dev@agents() { npm_update @kilocode/cli; }
 
-software-450-aws() {
+software-450-aws@dev() {
     require_cmd curl unzip || return 1
     local aws_name="aws"
     local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -849,7 +905,7 @@ software-450-aws() {
     "${aws_target_parent_folder}/bin/${aws_name}" --version || return 1
 }
 
-software-460-aws-v1() {
+software-460-aws-v1@dev() {
     require_cmd curl unzip || return 1
     local aws_name="aws-v1"
     local aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
@@ -886,7 +942,7 @@ software-disabled-480-ueberzugpp() {
 }
 
 software-490-yazi() { install_git_release "https://github.com/sxyazi/yazi"; }
-software-500-atoss-cli() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
+software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 software-510-jw-cli() { install_git_release "https://github.com/dgrieser/jw-cli"; }
 
 selected_install_types=()
@@ -901,7 +957,7 @@ discover_software
 while [ $# -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "-h --help -d --dry-run -t --types --verbose all ${possible_install_types[*]}"
+            echo "-h --help -d --dry-run -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
             exit 0
             ;;
         -h|--help)
@@ -915,12 +971,7 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             selected_install_types=()
             for t in ${1//,/ }; do
-                t="${t,,}"
-                if is_install_type "${t}"; then
-                    selected_install_types+=("${t}")
-                elif [ "${t}" = "all" ]; then
-                    selected_install_types=("${possible_install_types[@]}")
-                else
+                if ! select_install_type "${t}"; then
                     error "Unknown type: ${t}"
                     usage
                 fi
@@ -930,11 +981,7 @@ while [ $# -gt 0 ]; do
             verbose=1
             ;;
         *)
-            if [ "${1}" = "all" ]; then
-                selected_install_types=("${possible_install_types[@]}")
-            elif is_install_type "${1}"; then
-                selected_install_types+=("${1}")
-            else
+            if ! select_install_type "${1}"; then
                 error "Unknown argument: ${1}"
                 usage
             fi
