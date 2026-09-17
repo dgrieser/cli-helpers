@@ -12,7 +12,8 @@ bin_path="${0}"
 bin_name="$(basename "${bin_path}")"
 config_path="${HOME}/.config/terminator/config_${bin_name}"
 max_seconds=3
-dock_height=10
+# height of the GNOME top bar, so the launcher sits flush below it
+dock_height=32
 window_width=900
 window_height=200
 window_x=300

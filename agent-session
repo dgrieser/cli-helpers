@@ -48,18 +48,31 @@ C_MUTED=$'\033[90m'
 C_RESET=$'\033[0m'
 # the marker of a session that is open in a running agent: what it is doing
 # decides its symbol and its color, and a session nobody has open gets none
-C_LIVE_WORKING=$'\033[38;5;220m'
-C_LIVE_WAITING=$'\033[38;5;208;1m'
-C_LIVE_OPEN=$'\033[38;5;245m'
+C_LIVE_WORKING=$'\033[38;5;45m'
+# the one marker that wants to be seen from across the room, so it blinks; the
+# symbol alone carries it, the rest of the row stays still
+C_LIVE_WAITING=$'\033[38;5;208;5m'
+C_LIVE_OPEN=$'\033[38;5;40m'
 declare -A live_symbols=(
     [working]=$'\u25b6'
-    [waiting]='?'
-    [open]=$'\u25cb'
+    # the keyboard with the variation selector that asks for its text shape
+    [waiting]=$'\u2328\ufe0e'
+    [open]=$'\u2714'
 )
-# A cell of its own is what keeps the markers under each other; the column
-# formatter drops a cell that holds nothing, so a session nobody has open fills
-# it with a dot instead of a space.
-live_none_symbol=$'\u00b7'
+# The glyphs are drawn at different widths, so each is nudged right by as many
+# spaces as it takes for them to stand over each other. The spaces go between
+# copies of the color of the marker and not next to each other, because
+# k-format reads a run of two spaces as the end of a cell.
+declare -A live_paddings=(
+    [working]=1
+    [waiting]=0
+    [open]=1
+)
+# A cell of its own is what keeps the markers under each other, and the column
+# formatter drops a cell that holds nothing at all. A session nobody has open
+# and the heading of the column therefore hold a color and no character: that is
+# a cell to the formatter and nothing to the eye.
+live_empty_cell="${C_RESET}"
 declare -A live_colors=(
     [working]="${C_LIVE_WORKING}"
     [waiting]="${C_LIVE_WAITING}"
@@ -102,8 +115,8 @@ Called as claude-session or codex-session the matching agent is preselected.
 
 A session that is open in a running agent carries a marker next to its agent:
     ▶   working on something right now
-    ?   waiting for you: a question, a permission, a plan to confirm
-    ○   open, with nothing to do
+    ⌨︎   waiting for you: a question, a permission, a plan to confirm
+    ✔   open, with nothing to do
 Codex only says whether it is working on a turn; what it waits for while it is
 not, it does not write down anywhere. The state is searchable in the picker,
 as '@working, '@waiting or '@open - the leading quote is fzf's exact match,
@@ -118,7 +131,7 @@ Interactive keys:
     /                   Search messages case-insensitively
     enter               Use the session: asks what is to happen with it
     tab                 Toggle sessions from the folder of the scope only
-    shift-tab, ctrl-s   Take that folder from the selected session
+    ctrl-s              Take that folder from the selected session
     ctrl-a              Walk the agent filter: both, claude only, codex only
     ctrl-r              Refresh sessions
     esc                 Clear an active search, exit without one
@@ -671,13 +684,20 @@ read_live_marker() {
     local agent="${1}"
     local filepath="${2}"
     local state
+    local color
+    local pad
 
-    live_marker="${C_MUTED}${live_none_symbol}${C_RESET}"
+    live_marker="${live_empty_cell}"
     live_words=""
     read_session_id "${agent}" "${filepath}"
     state="${live_state_by_id[${session_id_value}]-}"
     [ -n "${state}" ] || return 0
-    live_marker="${live_colors[${state}]}${live_symbols[${state}]}${C_RESET}"
+    color="${live_colors[${state}]}"
+    live_marker="${color}"
+    for (( pad = live_paddings[${state}]; pad > 0; pad-- )); do
+        live_marker+=" ${color}"
+    done
+    live_marker+="${live_symbols[${state}]}${C_RESET}"
     live_words="@${state}${live_detail_by_id[${session_id_value}]:+ ${live_detail_by_id[${session_id_value}]}}"
 }
 
@@ -1123,10 +1143,9 @@ cycle_fzf_agents() {
     esac
 }
 
-# The folder scope is narrowed to the folder of the selected session - shift-tab
-# next to the folder toggle of tab, ctrl-s for a terminal that keeps shift-tab to
-# itself. This is why the directory it filters by lives in the state file as
-# well: it does not have to stay the one the picker was started in. A session
+# The folder scope is narrowed to the folder of the selected session, on ctrl-s
+# next to the folder toggle of tab. This is why the directory it filters by
+# lives in the state file as well: it does not have to stay the one the picker was started in. A session
 # whose directory is not recorded anywhere leaves the scope as it is.
 scope_fzf_session() {
     local agent="${1}"
@@ -1690,7 +1709,7 @@ print_session_list() {
     else
         title_max_length="${fzf_title_max_length}"
     fi
-    table="AGENT  ${C_MUTED}${live_none_symbol}${C_RESET}  AGE  TITLE"
+    table="AGENT  ${live_empty_cell}  AGE  TITLE"
     [ "${prompt_column}" -eq 1 ] && table+="  PROMPT"
     table+="  DIRECTORY"$'\n'
     for entry in "${session_entries[@]}"; do
@@ -1827,7 +1846,7 @@ browse_sessions() {
     escape_command="$(fzf_state_command --fzf-escape "${reload_actions}")"
 
     key_descriptions="/:search,enter:use,tab:folder scope"
-    key_descriptions+=",shift-tab/ctrl-s:session folder"
+    key_descriptions+=",ctrl-s:session folder"
     key_descriptions+=",ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
 
     "${fzf_with_header}" \
@@ -1845,7 +1864,6 @@ browse_sessions() {
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
         --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
-        --bind "shift-tab:execute-silent(${scope_session_command})+${reload_actions}" \
         --bind "ctrl-s:execute-silent(${scope_session_command})+${reload_actions}" \
         --bind "ctrl-a:execute-silent(${cycle_agent_command})+${reload_actions}" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
