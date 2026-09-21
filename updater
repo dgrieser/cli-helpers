@@ -505,14 +505,14 @@ npm_update() {
     require_cmd npm npm-pkg-dir || return 1
     local pkg="${1}"; shift
     local force=0
+    local npm_args=("install" "-g" "${pkg}")
     while [ $# -gt 0 ]; do
         case "${1}" in
             -f|--force)
                 force=1
                 ;;
             *)
-                echo "ERROR: Unrecognized option: ${1}" 1>&2
-                return 1
+                npm_args+=("${1}")
                 ;;
         esac
         shift
@@ -541,10 +541,9 @@ npm_update() {
                 ${sudo} mv "${target_dir}" "${backup_dir}"
             fi
         fi
-        npm_args=("install" "-g" "${pkg}")
         [ "${verbose}" -eq 1 ] && npm_args+=("--verbose")
         [ "${verbose}" -eq 1 ] && echo "+ ${sudo} npm ${npm_args[*]}" 1>&2
-        ${sudo} npm install "${npm_args[@]}"
+        ${sudo} npm "${npm_args[@]}"
     else
         require_cmd jq || return 1
         if ! npm_json="$(NODE_PATH="/usr/lib/node_modules" npm outdated -g "${pkg}" --json)"; then
@@ -859,9 +858,9 @@ software-370-wezterm() {
 }
 software-380-dive@dev@k8s() { install_git_release "https://github.com/wagoodman/dive"; }
 software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubecolor/kubecolor"; }
-software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force; }
+software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force --allow-scripts=@qwen-code/audio-capture; }
 software-430-codex@dev@agents() { npm_update @openai/codex; }
-software-440-kilocode@dev@agents() { npm_update @kilocode/cli; }
+software-440-kilocode@dev@agents() { npm_update @kilocode/cli --allow-scripts=@kilocode/cli; }
 
 software-450-aws@dev() {
     require_cmd curl unzip || return 1
