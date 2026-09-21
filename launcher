@@ -14,7 +14,7 @@ config_path="${HOME}/.config/terminator/config_${bin_name}"
 max_seconds=3
 # height of the GNOME top bar, so the launcher sits flush below it
 dock_height=32
-window_width=900
+window_width=1000
 window_height=200
 window_x=300
 window_y=${dock_height}
