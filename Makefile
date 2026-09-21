@@ -21,7 +21,7 @@ EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
 EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
-SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge
+SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them

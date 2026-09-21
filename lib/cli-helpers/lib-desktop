@@ -30,6 +30,10 @@ cli_helpers_gnome_window_bridge() {
     "$(cli_helpers_repo_dir)/gnome-window-bridge" "$@"
 }
 
+cli_helpers_gnome_window_place() {
+    "$(cli_helpers_repo_dir)/gnome-window-place" "$@"
+}
+
 cli_helpers_gnome_clipboard_bridge() {
     "$(cli_helpers_repo_dir)/gnome-clipboard-bridge" "$@"
 }

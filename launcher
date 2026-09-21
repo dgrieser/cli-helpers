@@ -59,25 +59,16 @@ EXIT_FILE="/tmp/launcher-${pid}.exit"
 rm -rf "${EXIT_FILE}"
 
 if cli_helpers_is_wayland; then
-    attempts=1
-    while true; do
-        win_id="$(window-by-title "${name}" 2>/dev/null | head -n 1)"
-        if [ -n "${win_id}" ]; then
-            cli_helpers_gnome_window_bridge set-above "${win_id}"
-            # wayland clients cannot position themselves, so --geometry only
-            # carries the size here and the compositor has to do the placing
-            cli_helpers_gnome_window_bridge set-geometry "${win_id}" \
-                "${window_x}" "${window_y}" "${window_width}" "${window_height}"
-            # the window manager may have denied the fresh window focus, and
-            # with it the raise, while another always-on-top window was in
-            # front, so claim both explicitly once the launcher is above
-            window-focus "${win_id}"
-            break
-        fi
-        ((attempts++))
-        sleep 0.5
-        [ "${attempts}" -gt 10 ] && break
-    done
+    # wayland clients cannot position themselves, so --geometry only carries the
+    # size here and the compositor has to do the placing. The window cannot be
+    # kept hidden until then either: mutter creates it without a buffer, throws
+    # away any geometry set in that state, and places it the moment it is shown.
+    # So the move has to land in the frame right after that, which a helper that
+    # watches the window over one D-Bus connection manages, while a poll loop
+    # spawning gdbus every few hundred milliseconds does not
+    cli_helpers_gnome_window_place --title "${name}" \
+        --geometry "${window_width}x${window_height}+${window_x}+${window_y}" \
+        --above --focus --timeout 5 >/dev/null
 else
     attempts=1
     while ! xprop -name "${name}" -f WM_CLASS 8s -set WM_CLASS "${bin_name}" 2>/dev/null; do

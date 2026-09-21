@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import sys
+import time
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except (ImportError, ValueError) as exc:
+    print(f"ERROR: python3-gi is required for GNOME Wayland window placement: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+BUS_NAME = "de.david.grieser.CliHelpers.WindowBridge"
+OBJECT_PATH = "/de/david/grieser/CliHelpers/WindowBridge"
+INTERFACE = "de.david.grieser.CliHelpers.WindowBridge"
+EXTENSION_UUID = "cli-helpers-window-bridge@dgrieser.de"
+# a wayland window cannot place itself, so the compositor picks the spot and the
+# window has to be moved afterwards. Mutter creates the window before it has a
+# buffer and discards any geometry set in that state when it finally places the
+# window, so the move can only happen once the window is mapped - and it has to
+# happen inside the frame that follows, or the wrong position becomes visible.
+# Polling over a proxy that stays connected keeps that gap at a few milliseconds
+# instead of the ~100 ms one gdbus call per attempt would cost.
+POLL_INTERVAL = 0.002
+GEOMETRY_REGEX = re.compile(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def bridge_proxy():
+    try:
+        return Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START,
+            None,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE,
+            None,
+        )
+    except GLib.Error as exc:
+        fail(
+            f"GNOME Wayland window control requires the {EXTENSION_UUID} GNOME Shell "
+            f"extension: {exc.message}"
+        )
+
+
+def call(proxy, method, signature, *args):
+    try:
+        return proxy.call_sync(
+            method,
+            GLib.Variant(signature, args),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        ).unpack()[0]
+    except GLib.Error as exc:
+        fail(f"Failed to call window bridge {method}: {exc.message}")
+
+
+def find_window(proxy, title, window_class):
+    windows = json.loads(call(proxy, "ListWindows", "()"))
+    for window in windows:
+        if title is not None and window.get("title", "") != title:
+            continue
+        if window_class is not None and window.get("wm_class", "") != window_class:
+            continue
+        return window
+    return None
+
+
+def wait_for_window(proxy, title, window_class, deadline):
+    while True:
+        window = find_window(proxy, title, window_class)
+        if window is not None:
+            return window
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_INTERVAL)
+
+
+def wait_until_mapped(proxy, window, deadline):
+    # an unmapped window is reported without a size; placing it in that state is
+    # pointless because mutter overrides the position when the window is shown
+    while window["width"] <= 0 or window["height"] <= 0:
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_INTERVAL)
+        window = find_window(proxy, window["title"], window["wm_class"])
+        if window is None:
+            return None
+    return window
+
+
+def parse_geometry(value):
+    match = GEOMETRY_REGEX.match(value)
+    if not match:
+        fail(f"Failed to parse geometry '{value}', expected <width>x<height>+<x>+<y>")
+    width, height, x, y = (int(part) for part in match.groups())
+    return x, y, width, height
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Wait for a window and place it as soon as it is mapped",
+    )
+    parser.add_argument("--title", help="title of the window to place")
+    parser.add_argument("--class", dest="window_class", help="WM_CLASS of the window to place")
+    parser.add_argument(
+        "--geometry",
+        required=True,
+        help="target geometry as <width>x<height>+<x>+<y>",
+    )
+    parser.add_argument("--above", action="store_true", help="keep the window above others")
+    parser.add_argument("--focus", action="store_true", help="focus the window once placed")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="seconds to wait for the window (default: 5)",
+    )
+    args = parser.parse_args()
+
+    if args.title is None and args.window_class is None:
+        fail("Either --title or --class is required")
+
+    x, y, width, height = parse_geometry(args.geometry)
+    deadline = time.monotonic() + args.timeout
+    proxy = bridge_proxy()
+
+    window = wait_for_window(proxy, args.title, args.window_class, deadline)
+    if window is None:
+        fail("Timed out waiting for the window to appear")
+
+    # everything that does not move the window happens while the window is still
+    # unmapped, so only the geometry call sits between the first paint and the
+    # window standing in its place
+    mapped = window["width"] > 0 and window["height"] > 0
+    if args.above and not mapped:
+        call(proxy, "SetWindowAbove", "(s)", window["id"])
+
+    window = wait_until_mapped(proxy, window, deadline)
+    if window is None:
+        fail("Timed out waiting for the window to be mapped")
+
+    call(proxy, "SetWindowGeometry", "(siiii)", window["id"], x, y, width, height)
+    if args.above and mapped:
+        call(proxy, "SetWindowAbove", "(s)", window["id"])
+    # the window manager may have denied the fresh window focus, and with it the
+    # raise, while another always-on-top window was in front, so claim both
+    # explicitly once the launcher is above
+    if args.focus:
+        call(proxy, "FocusWindow", "(s)", window["id"])
+
+    print(window["id"])
+
+
+if __name__ == "__main__":
+    main()
