@@ -103,8 +103,13 @@ Options:
     -l, --last          Print the latest session
     -n, --limit LIMIT   Limit sessions by count instead of age
     -d, --days DAYS     Only list sessions active within DAYS (default: 60)
+    -c, --current-directory
+                        Only list sessions from the current directory; the
+                        picker always starts with all of them
     -A, --all-directories
-                        List sessions from all directories (default: current)
+                        List sessions from all directories (the default)
+    -o, --open          Only list the sessions open in a running agent; the
+                        picker always starts with them
     -p, --print         Print the session table instead of opening the picker
     -P, --prompt-column Show the first prompt as a column of its own; without it
                         the prompt stays searchable in the picker
@@ -142,9 +147,14 @@ the folder costs the next listing its speed and nothing else.
 Interactive keys:
     /                   Search messages case-insensitively
     enter               Use the session: asks what is to happen with it
-    tab                 Toggle sessions from the folder of the scope only
+    tab                 Toggle the open sessions only (the start) and all of them
+    ctrl-space          Show the folders of the listed sessions to pick the scope
+                        from, <all> first; the cursor starts on the folder the
+                        picker was started in, or on <all> while a folder is
+                        picked; enter picks, esc and ctrl-space go back
     ctrl-s              Take that folder from the selected session
     ctrl-a              Walk the agent filter: both, claude only, codex only
+    ctrl-f              Focus the terminal a running session is open in
     ctrl-r              Refresh sessions
     esc                 Clear an active search, exit without one
     ctrl-c              Exit
@@ -152,6 +162,8 @@ Interactive keys:
 Asked for the selected session, esc stepping back one question and out of
 the first one into the picker again:
     Resume              Resume the session in its original directory
+    Focus terminal      In place of Resume for a running session: bring the
+                        terminal it runs in to the front, the picker stays open
     Fork                Continue it, asking for the folder and the agent
     Copy                Copy raw Markdown to the clipboard
     Print               Print it, asking for rendered Markdown or raw
@@ -592,6 +604,10 @@ flush_metadata_cache() {
 # and it changes while the picker is up.
 declare -A live_state_by_id=()
 declare -A live_detail_by_id=()
+# the agent process that has the session open, for finding its terminal
+declare -A live_pid_by_id=()
+# the session file, where the agent names it: codex holds it open
+declare -A live_file_by_id=()
 live_sessions_loaded=0
 
 load_live_sessions() {
@@ -639,6 +655,7 @@ load_claude_live_sessions() {
     while IFS=$'\t' read -r id pid started status waiting; do
         [ -n "${id}" ] && [ "${id}" != "-" ] || continue
         process_is_alive "${pid}" "${started}" || continue
+        live_pid_by_id["${id}"]="${pid}"
         case "${status}" in
             busy | shell)
                 live_state_by_id["${id}"]="working"
@@ -668,6 +685,8 @@ load_codex_live_sessions() {
             case "${target}" in
                 "${codex_session_folder}"/*."${session_ext}")
                     read_session_id codex "${target}"
+                    live_pid_by_id["${session_id_value}"]="${pid}"
+                    live_file_by_id["${session_id_value}"]="${target}"
                     read_codex_live_state "${pid}" "${target}"
                     ;;
             esac
@@ -1149,6 +1168,9 @@ write_fzf_state() {
         printf 'current_directory=%q\n' "${current_directory}"
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'igrep_pattern=%q\n' "${igrep_pattern}"
+        printf 'open_only=%q\n' "${open_only}"
+        printf 'fzf_view=%q\n' "${fzf_view}"
+        printf 'launch_directory=%q\n' "${launch_directory}"
     } > "${fzf_state_file}"
 }
 
@@ -1167,9 +1189,11 @@ read_fzf_state() {
 print_fzf_prompt() {
     local scope="all"
 
+    [ "${open_only}" -eq 1 ] && printf '%sopen%s ' "${C_LIVE_OPEN}" "${C_RESET}"
     [ "${agents}" != "${all_agents}" ] \
         && printf '%s%s%s ' "$(agent_color "${agents}")" "${agents}" "${C_RESET}"
     [ "${current_directory_only}" -eq 1 ] && scope="$(basename -- "${current_directory}")"
+    [ "${fzf_view}" = "folders" ] && scope="folders"
     printf '%s%s%s' "${C_DIRECTORY}" "${scope}" "${C_RESET}"
     [ -n "${igrep_pattern}" ] && printf '%s ~ %s%s' "${C_TITLE}" "${igrep_pattern}" "${C_RESET}"
     printf ' > '
@@ -1179,6 +1203,13 @@ print_fzf_prompt() {
 # happens here, so the actions handed back only have to bring the list and the
 # prompt in line with the state that was just written.
 print_fzf_escape() {
+    # the folders are left without choosing one, back to the sessions as they were
+    if [ "${fzf_view}" = "folders" ]; then
+        fzf_view="sessions"
+        write_fzf_state
+        printf 'show-preview+%s' "${fzf_escape_actions}"
+        return
+    fi
     if [ -z "${grep_pattern}" ] && [ -z "${igrep_pattern}" ]; then
         printf 'abort'
         return
@@ -1206,7 +1237,7 @@ cycle_fzf_agents() {
 }
 
 # The folder scope is narrowed to the folder of the selected session, on ctrl-s
-# next to the folder toggle of tab. This is why the directory it filters by
+# next to the folders of ctrl-space. This is why the directory it filters by
 # lives in the state file as well: it does not have to stay the one the picker was started in. A session
 # whose directory is not recorded anywhere leaves the scope as it is.
 scope_fzf_session() {
@@ -1214,12 +1245,59 @@ scope_fzf_session() {
     local filepath="${2}"
     local directory
 
+    case "${agent}" in
+        claude | codex) ;;
+        *) return 0 ;;
+    esac
     directory="$(session_cwd "${agent}" "${filepath}")"
     [ -n "${directory}" ] || return 0
     resolve_directory "${directory}"
     current_directory="${resolved_directory}"
     current_directory_only=1
     write_fzf_state
+}
+
+# ctrl-space switches between the sessions and the folders they were recorded
+# in; the preview belongs to the sessions, so it goes away with them.
+print_fzf_toggle_view() {
+    if [ "${fzf_view}" = "folders" ]; then
+        fzf_view="sessions"
+        write_fzf_state
+        printf 'show-preview+%s' "${fzf_view_actions}"
+    else
+        fzf_view="folders"
+        write_fzf_state
+        printf 'hide-preview+%s' "${fzf_view_actions}"
+    fi
+}
+
+# enter answers the question of the view: a folder becomes the scope of the
+# sessions, which are shown again; a session is asked what is to happen with it.
+print_fzf_enter() {
+    local agent="${1}"
+    local filepath="${2}"
+    local script_command
+    local answers
+
+    if [ "${fzf_view}" = "folders" ]; then
+        [ -n "${filepath}" ] || return 0
+        if [ "${filepath}" = "${folders_all}" ]; then
+            current_directory_only=0
+        else
+            resolve_directory "${filepath}"
+            current_directory="${resolved_directory}"
+            current_directory_only=1
+        fi
+        fzf_view="sessions"
+        write_fzf_state
+        printf 'show-preview+%s' "${fzf_view_actions}"
+        return
+    fi
+    # the placeholders are left for fzf to fill in when it runs the actions
+    printf -v script_command '%q' "${script_path}"
+    printf -v answers '%q' "${fzf_answer_file}"
+    printf 'execute(%s --fzf-answers %s --fzf-action ask {2} {3})' "${script_command}" "${answers}"
+    printf '+transform:%s --fzf-answers %s --fzf-action become {2} {3}' "${script_command}" "${answers}"
 }
 
 fzf_list_command() {
@@ -1243,7 +1321,7 @@ fzf_list_command() {
         arguments+=(--fzf-state "${fzf_state_file}")
     else
         [ "${agents}" != "${all_agents}" ] && arguments+=(--agent "${agents}")
-        [ "${current_directory_only}" -eq 0 ] && arguments+=(--all-directories)
+        [ "${current_directory_only}" -eq 1 ] && arguments+=(--current-directory)
         [ -n "${grep_pattern}" ] && arguments+=(--grep "${grep_pattern}")
         [ -n "${igrep_pattern}" ] && arguments+=(--igrep "${igrep_pattern}")
     fi
@@ -1406,17 +1484,70 @@ create_fork_context() {
 # Copying and printing come in a whole-conversation and a last-message variant
 # each, and the two of them share one row of the question: tab walks over the
 # variants, so the question stays four lines long.
+# A session that is open in a running agent is resumed already, so going to it
+# takes the place of resuming it: its terminal is brought to the front instead.
 ask_session_action() {
+    local running="${1}"
+    local choices=()
+
+    if [ "${running}" -eq 1 ]; then
+        choices+=("focus=Focus terminal")
+    else
+        choices+=("resume=Resume")
+    fi
+    choices+=(
+        "fork=Fork"
+        "clipboard=Copy"
+        "clipboard-last=Copy last message"
+        "print=Print"
+        "print-last=Print last message"
+    )
     prompt-select --prompt "Continue session:" --no-abort-message \
         --cycle "clipboard|clipboard-last" \
         --cycle "print|print-last" \
-        "resume=Resume" \
-        "fork=Fork" \
-        "clipboard=Copy" \
-        "clipboard-last=Copy last message" \
-        "print=Print" \
-        "print-last=Print last message" \
+        "${choices[@]}" \
         </dev/tty
+}
+
+# The agent process of a running session, or nothing.
+session_live_pid() {
+    local agent="${1}"
+    local filepath="${2}"
+
+    load_live_sessions
+    read_session_id "${agent}" "${filepath}"
+    printf '%s' "${live_pid_by_id[${session_id_value}]-}"
+}
+
+# Brings the terminal window the session runs in to the front. Which terminal
+# that is, is left to window-focus-by-process: it walks up from the agent
+# process to whatever owns a window, and the title the agents give their
+# terminal - the one of the session - decides between the windows of a
+# terminal that has several.
+focus_session() {
+    local agent="${1}"
+    local filepath="${2}"
+    local pid
+    local title
+    local focus_by_process="${script_folder}/window-focus-by-process"
+    local cwd
+    local texts=()
+
+    pid="$(session_live_pid "${agent}" "${filepath}")"
+    [ -n "${pid}" ] || fail "Session is not running"
+    [ -x "${focus_by_process}" ] || focus_by_process="$(command -v window-focus-by-process)"
+    [ -n "${focus_by_process}" ] || fail "window-focus-by-process not found"
+    # the title the agent gives its terminal first, then the directory a shell
+    # names in it - which is all a window shows of a session that is not in
+    # its active tab
+    title="$(session_title "${agent}" "${filepath}")"
+    [ -n "${title}" ] && texts+=(--title "${title}")
+    cwd="$(session_cwd "${agent}" "${filepath}")"
+    if [ -n "${cwd}" ]; then
+        texts+=(--title "$(display_path "${cwd}")")
+        [ "${cwd}" != "$(display_path "${cwd}")" ] && texts+=(--title "${cwd}")
+    fi
+    "${focus_by_process}" "${texts[@]}" "${pid}" >/dev/null
 }
 
 # The fork picks its working root before its agent, so the folder of the picker
@@ -1520,20 +1651,31 @@ session_ask() {
     local target_agent=""
     local format=""
     local session_directory
+    local running
 
     command -v prompt-select >/dev/null 2>&1 || fail "prompt-select not found"
     command -v prompt-complete >/dev/null 2>&1 || fail "prompt-complete not found"
     command -v prompt-folder >/dev/null 2>&1 || fail "prompt-folder not found"
     : > "${fzf_answer_file}" || fail "Cannot write the answers of the picker"
     session_directory="$(session_cwd "${agent}" "${filepath}")"
+    running=0
+    [ -n "$(session_live_pid "${agent}" "${filepath}")" ] && running=1
 
     while true; do
         case "${step}" in
             action)
-                action="$(ask_session_action)" || return 0
+                action="$(ask_session_action "${running}")" || return 0
                 case "${action}" in
                     resume | clipboard | clipboard-last)
                         break
+                        ;;
+                    focus)
+                        # nothing to become: the picker stays where it is, for
+                        # coming back to
+                        if ! (focus_session "${agent}" "${filepath}"); then
+                            read -r -s -n 1 -p "Press any key to go back" </dev/tty
+                        fi
+                        return 0
                         ;;
                     fork)
                         step="directory"
@@ -1726,6 +1868,9 @@ fzf_action() {
                 fail "Failed to copy session to clipboard"
             fi
             ;;
+        focus)
+            focus_session "${agent}" "${filepath}"
+            ;;
         resume)
             cwd="$(session_cwd "${agent}" "${filepath}")"
             [ -n "${cwd}" ] || fail "Session has no working directory"
@@ -1742,7 +1887,7 @@ fzf_action() {
 # and the marker. Kept as one record per session, fields separated by
 # cache_separator, which is what the snapshot of an open picker is made of:
 #   agent, mtime, datetime, size, file, title, prompt, directory, full title,
-#   full prompt
+#   full prompt, full directory
 # The title and the prompt are shortened to their column already.
 session_row=""
 declare -A formatted_cwds=()
@@ -1798,6 +1943,7 @@ read_session_row() {
     session_row+="${cache_separator}${size}${cache_separator}${filepath}"
     session_row+="${cache_separator}${title_cell}${cache_separator}${prompt_cell}"
     session_row+="${cache_separator}${cwd}${cache_separator}${title}${cache_separator}${prompt}"
+    session_row+="${cache_separator}${session_meta_cwd}"
     session_row="${session_row//[$'\t\r\n']/ }"
 }
 
@@ -1923,6 +2069,86 @@ print_session_rows() {
     printf '%s' "${picker_rows}"
 }
 
+# The session files of the sessions that are open in a running agent, in the
+# shape of session_files: the files are named by the agents themselves, so no
+# folder is searched.
+live_session_files() {
+    local id
+    local file
+    local agent
+    local files=()
+    local -A files_by_agent=()
+
+    load_live_sessions
+    for id in "${!live_state_by_id[@]}"; do
+        file="${live_file_by_id[${id}]-}"
+        if [ -n "${file}" ]; then
+            agent="codex"
+        else
+            agent="claude"
+            for file in "${claude_session_folder}"/*/"${id}.${session_ext}"; do
+                [ -f "${file}" ] && break
+            done
+        fi
+        [ -f "${file}" ] || continue
+        [[ " ${agents} " == *" ${agent} "* ]] || continue
+        files_by_agent["${agent}"]+="${file}"$'\n'
+    done
+    for agent in "${!files_by_agent[@]}"; do
+        mapfile -t files < <(printf '%s' "${files_by_agent[${agent}]}")
+        find "${files[@]}" -maxdepth 0 -printf '%T@\t'"${agent}"'\t%TY-%Tm-%TdT%TH:%TM:%TS\t%s\t%p\n'
+    done | LC_ALL=C sort -n
+}
+
+# The folders view: the folders the listed sessions were recorded in, each once
+# and in order, led by the one that stands for all of them. It is kept next to
+# the state file, as it is only worth making again once the state changed. The
+# cursor starts on the other way the scope can go: on the folder the picker was
+# started in while every folder is listed, on all of them while one is.
+folders_all="<all>"
+
+print_folder_rows() {
+    local folders_file="${1}"
+    local folder
+    local position=1
+    local wanted="${fzf_track_filepath}"
+    local wanted_found=0
+    local rows
+
+    if [ -z "${wanted}" ]; then
+        wanted="${folders_all}"
+        [ "${scoped_directory_only}" -eq 0 ] && wanted="${launch_directory}"
+    fi
+    rows="FOLDER"$'\tAGENT\tFILE\tFULL_TITLE\tFULL_PROMPT\tSTATE\n'
+    rows+="${C_DIRECTORY}${folders_all}${C_RESET}"$'\tfolder\t'"${folders_all}"$'\t\t\t\n'
+    while IFS= read -r folder; do
+        [ -n "${folder}" ] || continue
+        position=$((position + 1))
+        rows+="${C_DIRECTORY}$(display_path "${folder}")${C_RESET}"$'\tfolder\t'"${folder}"$'\t\t\t\n'
+        if [ -n "${fzf_track_file}" ] && [ "${folder}" = "${wanted}" ]; then
+            printf 'pos(%s)' "${position}" > "${fzf_track_file}"
+            wanted_found=1
+        fi
+    done < "${folders_file}"
+    # a folder without sessions in the list is no row to go to either
+    [ -n "${fzf_track_file}" ] && [ "${wanted_found}" -eq 0 ] \
+        && printf 'pos(1)' > "${fzf_track_file}"
+    printf '%s' "${rows}"
+}
+
+write_folders() {
+    local folders_file="${1}"
+    local temp_file
+
+    temp_file="$(mktemp "${folders_file}.XXXXXX")" || return 1
+    [ "${#session_rows[@]}" -gt 0 ] && printf '%s\n' "${session_rows[@]}" \
+        | cut -d "${cache_separator}" -f 11 \
+        | awk 'NF && !seen[$0]++' \
+        | while IFS= read -r folder; do printf '%s\t%s\n' "$(display_path "${folder}")" "${folder}"; done \
+        | LC_ALL=C sort -f -t $'\t' -k1,1 | cut -f 2 > "${temp_file}"
+    mv -f -- "${temp_file}" "${folders_file}"
+}
+
 # The snapshot of an open picker: what it listed last, as rows, led by a line
 # naming what the rows were listed for. A refresh lists from it as long as that
 # line still says the same and the snapshot is younger than refresh_full_seconds.
@@ -1934,7 +2160,8 @@ snapshot_marker=""
 
 snapshot_signature() {
     printf '%q ' "${agents}" "${current_directory_only}" "${current_directory}" \
-        "${grep_pattern}" "${igrep_pattern}" "${days}" "${limit}" "${prompt_column}"
+        "${grep_pattern}" "${igrep_pattern}" "${days}" "${limit}" "${prompt_column}" \
+        "${open_only}"
 }
 
 # touched before the files are looked at; takes the place of the marker once the
@@ -2091,9 +2318,10 @@ browse_sessions() {
     local track_command
     local search_command
     local escape_command
-    local ask_command
-    local become_command
-    local toggle_directory_command
+    local focus_command
+    local toggle_open_command
+    local toggle_view_command
+    local enter_command
     local scope_session_command
     local state_file_argument
     local cycle_agent_command
@@ -2117,6 +2345,10 @@ browse_sessions() {
     # the snapshot of the listing and what its refreshes leave lie next to the
     # state file, named after it
     trap 'rm -f "${fzf_state_file}" "${fzf_state_file}".* "${fzf_answer_file}"' EXIT
+    # the open sessions are few and run anywhere, so the picker starts with all
+    # of them wherever they were started; ctrl-space narrows the folder down
+    open_only=1
+    current_directory_only=0
     write_fzf_state
 
     printf -v script_command '%q' "${script_path}"
@@ -2130,7 +2362,7 @@ browse_sessions() {
     printf -v track_command '%q' "${fzf_state_file}.track"
     track_command="[ -z {q} ] && cat -- ${track_command} 2>/dev/null; rm -f -- ${track_command}"
     search_command="$(fzf_state_command --fzf-search)"
-    toggle_directory_command="$(fzf_state_command --fzf-toggle-directory)"
+    toggle_open_command="$(fzf_state_command --fzf-toggle-open)"
     # the placeholders of the picker are filled in by fzf itself, so this one is
     # spelled out instead of quoted along with the arguments around it
     printf -v state_file_argument '%q' "${fzf_state_file}"
@@ -2140,8 +2372,7 @@ browse_sessions() {
     prompt_command="$(fzf_state_command --fzf-prompt)"
     preview_command="${script_command} --fzf-action preview {2} {3}"
     printf -v answer_file_argument '%q' "${fzf_answer_file}"
-    ask_command="${script_command} --fzf-answers ${answer_file_argument} --fzf-action ask {2} {3}"
-    become_command="${script_command} --fzf-answers ${answer_file_argument} --fzf-action become {2} {3}"
+    focus_command="${script_command} --fzf-action focus {2} {3}"
     [ -n "${fzf_query}" ] && fzf_query_arguments+=(--query "${fzf_query}")
 
     # a changed scope or search shows the first batch again and loads the rest in
@@ -2156,9 +2387,14 @@ browse_sessions() {
     # because the actions handed over carry parentheses of their own and fzf
     # ends a parenthesized argument on the first one that closes.
     escape_command="$(fzf_state_command --fzf-escape "${reload_actions}")"
+    # enter and ctrl-space depend on the view, so they are decided the same way;
+    # enter is told the row, which fzf fills in
+    toggle_view_command="$(fzf_state_command --fzf-toggle-view "${reload_actions}")"
+    enter_command="${script_command} --fzf-state ${state_file_argument} --fzf-answers ${answer_file_argument}"
+    enter_command+=" --fzf-enter $(printf '%q' "${reload_actions}") {2} {3}"
 
-    key_descriptions="/:search,enter:use,tab:folder scope"
-    key_descriptions+=",ctrl-s:session folder"
+    key_descriptions="/:search,enter:use,tab:open or all,ctrl-space:folders"
+    key_descriptions+=",ctrl-s:session folder,ctrl-f:focus"
     key_descriptions+=",ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
 
     "${fzf_with_header}" \
@@ -2178,13 +2414,15 @@ browse_sessions() {
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
         --bind "result:transform:${track_command}" \
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
-        --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
+        --bind "tab:execute-silent(${toggle_open_command})+${reload_actions}" \
+        --bind "ctrl-space:transform:${toggle_view_command}" \
         --bind "ctrl-s:execute-silent(${scope_session_command})+${reload_actions}" \
         --bind "ctrl-a:execute-silent(${cycle_agent_command})+${reload_actions}" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
         --bind "esc:transform:${escape_command}" \
         --bind "ctrl-c:abort" \
-        --bind "enter:execute(${ask_command})+transform:${become_command}"
+        --bind "ctrl-f:execute-silent(${focus_command})" \
+        --bind "enter:transform:${enter_command}"
 }
 
 completion() {
@@ -2228,7 +2466,7 @@ completion() {
     done
 
     [ "${ids_only}" -eq 0 ] \
-        && echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -p --print -P --prompt-column -g --grep -i --igrep -r --raw --resume --fork --verbose"
+        && echo "-h --help -a --agent -l --last -n --limit -d --days -A --all-directories -c --current-directory -o --open -p --print -P --prompt-column -g --grep -i --igrep -r --raw --resume --fork --verbose"
     for agent in ${agents}; do
         while IFS=$'\t' read -r _ _ _ _ filepath; do
             [ -n "${filepath}" ] || continue
@@ -2258,8 +2496,13 @@ fzf_action_filepath=""
 fzf_list=0
 fzf_batch=""
 fzf_refresh=0
+fzf_toggle_open=0
+fzf_toggle_view=0
+fzf_view_actions=""
+fzf_enter=0
+fzf_enter_agent=""
+fzf_enter_filepath=""
 fzf_search=0
-fzf_toggle_directory=0
 fzf_scope_session=0
 fzf_scope_agent=""
 fzf_scope_filepath=""
@@ -2275,8 +2518,16 @@ limit=""
 limit_explicit=0
 days=60
 days_explicit=0
-current_directory_only=1
+# sessions of every folder are listed; -c narrows a listing down to this one
+current_directory_only=0
 current_directory="$(pwd -P)"
+# the folder the picker was started in, which the folders view offers first
+# while every folder is listed
+launch_directory="${current_directory}"
+# the picker starts with the sessions that are open in a running agent, a
+# listing of everything else starts with all of them
+open_only=0
+fzf_view="sessions"
 print=0
 prompt_column=0
 raw=0
@@ -2323,8 +2574,23 @@ while [ "${#}" -gt 0 ]; do
         --fzf-search)
             fzf_search=1
             ;;
-        --fzf-toggle-directory)
-            fzf_toggle_directory=1
+        --fzf-toggle-open)
+            fzf_toggle_open=1
+            ;;
+        --fzf-toggle-view)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-toggle-view"
+            fzf_toggle_view=1
+            fzf_view_actions="${1}"
+            ;;
+        --fzf-enter)
+            shift
+            [ "${#}" -ge 3 ] || fail "Missing arguments for --fzf-enter"
+            fzf_enter=1
+            fzf_view_actions="${1}"
+            fzf_enter_agent="${2}"
+            fzf_enter_filepath="${3}"
+            shift 2
             ;;
         --fzf-scope-session)
             shift
@@ -2410,6 +2676,12 @@ while [ "${#}" -gt 0 ]; do
         -A | --all-directories)
             current_directory_only=0
             ;;
+        -c | --current-directory)
+            current_directory_only=1
+            ;;
+        -o | --open)
+            open_only=1
+            ;;
         -p | --print)
             print=1
             ;;
@@ -2465,9 +2737,17 @@ if [ -n "${fzf_state_file}" ]; then
         print_fzf_escape
         exit 0
     fi
-    if [ "${fzf_toggle_directory}" -eq 1 ]; then
-        current_directory_only=$((1 - current_directory_only))
+    if [ "${fzf_toggle_open}" -eq 1 ]; then
+        open_only=$((1 - open_only))
         write_fzf_state
+        exit 0
+    fi
+    if [ "${fzf_toggle_view}" -eq 1 ]; then
+        print_fzf_toggle_view
+        exit 0
+    fi
+    if [ "${fzf_enter}" -eq 1 ]; then
+        print_fzf_enter "${fzf_enter_agent}" "${fzf_enter_filepath}"
         exit 0
     fi
     if [ "${fzf_scope_session}" -eq 1 ]; then
@@ -2490,8 +2770,10 @@ if [ -n "${fzf_state_file}" ]; then
         exit 0
     fi
 elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_escape}" -eq 1 ] \
-    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_scope_session}" -eq 1 ] \
-    || [ "${fzf_cycle_agent}" -eq 1 ] || [ "${fzf_search}" -eq 1 ]; then
+    || [ "${fzf_scope_session}" -eq 1 ] \
+    || [ "${fzf_cycle_agent}" -eq 1 ] || [ "${fzf_search}" -eq 1 ] \
+    || [ "${fzf_toggle_open}" -eq 1 ] || [ "${fzf_toggle_view}" -eq 1 ] \
+    || [ "${fzf_enter}" -eq 1 ]; then
     fail "The picker actions require --fzf-state"
 fi
 
@@ -2646,12 +2928,32 @@ else
         && { [ -z "${list_limit}" ] || [ "${fzf_batch}" -lt "${list_limit}" ]; }; then
         list_limit="${fzf_batch}"
     fi
+    # The folders view lists the folders of the sessions of every folder, and
+    # comes from the folders it listed last for as long as the state is the one
+    # they were listed for.
+    scoped_directory_only="${current_directory_only}"
+    scoped_directory="${current_directory}"
+    folders_file=""
+    if [ "${fzf_view}" = "folders" ] && [ -n "${fzf_state_file}" ]; then
+        folders_file="${fzf_state_file}.folders"
+        fzf_track_file="${fzf_state_file}.track"
+        if [ "${folders_file}" -nt "${fzf_state_file}" ]; then
+            print_folder_rows "${folders_file}"
+            exit 0
+        fi
+        current_directory_only=0
+        list_limit="${limit}"
+    fi
     # The open picker keeps a snapshot of the full listing for its refreshes to
-    # start from; the first batch of it is no listing of its own.
-    if [ -n "${fzf_state_file}" ] && [ -z "${fzf_batch}" ]; then
-        snapshot_file="${fzf_state_file}.snapshot"
-        snapshot_marker="${fzf_state_file}.marker"
+    # start from; the first batch of it is no listing of its own, and the open
+    # sessions are few enough to be listed anew every time, which is also what
+    # finds a session that was opened without being written to.
+    if [ -n "${fzf_state_file}" ] && [ -z "${fzf_batch}" ] && [ -z "${folders_file}" ]; then
         [ -n "${fzf_track_filepath}" ] && fzf_track_file="${fzf_state_file}.track"
+        if [ "${open_only}" -eq 0 ]; then
+            snapshot_file="${fzf_state_file}.snapshot"
+            snapshot_marker="${fzf_state_file}.marker"
+        fi
     fi
     if [ "${fzf_refresh}" -eq 1 ] && read_snapshot; then
         refresh_session_rows
@@ -2663,9 +2965,16 @@ else
     session_entries=()
     session_lines=()
     session_paths=()
-    # the directory of a codex session and the title of one are columns of its
-    # state database, so one query stands in for opening every file
-    [[ " ${agents} " == *" codex "* ]] && load_codex_state
+    # The directory of a codex session and the title of one are columns of its
+    # state database, so one query stands in for opening every file. The open
+    # sessions are named by the agents and are few, which is cheaper to read
+    # one by one than the whole database, and an open session is listed
+    # however long ago it was last written to.
+    if [ "${open_only}" -eq 1 ]; then
+        cutoff_epoch=0
+    else
+        [[ " ${agents} " == *" codex "* ]] && load_codex_state
+    fi
     load_metadata_cache
     while IFS=$'\t' read -r mtime agent datetime size filepath; do
         [ -n "${filepath}" ] || continue
@@ -2673,7 +2982,7 @@ else
         [ "${cutoff_epoch}" -gt 0 ] && [ "${mtime_epoch}" -lt "${cutoff_epoch}" ] && continue
         session_lines+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${size}"$'\t'"${filepath}")
         session_paths+=("${filepath}")
-    done < <(session_files)
+    done < <(if [ "${open_only}" -eq 1 ]; then live_session_files; else session_files; fi)
 
     # Grepping the raw files is a cheap pre-filter over all sessions; its
     # matches are confirmed against the decoded messages below, so that hits in
@@ -2699,6 +3008,11 @@ else
     done
 
     collect_session_rows
+    if [ -n "${folders_file}" ]; then
+        write_folders "${folders_file}"
+        print_folder_rows "${folders_file}"
+        exit 0
+    fi
     write_snapshot "${snapshot_built}"
     print_session_rows
 fi

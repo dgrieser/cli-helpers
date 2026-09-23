@@ -183,6 +183,8 @@ function serializeWindow(window) {
         title: window.get_title() || '',
         wm_class: window.get_wm_class() || '',
         sandboxed_app_id: sandboxedAppId || '',
+        // the process owning the window, for finding the window of a process
+        pid: typeof window.get_pid === 'function' ? window.get_pid() : 0,
         workspace: workspace ? workspace.index() : -1,
         monitor: monitorName(window.get_monitor()),
         x: frame.x,

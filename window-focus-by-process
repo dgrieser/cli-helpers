@@ -1,0 +1,172 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+usage() {
+    echo "Usage: $(basename "${0}") [--title <text>]... [--print] <pid>" 1>&2
+    echo "  --title <text>  a text the title of the window may hold; the first one found decides" 1>&2
+    echo "  --print         print the window id and title instead of focusing it" 1>&2
+    exit 1
+}
+
+# Finds the window a process runs in without knowing the terminal emulator: the
+# window belongs to one of the ancestors of the process, so the ancestors are
+# walked upwards until one of them owns a window. A terminal that serves several
+# windows from one process (terminator, gnome-terminal, kitty, ...) owns all of
+# them, so the title texts decide between them - a program in a terminal usually
+# puts its name or its state there. A process inside tmux has the tmux server
+# for an ancestor, which owns no window: the walk goes on from the clients
+# attached to the session of its pane instead, and that pane is selected as well.
+# Where the windows carry no process at all, the titles are all there is.
+
+titles=()
+print_only=0
+pid=""
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        --title)
+            shift
+            [ -n "${1}" ] || usage
+            titles+=("${1}")
+            ;;
+        --print)
+            print_only=1
+            ;;
+        -h | --help)
+            usage
+            ;;
+        *)
+            [ -z "${pid}" ] || usage
+            [[ "${1}" =~ ^[0-9]+$ ]] || usage
+            pid="${1}"
+            ;;
+    esac
+    shift
+done
+[ -n "${pid}" ] || usage
+[ -d "/proc/${pid}" ] || { echo "ERROR: No such process: ${pid}" 1>&2; exit 1; }
+
+parent_of() {
+    local stat_line
+    local fields=()
+
+    [ -r "/proc/${1}/stat" ] || return 1
+    stat_line="$(< "/proc/${1}/stat")"
+    # the name of the process is in brackets and can hold anything, the numbers
+    # after it cannot
+    read -r -a fields <<< "${stat_line##*') '}"
+    printf '%s' "${fields[1]}"
+}
+
+# the process itself and its ancestors, nearest first, up to init
+ancestors_of() {
+    local current="${1}"
+
+    while [ -n "${current}" ] && [ "${current}" -gt 1 ]; do
+        printf '%s\n' "${current}"
+        current="$(parent_of "${current}")" || break
+    done
+}
+
+mapfile -t chain < <(ancestors_of "${pid}")
+
+# tmux: the pane the process runs in, and the clients looking at its session
+tmux_pane=""
+tmux_window=""
+if command -v tmux >/dev/null 2>&1; then
+    declare -A in_chain=()
+    for ancestor in "${chain[@]}"; do
+        in_chain["${ancestor}"]=1
+    done
+    while IFS=$'\t' read -r pane_pid session window pane; do
+        [ -n "${in_chain[${pane_pid}]+set}" ] || continue
+        tmux_window="${window}"
+        tmux_pane="${pane}"
+        while IFS= read -r client_pid; do
+            [ -n "${client_pid}" ] && mapfile -t -O "${#chain[@]}" chain < <(ancestors_of "${client_pid}")
+        done < <(tmux list-clients -t "${session}" -F '#{client_pid}' 2>/dev/null)
+        break
+    done < <(tmux list-panes -a -F $'#{pane_pid}\t#{session_name}\t#{window_id}\t#{pane_id}' 2>/dev/null)
+fi
+
+# "<id>\t<pid>\t<title>" per window, the pid 0 where the window does not say
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    windows_json="$(cli_helpers_gnome_window_bridge list)" || exit 1
+    windows="$(python3 -c '
+import json, sys
+for window in json.load(sys.stdin):
+    if isinstance(window, dict):
+        title = str(window.get("title", "")).replace("\t", " ").replace("\n", " ")
+        print(window.get("id", ""), window.get("pid") or 0, title, sep="\t")
+' <<< "${windows_json}")" || exit 1
+else
+    cli_helpers_require_command wmctrl wmctrl || exit 1
+    windows="$(wmctrl -lp | awk '{ id = $1; pid = $3; $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print id "\t" pid "\t" $0 }')"
+fi
+
+window_ids=()
+window_pids=()
+window_titles=()
+while IFS=$'\t' read -r id window_pid title; do
+    [ -n "${id}" ] || continue
+    window_ids+=("${id}")
+    window_pids+=("${window_pid}")
+    window_titles+=("${title}")
+done <<< "${windows}"
+
+# Among the given window indexes: the one whose title names the process, the
+# texts tried in the order they were given, so a precise one wins over a vague
+# one that happens to be in the title of another window as well; else the
+# first of them - the most recently used one on GNOME.
+pick() {
+    local text
+    local index
+
+    for text in "${titles[@]}"; do
+        for index in "${@}"; do
+            [[ "${window_titles[index]}" == *"${text}"* ]] && { printf '%s' "${index}"; return 0; }
+        done
+    done
+    [ "${#titles[@]}" -eq 0 ] || [ "${pick_first}" -eq 1 ] || return 1
+    printf '%s' "${1}"
+}
+
+chosen=""
+pick_first=1
+for ancestor in "${chain[@]}"; do
+    owned=()
+    for index in "${!window_ids[@]}"; do
+        [ "${window_pids[index]}" = "${ancestor}" ] && owned+=("${index}")
+    done
+    [ "${#owned[@]}" -gt 0 ] || continue
+    chosen="$(pick "${owned[@]}")"
+    break
+done
+if [ -z "${chosen}" ] && [ "${#titles[@]}" -gt 0 ]; then
+    pick_first=0
+    chosen="$(pick "${!window_ids[@]}")"
+fi
+[ -n "${chosen}" ] || { echo "ERROR: No window found for process ${pid}" 1>&2; exit 1; }
+
+if [ "${print_only}" -eq 1 ]; then
+    printf '%s\t%s\n' "${window_ids[chosen]}" "${window_titles[chosen]}"
+    exit 0
+fi
+
+if [ -n "${tmux_pane}" ]; then
+    tmux select-window -t "${tmux_window}" 2>/dev/null
+    tmux select-pane -t "${tmux_pane}" 2>/dev/null
+fi
+if cli_helpers_is_wayland; then
+    cli_helpers_gnome_window_bridge focus "${window_ids[chosen]}"
+else
+    wmctrl -ia "${window_ids[chosen]}"
+fi
