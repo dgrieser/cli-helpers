@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage() {
-    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--ask-keep-keys <key>,...] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--ask-keep-keys <key>,...] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--watch-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [<query ...>] -- [fzf args]" 1>&2
     exit 1
 }
 
@@ -61,6 +61,10 @@ watch_while_cmd=""
 # a command naming the seconds between two reloads, asked again while watching:
 # for a caller whose view changes into one that is worth watching less often
 watch_interval_cmd=""
+# the command a watched list is reloaded with, where that is not the one it was
+# listed with first: for a caller that can refresh a list it has already cheaper
+# than it can make one
+watch_cmd=""
 watcher_pid=""
 watch_reset_file=""
 refresh_key="ctrl-r"
@@ -333,6 +337,11 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             watch_interval_cmd="${1}"
             ;;
+        --watch-command)
+            shift
+            [ -z "${1}" ] && usage
+            watch_cmd="${1}"
+            ;;
         --delimiter)
             shift
             [ -z "${1}" ] && usage
@@ -365,6 +374,7 @@ fi
 [ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
 [ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
 [ -n "${watch_interval_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-interval-command requires --watch" 1>&2 && usage
+[ -n "${watch_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-command requires --watch" 1>&2 && usage
 # no delay was named, so the first reload waits what every one after it waits
 [ -z "${watch_delay}" ] && watch_delay="${watch_seconds}"
 inline_keys="${reload_keys}${exec_reload_keys}${silent_keys}${exec_keys}"
@@ -1416,7 +1426,7 @@ while true; do
                 port=$((port+1))
             done
             listen_arg="--listen=127.0.0.1:${port}"
-            update_fzf "${cmd}" "${port}" "${watch_seconds}" &
+            update_fzf "${watch_cmd:-${cmd}}" "${port}" "${watch_seconds}" &
             watcher_pid=$!
         fi
         result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"

@@ -31,6 +31,12 @@ title_max_bytes=500
 # a separator the texts of a session cannot carry and that bash does not treat
 # as whitespace, so an empty field of a cached entry stays a field
 cache_separator=$'\037'
+# The open picker lists again on its own: every few seconds from what it listed
+# last, reading only the sessions whose files changed since, and from scratch
+# once a minute, for whatever that leaves out - a file that is gone, a title a
+# session was given elsewhere.
+refresh_seconds=5
+refresh_full_seconds=60
 all_agents="claude codex"
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 script_folder="$(dirname "${script_path}")"
@@ -122,6 +128,11 @@ its last call asks to run a command outside the sandbox or asks you a question
 and nothing runs for it yet. The state is searchable in the picker,
 as '@working, '@waiting or '@open - the leading quote is fzf's exact match,
 without which its letters are found spread over the rest of the row.
+
+The open picker refreshes itself every ${refresh_seconds} seconds: the sessions whose files
+were written since - new ones, resumed ones, working ones - are read again, and
+every row gets its age and its marker anew. Once every ${refresh_full_seconds} seconds the
+list is made from scratch instead.
 
 The title, the first prompt and the directory of a session are cached in
     ${cache_folder}
@@ -446,7 +457,8 @@ preload_codex_prompts() {
     local path
     local prompt
 
-    [ "${codex_state_loaded}" -eq 1 ] || return 0
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    [ -r "${codex_state_db}" ] || return 0
     for entry in "${session_entries[@]}"; do
         IFS=$'\t' read -r agent mtime _ size filepath <<< "${entry}"
         [ "${agent}" = "codex" ] || continue
@@ -705,7 +717,9 @@ read_codex_live_state() {
     local last
     local pending
 
-    last="$(grep -oE '"task_started"|"task_complete"' -- "${filepath}" 2>/dev/null | tail -1)"
+    # read from the end, so a session of megabytes costs the length of its
+    # last turn and not the length of its history
+    last="$(tac -- "${filepath}" 2>/dev/null | grep -m 1 -oE '"task_started"|"task_complete"')"
     if [ "${last}" != '"task_started"' ]; then
         live_state_by_id["${session_id_value}"]="open"
         return 0
@@ -1216,6 +1230,7 @@ fzf_list_command() {
     local arguments=(--fzf-list)
 
     [ "${scope}" = "initial" ] && arguments+=(--fzf-batch "${initial_batch_size}")
+    [ "${scope}" = "refresh" ] && arguments+=(--fzf-refresh)
 
     if [ -n "${limit}" ]; then
         arguments+=(--limit "${limit}")
@@ -1723,93 +1738,173 @@ fzf_action() {
     esac
 }
 
-print_session_list() {
-    local table
-    local entry
-    local agent
-    local agent_color_code
-    local age
-    local age_index=0
-    local ages=()
-    local mtime
-    local mtimes=()
-    local now
-    local size
-    local filepath
+# A row of the listing without what changes while its file does not: the age
+# and the marker. Kept as one record per session, fields separated by
+# cache_separator, which is what the snapshot of an open picker is made of:
+#   agent, mtime, datetime, size, file, title, prompt, directory, full title,
+#   full prompt
+# The title and the prompt are shortened to their column already.
+session_row=""
+declare -A formatted_cwds=()
+
+row_title_max_length() {
+    if [ "${print}" -eq 1 ]; then
+        printf '%s' "${print_title_max_length}"
+    elif [ "${prompt_column}" -eq 1 ]; then
+        printf '%s' "${fzf_text_max_length}"
+    else
+        printf '%s' "${fzf_title_max_length}"
+    fi
+}
+
+read_session_row() {
+    local agent="${1}"
+    local mtime="${2}"
+    local datetime="${3}"
+    local size="${4}"
+    local filepath="${5}"
+    local title_max_length="${6}"
     local cwd
     local title
     local prompt
-    local row_index
-    local formatted_row
-    local picker_rows
+    local title_cell
+    local prompt_cell=""
+
+    read_session_metadata "${agent}" "${filepath}" "${mtime}" "${size}"
+    # the sessions of a listing share their directories, so each of them is
+    # shortened once instead of once per row
+    if [ -z "${formatted_cwds[${session_meta_cwd}]+set}" ]; then
+        formatted_cwds["${session_meta_cwd}"]="$(format_cwd "${session_meta_cwd}")"
+    fi
+    cwd="${formatted_cwds[${session_meta_cwd}]}"
+    prompt="${session_meta_prompt}"
+    title="${session_meta_title}"
+    [ -n "${title}" ] || title="-"
+    [ -n "${prompt}" ] || prompt="-"
+    [ -n "${cwd}" ] || cwd="-"
+    set_shortened_text "${title}" "${title_max_length}"
+    title_cell="${shortened_text}"
+    # the prompt is kept as a hidden field of the picker either way, so
+    # without its column it stays searchable but takes no width
+    if [ "${prompt_column}" -eq 1 ]; then
+        if [ "${print}" -eq 1 ]; then
+            set_shortened_text "${prompt}" "${print_prompt_max_length}"
+        else
+            set_shortened_text "${prompt}" "${fzf_text_max_length}"
+        fi
+        prompt_cell="${shortened_text}"
+    fi
+    session_row="${agent}${cache_separator}${mtime}${cache_separator}${datetime}"
+    session_row+="${cache_separator}${size}${cache_separator}${filepath}"
+    session_row+="${cache_separator}${title_cell}${cache_separator}${prompt_cell}"
+    session_row+="${cache_separator}${cwd}${cache_separator}${title}${cache_separator}${prompt}"
+    session_row="${session_row//[$'\t\r\n']/ }"
+}
+
+# The rows of session_entries, newest first, left in session_rows.
+session_rows=()
+
+collect_session_rows() {
+    local entry
+    local agent
+    local mtime
+    local datetime
+    local size
+    local filepath
     local title_max_length
+
+    title_max_length="$(row_title_max_length)"
+    preload_codex_prompts
+    session_rows=()
+    for entry in "${session_entries[@]}"; do
+        IFS=$'\t' read -r agent mtime datetime size filepath <<< "${entry}"
+        read_session_row "${agent}" "${mtime}" "${datetime}" "${size}" "${filepath}" "${title_max_length}"
+        session_rows+=("${session_row}")
+    done
+    flush_metadata_cache
+}
+
+# Prints session_rows as the table, or as the rows of the picker: the ages and
+# the markers of the sessions are what is worked out here, the rest the rows
+# carry already. A picker row whose file is fzf_track_filepath has its position
+# left in fzf_track_file, as the action that puts the cursor back on it.
+fzf_track_filepath=""
+fzf_track_file=""
+
+# The columns of session_rows, as arrays of one element per row: one awk
+# splitting all of them into files costs less than a read per row, which is
+# what a refresh would otherwise spend its time on.
+row_agents=()
+row_mtimes=()
+row_files=()
+row_titles=()
+row_prompts=()
+row_cwds=()
+row_full_titles=()
+row_full_prompts=()
+
+split_session_rows() {
+    local folder
+
+    row_agents=() row_mtimes=() row_files=() row_titles=() row_prompts=()
+    row_cwds=() row_full_titles=() row_full_prompts=()
+    [ "${#session_rows[@]}" -gt 0 ] || return 0
+    folder="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.rows.XXXXXX")" || fail "Cannot split the rows"
+    printf '%s\n' "${session_rows[@]}" | awk -v separator="${cache_separator}" -v folder="${folder}" '
+        {
+            count = split($0, fields, separator)
+            for (field = 1; field <= 10; field++) print (field <= count ? fields[field] : "") > (folder "/" field)
+        }'
+    mapfile -t row_agents < "${folder}/1"
+    mapfile -t row_mtimes < "${folder}/2"
+    mapfile -t row_files < "${folder}/5"
+    mapfile -t row_titles < "${folder}/6"
+    mapfile -t row_prompts < "${folder}/7"
+    mapfile -t row_cwds < "${folder}/8"
+    mapfile -t row_full_titles < "${folder}/9"
+    mapfile -t row_full_prompts < "${folder}/10"
+    rm -rf -- "${folder}"
+}
+
+print_session_rows() {
+    local table
+    local agent
+    local agent_color_code
+    local ages=()
+    local row_index
+    local filepath
     local prompt_cell
-    local full_titles=()
-    local full_prompts=()
+    local now
+    local picker_rows
     local full_states=()
-    local -A formatted_cwds=()
+    local formatted_rows=()
+    local table_file
 
     now="$(date +%s)"
-    if [ "${print}" -eq 1 ]; then
-        title_max_length="${print_title_max_length}"
-    elif [ "${prompt_column}" -eq 1 ]; then
-        title_max_length="${fzf_text_max_length}"
-    else
-        title_max_length="${fzf_title_max_length}"
-    fi
     table="AGENT  ${live_empty_cell}  AGE  TITLE"
     [ "${prompt_column}" -eq 1 ] && table+="  PROMPT"
     table+="  DIRECTORY"$'\n'
-    for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r _ mtime _ <<< "${entry}"
-        mtimes+=("${mtime}")
-    done
     command -v toage >/dev/null 2>&1 || fail "toage not found"
-    mapfile -t ages < <(format_ages "${now}" "${mtimes[@]}")
-    preload_codex_prompts
+    split_session_rows
+    mapfile -t ages < <(format_ages "${now}" "${row_mtimes[@]}")
     load_live_sessions
-    # Entries were collected newest first. fzf's default layout places the
-    # first row next to its prompt, keeping the latest session selected.
-    for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r agent mtime _ size filepath <<< "${entry}"
+    # Rows were collected newest first. fzf's default layout places the first
+    # row next to its prompt, keeping the latest session selected.
+    for (( row_index = 0; row_index < ${#session_rows[@]}; row_index++ )); do
+        agent="${row_agents[row_index]}"
         agent_color_code="${agent_colors[${agent}]-${C_AGENT_OTHER}}"
-        age="${ages[age_index]:-}"
-        age_index=$((age_index + 1))
-        read_live_marker "${agent}" "${filepath}"
+        read_live_marker "${agent}" "${row_files[row_index]}"
         full_states+=("${live_words}")
-        read_session_metadata "${agent}" "${filepath}" "${mtime}" "${size}"
-        # the sessions of a listing share their directories, so each of them is
-        # shortened once instead of once per row
-        if [ -z "${formatted_cwds[${session_meta_cwd}]+set}" ]; then
-            formatted_cwds["${session_meta_cwd}"]="$(format_cwd "${session_meta_cwd}")"
-        fi
-        cwd="${formatted_cwds[${session_meta_cwd}]}"
-        prompt="${session_meta_prompt}"
-        title="${session_meta_title}"
-        [ -n "${title}" ] || title="-"
-        [ -n "${prompt}" ] || prompt="-"
-        full_titles+=("${title}")
-        full_prompts+=("${prompt}")
-        set_shortened_text "${title}" "${title_max_length}"
-        title="${shortened_text}"
-        # the prompt is kept as a hidden field of the picker either way, so
-        # without its column it stays searchable but takes no width
         prompt_cell=""
-        if [ "${prompt_column}" -eq 1 ]; then
-            if [ "${print}" -eq 1 ]; then
-                set_shortened_text "${prompt}" "${print_prompt_max_length}"
-            else
-                set_shortened_text "${prompt}" "${fzf_text_max_length}"
-            fi
-            prompt="${shortened_text}"
-            prompt_cell="  ${C_PROMPT}${prompt}${C_RESET}"
-        fi
-        [ -n "${cwd}" ] || cwd="-"
-        table+="${agent_color_code}${agent}${C_RESET}  ${live_marker}  ${age}  ${C_TITLE}${title}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${cwd}${C_RESET}"$'\n'
+        [ "${prompt_column}" -eq 1 ] && prompt_cell="  ${C_PROMPT}${row_prompts[row_index]}${C_RESET}"
+        table+="${agent_color_code}${agent}${C_RESET}  ${live_marker}  ${ages[row_index]:-}  ${C_TITLE}${row_titles[row_index]}${C_RESET}${prompt_cell}  ${C_DIRECTORY}${row_cwds[row_index]}${C_RESET}"$'\n'
     done
-    flush_metadata_cache
 
-    mapfile -t formatted_rows < <(printf '%s' "${table}" | k-format)
+    # through a file, which mapfile reads a block at a time and a pipe not
+    table_file="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.table.XXXXXX")" || fail "Cannot format the rows"
+    printf '%s' "${table}" | k-format > "${table_file}"
+    mapfile -t formatted_rows < "${table_file}"
+    rm -f -- "${table_file}"
 
     if [ "${print}" -eq 1 ]; then
         printf '%s\n' "${formatted_rows[@]}"
@@ -1817,15 +1912,173 @@ print_session_list() {
     fi
 
     picker_rows="${formatted_rows[0]}"$'\tAGENT\tFILE\tFULL_TITLE\tFULL_PROMPT\tSTATE\n'
-    row_index=1
-    for entry in "${session_entries[@]}"; do
-        IFS=$'\t' read -r agent _ _ _ filepath <<< "${entry}"
-        formatted_row="${formatted_rows[row_index]}"
-        picker_rows+="${formatted_row}"$'\t'"${agent}"$'\t'"${filepath}"$'\t'"${full_titles[row_index-1]}"$'\t'"${full_prompts[row_index-1]}"$'\t'"${full_states[row_index-1]}"$'\n'
-        row_index=$((row_index + 1))
+    for (( row_index = 0; row_index < ${#session_rows[@]}; row_index++ )); do
+        filepath="${row_files[row_index]}"
+        picker_rows+="${formatted_rows[row_index+1]}"$'\t'"${row_agents[row_index]}"$'\t'"${filepath}"$'\t'"${row_full_titles[row_index]}"$'\t'"${row_full_prompts[row_index]}"$'\t'"${full_states[row_index]}"$'\n'
+        if [ -n "${fzf_track_file}" ] && [ "${filepath}" = "${fzf_track_filepath}" ]; then
+            printf 'pos(%s)' "$((row_index + 1))" > "${fzf_track_file}"
+        fi
     done
 
     printf '%s' "${picker_rows}"
+}
+
+# The snapshot of an open picker: what it listed last, as rows, led by a line
+# naming what the rows were listed for. A refresh lists from it as long as that
+# line still says the same and the snapshot is younger than refresh_full_seconds.
+# Next to it lies a marker, touched before the session files were looked at, so
+# that every file written since is newer than the marker and no file written
+# while the rows were put together is missed.
+snapshot_file=""
+snapshot_marker=""
+
+snapshot_signature() {
+    printf '%q ' "${agents}" "${current_directory_only}" "${current_directory}" \
+        "${grep_pattern}" "${igrep_pattern}" "${days}" "${limit}" "${prompt_column}"
+}
+
+# touched before the files are looked at; takes the place of the marker once the
+# snapshot of that look is written
+start_snapshot() {
+    [ -n "${snapshot_file}" ] || return 0
+    touch -- "${snapshot_marker}.next" 2>/dev/null
+}
+
+write_snapshot() {
+    local built="${1}"
+    local temp_file
+
+    [ -n "${snapshot_file}" ] || return 0
+    temp_file="$(mktemp "${snapshot_file}.XXXXXX")" || return 0
+    {
+        printf '%s\n' "$(snapshot_signature)"
+        printf '%s\n' "${built}"
+        [ "${#session_rows[@]}" -gt 0 ] && printf '%s\n' "${session_rows[@]}"
+    } > "${temp_file}"
+    mv -f -- "${temp_file}" "${snapshot_file}" 2>/dev/null || rm -f -- "${temp_file}"
+    mv -f -- "${snapshot_marker}.next" "${snapshot_marker}" 2>/dev/null
+}
+
+# Reads the snapshot into session_rows where it still describes what is to be
+# listed, and says whether it did.
+snapshot_built=""
+
+read_snapshot() {
+    local signature
+    local now
+
+    [ -n "${snapshot_file}" ] && [ -r "${snapshot_file}" ] && [ -e "${snapshot_marker}" ] || return 1
+    {
+        IFS= read -r signature
+        IFS= read -r snapshot_built
+        mapfile -t session_rows
+    } < "${snapshot_file}"
+    [ "${signature}" = "$(snapshot_signature)" ] || return 1
+    [[ "${snapshot_built}" =~ ^[0-9]+$ ]] || return 1
+    now="$(date +%s)"
+    [ $(( now - snapshot_built )) -lt "${refresh_full_seconds}" ]
+}
+
+# Whether a session belongs in the listing: its directory, where the listing is
+# held to one, and the search, where there is one. The pre-filter over the raw
+# file is taken from prefilter_hits where a listing grepped all of them at once.
+session_is_listed() {
+    local agent="${1}"
+    local filepath="${2}"
+
+    if [ "${current_directory_only}" -eq 1 ] \
+        && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
+        return 1
+    fi
+    [ -n "${filter_pattern}" ] || return 0
+    if [ "${prefilter_done}" -eq 1 ]; then
+        [ -n "${prefilter_hits[${filepath}]+set}" ] || return 1
+    else
+        grep "${verify_args[@]}" -- "${prefilter_pattern}" "${filepath}" 2>/dev/null || return 1
+    fi
+    session_messages "${agent}" "${filepath}" \
+        | grep "${verify_args[@]}" -- "${filter_pattern}"
+}
+
+# The fast refresh: the rows of the snapshot, with the sessions whose files were
+# written since - new ones, resumed ones, the ones that are working - read again
+# and put where their time puts them. Nothing else is opened: the age and the
+# marker of every row are worked out anew anyway, and a session that is merely
+# open changes nothing but its marker.
+refresh_session_rows() {
+    local row
+    local agent
+    local mtime
+    local datetime
+    local size
+    local filepath
+    local folder
+    local title_max_length
+    local changed_file="${snapshot_marker}.changed"
+    local merged_file="${snapshot_marker}.merged"
+    local changed=()
+    local new_rows=()
+
+    start_snapshot
+    for agent in ${agents}; do
+        folder="$(session_folder "${agent}")"
+        [ -d "${folder}" ] || continue
+        case "${agent}" in
+            claude)
+                find "${folder}" -mindepth 2 -maxdepth 2 -name "*.${session_ext}" \
+                    -newer "${snapshot_marker}" -printf "${agent}"'\t%T@\t%TY-%Tm-%TdT%TH:%TM:%TS\t%s\t%p\n'
+                ;;
+            codex)
+                find "${folder}" -name "${codex_session_prefix}*.${session_ext}" \
+                    -newer "${snapshot_marker}" -printf "${agent}"'\t%T@\t%TY-%Tm-%TdT%TH:%TM:%TS\t%s\t%p\n'
+                ;;
+        esac
+    done > "${changed_file}"
+    mapfile -t changed < "${changed_file}"
+
+    # The metadata cache is left alone: the files read here are the ones being
+    # written to, and an entry for each of their sizes would be outdated by the
+    # next refresh already.
+    if [ "${#changed[@]}" -gt 0 ]; then
+        title_max_length="$(row_title_max_length)"
+        session_entries=("${changed[@]}")
+        preload_codex_prompts
+        for row in "${changed[@]}"; do
+            IFS=$'\t' read -r agent mtime datetime size filepath <<< "${row}"
+            [ -n "${filepath}" ] || continue
+            session_is_listed "${agent}" "${filepath}" || continue
+            read_session_row "${agent}" "${mtime}" "${datetime}" "${size}" "${filepath}" "${title_max_length}"
+            new_rows+=("${session_row}")
+        done
+    fi
+
+    # The rows of the files that were written are dropped from the snapshot and
+    # the new ones put in, newest first again, so a session that was written
+    # moves up to where its time puts it; the age of the listing is held to as
+    # well, and its limit.
+    # mapfile reads a pipe a byte at a time and a file a block at a time, so the
+    # rows go through a file of their own
+    {
+        [ "${#session_rows[@]}" -gt 0 ] && printf '%s\n' "${session_rows[@]}"
+        [ "${#new_rows[@]}" -gt 0 ] && printf '%s\n' "${new_rows[@]}"
+    } | awk -v separator="${cache_separator}" -v cutoff="${cutoff_epoch}" \
+            -v kept="${#session_rows[@]}" -v changed_file="${changed_file}" '
+        FILENAME == changed_file {
+            split($0, fields, "\t")
+            if (fields[5] != "") written[fields[5]] = 1
+            next
+        }
+        {
+            split($0, fields, separator)
+            if (FNR <= kept && (fields[5] in written)) next
+            if (cutoff > 0 && fields[2] + 0 < cutoff) next
+            print
+        }' "${changed_file}" - \
+      | LC_ALL=C sort -s -t "${cache_separator}" -k2,2gr \
+      | if [ -n "${limit}" ]; then head -n "${limit}"; else cat; fi > "${merged_file}"
+    mapfile -t session_rows < "${merged_file}"
+    rm -f -- "${changed_file}" "${merged_file}"
+    write_snapshot "${snapshot_built}"
 }
 
 browse_sessions() {
@@ -1834,6 +2087,8 @@ browse_sessions() {
     local preview_command
     local initial_list_command
     local list_command
+    local refresh_command
+    local track_command
     local search_command
     local escape_command
     local ask_command
@@ -1859,12 +2114,21 @@ browse_sessions() {
     # open, so their answers are left here for the action that follows them
     fzf_answer_file="$(mktemp "${TMPDIR:-/tmp}/$(basename -- "${script_path}").answers.XXXXXX")" \
         || fail "Cannot create the answers file of the picker"
-    trap 'rm -f "${fzf_state_file}" "${fzf_answer_file}"' EXIT
+    # the snapshot of the listing and what its refreshes leave lie next to the
+    # state file, named after it
+    trap 'rm -f "${fzf_state_file}" "${fzf_state_file}".* "${fzf_answer_file}"' EXIT
     write_fzf_state
 
     printf -v script_command '%q' "${script_path}"
     initial_list_command="$(fzf_list_command initial)"
     list_command="$(fzf_list_command all)"
+    # A refresh is told the session under the cursor, so that it can put the
+    # cursor back on it once the rows moved: the new list is in, the result
+    # event takes the position the refresh found, and only while nothing is
+    # searched for - a query orders the rows by itself.
+    refresh_command="$(fzf_list_command refresh) --fzf-track {3}"
+    printf -v track_command '%q' "${fzf_state_file}.track"
+    track_command="[ -z {q} ] && cat -- ${track_command} 2>/dev/null; rm -f -- ${track_command}"
     search_command="$(fzf_state_command --fzf-search)"
     toggle_directory_command="$(fzf_state_command --fzf-toggle-directory)"
     # the placeholders of the picker are filled in by fzf itself, so this one is
@@ -1903,13 +2167,16 @@ browse_sessions() {
         --filter-columns 1,4,5,6 \
         --delimiter $'\t' \
         --key-descriptions "${key_descriptions}" \
+        --watch "${refresh_seconds}" \
+        --watch-command "${refresh_command}" \
         -- \
         --no-multi \
         "${fzf_query_arguments[@]}" \
         --prompt "$(print_fzf_prompt)" \
         --preview "${preview_command}" \
-        --preview-window 'right,60%,wrap' \
+        --preview-window 'right,60%,wrap,follow' \
         --bind "load:reload-sync(${list_command})+unbind(load)+refresh-preview" \
+        --bind "result:transform:${track_command}" \
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
         --bind "tab:execute-silent(${toggle_directory_command})+${reload_actions}" \
         --bind "ctrl-s:execute-silent(${scope_session_command})+${reload_actions}" \
@@ -1990,6 +2257,7 @@ fzf_action_agent=""
 fzf_action_filepath=""
 fzf_list=0
 fzf_batch=""
+fzf_refresh=0
 fzf_search=0
 fzf_toggle_directory=0
 fzf_scope_session=0
@@ -2042,6 +2310,15 @@ while [ "${#}" -gt 0 ]; do
             [ "${1}" -gt 0 ] || fail "Invalid fzf batch size: ${1}"
             fzf_list=1
             fzf_batch="${1}"
+            ;;
+        --fzf-refresh)
+            fzf_list=1
+            fzf_refresh=1
+            ;;
+        --fzf-track)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-track"
+            fzf_track_filepath="${1}"
             ;;
         --fzf-search)
             fzf_search=1
@@ -2289,6 +2566,7 @@ done
 [ "${folders_found}" -eq 1 ] || fail "No session folder found for: ${agents}"
 
 filter_pattern=""
+prefilter_done=0
 prefilter_pattern=""
 prefilter_args=()
 verify_args=()
@@ -2368,6 +2646,20 @@ else
         && { [ -z "${list_limit}" ] || [ "${fzf_batch}" -lt "${list_limit}" ]; }; then
         list_limit="${fzf_batch}"
     fi
+    # The open picker keeps a snapshot of the full listing for its refreshes to
+    # start from; the first batch of it is no listing of its own.
+    if [ -n "${fzf_state_file}" ] && [ -z "${fzf_batch}" ]; then
+        snapshot_file="${fzf_state_file}.snapshot"
+        snapshot_marker="${fzf_state_file}.marker"
+        [ -n "${fzf_track_filepath}" ] && fzf_track_file="${fzf_state_file}.track"
+    fi
+    if [ "${fzf_refresh}" -eq 1 ] && read_snapshot; then
+        refresh_session_rows
+        print_session_rows
+        exit 0
+    fi
+    snapshot_built="$(date +%s)"
+    start_snapshot
     session_entries=()
     session_lines=()
     session_paths=()
@@ -2393,6 +2685,7 @@ else
             prefilter_hits["${filepath}"]=1
         done < <(printf '%s\0' "${session_paths[@]}" \
             | xargs -0 -r grep "${prefilter_args[@]}" -- "${prefilter_pattern}" 2>/dev/null)
+        prefilter_done=1
         verbose "${#prefilter_hits[@]} session files to confirm..."
     fi
 
@@ -2400,20 +2693,14 @@ else
     # age mode was already restricted while collecting session files.
     for (( index=${#session_lines[@]} - 1; index >= 0; index-- )); do
         IFS=$'\t' read -r agent mtime datetime size filepath <<< "${session_lines[index]}"
-        if [ "${current_directory_only}" -eq 1 ] \
-            && ! session_is_in_directory "${agent}" "${filepath}" "${current_directory}"; then
-            continue
-        fi
-        if [ -n "${filter_pattern}" ]; then
-            [ -n "${prefilter_hits[${filepath}]+set}" ] || continue
-            session_messages "${agent}" "${filepath}" \
-                | grep "${verify_args[@]}" -- "${filter_pattern}" || continue
-        fi
+        session_is_listed "${agent}" "${filepath}" || continue
         session_entries+=("${agent}"$'\t'"${mtime}"$'\t'"${datetime}"$'\t'"${size}"$'\t'"${filepath}")
         [ -n "${list_limit}" ] && [ "${#session_entries[@]}" -ge "${list_limit}" ] && break
     done
 
-    print_session_list
+    collect_session_rows
+    write_snapshot "${snapshot_built}"
+    print_session_rows
 fi
 
 exit 0
