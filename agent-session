@@ -117,8 +117,9 @@ A session that is open in a running agent carries a marker next to its agent:
     ▶   working on something right now
     ⌨︎   waiting for you: a question, a permission, a plan to confirm
     ✔   open, with nothing to do
-Codex only says whether it is working on a turn; what it waits for while it is
-not, it does not write down anywhere. The state is searchable in the picker,
+Codex does not write down what it waits for; a session counts as waiting when
+its last call asks to run a command outside the sandbox or asks you a question
+and nothing runs for it yet. The state is searchable in the picker,
 as '@working, '@waiting or '@open - the leading quote is fzf's exact match,
 without which its letters are found spread over the rest of the row.
 
@@ -574,8 +575,9 @@ flush_metadata_cache() {
 # Claude publishes a file per process naming the session it has open and its
 # state, so it answers both. Codex publishes nothing, but the process that has a
 # session open holds its file open, and the last turn event written to that file
-# says whether it is still working on something. None of this is cached: it is
-# what the sessions are doing right now, and it changes while the picker is up.
+# says whether it is still working on something, the last call whether it waits
+# for you. None of this is cached: it is what the sessions are doing right now,
+# and it changes while the picker is up.
 declare -A live_state_by_id=()
 declare -A live_detail_by_id=()
 live_sessions_loaded=0
@@ -654,7 +656,7 @@ load_codex_live_sessions() {
             case "${target}" in
                 "${codex_session_folder}"/*."${session_ext}")
                     read_session_id codex "${target}"
-                    live_state_by_id["${session_id_value}"]="$(codex_turn_state "${target}")"
+                    read_codex_live_state "${pid}" "${target}"
                     ;;
             esac
         done < <(readlink -- "/proc/${pid}/fd/"* 2>/dev/null)
@@ -662,15 +664,61 @@ load_codex_live_sessions() {
 }
 
 # Codex writes the start and the end of a turn into the session file, so the
-# last of the two says whether it is still working on one. What it is waiting
-# for while it is not - a question, a permission - it does not write down
-# anywhere a listing could read it.
-codex_turn_state() {
-    local filepath="${1}"
+# last of the two says whether it is still working on one. What it waits for
+# inside a turn it does not write down, but the call that makes it wait is
+# there: a command that asks to run outside the sandbox, or a question to the
+# user, with no output after it yet. Such a call is written before it is
+# approved or answered; once it runs, its command is a process below codex, so
+# a call without one is still at the prompt. The code mode host is a child of
+# codex for as long as it runs and says nothing about a command.
+jq_codex_pending_prompt='
+    [inputs | .payload // {}] as $items
+    | ([$items | to_entries[]
+        | select(.value.type == "custom_tool_call" or .value.type == "function_call")]
+        | last) as $call
+    | select($call != null)
+    | select([$items[$call.key + 1:][]
+              | select(.call_id == $call.value.call_id
+                       and ((.type // "") | endswith("_output")))]
+             | length == 0)
+    | $call.value
+    | if .name == "request_user_input" then "question"
+      elif ((.input // .arguments // "") | contains("require_escalated")) then "approval"
+      else empty end
+'
+
+codex_has_command_process() {
+    local pid="${1}"
+    local child
+
+    while IFS= read -r child; do
+        [ "$(< "/proc/${child}/comm")" != "codex-code-mode" ] && return 0
+    done < <(pgrep -P "${pid}" 2>/dev/null)
+    return 1
+}
+
+# Leaves the state of the session in live_state_by_id and what it waits for in
+# live_detail_by_id, under session_id_value.
+read_codex_live_state() {
+    local pid="${1}"
+    local filepath="${2}"
     local last
+    local pending
 
     last="$(grep -oE '"task_started"|"task_complete"' -- "${filepath}" 2>/dev/null | tail -1)"
-    [ "${last}" = '"task_started"' ] && printf 'working' || printf 'open'
+    if [ "${last}" != '"task_started"' ]; then
+        live_state_by_id["${session_id_value}"]="open"
+        return 0
+    fi
+    live_state_by_id["${session_id_value}"]="working"
+    # the call that waits is among the last lines; what follows it is the
+    # bookkeeping of the turn, not output
+    pending="$(tail -n 50 -- "${filepath}" 2>/dev/null \
+        | jq -rn "${jq_codex_pending_prompt}" 2>/dev/null)"
+    [ -n "${pending}" ] || return 0
+    codex_has_command_process "${pid}" && return 0
+    live_state_by_id["${session_id_value}"]="waiting"
+    live_detail_by_id["${session_id_value}"]="${pending}"
 }
 
 # The marker cell of a row, left in live_marker, and the words that make its
