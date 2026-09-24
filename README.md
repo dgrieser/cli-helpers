@@ -2224,6 +2224,8 @@ Opens a URL in a small chromeless browser window that stays above other windows,
 
 The window is opened with the browser's `--app` mode, which leaves out the tab strip and the address bar. On X11 the browser applies the geometry itself; on Wayland the window is moved and resized through the window bridge afterwards, which needs a GNOME Shell restart after the extension has been updated.
 
+Once the window title reports a finished login (for example the `Authenticated` page of kubelogin, or a title like `Login successful` or `You can close this window`), the window closes by itself after a second. A background watcher polls the title for as long as the window is open; there is no timeout, and nothing gets closed when the title never matches.
+
 **Usage:** `browser-2fa-window [OPTIONS] URL`
 
 **Options:**
@@ -2232,10 +2234,12 @@ The window is opened with the browser's `--app` mode, which leaves out the tab s
 - `-b`, `--browser BROWSER` — browser command to use (default `google-chrome`)
 - `-t`, `--timeout SECONDS` — how long to wait for the window to appear (default `10`)
 - `--no-above` — do not keep the window above other windows
+- `--no-close` — do not close the window after authentication
+- `--close-pattern REGEX` — case-insensitive extended regex matched against the window title to detect a finished login (default: built-in list of success titles)
 - `-q`, `--quiet` — do not print the window ID
 - `-h`, `--help` — show the help message and exit
 
-**Environment:** `CLI_HELPERS_2FA_BROWSER`, `CLI_HELPERS_2FA_SIZE`, `CLI_HELPERS_2FA_POSITION` and `CLI_HELPERS_2FA_TIMEOUT` change the defaults.
+**Environment:** `CLI_HELPERS_2FA_BROWSER`, `CLI_HELPERS_2FA_SIZE`, `CLI_HELPERS_2FA_POSITION`, `CLI_HELPERS_2FA_TIMEOUT` and `CLI_HELPERS_2FA_CLOSE_PATTERN` change the defaults.
 
 **Examples:**
 ```bash

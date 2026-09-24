@@ -53,6 +53,10 @@ const IFACE_XML = `
       <arg type="i" direction="in" name="height"/>
       <arg type="b" direction="out" name="set"/>
     </method>
+    <method name="CloseWindow">
+      <arg type="s" direction="in" name="window_id"/>
+      <arg type="b" direction="out" name="closed"/>
+    </method>
   </interface>
 </node>`;
 
@@ -317,6 +321,14 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         if (windowIsMaximized(window))
             window.unmaximize(Meta.MaximizeFlags.BOTH);
         window.move_resize_frame(true, x, y, width, height);
+        return true;
+    }
+
+    CloseWindow(id) {
+        const window = this._findWindow(id);
+        if (!window || !window.can_close())
+            return false;
+        window.delete(currentTime());
         return true;
     }
 }

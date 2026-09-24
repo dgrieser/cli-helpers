@@ -22,6 +22,10 @@ regular browser window.
 The window uses the regular browser profile, so an existing single sign-on
 session is reused.
 
+The window closes by itself once its title reports a finished login (for
+example the "Authenticated" page of kubelogin). It stays open for as long as
+the title does not match; there is no timeout.
+
 Options:
   -s, --size WIDTHxHEIGHT  Window size (default ${DEFAULT_SIZE})
   -p, --position POSITION  Window position as X,Y, or one of 'center',
@@ -30,6 +34,11 @@ Options:
   -t, --timeout SECONDS    How long to wait for the window to appear
                            (default ${DEFAULT_TIMEOUT})
       --no-above           Do not keep the window above other windows
+      --no-close           Do not close the window after authentication
+      --close-pattern REGEX
+                           Case-insensitive extended regex matched against the
+                           window title to detect a finished login
+                           (default: built-in list of success titles)
   -q, --quiet              Do not print the window id
   -h, --help               Show this help message and exit
 EOF
@@ -71,6 +80,56 @@ for window in json.load(sys.stdin):
     else
         wmctrl -l | awk '{print $1}'
     fi
+}
+
+window_title() {
+    local id="${1}"
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_gnome_window_bridge list | python3 -c '
+import json
+import sys
+
+for window in json.load(sys.stdin):
+    if window.get("id", "") == sys.argv[1]:
+        print(window.get("title", ""))
+        break
+else:
+    sys.exit(1)
+' "${id}"
+    else
+        wmctrl -l | awk -v id="${id}" '
+            $1 == id { $1 = $2 = $3 = ""; sub(/^ +/, ""); print; found = 1 }
+            END { exit !found }'
+    fi
+}
+
+close_window() {
+    local id="${1}"
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_gnome_window_bridge close "${id}" >/dev/null 2>&1
+    else
+        wmctrl -i -c "${id}" >/dev/null 2>&1
+    fi
+}
+
+# Polls the window title until it reports a finished login, then closes the
+# window. Ends without closing anything when the window goes away first.
+close_when_authenticated() {
+    local id="${1}" pattern="${2}" title
+
+    shopt -s nocasematch
+    while title="$(window_title "${id}")"; do
+        if [[ "${title}" =~ ${pattern} ]]; then
+            # Leave the success page visible for a moment.
+            sleep 1
+            close_window "${id}" || \
+                warning "Could not close the window. The window bridge extension needs a GNOME Shell restart to pick up close."
+            return
+        fi
+        sleep 0.5
+    done
 }
 
 new_browser_window() {
@@ -162,12 +221,17 @@ DEFAULT_BROWSER="${CLI_HELPERS_2FA_BROWSER:-google-chrome}"
 DEFAULT_SIZE="${CLI_HELPERS_2FA_SIZE:-520x780}"
 DEFAULT_POSITION="${CLI_HELPERS_2FA_POSITION:-center}"
 DEFAULT_TIMEOUT="${CLI_HELPERS_2FA_TIMEOUT:-10}"
+# Titles of success pages shown by common CLI login flows (kubelogin, gcloud,
+# az, aws sso and similar), plus the usual "you can close this window" wording.
+DEFAULT_CLOSE_PATTERN="${CLI_HELPERS_2FA_CLOSE_PATTERN:-^(authenticated|authentication (successful|succeeded|complete[d]?)|(login|sign[- ]?in) (successful|succeeded|complete[d]?)|(successfully )?(logged|signed) in|success(ful)?)[.!]?$|(can|may) (now )?close this (window|tab)}"
 
 browser="${DEFAULT_BROWSER}"
 size="${DEFAULT_SIZE}"
 position="${DEFAULT_POSITION}"
 timeout="${DEFAULT_TIMEOUT}"
 above=1
+close=1
+close_pattern="${DEFAULT_CLOSE_PATTERN}"
 quiet=0
 url=""
 
@@ -198,6 +262,14 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --no-above)
             above=0
+            ;;
+        --no-close)
+            close=0
+            ;;
+        --close-pattern)
+            shift
+            [ -z "${1}" ] && usage
+            close_pattern="${1}"
             ;;
         -q|--quiet)
             quiet=1
@@ -321,6 +393,12 @@ else
             warning "Could not keep the window above other windows"
     fi
     wmctrl -i -a "${window_id}" >/dev/null 2>&1
+fi
+
+if [ "${close}" -eq 1 ]; then
+    # Detach the watcher, so callers do not wait for the login to finish.
+    close_when_authenticated "${window_id}" "${close_pattern}" </dev/null >/dev/null 2>&1 &
+    disown
 fi
 
 [ "${quiet}" -eq 0 ] && echo "${window_id}"
