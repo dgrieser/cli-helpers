@@ -1199,6 +1199,14 @@ print_fzf_prompt() {
     printf ' > '
 }
 
+# The preview is shown or hidden along with the view, which gives the list
+# another width: the footer of fzf-with-header is packed again for it by the
+# action that picker exports for this.
+print_fzf_preview() {
+    printf '%s-preview' "${1}"
+    [ -n "${FZF_WITH_HEADER_FOOTER_ACTION}" ] && printf '+%s' "${FZF_WITH_HEADER_FOOTER_ACTION}"
+}
+
 # esc clears an active search and leaves the picker without one. The clearing
 # happens here, so the actions handed back only have to bring the list and the
 # prompt in line with the state that was just written.
@@ -1207,7 +1215,7 @@ print_fzf_escape() {
     if [ "${fzf_view}" = "folders" ]; then
         fzf_view="sessions"
         write_fzf_state
-        printf 'show-preview+%s' "${fzf_escape_actions}"
+        printf '%s+%s' "$(print_fzf_preview show)" "${fzf_escape_actions}"
         return
     fi
     if [ -z "${grep_pattern}" ] && [ -z "${igrep_pattern}" ]; then
@@ -1263,11 +1271,11 @@ print_fzf_toggle_view() {
     if [ "${fzf_view}" = "folders" ]; then
         fzf_view="sessions"
         write_fzf_state
-        printf 'show-preview+%s' "${fzf_view_actions}"
+        printf '%s+%s' "$(print_fzf_preview show)" "${fzf_view_actions}"
     else
         fzf_view="folders"
         write_fzf_state
-        printf 'hide-preview+%s' "${fzf_view_actions}"
+        printf '%s+%s' "$(print_fzf_preview hide)" "${fzf_view_actions}"
     fi
 }
 
@@ -1290,7 +1298,7 @@ print_fzf_enter() {
         fi
         fzf_view="sessions"
         write_fzf_state
-        printf 'show-preview+%s' "${fzf_view_actions}"
+        printf '%s+%s' "$(print_fzf_preview show)" "${fzf_view_actions}"
         return
     fi
     # the placeholders are left for fzf to fill in when it runs the actions

@@ -191,6 +191,133 @@ ask_route() {
     return 0
 }
 
+# every footer line is a line the list does not get, so on a short terminal the
+# keys are packed into fewer lines and the ones that no longer fit are dropped
+# behind a "…"
+pack_keys_header() {
+    local max_lines="${1}"
+    local i lines=1 line_width=${lead_width} entry_width limit
+    keys_header=""
+    footer_ind_sep=""
+    for (( i = 0; i < ${#entry_texts[@]}; i++ )); do
+        entry_width="${entry_widths[i]}"
+        # the last line still has to fit the "…" marker
+        limit=${max_line_width}
+        [ ${lines} -ge ${max_lines} ] && limit=$(( max_line_width - 2 ))
+        if [ -z "${keys_header}" ] && [ ${lead_width} -eq 0 ]; then
+            keys_header="${entry_texts[i]}"
+            line_width=${entry_width}
+        elif [ $((line_width + 3 + entry_width)) -le ${limit} ]; then
+            if [ -z "${keys_header}" ]; then
+                # the prefix or the indicator holds the first slot of the line
+                footer_ind_sep=" · "
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header} · ${entry_texts[i]}"
+            fi
+            line_width=$((line_width + 3 + entry_width))
+        elif [ ${lines} -lt ${max_lines} ]; then
+            if [ -z "${keys_header}" ]; then
+                footer_ind_sep=$'\n'
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header}"$'\n'"${entry_texts[i]}"
+            fi
+            line_width=${entry_width}
+            lines=$((lines + 1))
+        else
+            [ -z "${keys_header}" ] && [ ${lead_width} -gt 0 ] && footer_ind_sep=" "
+            keys_header="${keys_header}${C_HELP}…"
+            break
+        fi
+    done
+}
+
+# everything of the footer but the prefix, which is asked for separately because
+# it is the one part that changes without the footer being rebuilt here
+build_footer_rest() {
+    local indicator="${1}"
+    local lead=""
+
+    if [ ${watch_indicator} -eq 1 ] && [ -n "${indicator}" ]; then
+        # the prefix took the first slot, so the indicator follows it
+        [ -n "${footer_prefix_cmd}" ] && lead="${C_HELP} · "
+        lead="${lead}${C_HELP}↻ ${indicator}"
+    fi
+    if [ -z "${lead}" ] && [ -z "${footer_prefix_cmd}" ]; then
+        printf '%s' "${keys_header}${C_RESET}"
+    else
+        # the separator carries the color of the descriptions, so a prefix that
+        # ends its own colors does not leave it in whatever comes next
+        printf '%s' "${lead}${C_HELP}${footer_ind_sep}${keys_header}${C_RESET}"
+    fi
+}
+
+build_footer() {
+    local indicator="${1}"
+
+    [ -n "${footer_prefix_cmd}" ] && printf '%s' "$(${footer_prefix_cmd} 2>/dev/null)"
+    build_footer_rest "${indicator}"
+}
+
+# The footer as the running fzf has room for it right now, called by fzf whenever
+# that room may have changed: the terminal was resized, the preview was toggled or
+# changed its width, or the footer is put together again anyway. fzf names its own
+# size and the one of a visible preview, so the keys are packed into what is left
+# of them instead of into what the terminal looked like when the picker started.
+#
+# The keys, and whatever else leads them, are written to a configuration file
+# before fzf starts, the way the router of the asking keys gets its own.
+footer_route() {
+    local config="${1}"
+    local cols lines list_cols avail_lines max_footer_lines
+    local indicator="" prefix="" prefix_text prefix_width=0
+
+    { [ -z "${config}" ] || [ ! -s "${config}" ]; } && return 0
+    # shellcheck source=/dev/null
+    . "${config}"
+
+    # a question is open, and the footer names the keys that answer it
+    if [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ]; then
+        cat "${ask_hint_file}" 2>/dev/null
+        return 0
+    fi
+
+    cols="${FZF_COLUMNS:-80}"
+    lines="${FZF_LINES:-24}"
+    list_cols="${cols}"
+    # fzf spends three lines on the header, its separator and the prompt, and one
+    # more on the border above the footer
+    avail_lines=$(( lines - 4 ))
+    # a hidden preview names no size at all; a visible one next to the list takes
+    # its columns and border away from the footer, one above or below it the lines
+    if [ -n "${FZF_PREVIEW_COLUMNS}" ]; then
+        if [ $(( cols - FZF_PREVIEW_COLUMNS )) -gt 6 ]; then
+            list_cols=$(( cols - FZF_PREVIEW_COLUMNS - 4 ))
+        else
+            avail_lines=$(( avail_lines - ${FZF_PREVIEW_LINES:-0} - 2 ))
+        fi
+    fi
+    # fzf indents the footer by 2 columns
+    max_line_width=$(( list_cols - 4 ))
+    [ "${max_line_width}" -lt 10 ] && max_line_width=10
+    # not even one line to spare: the list needs every row it can get
+    max_footer_lines=$(( avail_lines - min_list_lines ))
+    [ ${max_footer_lines} -lt 1 ] && return 0
+
+    [ ${watch_indicator} -eq 1 ] && indicator="$(cat "${footer_indicator_file}" 2>/dev/null)"
+    if [ -n "${footer_prefix_cmd}" ]; then
+        prefix="$(${footer_prefix_cmd} 2>/dev/null)"
+        prefix_text="$(printf '%s' "${prefix}" | sed 's/\x1b\[[0-9;]*m//g')"
+        [ -n "${prefix_text}" ] && prefix_width=$(( ${#prefix_text} + 3 ))
+    fi
+    lead_width=$(( ind_width + prefix_width ))
+    pack_keys_header ${max_footer_lines}
+    printf '%s' "${prefix}"
+    build_footer_rest "${indicator}"
+    return 0
+}
+
 while [ $# -gt 0 ]; do
     case "${1}" in
         --columns)
@@ -312,6 +439,12 @@ while [ $# -gt 0 ]; do
             ask_route "${@}"
             exit 0
             ;;
+        --footer-route)
+            # the footer packed into the room the running fzf has for it
+            shift
+            footer_route "${@}"
+            exit 0
+            ;;
         --footer-prefix)
             shift
             [ -z "${1}" ] && usage
@@ -419,6 +552,18 @@ done
 # collected here instead of the screen and shown as a message above the header
 [ -n "${inline_keys}" ] && msg_file="${TMPDIR:-/tmp}/fzf-with-header-message.$$"
 
+# the script itself, called back by the running fzf for what only it knows
+self_path="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)"
+[ -z "${self_path}" ] && self_path="${BASH_SOURCE[0]}"
+printf -v self_arg '%q' "${self_path}"
+
+# The footer is packed again by the running fzf whenever the room for it may have
+# changed, from what this file says about the keys and the rest of it; the watch
+# indicator lives in a file of its own, because the watcher changes it later.
+footer_config_file="${TMPDIR:-/tmp}/fzf-with-header-footer.$$"
+footer_indicator_file="${footer_config_file}.indicator"
+footer_route_action="$(action_arg transform-footer "${self_arg} --footer-route '${footer_config_file}'")"
+
 # The files an open question lives in. The one naming the key is the question
 # itself: as long as it is there, the query line holds an answer instead of a
 # search, and the router below decides what enter and esc do. The others keep
@@ -426,7 +571,6 @@ done
 ask_prefix=""
 ask_state_file=""
 ask_pending_file=""
-ask_footer_file=""
 if [ "${#ask_keys[@]}" -gt 0 ]; then
     ask_prefix="${TMPDIR:-/tmp}/fzf-with-header-ask.$$"
     ask_state_file="${ask_prefix}.state"
@@ -758,7 +902,9 @@ done
 # the preview-wrap bindings are always added, so they belong in the footer
 # whenever there is a preview window - including the --key-descriptions case,
 # which rebuilds the list from the caller's keys alone. The preview is toggled
-# on top of that, unless the caller uses that key for something else
+# on top of that, unless the caller uses that key for something else. Toggling
+# and resizing the preview give the list another width, so both pack the footer
+# again for it.
 preview_toggle_bind_args=()
 preview_width_bind_args=()
 if [ "${has_preview}" -eq 1 ]; then
@@ -772,13 +918,13 @@ if [ "${has_preview}" -eq 1 ]; then
             width_spec="${width_spec}${width_spec:+|}${preview_pos},${preview_width}%"
         done
         if [ -n "${width_spec}" ]; then
-            preview_width_bind_args=(--bind "${preview_width_key}:change-preview-window(${width_spec}|)")
+            preview_width_bind_args=(--bind "${preview_width_key}:change-preview-window(${width_spec}|)+${footer_route_action}")
             used_keys="${used_keys}"$'\n'"${preview_width_key}"
             mapped_keys="${preview_width_key}"$'\t'"width"$'\n'"${mapped_keys}"
         fi
     fi
     if ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_toggle_key}"; then
-        preview_toggle_bind_args=(--bind "${preview_toggle_key}:toggle-preview")
+        preview_toggle_bind_args=(--bind "${preview_toggle_key}:toggle-preview+${footer_route_action}")
         used_keys="${used_keys}"$'\n'"${preview_toggle_key}"
         mapped_keys="${preview_toggle_key}"$'\t'"preview"$'\n'"${mapped_keys}"
     fi
@@ -976,48 +1122,6 @@ while IFS=$'\t' read -r entry_key entry_desc; do
     fi
 done <<< "${mapped_keys}"
 
-# every footer line is a line the list does not get, so on a short terminal the
-# keys are packed into fewer lines and the ones that no longer fit are dropped
-# behind a "…"
-pack_keys_header() {
-    local max_lines="${1}"
-    local i lines=1 line_width=${lead_width} entry_width limit
-    keys_header=""
-    footer_ind_sep=""
-    for (( i = 0; i < ${#entry_texts[@]}; i++ )); do
-        entry_width="${entry_widths[i]}"
-        # the last line still has to fit the "…" marker
-        limit=${max_line_width}
-        [ ${lines} -ge ${max_lines} ] && limit=$(( max_line_width - 2 ))
-        if [ -z "${keys_header}" ] && [ ${lead_width} -eq 0 ]; then
-            keys_header="${entry_texts[i]}"
-            line_width=${entry_width}
-        elif [ $((line_width + 3 + entry_width)) -le ${limit} ]; then
-            if [ -z "${keys_header}" ]; then
-                # the prefix or the indicator holds the first slot of the line
-                footer_ind_sep=" · "
-                keys_header="${entry_texts[i]}"
-            else
-                keys_header="${keys_header} · ${entry_texts[i]}"
-            fi
-            line_width=$((line_width + 3 + entry_width))
-        elif [ ${lines} -lt ${max_lines} ]; then
-            if [ -z "${keys_header}" ]; then
-                footer_ind_sep=$'\n'
-                keys_header="${entry_texts[i]}"
-            else
-                keys_header="${keys_header}"$'\n'"${entry_texts[i]}"
-            fi
-            line_width=${entry_width}
-            lines=$((lines + 1))
-        else
-            [ -z "${keys_header}" ] && [ ${lead_width} -gt 0 ] && footer_ind_sep=" "
-            keys_header="${keys_header}${C_HELP}…"
-            break
-        fi
-    done
-}
-
 footer_enabled=1
 if [ ${max_footer_lines} -lt 1 ]; then
     # not even one line to spare: the list needs every row it can get
@@ -1026,33 +1130,6 @@ if [ ${max_footer_lines} -lt 1 ]; then
 else
     pack_keys_header ${max_footer_lines}
 fi
-
-# everything of the footer but the prefix, which is asked for separately because
-# it is the one part that changes without the footer being rebuilt here
-build_footer_rest() {
-    local indicator="${1}"
-    local lead=""
-
-    if [ ${watch_indicator} -eq 1 ] && [ -n "${indicator}" ]; then
-        # the prefix took the first slot, so the indicator follows it
-        [ -n "${footer_prefix_cmd}" ] && lead="${C_HELP} · "
-        lead="${lead}${C_HELP}↻ ${indicator}"
-    fi
-    if [ -z "${lead}" ] && [ -z "${footer_prefix_cmd}" ]; then
-        printf '%s' "${keys_header}${C_RESET}"
-    else
-        # the separator carries the color of the descriptions, so a prefix that
-        # ends its own colors does not leave it in whatever comes next
-        printf '%s' "${lead}${C_HELP}${footer_ind_sep}${keys_header}${C_RESET}"
-    fi
-}
-
-build_footer() {
-    local indicator="${1}"
-
-    [ -n "${footer_prefix_cmd}" ] && printf '%s' "$(${footer_prefix_cmd} 2>/dev/null)"
-    build_footer_rest "${indicator}"
-}
 
 # until the first reload the wait is the delay, afterwards the interval
 if [ ${watch_delay} -gt 0 ]; then
@@ -1064,34 +1141,56 @@ fi
 # fzf is started with nothing to show and fetches the list on its start event, so
 # the picker is on the screen while the command is still running instead of after
 # it. Whatever the caller wanted to do on start follows the reload.
-start_bind_args=()
-if [ -n "${cmd}" ]; then
-    start_action="reload(${cmd})"
-    [ -n "${caller_start_actions}" ] && start_action="${start_action}+${caller_start_actions}"
-    start_bind_args=(--bind "start:${start_action}")
-elif [ -n "${caller_start_actions}" ]; then
-    start_bind_args=(--bind "start:${caller_start_actions}")
+[ ${watch_indicator} -eq 0 ] && initial_indicator=""
+
+# The footer given to fzf is packed for the terminal as it is now, and packed
+# again by fzf itself from the configuration written here once the room for it
+# changes: on a resize, on the preview keys above, and wherever else the footer
+# is put together again anyway. A footer that did not fit at first may still get
+# its room that way.
+footer_args=()
+footer_route_bind_args=()
+if [ "${#entry_texts[@]}" -gt 0 ] || [ ${watch_indicator} -eq 1 ] || [ -n "${footer_prefix_cmd}" ]; then
+    [ ${footer_enabled} -eq 1 ] && footer_args=(--footer "$(build_footer "${initial_indicator}")")
+    {
+        declare -p entry_texts entry_widths
+        printf 'watch_indicator=%q\n' "${watch_indicator}"
+        printf 'ind_width=%q\n' "${ind_width}"
+        printf 'footer_prefix_cmd=%q\n' "${footer_prefix_cmd}"
+        printf 'footer_indicator_file=%q\n' "${footer_indicator_file}"
+        printf 'min_list_lines=%q\n' "${min_list_lines}"
+        printf 'ask_state_file=%q\n' "${ask_state_file}"
+        printf 'ask_hint_file=%q\n' "${ask_hint_file}"
+    } > "${footer_config_file}"
+    printf '%s' "${initial_indicator}" > "${footer_indicator_file}"
+    footer_route_bind_args=(--bind "resize:${footer_route_action}")
+    # the same action put into the environment of everything started from inside
+    # fzf: a caller that shows or hides the preview from actions it prints itself,
+    # e.g. through a transform, adds it to them to have the footer follow
+    export FZF_WITH_HEADER_FOOTER_ACTION="${footer_route_action}"
+else
+    footer_config_file=""
+    footer_route_action=""
 fi
 
-footer_args=()
-if [ ${footer_enabled} -eq 1 ] && { [ -n "${keys_header}" ] || [ ${watch_indicator} -eq 1 ] || [ -n "${footer_prefix_cmd}" ]; }; then
-    [ ${watch_indicator} -eq 0 ] && initial_indicator=""
-    footer_args=(--footer "$(build_footer "${initial_indicator}")")
-fi
+# fzf is started with nothing to show and fetches the list on its start event, so
+# the picker is on the screen while the command is still running instead of after
+# it. Whatever the caller wanted to do on start follows the reload; the footer
+# goes first, packed for the size fzf really came up with.
+start_action="${footer_route_action}"
+[ -n "${cmd}" ] && start_action="${start_action:+${start_action}+}reload(${cmd})"
+[ -n "${caller_start_actions}" ] && start_action="${start_action:+${start_action}+}${caller_start_actions}"
+start_bind_args=()
+[ -n "${start_action}" ] && start_bind_args=(--bind "start:${start_action}")
 
 # A prefix names something the caller changes while the picker runs, so waiting
 # for the next watch interval to show it would be too late. Every reload fires
 # the load event, and every key that changes the prefix reloads, so the footer is
-# put together again there: the prefix is asked for anew and the rest is read
-# back from a file the watcher keeps up to date - it is the only part that
-# changes without a reload.
+# put together again there, with the prefix asked for anew.
 footer_refresh_bind_args=()
-footer_rest_file=""
-if [ -n "${footer_prefix_cmd}" ] && [ ${footer_enabled} -eq 1 ] && [ -n "${cmd}" ] &&
+if [ -n "${footer_prefix_cmd}" ] && [ -n "${footer_route_action}" ] && [ -n "${cmd}" ] &&
    ! printf '%s\n' "${used_keys}" | grep -qxF -- "load"; then
-    footer_rest_file="${TMPDIR:-/tmp}/fzf-with-header-footer.$$"
-    build_footer_rest "${initial_indicator}" > "${footer_rest_file}"
-    footer_refresh_bind_args=(--bind "load:transform-footer(printf '%s%s' \"\$(${footer_prefix_cmd})\" \"\$(cat '${footer_rest_file}')\")")
+    footer_refresh_bind_args=(--bind "load:${footer_route_action}")
 fi
 
 # The bindings of the keys that ask something. Pressing one hands the query line
@@ -1106,11 +1205,8 @@ ask_bind_args=()
 ask_router_bind_args=()
 if [ -n "${ask_prefix}" ]; then
     # without a footer there is nothing to show a hint in, and nothing to restore
-    [ "${#footer_args[@]}" -gt 0 ] && ask_footer_file="${ask_prefix}.footer"
-    if [ -n "${ask_footer_file}" ]; then
+    [ -n "${footer_route_action}" ] &&
         printf '%s' "${C_HELP}enter submit · esc cancel${C_RESET}" > "${ask_hint_file}"
-        build_footer "${initial_indicator}" > "${ask_footer_file}"
-    fi
 
     # Every key of the picker is dead while a question is open, apart from the two
     # that answer it. A binding on the query changing goes with them, because what
@@ -1132,7 +1228,7 @@ if [ -n "${ask_prefix}" ]; then
         ask_unbind_keys="${ask_unbind_keys:+${ask_unbind_keys},}${ask_used_key}"
     done <<< "${used_keys}"
     ask_restore_actions="transform-prompt(cat '${ask_prompt_file}')+transform-ghost(cat '${ask_ghost_file}')+transform-query(cat '${ask_query_file}')"
-    [ -n "${ask_footer_file}" ] && ask_restore_actions="${ask_restore_actions}+transform-footer(cat '${ask_footer_file}')"
+    [ -n "${footer_route_action}" ] && ask_restore_actions="${ask_restore_actions}+${footer_route_action}"
     [ -n "${ask_unbind_keys}" ] && ask_restore_actions="${ask_restore_actions}+rebind(${ask_unbind_keys})"
 
     for ask_key in "${ask_keys[@]}"; do
@@ -1222,17 +1318,14 @@ if [ -n "${ask_prefix}" ]; then
             # list stays what it was while the answer is typed
             ask_open_action="${ask_open_action}+disable-search+transform-query(cat '${ask_prefill_file}')+change-ghost()"
         fi
-        [ -n "${ask_footer_file}" ] && ask_open_action="${ask_open_action}+transform-footer(cat '${ask_hint_file}')"
+        [ -n "${footer_route_action}" ] && ask_open_action="${ask_open_action}+transform-footer(cat '${ask_hint_file}')"
         ask_bind_args+=(--bind "${ask_key}:${ask_open_action}")
     done
 
-    ask_self="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)"
-    [ -z "${ask_self}" ] && ask_self="${BASH_SOURCE[0]}"
-    printf -v ask_self_arg '%q' "${ask_self}"
     ask_router_bind_args=(
-        --bind "enter:transform:${ask_self_arg} --ask-route submit {q} {}"
-        --bind "esc:transform:${ask_self_arg} --ask-route cancel"
-        --bind "load:transform:${ask_self_arg} --ask-route load"
+        --bind "enter:transform:${self_arg} --ask-route submit {q} {}"
+        --bind "esc:transform:${self_arg} --ask-route cancel"
+        --bind "load:transform:${self_arg} --ask-route load"
     )
     # what the load event does while no question is open: the footer of a caller
     # with a prefix, which the router prints instead of the binding built above,
@@ -1362,19 +1455,15 @@ update_fzf() {
 post_footer() {
     local port="${1}"
     local indicator="${2}"
-    # no footer was shown in the first place
-    [ ${footer_enabled} -eq 0 ] && return 0
-    # the load event puts the footer together again from this file, so it has to
-    # know the indicator the watcher is showing right now
-    [ -n "${footer_rest_file}" ] && build_footer_rest "${indicator}" > "${footer_rest_file}"
-    # an answered question puts the footer back from this file, so it holds what
-    # the footer says while no question is open
-    [ -n "${ask_footer_file}" ] && build_footer "${indicator}" > "${ask_footer_file}"
-    # the footer of an open question names the keys that answer it, and the file
-    # above is what puts this one back once it is answered
+    # there is no footer to show the indicator in
+    [ -z "${footer_route_action}" ] && return 0
+    # every footer fzf packs from now on names the indicator the watcher is showing
+    printf '%s' "${indicator}" > "${footer_indicator_file}"
+    # the footer of an open question names the keys that answer it, and the one
+    # put back once it is answered reads the indicator from the file above
     [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ] && return 0
-    # --data-binary keeps the newlines of a wrapped footer intact
-    curl -XPOST 127.0.0.1:${port} --data-binary "change-footer($(build_footer "${indicator}"))" &> /dev/null
+    # fzf packs it itself, because only fzf knows the room it has for it
+    curl -XPOST 127.0.0.1:${port} --data-binary "${footer_route_action}" &> /dev/null
     return 0
 }
 
@@ -1403,7 +1492,7 @@ stop_watcher() {
 cleanup() {
     stop_watcher
     [ -n "${msg_file}" ] && rm -f "${msg_file}"
-    [ -n "${footer_rest_file}" ] && rm -f "${footer_rest_file}"
+    [ -n "${footer_config_file}" ] && rm -f "${footer_config_file}" "${footer_indicator_file}"
     [ -n "${ask_prefix}" ] && rm -f "${ask_prefix}".*
     return 0
 }
@@ -1413,6 +1502,8 @@ trap cleanup EXIT
 while true; do
     # a message left over from the previous round must not reappear
     [ -n "${msg_file}" ] && : > "${msg_file}"
+    # so does the indicator the watcher of the previous round was showing
+    [ -n "${footer_config_file}" ] && printf '%s' "${initial_indicator}" > "${footer_indicator_file}"
     # a question of the previous round was answered by ending fzf, so the round
     # after it starts on the list again instead of on that question
     [ -n "${ask_state_file}" ] && rm -f "${ask_state_file}" "${ask_pending_file}"
@@ -1429,7 +1520,7 @@ while true; do
             update_fzf "${watch_cmd:-${cmd}}" "${port}" "${watch_seconds}" &
             watcher_pid=$!
         fi
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${footer_route_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" < /dev/null)"
         fzf_rc=$?
         stop_watcher
         if [ ${print_query} -eq 1 ]; then
@@ -1437,7 +1528,7 @@ while true; do
             result="$(echo "${result}" | sed '1d')"
         fi
     else
-        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
+        result="$(fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_route_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info inline-right --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@")"
         fzf_rc=$?
     fi
 
