@@ -1187,6 +1187,66 @@ software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup"
 software-530-wscat@dev() { npm_update wscat; }
 software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
 
+software-550-go@dev() {
+    require_cmd curl jq tar sha256sum || return 1
+    local go_dl_url="https://go.dev/dl"
+    local go_root="${CURRENT_USER_HOME}/.local/go"
+    local bin_dir="${CURRENT_USER_HOME}/.local/bin"
+    local release_json
+    local version
+    local file_name
+    local sha256
+    local installed_version
+    local staging_dir
+    local bin
+
+    release_json="$(curl -fsSL "${go_dl_url}/?mode=json")" || return 1
+    version="$(echo "${release_json}" | jq -r '.[0].version')"
+    file_name="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .filename')"
+    sha256="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .sha256')"
+    if [[ ! "${version}" =~ ^go[0-9.]+$ ]] || [ -z "${file_name}" ] || [ -z "${sha256}" ]; then
+        error "Failed to get latest version of Go from ${go_dl_url}"
+        return 1
+    fi
+
+    installed_version="$(head -n 1 "${go_root}/VERSION" 2>/dev/null)"
+    [ -z "${installed_version}" ] && installed_version="<none>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: Go ${installed_version} is up to date" 1>&2
+        return 0
+    fi
+
+    if [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\ngo\t${installed_version}\t${version}" | column -t -s $'\t'
+        return 0
+    fi
+
+    # everything below runs as the user, Go lives in the user's home
+    ${SUDO_USER} mkdir -p "${CURRENT_USER_HOME}/.local" "${bin_dir}" || return 1
+    staging_dir="$(${SUDO_USER} mktemp -d "${CURRENT_USER_HOME}/.local/.go-XXXXXX")" || return 1
+    trap '${SUDO_USER} rm -rf "${staging_dir}"; trap - RETURN' RETURN
+
+    echo "${APP_NAME}: Installing Go ${installed_version} -> ${version}..." 1>&2
+    verbose "curl -fsSL ${go_dl_url}/${file_name} | ${SUDO_USER} tee ${staging_dir}/${file_name}"
+    curl -fsSL "${go_dl_url}/${file_name}" | ${SUDO_USER} tee "${staging_dir}/${file_name}" > /dev/null || return 1
+    if [ "$(sha256sum "${staging_dir}/${file_name}" | cut -d' ' -f1)" != "${sha256}" ]; then
+        error "Checksum mismatch for ${file_name}"
+        return 1
+    fi
+    verbose "${SUDO_USER} tar -xzf ${staging_dir}/${file_name} -C ${staging_dir}"
+    ${SUDO_USER} tar -xzf "${staging_dir}/${file_name}" -C "${staging_dir}" || return 1
+
+    # swap in the new tree, the old one is removed with the staging dir
+    if [ -d "${go_root}" ]; then
+        ${SUDO_USER} mv "${go_root}" "${staging_dir}/go.old" || return 1
+    fi
+    ${SUDO_USER} mv "${staging_dir}/go" "${go_root}" || return 1
+    for bin in go gofmt; do
+        ${SUDO_USER} ln -sfn "${go_root}/bin/${bin}" "${bin_dir}/${bin}" || return 1
+    done
+    ${SUDO_USER} "${go_root}/bin/go" version 1>&2 || return 1
+}
+
 selected_install_types=()
 dry_run=0
 verbose=0
