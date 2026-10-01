@@ -803,7 +803,7 @@ install_adb() {
 # Group names are lowercase and "all" is reserved. A group may carry the name of a
 # software only if that software is a member of it (e.g. mw is both the mittwald CLI
 # and the group of all mittwald tools); "updater mw" then updates the whole group.
-software-010-firmware@base() {
+software-010-firmware() {
     require_cmd fwupdmgr || return 1
     ${SUDO} fwupdmgr get-devices --force \
         && ${SUDO} fwupdmgr refresh --force \
@@ -915,8 +915,8 @@ software-290-trivy@dev@k8s() {
 
 software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
-software-311-gnome-extension-manager() { apt_upgrade "gnome-shell-extension-manager"; }
-software-312-gnome-tweaks() { apt_upgrade "gnome-tweaks"; }
+software-311-gnome-extension-manager@base() { apt_upgrade "gnome-shell-extension-manager"; }
+software-312-gnome-tweaks@base() { apt_upgrade "gnome-tweaks"; }
 software-320-opencode@dev@agents() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
 
 software-330-zoom() {
