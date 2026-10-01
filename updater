@@ -1180,7 +1180,7 @@ software-disabled-480-ueberzugpp() {
     apt_add_with_repo "ueberzugpp" "http://download.opensuse.org/repositories/home:/justkidding/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
 }
 
-software-490-yazi() { install_git_release "https://github.com/sxyazi/yazi"; }
+software-490-yazi@base() { install_git_release "https://github.com/sxyazi/yazi"; }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 software-510-jw-cli() { install_git_release "https://github.com/dgrieser/jw-cli"; }
 software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
