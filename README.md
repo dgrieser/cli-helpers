@@ -1622,7 +1622,7 @@ reminder --add     # or -a
 ### `prompt`
 Reads input from the terminal in one of four modes: multi-line (collecting lines until Ctrl-D), single-line, list selection (`--select`), or single-line input with completion (`--complete`), with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
 
-**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--files|--dirs] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
+**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--filter] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--files|--dirs] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
 
 | Argument / Flag | Description |
 |---|---|
@@ -1640,6 +1640,7 @@ Reads input from the terminal in one of four modes: multi-line (collecting lines
 | `--key-regex <regex>` | Select mode only: takes the key from the first match of this regular expression (capture group 1 when the pattern has one) and keeps the whole item as the title, e.g. `^\S+` to display a full table row but return its first column. Mutually exclusive with `--delimiter` and `--delimiter-regex`. |
 | `--return key\|title\|index\|number` | Select mode only: print the item's key (default), its title, its 0-based index or its 1-based number. |
 | `--show-keys` | Select mode only: show the item keys next to the titles. |
+| `--filter` | Select mode only: typing filters the list instead of triggering the `j`/`k`, `g`/`G`, `q` and digit shortcuts. An item stays when every word typed appears somewhere in its key or title, in any order, ignoring case. The filter is shown above the list as `filter: <text>`, with the label faded and the text plain. Items keep their numbers from the whole list, and what `--return` prints still refers to the whole list. Backspace, Ctrl-W and Ctrl-U edit the filter. Esc clears it, and aborts once it is empty. |
 | `--cycle <key>\|<key>[\|...]` | Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long instead of taking a row each. The row sits where the first of its items was, and selecting it returns the item it currently shows (`--return index`/`number` stay the item's own position in the input). Items are named by key, title or number; repeatable for several groups. |
 | `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. Header lines are upper-cased (see `--no-header-uppercase`). Since the header already labels the list, the default `Choose:` prompt is suppressed (pass `-p` to get one anyway). |
 | `--no-header-uppercase` | Select mode only: print the `--header-lines` header as given instead of upper-casing it. |
@@ -1713,8 +1714,10 @@ Pasting works as expected: a pasted `\r\n` counts as one line break rather than 
 | Home / `g`, End / `G` | Jump to the first / last entry. |
 | `1`…`9`, `0` | Jump to that entry (`0` is the tenth). |
 | Tab / Shift-Tab | On a `--cycle` row, show its next / previous item; elsewhere ignored. |
+| any character (with `--filter`) | Add it to the filter; the cursor stays on its row while that still matches. |
+| Backspace / Ctrl-W / Ctrl-U (with `--filter`) | Delete a character / a word / the whole filter. |
 | Enter | Select the highlighted entry and print it. |
-| Esc, `q` | Abort (exit 1). |
+| Esc, `q` | Abort (exit 1). With `--filter`, Esc first clears the filter and `q` is filter text. |
 | Ctrl-C | Abort (exit 130). |
 
 #### Completion mode keys (`--complete` / `prompt-complete`)
@@ -2222,7 +2225,7 @@ A URL counts as an authentication URL when it is a loopback URL on one of the au
 
 The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
 
-Register it as the default browser with `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
+Register it as the default browser with `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
 
 **Usage:** `browser-router [OPTIONS] [URL ...]`
 

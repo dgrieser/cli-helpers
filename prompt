@@ -681,12 +681,18 @@ def visible_window(index, count, view):
     return offset
 
 
-def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys, cycling=False):
+def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys, cycling=False,
+                  numbers=None, total=None, query=None):
     lines = []
     if prompt:
         lines.append(paint_prompt(theme, truncate(prompt, width)))
+    # what has been typed to filter by: the label faded, the text itself plain
+    if query:
+        lines.append(theme.paint('hint', 'filter: ') + truncate(query, width - len('filter: ')))
     count = len(items)
-    number_width = len(str(count))
+    # a filtered list keeps the numbers the items have in the whole list, so a
+    # row does not change its number while the filter is typed
+    number_width = len(str(total if total is not None else count))
     marker_width = visible_length(pointer) + 1
     # indent the header so its columns line up with the item titles below it
     header_indent = ' ' * (marker_width + number_width + 2)
@@ -696,7 +702,7 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
         key, title = items[position]
         selected = position == index
         marker = (pointer + ' ') if selected else ' ' * marker_width
-        number = str(position + 1).rjust(number_width)
+        number = str((numbers[position] if numbers else position) + 1).rjust(number_width)
         suffix = '  (' + key + ')' if show_keys and key != title else ''
         available = width - marker_width - number_width - 2
         text = truncate(title, available - len(suffix))
@@ -708,13 +714,17 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
             if suffix:
                 row += theme.paint('key', suffix)
             lines.append(row)
+    if query is not None and not count:
+        lines.append(theme.paint('hint', '(nothing matches)'))
     hints = ['↑/↓ move']
-    if count > 1:
+    if query is not None:
+        hints.append('type to filter')
+    elif count > 1:
         hints.append('1-9 jump')
     if cycling:
         hints.append('tab cycle')
     hints.append('enter select')
-    hints.append('esc abort')
+    hints.append('esc clear' if query else 'esc abort')
     hint = SEPARATOR.join(hints)
     if count > view:
         hint = hint + SEPARATOR + str(index + 1) + '/' + str(count)
@@ -725,33 +735,78 @@ def render_select(theme, width, prompt, header, items, pointer, index, offset, v
 # The rows the cursor walks through are not the items themselves: a cycle group
 # collapses several items into one row, which shows the one it is currently on.
 # selection says which that is per row, and tab moves it.
-def run_select(term, theme, prompt, header, items, rows, selection, pointer, index, show_keys, max_height):
+def matching_variants(items, row, query):
+    # Every word must match the same item, rather than separate cycle variants.
+    words = query.lower().split()
+    matches = []
+    for variant, member in enumerate(row):
+        text = (items[member][0] + ' ' + items[member][1]).lower()
+        if all(word in text for word in words):
+            matches.append(variant)
+    return matches
+
+
+# With `filtering`, typed characters narrow the list down instead of being
+# shortcuts (j/k, g/G, q and the digits), so they can be part of the filter.
+# The cursor then walks the rows that match; what is returned is always the
+# position of the row in the whole list.
+def run_select(term, theme, prompt, header, items, rows, selection, pointer, index, show_keys, max_height,
+               filtering=False):
     renderer = Renderer(term)
-    count = len(rows)
+    total = len(rows)
     cycling = any(len(row) > 1 for row in rows)
+    query = '' if filtering else None
+    visible = list(range(total))
+    variants = [list(range(len(row))) for row in rows]
     term.write(HIDE_CURSOR)
     try:
         while True:
+            count = len(visible)
             width, screen_rows = term.size()
             width = max(20, width - 1)
-            view = max_height if max_height > 0 else max(1, screen_rows - 3 - len(header))
-            view = max(1, min(view, count))
+            reserved = 3 + len(header) + (1 if query else 0) + (1 if query is not None and not count else 0)
+            view = max_height if max_height > 0 else max(1, screen_rows - reserved)
+            view = max(1, min(view, max(count, 1)))
             offset = visible_window(index, count, view)
-            shown = [items[row[selection[position]]] for position, row in enumerate(rows)]
-            renderer.draw(render_select(theme, width, prompt, header, shown, pointer, index, offset, view, show_keys, cycling))
+            shown = [items[rows[position][selection[position]]] for position in visible]
+            renderer.draw(render_select(theme, width, prompt, header, shown, pointer, index, offset, view, show_keys,
+                                        cycling, numbers=visible, total=total, query=query))
             key, char = term.read_key()
             if key == 'ctrl-c':
                 renderer.clear()
                 raise KeyboardInterrupt
+            if filtering and key in ('char', 'backspace', 'ctrl-u', 'ctrl-w', 'esc') and (query or key == 'char'):
+                if key == 'char':
+                    query += char
+                elif key == 'backspace':
+                    query = query[:-1]
+                elif key == 'ctrl-w':
+                    query = re.sub(r'\S*\s*$', '', query.rstrip())
+                else:
+                    query = ''
+                # stay on the row the cursor was on, as long as it still matches
+                current = visible[index] if visible else None
+                variants = [matching_variants(items, row, query) for row in rows]
+                visible = [position for position in range(total) if variants[position]]
+                for position in visible:
+                    if selection[position] not in variants[position]:
+                        selection[position] = variants[position][0]
+                index = visible.index(current) if current in visible else 0
+                continue
             if key in ('esc', 'eof', 'ctrl-d') or (key == 'char' and char == 'q'):
                 renderer.clear()
                 return None
+            if not count:
+                continue
             if key == 'enter':
                 renderer.clear()
-                return index
-            if key in ('tab', 'backtab') and len(rows[index]) > 1:
+                return visible[index]
+            if key in ('tab', 'backtab') and len(rows[visible[index]]) > 1:
                 step = 1 if key == 'tab' else -1
-                selection[index] = (selection[index] + step) % len(rows[index])
+                row = visible[index]
+                matches = variants[row]
+                current_variant = matches.index(selection[row])
+                selection[row] = matches[(current_variant + step) % len(matches)]
             elif key == 'up' or (key == 'char' and char == 'k'):
                 index = (index - 1) % count
             elif key == 'down' or (key == 'char' and char == 'j'):
@@ -1267,7 +1322,8 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
     interrupted = False
     try:
         if select_mode:
-            choice = run_select(term, theme, prompt, header, items, rows, selection, prompt_char, index, args.show_keys, height)
+            choice = run_select(term, theme, prompt, header, items, rows, selection, prompt_char, index, args.show_keys, height,
+                                args.filter)
             if choice is None:
                 if not args.no_abort_message:
                     term.write(theme.paint('hint', 'Abort.') + '\r\n')
@@ -1351,6 +1407,7 @@ def main():
     parser.add_argument('--key-regex', dest='key_regex', type=str, help='Take the item key from the first match of this regular expression (capture group 1 when there is one) and keep the whole item as the title, e.g. "^\\S+" to return the first column of a table row')
     parser.add_argument('--return', dest='returns', choices=['key', 'title', 'index', 'number'], default='key', help='What select mode prints: the item key (default), its title, its 0-based index or its 1-based number')
     parser.add_argument('--show-keys', action='store_true', help='Show the item keys next to the titles in select mode')
+    parser.add_argument('--filter', action='store_true', help='Select mode only: typing filters the list (every word has to appear in an item, in any order, ignoring case) instead of the j/k, g/G, q and digit shortcuts; Backspace/Ctrl-W/Ctrl-U edit the filter, Esc clears it and aborts once it is empty')
     parser.add_argument('--cycle', action='append', default=[], metavar='KEY|KEY[|KEY...]', help='Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long; the row sits where the first of its items was and selecting it returns the one it currently shows. Items are named by key, title or number; repeatable for several groups')
     parser.add_argument('--header-lines', dest='header_lines', type=int, default=0, help='Select mode only: treat the first n items as a header, printed above the list, aligned with the item titles and not selectable; suppresses the default prompt')
     parser.add_argument('--no-header-uppercase', dest='no_header_uppercase', action='store_true', help='Keep the header lines as they are instead of upper-casing them')

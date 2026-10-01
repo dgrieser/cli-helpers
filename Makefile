@@ -16,6 +16,9 @@ COMPLETION := bash_completion/cli-helpers
 DESKTOPDIR ?= $(HOME)/.local/share/applications
 DESKTOPSRCDIR := desktop
 DESKTOPS := browser-router.desktop
+# Chrome policy so Chrome never asks to become the default browser (browser-router is)
+CHROME_POLICY := $(DESKTOPSRCDIR)/chrome-policy-default-browser.json
+CHROME_POLICY_DIR ?= /etc/opt/chrome/policies/managed
 # GNOME extension steps are skipped automatically when no GNOME Shell is
 # present; set ENABLE_GNOME_EXTENSION=1 to force them anyway
 HAVE_GNOME := $(shell command -v gnome-extensions >/dev/null 2>&1 && command -v gnome-shell >/dev/null 2>&1 && echo 1 || echo 0)
@@ -48,7 +51,7 @@ list:
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension (skipped without GNOME)\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
 	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
-	@printf '  make set-default-browser      Make browser-router the default browser (as your user, not root)\n'
+	@printf '  make set-default-browser      Make browser-router the default browser, stop Chrome asking (as your user)\n'
 	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
 	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
@@ -228,6 +231,11 @@ set-default-browser:
 	fi
 	xdg-settings set default-web-browser browser-router.desktop
 	@echo "Default browser: $$(xdg-settings get default-web-browser)"
+	@# root only for the policy file, and only when Chrome is there and the file differs
+	@if [ -d /opt/google/chrome ] && ! cmp -s "$(CHROME_POLICY)" "$(CHROME_POLICY_DIR)/default-browser.json"; then \
+		echo "Installing Chrome policy (needs sudo): $(CHROME_POLICY_DIR)/default-browser.json"; \
+		sudo install -D -m 0644 "$(CHROME_POLICY)" "$(CHROME_POLICY_DIR)/default-browser.json"; \
+	fi
 
 default-browser-hint:
 	@if [ -z "$(DESTDIR)" ] && command -v xdg-settings >/dev/null 2>&1 && \
@@ -273,6 +281,7 @@ uninstall:
 	for entry in $(DESKTOPS); do \
 		rm -f "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
 	done
+	rm -f "$(DESTDIR)$(CHROME_POLICY_DIR)/default-browser.json"
 	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
 		update-desktop-database "$(DESKTOPDIR)" || true; \
 	fi
