@@ -1,0 +1,45 @@
+#!/usr/bin/env node
+
+import path from "node:path";
+import { execSync } from "node:child_process";
+import fs from "node:fs";
+
+const scriptName = path.basename(process.argv[1] || "pkg-dir-global");
+
+function printUsage(exitCode = 1) {
+  console.error(`usage: ${scriptName} <package-name>`);
+  process.exit(exitCode);
+}
+
+const [, , pkgName] = process.argv;
+
+if (!pkgName || pkgName === "-h" || pkgName === "--help") {
+  printUsage(pkgName ? 0 : 1);
+}
+
+function resolveGlobal(pkg) {
+  let globalRoot;
+  try {
+    globalRoot = execSync("npm root -g").toString().trim();
+  } catch (err) {
+    console.error(`Failed to get global npm root: ${err.message}`);
+    process.exit(3);
+  }
+
+  const candidate = path.join(globalRoot, pkg, "package.json");
+  if (fs.existsSync(candidate)) return candidate;
+
+  const legacy = path.join(globalRoot, "npm", "node_modules", pkg, "package.json");
+  if (fs.existsSync(legacy)) return legacy;
+
+  return null;
+}
+
+const pkgJsonPath = resolveGlobal(pkgName);
+
+if (!pkgJsonPath) {
+  console.error(`Could not resolve global package "${pkgName}".`);
+  process.exit(2);
+}
+
+console.log(path.dirname(pkgJsonPath));

@@ -501,6 +501,82 @@ curl_update() {
     fi
 }
 
+nvm_load() {
+    export NVM_DIR="${CURRENT_USER_HOME}/.nvm"
+    [ -s "${NVM_DIR}/nvm.sh" ] || return 1
+    # shellcheck disable=SC1091
+    \. "${NVM_DIR}/nvm.sh" --no-use || return 1
+    nvm ls default >/dev/null 2>&1 || return 0
+    # puts the default node and its npm on PATH for this process
+    if ! nvm use --silent default >/dev/null 2>&1; then
+        warning "nvm cannot activate node, a prefix or globalconfig in ${CURRENT_USER_HOME}/.npmrc is incompatible with nvm (remove it or run: nvm use --delete-prefix default)"
+    fi
+    return 0
+}
+
+nvm_run() {
+    # run as the user, so nothing in ~/.nvm ends up owned by root
+    verbose "${SUDO_USER} bash -c '. ${NVM_DIR}/nvm.sh && nvm ${*}'"
+    ${SUDO_USER} bash -c '\. "${1}/nvm.sh" --no-use && shift && nvm "${@}"' bash "${NVM_DIR}" "${@}"
+}
+
+install_nodejs() {
+    require_cmd curl || return 1
+    local nvm_repo_url="https://github.com/nvm-sh/nvm"
+    local node_version="lts/*"
+    local latest_url
+    local nvm_version
+    local installed_nvm_version
+    local node_latest
+    local node_installed
+
+    latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${nvm_repo_url}/releases/latest")" || return 1
+    nvm_version="${latest_url##*/}"
+    if [[ ! "${nvm_version}" =~ ^v[0-9.]+$ ]]; then
+        error "Failed to get latest version of nvm from ${latest_url}"
+        return 1
+    fi
+
+    installed_nvm_version="<none>"
+    nvm_load && installed_nvm_version="v$(nvm --version)"
+
+    if [ "${dry_run}" -eq 1 ]; then
+        node_installed="<none>"
+        node_latest="<unknown>"
+        if [ "${installed_nvm_version}" != "<none>" ]; then
+            node_installed="$(nvm version "${node_version}")"
+            node_latest="$(nvm version-remote "${node_version}")"
+        fi
+        local updates=""
+        [ "${installed_nvm_version}" != "${nvm_version}" ] && updates+="nvm\t${installed_nvm_version}\t${nvm_version}\n"
+        [ "${node_installed}" != "${node_latest}" ] && updates+="node\t${node_installed}\t${node_latest}\n"
+        if [ -n "${updates}" ]; then
+            echo -e "NAME\tCURRENT\tUPDATE\n${updates%\\n}" | column -t -s $'\t'
+        else
+            echo "nodejs is up to date" 1>&2
+        fi
+        return 0
+    fi
+
+    # the install script also upgrades an existing nvm in place
+    if [ "${installed_nvm_version}" != "${nvm_version}" ]; then
+        echo "${APP_NAME}: Installing nvm ${installed_nvm_version} -> ${nvm_version}..." 1>&2
+        verbose "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_version}/install.sh | ${SUDO_USER} bash"
+        curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_version}/install.sh" | ${SUDO_USER} bash || return 1
+        nvm_load || { error "nvm not found in ${NVM_DIR} after install"; return 1; }
+    fi
+
+    local -a nvm_install_args=("install" "${node_version}")
+    # carry global npm packages over to a new node version
+    nvm current >/dev/null 2>&1 && [ "$(nvm current)" != "none" ] && nvm_install_args+=("--reinstall-packages-from=current")
+    nvm_run "${nvm_install_args[@]}" || return 1
+    nvm_run alias default "${node_version}" || return 1
+    # reload so the following handlers see the new node and npm
+    nvm_load || return 1
+    require_cmd node npm || return 1
+    echo "${APP_NAME}: node $(node -v), npm $(npm -v)" 1>&2
+}
+
 npm_update() {
     require_cmd npm npm-pkg-dir || return 1
     local pkg="${1}"; shift
@@ -526,7 +602,10 @@ npm_update() {
     [ -z "${pkg}" ] && echo "ERROR: npm_update requires a package name" 1>&2 && return 1
 
     local sudo=""
-    if [ -d "${target_dir}" ] && [ ! -w "${target_dir}" ]; then
+    if [ -n "${SUDO_USER}" ] && [[ "$(npm root -g)" == "${CURRENT_USER_HOME}/"* ]]; then
+        # nvm keeps global packages in the user's home, never install those as root
+        sudo="sudo -n -u ${CURRENT_USER_NAME} env PATH=${PATH}"
+    elif [ -d "${target_dir}" ] && [ ! -w "${target_dir}" ]; then
         sudo="${SUDO}"
     fi
 
@@ -725,7 +804,14 @@ software-010-firmware@base() {
 }
 
 software-020-apt@base() { apt_upgrade; }
-software-030-npm@dev@base() { npm_update npm; }
+software-025-nodejs@dev@base() { install_nodejs; }
+software-030-npm@dev@base() {
+    if ! command -v npm >/dev/null 2>&1; then
+        install_nodejs || return 1
+        [ "${dry_run}" -eq 1 ] && return 0
+    fi
+    npm_update npm
+}
 software-040-flatpak@base() { flatpak_update; }
 software-050-adb@dev() { install_adb; }
 
@@ -737,7 +823,52 @@ software-070-mw@dev@mw() { npm_update @mittwald/cli; }
 software-080-claude@dev@agents() { curl_update "claude" "https://claude.ai/install.sh"; }
 software-090-code@dev() { apt_upgrade "code"; }
 software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
-software-110-powerline-fonts() { install_from_git "https://github.com/powerline/fonts" "bash" "-c" "bash ./install.sh"; }
+software-110-nerd-fonts() {
+    require_cmd curl tar fc-cache || return 1
+    local repo_url="https://github.com/ryanoasis/nerd-fonts"
+    local -a fonts=("JetBrainsMono" "Agave" "0xProto" "FiraCode" "Hack")
+    local font_dir
+    local version_file
+    local latest_url
+    local version
+    local installed_version
+    local font
+
+    font_dir="${CURRENT_USER_HOME}/.local/share/fonts"
+    version_file="${font_dir}/.nerd-fonts-version"
+
+    latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${repo_url}/releases/latest")" || return 1
+    version="${latest_url##*/}"
+    if [[ ! "${version}" =~ ^v[0-9.]+$ ]]; then
+        error "Failed to get latest version of Nerd Fonts from ${latest_url}"
+        return 1
+    fi
+
+    installed_version="$(cat "${version_file}" 2>/dev/null)"
+    [ -z "${installed_version}" ] && installed_version="<unknown>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: Nerd Fonts ${installed_version} is up to date" 1>&2
+        return 0
+    fi
+
+    if [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\nNerd Fonts\t${installed_version}\t${version}" | column -t -s $'\t'
+        return 0
+    fi
+
+    verbose "${SUDO_USER} mkdir -p ${font_dir}"
+    ${SUDO_USER} mkdir -p "${font_dir}" || return 1
+    for font in "${fonts[@]}"; do
+        echo "${APP_NAME}: Installing Nerd Font ${font} ${version}..." 1>&2
+        verbose "curl -fsSL ${repo_url}/releases/download/${version}/${font}.tar.xz | ${SUDO_USER} tar -xJf - -C ${font_dir} --wildcards '*.ttf'"
+        curl -fsSL "${repo_url}/releases/download/${version}/${font}.tar.xz" \
+            | ${SUDO_USER} tar -xJf - -C "${font_dir}" --wildcards '*.ttf' \
+            || return 1
+    done
+    verbose "${SUDO_USER} fc-cache -f ${font_dir}"
+    ${SUDO_USER} fc-cache -f "${font_dir}" || return 1
+    echo "${version}" | ${SUDO_USER} tee "${version_file}" > /dev/null
+}
 software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
 software-121-mittwald-outlook-bridge@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
 software-130-slack() {
@@ -860,6 +991,12 @@ software-370-wezterm() {
 }
 software-380-dive@dev@k8s() { install_git_release "https://github.com/wagoodman/dive"; }
 software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubecolor/kubecolor"; }
+# the kubectl-oidc_login symlink makes it available as "kubectl oidc-login", which the kubeconfigs call
+software-391-kubelogin@dev@k8s() {
+    install_git_release "https://github.com/int128/kubelogin" \
+        --pattern "kubelogin_linux_amd64.zip" \
+        --post-install 'ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
+}
 software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force --allow-scripts=@qwen-code/audio-capture; }
 software-430-codex@dev@agents() { npm_update @openai/codex; }
 software-440-kilocode@dev@agents() { npm_update @kilocode/cli --allow-scripts=@kilocode/cli; }
@@ -931,6 +1068,9 @@ software-disabled-480-ueberzugpp() {
 software-490-yazi() { install_git_release "https://github.com/sxyazi/yazi"; }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 software-510-jw-cli() { install_git_release "https://github.com/dgrieser/jw-cli"; }
+software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
+software-530-wscat@dev() { npm_update wscat; }
+software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
 
 selected_install_types=()
 dry_run=0
@@ -981,6 +1121,7 @@ loggedin_id_name="$(loggedin --id-name)" || fail "Failed to run loggedin --id-na
 CURRENT_USER_ID="$(echo "${loggedin_id_name}" | cut -d: -f1)"
 CURRENT_USER_NAME="$(echo "${loggedin_id_name}" | cut -d: -f2)"
 unset loggedin_id_name
+CURRENT_USER_HOME="$(getent passwd "${CURRENT_USER_NAME}" | cut -d: -f6)"
 
 if [ "${#selected_install_types[@]}" -eq 0 ]; then
     selected_install_types=("${possible_install_types[@]}")
@@ -993,6 +1134,7 @@ fi
 
 [ -z "${CURRENT_USER_NAME}" ] && fail "Failed to determine CURRENT_USER_NAME"
 [ -z "${CURRENT_USER_ID}" ] && fail "Failed to determine CURRENT_USER_ID"
+[ -z "${CURRENT_USER_HOME}" ] && fail "Failed to determine CURRENT_USER_HOME"
 
 SUDO_USER=""
 if [ "${EUID}" -ne "${CURRENT_USER_ID}" ]; then
@@ -1017,6 +1159,9 @@ else
     UPDATE_MESSAGE="Checking %PKGNAME% upgrade"
     echo "Running ${APP_NAME} in dry-run mode..." 1>&2
 fi
+
+# node and npm may only be available through nvm
+nvm_load
 
 run_selected_software
 
