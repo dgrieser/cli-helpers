@@ -2218,6 +2218,43 @@ Applies a personal set of GNOME settings for the current user with `gsettings`/`
 |---|---|
 | `-h, --help` | Show the usage message. |
 
+### `app-shortcut`
+The action behind a keyboard shortcut: focuses an app's window, or launches the app when it has none, so a GNOME custom shortcut is just `app-shortcut <app>`. `--bind` (or `make bind-shortcuts` for all apps) turns the `bindings` of the YAML files into such GNOME custom shortcuts. They live under their own paths (`custom-keybindings/app-shortcut-<app>-<n>/`), so binding again replaces exactly them and leaves shortcuts made in Settings alone; a key GNOME already uses itself (e.g. `Print` for the screenshot UI, the media key in `media-static`) is taken away from that GNOME shortcut, which keeps its other keys (`--bind --dry-run` shows what would be freed).
+
+Each app is one YAML file, `<app>.yaml`. The shipped ones live in `$(LIBDIR)/app-shortcuts` (from `lib/cli-helpers/app-shortcuts` in this repo); a file of the same name in `~/.config/cli-helpers/app-shortcuts` wins, so a shortcut is changed by copying its file there and editing it.
+
+```yaml
+description: Files                          # shown by --list
+bindings: ['<Shift><Control>e', '<Super>e'] # what --bind binds
+focus:                                      # optional: focus an existing window ...
+  class: [org.gnome.Nautilus]               #   any of these WM classes (or title: <window title>)
+launch:                                     # ... otherwise start it
+  desktop: org.gnome.Nautilus               #   gtk-launch <desktop> [args], or command: [cmd, args...]
+  args: ['~/Downloads']                     #   ~ and $VARS are expanded
+```
+
+Shipped apps: `chrome`, `chrome-new`, `files`, `launcher`, `mic-toggle`, `outlook`, `paste-primary`, `screenshot`, `slack`, `terminal`, `wallpaper`, `zed`.
+
+**Usage:** `app-shortcut [-l] [-p] [-b] [-n] [APP]`
+
+| Argument / Flag | Description |
+|---|---|
+| `APP` | Name of the app, i.e. its YAML file without `.yaml`. |
+| `-l, --list` | List the apps with description, bindings and the file that defines them. |
+| `-p, --path` | Print the file that defines `APP`. |
+| `-b, --bind` | Bind the `bindings` of `APP` (all apps without `APP`) as GNOME custom shortcuts. |
+| `-n, --dry-run` | Print the focus/launch commands (with `--bind`: the shortcuts) instead of running/binding them. |
+| `-h, --help` | Show the help message. |
+
+**Examples:**
+```bash
+app-shortcut slack
+app-shortcut --dry-run files
+app-shortcut --list
+app-shortcut --bind --dry-run
+app-shortcut --bind slack
+```
+
 ### `browser-router`
 Acts as the default browser and decides per URL where it opens. Regular URLs go to the normal browser, while URLs belonging to an interactive authentication flow open in a small chromeless window that stays above other windows (see `browser-2fa-window`), so a login prompt started from the command line cannot get lost behind the browser window.
 

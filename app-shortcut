@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Focus an application's window, or launch it when it has none: the action
+behind a keyboard shortcut, so a binding is just `app-shortcut <app>`.
+
+Every app is one YAML file named <app>.yaml. A file in the user directory
+(~/.config/cli-helpers/app-shortcuts) wins over the shipped one of the same
+name in /usr/local/lib/cli-helpers/app-shortcuts, so a shortcut is changed by
+copying its file there and editing it. Keys of a file:
+
+  description: Slack                  # shown by --list
+  bindings: ['<Shift><Control>k']     # what --bind turns into GNOME custom shortcuts
+  focus:                              # optional: focus an existing window ...
+    class: [Slack]                    #   any of these WM classes
+    title: Launcher                   #   or a window title
+  launch:                             # ... otherwise (or without focus) start it
+    desktop: slack                    #   gtk-launch <desktop> [args...]
+    command: [amixer-mic-toggle]      #   or run a command as is
+    args: ['~/Downloads']             #   arguments; ~ and $VARS are expanded
+
+--bind creates a GNOME custom shortcut per binding that runs `app-shortcut <app>`.
+Those shortcuts live under their own paths (custom-keybindings/app-shortcut-<app>-<n>/),
+so binding again replaces exactly them and leaves shortcuts made in Settings alone.
+A key GNOME already uses itself (Print for the screenshot UI, the media key) is taken
+away from that GNOME shortcut, which keeps its other keys.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+import yaml
+
+USER_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                        "cli-helpers", "app-shortcuts")
+# rewritten by make install to $(LIBDIR)
+SYSTEM_DIR = "/usr/local/lib/cli-helpers/app-shortcuts"
+# a checkout run in place (or installed as a symlink) finds the shipped files next to it
+REPO_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib", "cli-helpers", "app-shortcuts")
+
+
+def search_dirs():
+    dirs = [USER_DIR, SYSTEM_DIR, REPO_DIR]
+    seen = []
+    for d in dirs:
+        if os.path.isdir(d) and os.path.realpath(d) not in [os.path.realpath(s) for s in seen]:
+            seen.append(d)
+    return seen
+
+
+def find(app):
+    for d in search_dirs():
+        path = os.path.join(d, app + ".yaml")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def all_apps():
+    apps = {}
+    for d in search_dirs():
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".yaml"):
+                apps.setdefault(name[:-len(".yaml")], os.path.join(d, name))
+    return apps
+
+
+def load(path):
+    with open(path) as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        sys.exit(f"ERROR: {path} must be a mapping")
+    return config
+
+
+def as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def expand(arg):
+    return os.path.expandvars(os.path.expanduser(str(arg)))
+
+
+def focus_command(config):
+    focus = config.get("focus") or {}
+    classes = as_list(focus.get("class"))
+    if classes:
+        return ["window-focus-by-class", *map(str, classes)]
+    if focus.get("title"):
+        return ["window-focus-by-title", str(focus["title"])]
+    return None
+
+
+def launch_command(config, path):
+    launch = config.get("launch") or {}
+    args = [expand(a) for a in as_list(launch.get("args"))]
+    if launch.get("command"):
+        return [expand(c) for c in as_list(launch["command"])] + args
+    if launch.get("desktop"):
+        return ["gtk-launch", str(launch["desktop"]), *args]
+    if focus_command(config) is None:
+        sys.exit(f"ERROR: {path} has neither focus nor launch")
+    return None
+
+
+MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+CUSTOM_SCHEMA = MEDIA_KEYS + ".custom-keybinding"
+CUSTOM_BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+OWN_PREFIX = CUSTOM_BASE + "app-shortcut-"
+# schemas whose keys GNOME binds itself; --bind frees a key it needs from them
+SYSTEM_KEYBINDING_SCHEMAS = ["org.gnome.desktop.wm.keybindings", "org.gnome.shell.keybindings",
+                             "org.gnome.mutter.keybindings", "org.gnome.mutter.wayland.keybindings", MEDIA_KEYS]
+
+
+def gsettings(*args):
+    return subprocess.run(["gsettings", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def gvariant_strings(value):
+    # "['/a/', '/b/']" or "@as []" -> list of the quoted strings
+    return re.findall(r"'((?:[^'\\]|\\.)*)'", value)
+
+
+def gvariant_list(items):
+    return "[" + ", ".join("'" + i.replace("\\", "\\\\").replace("'", "\\'") + "'" for i in items) + "]"
+
+
+def accel_key(accel):
+    # GNOME writes media keys with or without the XF86 prefix (AudioMedia / XF86AudioMedia)
+    accel = accel.lower()
+    return accel[len("xf86"):] if accel.startswith("xf86") else accel
+
+
+def system_bindings():
+    # normalized accelerator -> [(schema, key, current value)] of GNOME's own shortcuts
+    taken = {}
+    for schema in SYSTEM_KEYBINDING_SCHEMAS:
+        result = subprocess.run(["gsettings", "list-recursively", schema], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) != 3 or parts[1] == "custom-keybindings":
+                continue
+            for accel in gvariant_strings(parts[2]):
+                if accel.startswith("<") or accel[:1].isupper():
+                    taken.setdefault(accel_key(accel), []).append((schema, parts[1], parts[2]))
+    return taken
+
+
+def free(schema, key, value, accel, dry_run):
+    """Take ACCEL away from GNOME's shortcut SCHEMA KEY, keeping its other keys."""
+    if value.startswith("[") or value.startswith("@as"):
+        rest = [a for a in gvariant_strings(value) if accel_key(a) != accel_key(accel)]
+        new = gvariant_list(rest) if rest else "@as []"
+    else:
+        new = "''"
+    print(f"{'would free' if dry_run else 'free'} {accel} from {schema} {key} ({value} -> {new})")
+    if not dry_run:
+        gsettings("set", schema, key, new)
+
+
+def bind(apps, dry_run):
+    """Replace the custom shortcuts of APPS (dict app -> path) with their bindings."""
+    current = gvariant_strings(gsettings("get", MEDIA_KEYS, "custom-keybindings"))
+    # exactly app-shortcut-<app>-<n>/, so binding "chrome" leaves "chrome-new" alone
+    own = [re.compile(re.escape(f"{OWN_PREFIX}{app}-") + r"\d+/$") for app in apps]
+    replaced = [p for p in current if any(r.match(p) for r in own)]
+    keep = [p for p in current if p not in replaced]
+    taken = system_bindings()
+    created = []
+    for app, path in apps.items():
+        config = load(path)
+        for n, accel in enumerate(as_list(config.get("bindings"))):
+            accel = str(accel)
+            kpath = f"{OWN_PREFIX}{app}-{n}/"
+            name = str(config.get("description") or app)
+            # GNOME's own shortcut would get the key first, so it gives it up
+            for schema, key, value in taken.pop(accel_key(accel), []):
+                free(schema, key, value, accel, dry_run)
+            print(f"bind {accel:<24} -> app-shortcut {app}")
+            created.append((kpath, name, f"app-shortcut {app}", accel))
+    if dry_run:
+        return 0
+    for kpath in replaced:
+        for key in ("name", "command", "binding"):
+            gsettings("reset", f"{CUSTOM_SCHEMA}:{kpath}", key)
+    for kpath, name, command, accel in created:
+        gsettings("set", f"{CUSTOM_SCHEMA}:{kpath}", "name", name)
+        gsettings("set", f"{CUSTOM_SCHEMA}:{kpath}", "command", command)
+        gsettings("set", f"{CUSTOM_SCHEMA}:{kpath}", "binding", accel)
+    gsettings("set", MEDIA_KEYS, "custom-keybindings", gvariant_list(keep + [c[0] for c in created]))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Focus an app's window or launch it, for keyboard shortcuts.")
+    parser.add_argument("app", nargs="?", help="name of the app (its YAML file without .yaml)")
+    parser.add_argument("-l", "--list", action="store_true", help="list the apps with their file and bindings")
+    parser.add_argument("-p", "--path", action="store_true", help="print the file that defines APP")
+    parser.add_argument("-b", "--bind", action="store_true",
+                        help="turn the bindings of APP (all apps without APP) into GNOME custom shortcuts")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="print the commands instead of running them")
+    args = parser.parse_args()
+
+    if args.bind:
+        if os.geteuid() == 0:
+            print("ERROR: --bind changes the shortcuts of the user running it, run it as your user", file=sys.stderr)
+            return 1
+        if args.app:
+            path = find(args.app)
+            if path is None:
+                print(f"ERROR: no app shortcut '{args.app}' in {', '.join(search_dirs())}", file=sys.stderr)
+                return 1
+            return bind({args.app: path}, args.dry_run)
+        return bind(all_apps(), args.dry_run)
+
+    if args.list:
+        for app, path in all_apps().items():
+            config = load(path)
+            bindings = ", ".join(as_list(config.get("bindings"))) or "-"
+            print(f"{app:<16} {str(config.get('description', '')):<22} {bindings:<36} {path}")
+        return 0
+
+    if not args.app:
+        parser.print_usage(sys.stderr)
+        return 1
+
+    path = find(args.app)
+    if path is None:
+        print(f"ERROR: no app shortcut '{args.app}' in {', '.join(search_dirs())}", file=sys.stderr)
+        return 1
+    if args.path:
+        print(path)
+        return 0
+
+    config = load(path)
+    focus = focus_command(config)
+    launch = launch_command(config, path)
+
+    if args.dry_run:
+        if focus:
+            print("focus: " + " ".join(focus))
+        if launch:
+            print(("else " if focus else "") + "launch: " + " ".join(launch))
+        return 0
+
+    if focus and subprocess.run(focus, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return 0
+    if launch:
+        # detached, so the shortcut returns at once and the app outlives it
+        subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

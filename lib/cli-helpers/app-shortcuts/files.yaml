@@ -1,0 +1,7 @@
+description: Files
+bindings: ['<Shift><Control>e', '<Super>e']
+focus:
+  class: [org.gnome.Nautilus]
+launch:
+  desktop: org.gnome.Nautilus
+  args: ['~/Downloads']

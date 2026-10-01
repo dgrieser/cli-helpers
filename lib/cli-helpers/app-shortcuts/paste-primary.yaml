@@ -1,0 +1,5 @@
+# pastes the primary selection by sending a middle click (X11 / xdotool)
+description: Paste primary
+bindings: ['Menu']
+launch:
+  command: [xdotool, click, '2']

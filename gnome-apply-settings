@@ -41,8 +41,8 @@ gsettings set org.gnome.mutter attach-modal-dialogs false
 
 dconf write /org/gnome/desktop/notifications/application/solaar/enable false
 
-# keyboard: German, dead keys only for grave/acute
-gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de+deadgraveacute')]"
+# keyboard: German without dead keys, so ` and ^ type immediately
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de+nodeadkeys')]"
 
 # appearance
 gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'

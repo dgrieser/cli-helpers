@@ -1,0 +1,6 @@
+description: Terminal
+bindings: ['<Shift><Control>t']
+focus:
+  class: [terminator]
+launch:
+  desktop: terminator

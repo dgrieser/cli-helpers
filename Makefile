@@ -30,6 +30,8 @@ EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place
+# the app definitions of app-shortcut, one YAML file per app
+APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them
@@ -39,7 +41,7 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
+.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links bind-shortcuts gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
@@ -53,6 +55,7 @@ list:
 	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
 	@printf '  make set-default-browser      Make browser-router the default browser, stop Chrome asking (as your user)\n'
 	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
+	@printf '  make bind-shortcuts           Bind every app-shortcut binding as a GNOME custom shortcut (as your user)\n'
 	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
@@ -99,6 +102,10 @@ install: check-dirs
 	for shared in $(SHARED); do \
 		install -m 0755 "$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
+	[ -d "$(DESTDIR)$(LIBDIR)/app-shortcuts" ] || mkdir -p "$(DESTDIR)$(LIBDIR)/app-shortcuts"
+	for app in $(APPSHORTCUTS); do \
+		install -m 0644 "$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
 	for module in $(MODULES); do \
 		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
@@ -133,6 +140,10 @@ install-links: check-dirs
 	done
 	for shared in $(SHARED); do \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	[ -d "$(DESTDIR)$(LIBDIR)/app-shortcuts" ] || mkdir -p "$(DESTDIR)$(LIBDIR)/app-shortcuts"
+	for app in $(APPSHORTCUTS); do \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
 	for module in $(MODULES); do \
 		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
@@ -216,6 +227,14 @@ install-desktop-links:
 
 # the default browser is a per-user setting (~/.config/mimeapps.list), so it is
 # never changed by install, which usually runs as root
+# GNOME custom shortcuts for every app-shortcut binding (replaces only its own ones)
+bind-shortcuts:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		echo "ERROR: run make bind-shortcuts as your user, not as root" 1>&2; \
+		exit 1; \
+	fi
+	./app-shortcut --bind
+
 # personal GNOME settings of the current user, so never as root (see set-default-browser)
 gnome-settings:
 	@if [ "$$(id -u)" -eq 0 ]; then \
@@ -265,6 +284,10 @@ uninstall:
 	for shared in $(SHARED); do \
 		rm -f "$(DESTDIR)$(LIBDIR)/$$shared"; \
 	done
+	for app in $(APPSHORTCUTS); do \
+		rm -f "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
+	rmdir "$(DESTDIR)$(LIBDIR)/app-shortcuts" 2>/dev/null || true
 	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
 	for module in $(MODULES); do \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \

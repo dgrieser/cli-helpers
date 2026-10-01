@@ -1,0 +1,6 @@
+description: Launcher
+bindings: ['<Shift><Control>l', 'AudioMedia']
+focus:
+  title: Launcher
+launch:
+  desktop: launcher

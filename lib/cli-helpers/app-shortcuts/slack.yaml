@@ -1,0 +1,6 @@
+description: Slack
+bindings: ['<Shift><Control>k']
+focus:
+  class: [Slack]
+launch:
+  desktop: slack

@@ -1,0 +1,7 @@
+# the Outlook web app installed through Chrome
+description: Outlook
+bindings: ['<Shift><Control>m']
+focus:
+  class: [chrome-faolnafnngnfdaknnbpnkhgohbobgegn-Default]
+launch:
+  desktop: chrome-faolnafnngnfdaknnbpnkhgohbobgegn-Default

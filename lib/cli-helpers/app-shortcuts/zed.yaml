@@ -1,0 +1,6 @@
+description: Zed
+bindings: ['<Shift><Control>g']
+focus:
+  class: [dev.zed.Zed]
+launch:
+  desktop: dev.zed.Zed
