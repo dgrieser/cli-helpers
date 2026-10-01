@@ -36,7 +36,7 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links set-default-browser default-browser-hint install-pth uninstall list-install
+.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
@@ -49,6 +49,7 @@ list:
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
 	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
 	@printf '  make set-default-browser      Make browser-router the default browser (as your user, not root)\n'
+	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
 	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
@@ -212,6 +213,14 @@ install-desktop-links:
 
 # the default browser is a per-user setting (~/.config/mimeapps.list), so it is
 # never changed by install, which usually runs as root
+# personal GNOME settings of the current user, so never as root (see set-default-browser)
+gnome-settings:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		echo "ERROR: run make gnome-settings as your user, not as root" 1>&2; \
+		exit 1; \
+	fi
+	./gnome-apply-settings
+
 set-default-browser:
 	@if [ "$$(id -u)" -eq 0 ]; then \
 		echo "ERROR: run make set-default-browser as your user, not as root" 1>&2; \

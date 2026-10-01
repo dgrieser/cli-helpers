@@ -2206,6 +2206,17 @@ cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 
 These tools work on both X11 (via `xdotool`/`wmctrl`/`xrandr`) and Wayland/GNOME (via the bundled `cli-helpers-window-bridge` GNOME Shell extension installed by `make install`).
 
+### `gnome-apply-settings`
+Applies a personal set of GNOME settings for the current user with `gsettings`/`dconf`: keyboard layout, dark Yaru theme and monospace font, clock and panel, mouse/touchpad, power (no suspend, no dimming), dock (layout, behavior, pinned Settings > Displays), Files list view, extensions (no desktop icons, tiling assistant) and Ptyxis. Pinning only adds what is missing, so other pinned apps stay. Refuses to run as root, since that would change root's settings. Run it with `make gnome-settings`.
+
+⚠️ It also disables the built-in touchpad (`send-events 'disabled'`).
+
+**Usage:** `gnome-apply-settings [-h|--help]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the usage message. |
+
 ### `browser-router`
 Acts as the default browser and decides per URL where it opens. Regular URLs go to the normal browser, while URLs belonging to an interactive authentication flow open in a small chromeless window that stays above other windows (see `browser-2fa-window`), so a login prompt started from the command line cannot get lost behind the browser window.
 

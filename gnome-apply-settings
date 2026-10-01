@@ -1,0 +1,133 @@
+#!/bin/bash
+
+usage()
+{
+    echo "Usage: gnome-apply-settings [-h|--help]"
+    echo
+    echo "Applies personal GNOME settings (keyboard, appearance, dock, power, Files,"
+    echo "Ptyxis, extensions) for the current user with gsettings/dconf."
+    exit "${1:-1}"
+}
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage 0
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+# gsettings writes the settings of the user running it, so under sudo it would
+# change root's settings instead of yours
+if [ "$(id -u)" -eq 0 ]; then
+    echo "ERROR: run gnome-apply-settings as your user, not as root" 1>&2
+    exit 1
+fi
+
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-up "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-down "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left "['']"
+gsettings set org.gnome.shell disable-extension-version-validation true
+gsettings set org.gnome.desktop.remote-desktop.rdp screen-share-mode extend
+gsettings set org.gnome.shell.extensions.dash-to-dock show-icons-emblems false
+gsettings set org.gnome.shell.extensions.dash-to-dock show-show-apps-button false
+gsettings set org.gnome.mutter attach-modal-dialogs false
+gsettings set org.gnome.desktop.peripherals.touchpad send-events 'disabled'
+
+
+dconf write /org/gnome/desktop/notifications/application/solaar/enable false
+
+# keyboard: German, dead keys only for grave/acute
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de+deadgraveacute')]"
+
+# appearance
+gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+gsettings set org.gnome.desktop.interface gtk-theme 'Yaru-dark'
+gsettings set org.gnome.desktop.interface icon-theme 'Yaru-dark'
+gsettings set org.gnome.desktop.interface enable-hot-corners true
+gsettings set org.gnome.desktop.interface gtk-enable-primary-paste true
+
+# mouse and touchpad
+gsettings set org.gnome.desktop.peripherals.mouse speed 0.002904647435897436
+gsettings set org.gnome.desktop.peripherals.touchpad click-method 'fingers'
+gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll false
+gsettings set org.gnome.desktop.peripherals.touchpad tap-to-click false
+
+# power: never suspend on AC (the timeout only applies if a type is set again)
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 3600
+gsettings set org.gnome.settings-daemon.plugins.color night-light-schedule-automatic false
+
+# dock
+gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 24
+gsettings set org.gnome.shell.extensions.dash-to-dock multi-monitor true
+gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
+# pin Settings > Displays, keeping whatever else is pinned
+favorite="gnome-display-panel.desktop"
+favorites="$(gsettings get org.gnome.shell favorite-apps)"
+if [[ "${favorites}" != *"'${favorite}'"* ]]; then
+    if [ "${favorites}" = "@as []" ] || [ "${favorites}" = "[]" ]; then
+        gsettings set org.gnome.shell favorite-apps "['${favorite}']"
+    else
+        gsettings set org.gnome.shell favorite-apps "${favorites%]}, '${favorite}']"
+    fi
+fi
+
+# extensions: no desktop icons; tiling assistant look and popup
+gnome-extensions disable ding@rastersoft.com 2>/dev/null \
+    || gsettings set org.gnome.shell disabled-extensions "['ding@rastersoft.com']"
+gsettings set org.gnome.shell.extensions.tiling-assistant focus-hint-color 'rgb(203,67,20)'
+gsettings set org.gnome.shell.extensions.tiling-assistant tiling-popup-all-workspace true
+
+# Ptyxis: no bells, nord palette and unlimited scrollback on the default profile
+gsettings set org.gnome.Ptyxis audible-bell false
+gsettings set org.gnome.Ptyxis visual-bell false
+gsettings set org.gnome.Ptyxis use-system-font true
+ptyxis_profile="$(gsettings get org.gnome.Ptyxis default-profile-uuid 2>/dev/null | tr -d "'")"
+if [ -n "${ptyxis_profile}" ]; then
+    gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" palette 'nord'
+    gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" limit-scrollback false
+fi
+
+# from the old system: clock and panel
+gsettings set org.gnome.desktop.interface clock-show-seconds true
+gsettings set org.gnome.desktop.interface clock-show-weekday true
+gsettings set org.gnome.desktop.interface show-battery-percentage true
+gsettings set org.gnome.desktop.calendar show-weekdate true
+gsettings set org.gnome.desktop.datetime automatic-timezone true
+# monospace font (nerd-fonts entry of updater): the Mono variant keeps Nerd Font icons one cell wide (prompt, vim)
+gsettings set org.gnome.desktop.interface monospace-font-name 'Agave Nerd Font Mono 14'
+
+# windows and sound; the screen never blanks
+gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,close'
+gsettings set org.gnome.desktop.sound event-sounds false
+gsettings set org.gnome.desktop.sound allow-volume-above-100-percent true
+gsettings set org.gnome.desktop.session idle-delay 'uint32 0'
+
+# power: no dimming, power button suspends, never suspend on battery either
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+gsettings set org.gnome.settings-daemon.plugins.power power-button-action 'suspend'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 1500
+
+# dock behavior, on the laptop screen
+gsettings set org.gnome.shell.extensions.dash-to-dock autohide false
+gsettings set org.gnome.shell.extensions.dash-to-dock scroll-action 'cycle-windows'
+gsettings set org.gnome.shell.extensions.dash-to-dock dance-urgent-applications false
+gsettings set org.gnome.shell.extensions.dash-to-dock apply-custom-theme true
+gsettings set org.gnome.shell.extensions.dash-to-dock shortcut-timeout 5.0
+gsettings set org.gnome.shell.extensions.dash-to-dock preferred-monitor-by-connector 'eDP'
+
+# Files: list view, thumbnails also for remote files
+gsettings set org.gnome.nautilus.preferences default-folder-viewer 'list-view'
+gsettings set org.gnome.nautilus.preferences show-image-thumbnails 'always'
+
+# tiling assistant: no popup, no example layouts
+gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
+gsettings set org.gnome.shell.extensions.tiling-assistant import-layout-examples false

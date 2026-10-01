@@ -936,6 +936,7 @@ software-110-nerd-fonts() {
 }
 software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
 software-121-mittwald-outlook-bridge@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
+software-122-git-commit-ai@dev@agents() { curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh"; }
 software-130-slack() {
     # jessie is the only supported version
     apt_add_with_list_file "slack-desktop" \
