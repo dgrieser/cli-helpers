@@ -3,6 +3,7 @@
 APP_NAME="$(basename "${0}")"
 PLATFORM="$(dpkg --print-architecture)"
 UPDATE_MESSAGE="Running %PKGNAME% upgrade"
+FLATHUB_REPO_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
 # shellcheck disable=SC1090
 [ -f /etc/os-release ] && source <(sed -E 's/^([A-Z0-9_]+)=/OS_RELEASE_\1=/' /etc/os-release)
 
@@ -451,9 +452,12 @@ helm_plugin_update() {
 
 flatpak_list_updates() {
     local pkg="${1}"
-    all_updates="$(join -t $'\t' -j 1 <(flatpak list --app --columns=name,version | tail -n +2 | sort) <(flatpak remote-ls --updates --app --columns=name,version | tail -n +2 | sort))"
+    # by application id, which is what the handlers pass; plugins are runtimes, not apps
+    local -a kind=("--app")
+    [ -n "${pkg}" ] && kind=()
+    all_updates="$(join -t $'\t' -j 1 <(flatpak list "${kind[@]}" --columns=application,version | sort) <(flatpak remote-ls --updates "${kind[@]}" --columns=application,version | sort))"
     if [ -n "${pkg}" ]; then
-        updates="$(echo "${all_updates}" | grep -w "${pkg}")"
+        updates="$(echo "${all_updates}" | grep -F -w "${pkg%%//*}")"
     else
         updates="${all_updates}"
     fi
@@ -466,22 +470,62 @@ flatpak_list_updates() {
     fi
 }
 
+# installs flatpak itself (apt) and the flathub remote when missing; in a dry-run
+# without flatpak it only says so and sets flatpak_missing, as there is nothing to query
+flatpak_setup() {
+    flatpak_missing=0
+    if ! command -v flatpak >/dev/null 2>&1; then
+        if [ "${dry_run}" -eq 1 ]; then
+            # once per run, not for every app and plugin
+            [ -z "${flatpak_missing_reported}" ] && echo "flatpak is not installed, would install it and add the flathub remote" 1>&2
+            flatpak_missing_reported=1
+            flatpak_missing=1
+            return 0
+        fi
+        apt_upgrade flatpak || return 1
+    fi
+    if ! flatpak remotes --system --columns=name 2>/dev/null | grep -qFx "flathub"; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would add flatpak remote flathub (${FLATHUB_REPO_URL})" 1>&2
+        else
+            verbose "${SUDO} flatpak remote-add --system --if-not-exists flathub ${FLATHUB_REPO_URL}"
+            ${SUDO} flatpak remote-add --system --if-not-exists flathub "${FLATHUB_REPO_URL}" || return 1
+        fi
+    fi
+}
+
+# flatpak_update [REF [REMOTE | --from FLATPAKREF_URL]]: without an app, update all
+# of them; an app that is not installed yet comes from REMOTE (default flathub), or
+# from a .flatpakref, which also adds the remote it names (for apps outside flathub)
 flatpak_update() {
+    flatpak_setup || return 1
+    [ "${flatpak_missing}" -eq 1 ] && return 0
     require_cmd flatpak || return 1
     local pkg="${1}"
+    local remote="${2:-flathub}"
+    local ref_url=""
+    if [ "${2}" = "--from" ]; then
+        ref_url="${3}"
+        remote=""
+    fi
     if [ "${dry_run}" -eq 0 ]; then
         if [ -n "${pkg}" ]; then
-            # check if installed
-            if ${SUDO_USER} flatpak list --app --columns=application 2>/dev/null | tail -n +1 | grep -qFx "${pkg}"; then
-                ${SUDO_USER} flatpak update -y "${pkg}"
+            if [ -n "${ref_url}" ]; then
+                if ${SUDO_USER} flatpak list --app --columns=application 2>/dev/null | grep -qFx "${pkg}"; then
+                    ${SUDO_USER} flatpak update -y "${pkg}"
+                else
+                    ${SUDO_USER} flatpak install -y --from "${ref_url}"
+                fi
             else
-                ${SUDO_USER} flatpak install -y "${pkg}"
+                # --or-update: installs or updates, apps and runtimes (plugins) alike;
+                # PKG may carry a branch, e.g. org.gimp.GIMP.Plugin.GMic//3
+                ${SUDO_USER} flatpak install -y --or-update "${remote}" "${pkg}"
             fi
         else
             ${SUDO_USER} flatpak update -y
         fi
     else
-        flatpak_list_updates "${pkg}" 
+        flatpak_list_updates "${pkg}"
     fi
 }
 
@@ -568,8 +612,17 @@ install_nodejs() {
     fi
 
     local -a nvm_install_args=("install" "${node_version}")
-    # carry global npm packages over to a new node version
-    nvm current >/dev/null 2>&1 && [ "$(nvm current)" != "none" ] && nvm_install_args+=("--reinstall-packages-from=current")
+    local node_current
+    local node_target
+    node_current="$(nvm current 2>/dev/null)"
+    node_target="$(nvm version-remote "${node_version}" 2>/dev/null)"
+    # carry global npm packages over to a new node version; nvm refuses to reinstall
+    # them from the version it is installing ("Can not reinstall packages from the
+    # current version of node"), which is the case whenever node is already up to date
+    if [ -n "${node_current}" ] && [ "${node_current}" != "none" ] && [ "${node_current}" != "system" ] \
+        && [ "${node_current}" != "${node_target}" ]; then
+        nvm_install_args+=("--reinstall-packages-from=current")
+    fi
     nvm_run "${nvm_install_args[@]}" || return 1
     nvm_run alias default "${node_version}" || return 1
     # reload so the following handlers see the new node and npm
@@ -901,7 +954,21 @@ software-210-himalaya() { install_git_release "https://github.com/pimalaya/himal
 
 software-230-zed@dev() { curl_update "zed" "https://zed.dev/install.sh"; }
 software-240-hwatch@dev() { install_git_release "https://github.com/blacknon/hwatch"; }
-software-250-gradia() { flatpak_update "be.alexandervanhee.gradia"; }
+software-250-gradia() { flatpak_update "be.alexandervanhee.gradia" flathub; }
+software-251-obs() {
+    flatpak_update "com.obsproject.Studio" flathub \
+        && flatpak_update "com.obsproject.Studio.Plugin.BackgroundRemoval" flathub \
+        && flatpak_update "com.obsproject.Studio.Plugin.DroidCam" flathub
+}
+# only plugins built for GIMP 3 (branch 3); the 2-40 ones (BIMP, FocusBlur, Lensfun,
+# LiquidRescale) install fine but are never loaded by GIMP 3
+software-252-gimp() {
+    flatpak_update "org.gimp.GIMP" flathub \
+        && flatpak_update "org.gimp.GIMP.Plugin.Fourier//3" flathub \
+        && flatpak_update "org.gimp.GIMP.Plugin.GMic//3" flathub \
+        && flatpak_update "org.gimp.GIMP.Plugin.Resynthesizer//3" flathub
+}
+software-253-cobang() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
@@ -913,7 +980,13 @@ software-290-trivy@dev@k8s() {
     apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
 }
 
-software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
+software-300-threema() {
+    flatpak_update "ch.threema.threema-desktop" --from "https://releases.threema.ch/flatpak/threema-desktop/ch.threema.threema-desktop.flatpakref" || return 1
+    [ "${dry_run}" -eq 1 ] && return 0
+    # access to all files, e.g. to send attachments from anywhere (system-wide override, needs root)
+    verbose "${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host"
+    ${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host
+}
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
 software-311-gnome-extension-manager@base() { apt_upgrade "gnome-shell-extension-manager"; }
 software-312-gnome-tweaks@base() { apt_upgrade "gnome-tweaks"; }
