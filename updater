@@ -378,7 +378,8 @@ apt_add_with_repo() {
 
 apt_upgrade() {
     require_cmd apt-get || return 1
-    local pkg="${1}"
+    # no packages: upgrade everything installed; otherwise install/upgrade just these
+    local -a pkgs=("${@}")
     echo "${APP_NAME}: Updating sources..." 1>&2
     local apt_exit_code=-1
     if [ "${verbose}" -eq 1 ]; then
@@ -393,14 +394,14 @@ apt_upgrade() {
     [ ${apt_exit_code} -ne 0 ] && return 1
 
     if [ "${dry_run}" -eq 0 ]; then
-        if [ -n "${pkg}" ]; then
-            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkg}" 1>&2
+        if [ "${#pkgs[@]}" -gt 0 ]; then
+            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" 1>&2
         else
             LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 1>&2 \
                 && LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 1>&2
         fi
     else
-        apt_list_output="$(LC_ALL=C ${SUDO} apt list "${pkg}" --upgradable 2>/dev/null)"
+        apt_list_output="$(LC_ALL=C ${SUDO} apt list "${pkgs[@]}" --upgradable 2>/dev/null)"
         apt_list_output="$(echo "${apt_list_output}" | awk -F'[][]' '
   /^Listing/ { next }
   /upgradable from:/ {
@@ -420,7 +421,7 @@ apt_upgrade() {
         if [ -n "${apt_list_output}" ]; then
             echo -e "NAME\tCURRENT\tUPDATE\n${apt_list_output}" | column -t -s $'\t'
         else
-            echo "${pkg:-apt} is up to date" 1>&2
+            echo "${pkgs[*]:-apt} is up to date" 1>&2
         fi
     fi
 }
@@ -594,12 +595,22 @@ npm_update() {
         shift
     done
     
-    local target_dir
-    target_dir="$(npm-pkg-dir "${pkg}")"
-    local backup_dir="${target_dir}.old"
+    [ -z "${pkg}" ] && echo "ERROR: npm_update requires a package name" 1>&2 && return 1
+
+    # a package that is not installed yet has no directory (npm-pkg-dir exits 2), any
+    # other failure is real; without a target there is nothing to back up either, so a
+    # backup_dir of ".old" never points at the current directory
+    local target_dir=""
+    local backup_dir=""
+    local rc=0
+    target_dir="$(npm-pkg-dir "${pkg}" 2>/dev/null)" || rc=$?
+    if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 2 ]; then
+        error "Failed to resolve the global npm directory of ${pkg}"
+        return 1
+    fi
+    [ -n "${target_dir}" ] && backup_dir="${target_dir}.old"
     local npm_json
     local npm_table
-    [ -z "${pkg}" ] && echo "ERROR: npm_update requires a package name" 1>&2 && return 1
 
     local sudo=""
     if [ -n "${SUDO_USER}" ] && [[ "$(npm root -g)" == "${CURRENT_USER_HOME}/"* ]]; then
@@ -804,6 +815,7 @@ software-010-firmware@base() {
 }
 
 software-020-apt@base() { apt_upgrade; }
+software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete; }
 software-025-nodejs@dev@base() { install_nodejs; }
 software-030-npm@dev@base() {
     if ! command -v npm >/dev/null 2>&1; then
@@ -903,6 +915,8 @@ software-290-trivy@dev@k8s() {
 
 software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
+software-311-extension-manager() { apt_upgrade "gnome-shell-extension-manager"; }
+software-312-gnome-tweaks() { apt_upgrade "gnome-tweaks"; }
 software-320-opencode@dev@agents() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
 
 software-330-zoom() {
@@ -968,6 +982,29 @@ software-360-helm@dev@k8s() {
         "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" \
         && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
         && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
+}
+# pkgs.k8s.io has one repo per minor version, so follow the latest stable minor
+software-365-kubectl@dev@k8s() {
+    require_cmd curl || return 1
+    local stable
+    local minor
+    stable="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" || return 1
+    if [[ ! "${stable}" =~ ^(v[0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+        error "Unexpected kubernetes stable version: ${stable}"
+        return 1
+    fi
+    minor="${BASH_REMATCH[1]}"
+    # a repo added by hand following the kubernetes docs would point at the same
+    # URL with another keyring, which apt rejects ("Conflicting values set for option Signed-By")
+    if [ -f /etc/apt/sources.list.d/kubernetes.list ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would remove /etc/apt/sources.list.d/kubernetes.list (replaced by kubectl.list)" 1>&2
+        else
+            verbose "${SUDO} rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+            ${SUDO} rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes-apt-keyring.gpg || return 1
+        fi
+    fi
+    apt_add_with_repo "kubectl" "https://pkgs.k8s.io/core:/stable:/${minor}/deb/"
 }
 
 software-370-wezterm() {

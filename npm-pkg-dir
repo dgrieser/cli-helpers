@@ -4,7 +4,7 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 
-const scriptName = path.basename(process.argv[1] || "pkg-dir-global");
+const scriptName = path.basename(process.argv[1] || "npm-pkg-dir");
 
 function printUsage(exitCode = 1) {
   console.error(`usage: ${scriptName} <package-name>`);
@@ -27,10 +27,9 @@ function resolveGlobal(pkg) {
   }
 
   const candidate = path.join(globalRoot, pkg, "package.json");
+  // only top-level global packages: npm/node_modules holds npm's own bundled
+  // dependencies, which callers like updater's npm_update must never move away
   if (fs.existsSync(candidate)) return candidate;
-
-  const legacy = path.join(globalRoot, "npm", "node_modules", pkg, "package.json");
-  if (fs.existsSync(legacy)) return legacy;
 
   return null;
 }

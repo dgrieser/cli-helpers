@@ -12,7 +12,7 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 
 ## Installation
 
-The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `/etc/profile.d/python.sh` puts on `PYTHONPATH`, so other tools can import them instead of piping through them.
+The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
 ```bash
 make list                     # show targets and the full command list
@@ -22,6 +22,11 @@ sudo make install             # copy commands + shared helpers + GNOME extension
 sudo make uninstall           # remove installed files
 make list-install             # show install destinations
 ```
+
+To install without `sudo` afterwards, run `sudo make setup-dirs` once: it creates the install folders (`BINDIR`,
+`LIBDIR`, `PYTHONDIR`, the completions folder) owned by `root:<your group>` and group-writable. The group is the
+primary group of the user who ran `sudo`; override it with `INSTALL_GROUP=...`. The `.pth` file still needs root
+once (`sudo make install-pth`), since it lives in the system's `/usr/lib/python3/dist-packages`.
 
 Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`, `PYTHONDIR=...`.  
 The GNOME extension steps (packaging, installing, enabling) are skipped automatically when no GNOME Shell is
@@ -1447,6 +1452,24 @@ install-git-release -p '*linux*arm64*' -b 'mytool' -n mt my/project
 install-git-release -c 'sudo setcap cap_net_raw+ep "$BINARY_PATH"' some/network-tool
 ```
 
+### `npm-pkg-dir`
+Prints the directory of a globally installed npm package, resolved under `npm root -g` (so it follows the active nvm node). Only top-level global packages count, never the dependencies bundled inside npm itself. `updater` uses it to back up a package before a forced reinstall. Needs `node` and `npm` on `PATH`.
+
+**Usage:** `npm-pkg-dir <package-name>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<package-name>` | Name of the global package, scoped names included (e.g. `@openai/codex`). |
+| `-h, --help` | Show the usage message. |
+
+Exit codes: `0` found, `1` usage error, `2` package not installed globally, `3` `npm root -g` failed.
+
+**Examples:**
+```bash
+npm-pkg-dir @openai/codex
+cd "$(npm-pkg-dir npm)"
+```
+
 ### `generate-password`
 Generates a random password of a given length using `openssl` for randomness, optionally enforcing minimum counts of lowercase, uppercase, digit, and special characters.
 
@@ -2190,7 +2213,7 @@ A URL counts as an authentication URL when it is a loopback URL on one of the au
 
 The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
 
-Register it as the default browser with `xdg-settings set default-web-browser browser-router.desktop`. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well.
+Register it as the default browser with `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
 
 **Usage:** `browser-router [OPTIONS] [URL ...]`
 

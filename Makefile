@@ -3,9 +3,14 @@ DESTDIR ?=
 
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/cli-helpers
-# /etc/profile.d/python.sh puts this directory on PYTHONPATH
 PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
+# a .pth file in the system site-packages puts $(PYTHONDIR) on sys.path for every
+# python3 process (also under sudo, cron and systemd, which PYTHONPATH from a
+# login shell never reaches); python3 reads it at startup
+PTHFILE ?= /usr/lib/python3/dist-packages/usr-local-python3.pth
 COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
+# the group that may install without root: the invoking user's primary group
+INSTALL_GROUP ?= $(shell id -gn "$${SUDO_USER:-$$(id -un)}")
 COMPLETION := bash_completion/cli-helpers
 # desktop entries are per-user, like the GNOME extension
 DESKTOPDIR ?= $(HOME)/.local/share/applications
@@ -31,27 +36,55 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links uninstall list-install
+.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links set-default-browser default-browser-hint install-pth uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
 	@printf '  make list                     Show this help and available commands\n'
 	@printf '  make list-install             Show install destinations and installed files\n'
+	@printf '  sudo make setup-dirs          Create the install folders as root:$(INSTALL_GROUP), group-writable (once)\n'
 	@printf '  make extension-zip            Package the GNOME extension\n'
 	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension (skipped without GNOME)\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
 	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
+	@printf '  make set-default-browser      Make browser-router the default browser (as your user, not root)\n'
+	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
 	@printf '  sudo make uninstall           Remove installed files\n'
 	@printf '\nAvailable commands:\n'
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 
+# run once as root: creates the install folders as root:$(INSTALL_GROUP) and
+# group-writable, so install-links (and install) work afterwards without sudo
+# runs before install/install-links: as a user, fail early with a hint instead of
+# halfway through, when a folder (or the parent it would be created in) is not writable
+check-dirs:
+	@[ "$$(id -u)" -eq 0 ] && exit 0; \
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)"; do \
+		existing="$$dir"; \
+		while [ ! -e "$$existing" ]; do existing="$$(dirname "$$existing")"; done; \
+		if [ ! -w "$$existing" ]; then \
+			echo "ERROR: $$existing is not writable for $$(id -un), cannot install into $$dir" 1>&2; \
+			echo "HINT: run once: sudo make setup-dirs$(if $(strip $(MAKEOVERRIDES)), $(MAKEOVERRIDES))  (then install without sudo), or install with sudo" 1>&2; \
+			exit 1; \
+		fi; \
+	done
+
+setup-dirs:
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "ERROR: setup-dirs needs root, run: sudo make setup-dirs" 1>&2; \
+		exit 1; \
+	fi
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)"; do \
+		mkdir -p "$$dir" && chown root:"$(INSTALL_GROUP)" "$$dir" && chmod g+w "$$dir" || exit 1; \
+	done
+
 update:
 	./updater $(UPDATE_ARGS)
 
-install:
+install: check-dirs
 	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
 		[ -d "$$dir" ] || mkdir -p "$$dir"; \
 	done
@@ -66,6 +99,7 @@ install:
 		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
+	$(MAKE) --no-print-directory install-pth
 	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
 	$(MAKE) install-gnome-extension
 	$(MAKE) install-completions
@@ -84,8 +118,9 @@ install:
 	else \
 		echo "Skipping GNOME extension enable step."; \
 	fi
+	$(MAKE) --no-print-directory default-browser-hint
 
-install-links:
+install-links: check-dirs
 	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
 		[ -d "$$dir" ] || mkdir -p "$$dir"; \
 	done
@@ -99,6 +134,7 @@ install-links:
 		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
+	$(MAKE) --no-print-directory install-pth
 	$(MAKE) install-gnome-extension
 	$(MAKE) install-completions-links
 	$(MAKE) install-desktop-links
@@ -115,6 +151,7 @@ install-links:
 	else \
 		echo "Skipping GNOME extension enable step."; \
 	fi
+	$(MAKE) --no-print-directory default-browser-hint
 
 extension-zip:
 	rm -f "$(EXTENSION_ZIP)"
@@ -173,6 +210,37 @@ install-desktop-links:
 		update-desktop-database "$(DESKTOPDIR)" || true; \
 	fi
 
+# the default browser is a per-user setting (~/.config/mimeapps.list), so it is
+# never changed by install, which usually runs as root
+set-default-browser:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		echo "ERROR: run make set-default-browser as your user, not as root" 1>&2; \
+		exit 1; \
+	fi
+	xdg-settings set default-web-browser browser-router.desktop
+	@echo "Default browser: $$(xdg-settings get default-web-browser)"
+
+default-browser-hint:
+	@if [ -z "$(DESTDIR)" ] && command -v xdg-settings >/dev/null 2>&1 && \
+		{ [ "$$(id -u)" -eq 0 ] || [ "$$(xdg-settings get default-web-browser 2>/dev/null)" != "browser-router.desktop" ]; }; then \
+		echo; \
+		echo "HINT: to route URLs through browser-router, run as your user: make set-default-browser"; \
+	fi
+
+# the system site-packages is root's, while install-links also runs as a user with
+# a group-writable $(PREFIX): an up to date .pth is left alone, one that cannot be
+# written only warns instead of failing the whole install
+install-pth:
+	@pth="$(DESTDIR)$(PTHFILE)"; \
+	if [ "$$(cat "$$pth" 2>/dev/null)" = "$(PYTHONDIR)" ]; then \
+		echo "$$pth is up to date"; \
+	elif { [ -d "$$(dirname "$$pth")" ] || mkdir -p "$$(dirname "$$pth")"; } 2>/dev/null \
+		&& printf '%s\n' "$(PYTHONDIR)" 2>/dev/null > "$$pth" && chmod 0644 "$$pth"; then \
+		echo "Wrote $$pth"; \
+	else \
+		echo "WARNING: cannot write $$pth, so $(PYTHONDIR) is not on sys.path; run: sudo make install-pth" 1>&2; \
+	fi
+
 uninstall:
 	for script in $(SCRIPTS) $(LINKS); do \
 		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
@@ -185,6 +253,7 @@ uninstall:
 		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
+	rm -f "$(DESTDIR)$(PTHFILE)"
 	for name in $(SCRIPTS) $(LINKS); do \
 		target="$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
 		case "$$([ -L "$$target" ] && readlink "$$target")" in \
@@ -207,7 +276,7 @@ list-install:
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 	@printf 'Shared -> %s\n' "$(DESTDIR)$(LIBDIR)"
 	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
-	@printf 'Python modules -> %s\n' "$(DESTDIR)$(PYTHONDIR)"
+	@printf 'Python modules -> %s (on sys.path via %s)\n' "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(PTHFILE)"
 	@printf '%s\n' $(MODULES) | sed 's#^#  #;s#$$#.py#'
 ifeq ($(ENABLE_GNOME_EXTENSION),0)
 	@printf 'GNOME extension -> skipped\n'
