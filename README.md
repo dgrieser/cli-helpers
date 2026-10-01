@@ -2209,8 +2209,6 @@ These tools work on both X11 (via `xdotool`/`wmctrl`/`xrandr`) and Wayland/GNOME
 ### `gnome-apply-settings`
 Applies a personal set of GNOME settings for the current user with `gsettings`/`dconf`: keyboard layout, dark Yaru theme and monospace font, clock and panel, mouse/touchpad, power (no suspend, no dimming), dock (layout, behavior, pinned Settings > Displays), Files list view, extensions (no desktop icons, tiling assistant) and Ptyxis. Pinning only adds what is missing, so other pinned apps stay. Refuses to run as root, since that would change root's settings. Run it with `make gnome-settings`.
 
-⚠️ It also disables the built-in touchpad (`send-events 'disabled'`).
-
 **Usage:** `gnome-apply-settings [-h|--help]`
 
 | Argument / Flag | Description |

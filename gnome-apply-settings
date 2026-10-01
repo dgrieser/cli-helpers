@@ -37,7 +37,6 @@ gsettings set org.gnome.desktop.remote-desktop.rdp screen-share-mode extend
 gsettings set org.gnome.shell.extensions.dash-to-dock show-icons-emblems false
 gsettings set org.gnome.shell.extensions.dash-to-dock show-show-apps-button false
 gsettings set org.gnome.mutter attach-modal-dialogs false
-gsettings set org.gnome.desktop.peripherals.touchpad send-events 'disabled'
 
 
 dconf write /org/gnome/desktop/notifications/application/solaar/enable false
