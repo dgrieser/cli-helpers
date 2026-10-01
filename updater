@@ -868,7 +868,7 @@ software-010-firmware() {
 }
 
 software-020-apt@base() { apt_upgrade; }
-software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete; }
+software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml; }
 software-022-glow@base() { apt_upgrade glow; }
 software-023-sshpass@base() { apt_upgrade sshpass; }
 software-024-secret-tool@base() { apt_upgrade libsecret-tools; }
