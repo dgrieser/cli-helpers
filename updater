@@ -638,6 +638,8 @@ install_from_git() {
         else
             echo "Would run: ${cmd[*]} ${script_args[*]}"
         fi
+        # the "[ ... ] && ... && exit 1" check above leaves status 1 on success
+        exit 0
     ) || return 1
 }
 
