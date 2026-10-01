@@ -915,7 +915,7 @@ software-290-trivy@dev@k8s() {
 
 software-300-threema() { flatpak_update "ch.threema.threema-desktop"; }
 software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
-software-311-extension-manager() { apt_upgrade "gnome-shell-extension-manager"; }
+software-311-gnome-extension-manager() { apt_upgrade "gnome-shell-extension-manager"; }
 software-312-gnome-tweaks() { apt_upgrade "gnome-tweaks"; }
 software-320-opencode@dev@agents() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
 
