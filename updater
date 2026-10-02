@@ -388,13 +388,13 @@ apt_add_with_list_file() {
         [ -n "${key_path}" ] && repo_gpg_path="${key_path}"
 
         [ "${verbose}" -eq 1 ] && echo "+ mv ${file_args[*]} ${tmp_list_file} ${repo_list_path}" 1>&2
-        ${SUDO} LC_ALL=C mv "${file_args[@]}" "${tmp_list_file}" "${repo_list_path}" 2>&1 | sed 's/^/+ /' 1>&2
+        LC_ALL=C ${SUDO} mv "${file_args[@]}" "${tmp_list_file}" "${repo_list_path}" 2>&1 | sed 's/^/+ /' 1>&2
 
         [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} mkdir -p ${file_args[*]} $(dirname "${repo_gpg_path}")" 1>&2
-        ${SUDO} LC_ALL=C mkdir -p "${file_args[@]}" "$(dirname "${repo_gpg_path}")" 2>&1 | sed 's/^/+ /' 1>&2
+        LC_ALL=C ${SUDO} mkdir -p "${file_args[@]}" "$(dirname "${repo_gpg_path}")" 2>&1 | sed 's/^/+ /' 1>&2
 
         [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} gpg --dearmor --yes -o ${repo_gpg_path} < ${tmp_key_file}" 1>&2
-        ${SUDO} LC_ALL=C gpg --dearmor --yes -o "${repo_gpg_path}" < "${tmp_key_file}" || return 1
+        LC_ALL=C ${SUDO} gpg --dearmor --yes -o "${repo_gpg_path}" < "${tmp_key_file}" || return 1
 
         if [ "${verbose}" -eq 1 ]; then
             echo "+ gpg --no-options --show-keys --with-fingerprint ${repo_gpg_path}"
@@ -501,6 +501,15 @@ apt_add_with_repo() {
     apt_upgrade "${name}"
 }
 
+# apt-get that never stops to ask: DEBIAN_FRONTEND only quiets debconf, dpkg still
+# asks about a config file changed here that the package ships too (the list
+# apt_add_with_repo writes, e.g. teamviewer.list), so keep the local one; env, as
+# sudo drops DEBIAN_FRONTEND and an assignment after an empty SUDO is the command
+apt_get_noninteractive() {
+    LC_ALL=C ${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${@}"
+}
+
 apt_upgrade() {
     require_cmd apt-get || return 1
     # no packages: upgrade everything installed; otherwise install/upgrade just these
@@ -520,10 +529,10 @@ apt_upgrade() {
 
     if [ "${dry_run}" -eq 0 ]; then
         if [ "${#pkgs[@]}" -gt 0 ]; then
-            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" 1>&2
+            apt_get_noninteractive install "${pkgs[@]}" 1>&2
         else
-            LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 1>&2 \
-                && LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 1>&2
+            apt_get_noninteractive upgrade 1>&2 \
+                && apt_get_noninteractive autoremove 1>&2
         fi
     else
         apt_list_output="$(LC_ALL=C ${SUDO} apt list "${pkgs[@]}" --upgradable 2>/dev/null)"
@@ -1038,7 +1047,10 @@ flatpak_update() {
                 if ${SUDO_USER} flatpak list --app --columns=application 2>/dev/null | grep -qFx "${pkg}"; then
                     ${SUDO_USER} flatpak update -y "${pkg}"
                 else
-                    ${SUDO_USER} flatpak install -y --from "${ref_url}"
+                    # a flatpakref adds its remote; polkit only grants configure-remote with an
+                    # interactive admin prompt, so install system-wide as root
+                    verbose "${SUDO} flatpak install --system -y --from ${ref_url}"
+                    ${SUDO} flatpak install --system -y --from "${ref_url}"
                 fi
             else
                 # --or-update: installs or updates, apps and runtimes (plugins) alike;
@@ -1289,6 +1301,53 @@ install_git_release() {
     install-git-release "${url}" "${install_git_args[@]}"
 }
 
+# Ubuntu lets a program create user namespaces only when its AppArmor profile allows
+# it, so an Electron app from a release bundle aborts at start: its sandbox needs
+# them, or else a chrome-sandbox owned by root with mode 4755; like the profiles
+# Ubuntu ships for such apps, this one confines nothing and only adds userns
+apparmor_allow_userns() {
+    local name="${1}"
+    local binary="${2}"
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] || return 0
+    local binary_path
+    binary_path="$(command -v "${binary}")" && binary_path="$(readlink -f "${binary_path}")"
+    if [ -z "${binary_path}" ]; then
+        # a dry run did not install it
+        [ "${dry_run}" -eq 1 ] && return 0
+        error "${binary} is not installed, so there is no AppArmor profile to write for it"
+        return 1
+    fi
+    local profile_path="/etc/apparmor.d/${name}"
+    local content
+    content="$(cat <<EOF
+# Written by ${APP_NAME}. This profile allows everything and only lets
+# ${name} create the user namespaces of its sandbox
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ${name} "${binary_path}" flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/${name}>
+}
+EOF
+)"
+    if [ "$(cat "${profile_path}" 2>/dev/null)" = "${content}" ]; then
+        echo "${APP_NAME}: ${profile_path} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would write ${profile_path} (lets ${binary_path} create user namespaces)" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} tee ${profile_path}"
+    echo "${content}" | ${SUDO} tee "${profile_path}" > /dev/null \
+        && ${SUDO} chmod 0644 "${profile_path}" \
+        && ${SUDO} apparmor_parser -r "${profile_path}"
+}
+
 install_adb() {
     require_cmd git gpasswd udevadm systemd-sysusers systemctl || return 1
     apt_upgrade "adb" || return 1
@@ -1322,25 +1381,25 @@ install_adb() {
         [ -z "${conf_file}" ] && error "No android-udev.conf file found" && return 1
 
         verbose "rm -f ${file_args[*]} /etc/udev/rules.d/[0-9][0-9]-android.rules"
-    	${SUDO} LC_ALL=C rm -f "${file_args[@]}" "/etc/udev/rules.d/"[0-9][0-9]"-android.rules"
+    	LC_ALL=C ${SUDO} rm -f "${file_args[@]}" "/etc/udev/rules.d/"[0-9][0-9]"-android.rules"
         verbose "cp ${file_args[*]} ${rules_file} /etc/udev/rules.d/${rules_file}" || return 1
-        ${SUDO} LC_ALL=C cp "${file_args[@]}" "${rules_file}" "/etc/udev/rules.d/${rules_file}"
+        LC_ALL=C ${SUDO} cp "${file_args[@]}" "${rules_file}" "/etc/udev/rules.d/${rules_file}"
         verbose "chmod ${file_args[*]} a+r /etc/udev/rules.d/${rules_file}" || return 1
-    	${SUDO} LC_ALL=C chmod "${file_args[@]}" a+r "/etc/udev/rules.d/${rules_file}"
+    	LC_ALL=C ${SUDO} chmod "${file_args[@]}" a+r "/etc/udev/rules.d/${rules_file}"
         verbose "rm -f ${file_args[*]} /usr/lib/sysusers.d/android-udev.conf" || true
-        ${SUDO} LC_ALL=C rm -f "${file_args[@]}" /usr/lib/sysusers.d/android-udev.conf
+        LC_ALL=C ${SUDO} rm -f "${file_args[@]}" /usr/lib/sysusers.d/android-udev.conf
         verbose "cp ${file_args[*]} ${conf_file} /usr/lib/sysusers.d/" || return 1
-    	${SUDO} LC_ALL=C cp "${file_args[@]}" "${conf_file}" /usr/lib/sysusers.d/
+    	LC_ALL=C ${SUDO} cp "${file_args[@]}" "${conf_file}" /usr/lib/sysusers.d/
     ) || return 1
 
     verbose "systemd-sysusers"
-	${SUDO} LC_ALL=C systemd-sysusers
+	LC_ALL=C ${SUDO} systemd-sysusers
     verbose "gpasswd -a ${CURRENT_USER_NAME} adbusers"
-	${SUDO} LC_ALL=C gpasswd -a "${CURRENT_USER_NAME}" adbusers
+	LC_ALL=C ${SUDO} gpasswd -a "${CURRENT_USER_NAME}" adbusers
     verbose "udevadm control --reload-rules"
-	${SUDO} LC_ALL=C udevadm control --reload-rules
+	LC_ALL=C ${SUDO} udevadm control --reload-rules
     verbose "systemctl restart systemd-udevd.service"
-	${SUDO} LC_ALL=C systemctl restart systemd-udevd.service
+	LC_ALL=C ${SUDO} systemctl restart systemd-udevd.service
 
     verbose "adb kill-server"
 	${SUDO_USER} adb kill-server
@@ -1720,7 +1779,8 @@ software-254-inkscape@media() {
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38" "56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38"
 }
 software-255-losslesscut@media() {
-    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-x64.tar.bz2" --bundle --binary "losslesscut"
+    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-x64.tar.bz2" --bundle --binary "losslesscut" \
+        && apparmor_allow_userns losslesscut losslesscut
 }
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
@@ -1796,7 +1856,7 @@ software-330-zoom@comms() {
         error "Failed to download latest version of Zoom from ${zoom_client_url}"
         return 1
     fi
-    LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${zoom_deb_file_path}"
+    apt_get_noninteractive install "${zoom_deb_file_path}"
 }
 software-335-teamviewer@desktop() {
     apt_add_with_repo "teamviewer" "https://linux.teamviewer.com/deb" "stable" "main" \
