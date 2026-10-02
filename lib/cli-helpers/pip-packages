@@ -46,7 +46,10 @@ from packaging.utils import canonicalize_name
 target = sys.argv[1]
 active = {}
 for dist in md.distributions():
-    active.setdefault(canonicalize_name(dist.metadata["Name"]), dist)
+    # e.g. Debian's stubs in /usr/lib/python3.X/dist-packages carry no metadata
+    name = dist.metadata.get("Name")
+    if name:
+        active.setdefault(canonicalize_name(name), dist)
 for name, dist in sorted(active.items()):
     if not str(getattr(dist, "_path", "")).startswith(target + "/"):
         continue
@@ -293,7 +296,7 @@ def main():
         update_links(target, args.bin_dir, args.dry_run)
 
     if not args.dry_run and wanted:
-        result = subprocess.run([sys.executable, "-c", CHECK_SHADOWED, target], capture_output=True, text=True, check=False)
+        result = subprocess.run([sys.executable, "-W", "ignore", "-c", CHECK_SHADOWED, target], capture_output=True, text=True, check=False)
         for line in result.stdout.splitlines():
             log(f"WARNING: {line}")
         if result.returncode != 0:

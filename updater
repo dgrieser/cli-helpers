@@ -2166,7 +2166,7 @@ software-580-python-libs@base() {
     apt_upgrade python3-anthropic python3-openai python3-pandas python3-pyautogui python3-sounddevice \
         python3-soundfile python3-piexif python3-croniter python3-parse python3-sh
 }
-software-581-python-tools@base() { apt_upgrade glances weasyprint goobook python3-msoffcrypto-tool python3-shtab; }
+software-581-python-tools@base() { apt_upgrade glances weasyprint python3-msoffcrypto-tool python3-shtab; }
 software-582-python-dev-tools@dev() { apt_upgrade python3-pyinstrument mkdocs-material; }
 # the libraries of the own scripts
 software-583-pip-libs@base() {
