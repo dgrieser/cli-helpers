@@ -639,6 +639,22 @@ opencode-run -C ~/src/my-project lintfix
 opencode-run --list-commands
 ```
 
+### `vim-fzf`
+Picks a file with fzf (with a preview of its contents) and opens it in vi, appending the `vi` command to the shell history. Bound to `z` in the shipped yazi keymap.
+
+**Usage:** `vim-fzf [-h] [QUERY]`
+
+| Argument / Flag | Description |
+|---|---|
+| `QUERY` | An initial query to pass to fzf. |
+| `-h, --help` | Show the help message and exit. |
+
+**Examples:**
+```bash
+vim-fzf
+vim-fzf updater
+```
+
 ### `vish`
 Edits or creates a file or command in vim (using sudo when needed), making new files executable bash scripts, handling vim swap-file recovery, and running a syntax check on save with the option to re-edit.
 

@@ -1,0 +1,69 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [QUERY]
+
+Open a file for editing using vi.
+
+QUERY
+    A query to pass to fzf.
+
+Options:
+    -h, --help  Show this message.
+EOF
+    exit 1
+}
+
+error() {
+    print-text-error "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+log() {
+    print-text-info "${1}" 1>&2
+}
+
+
+query=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${query}" ]; then
+                query="${1}"
+            else
+                fail "Unknown option: ${1}"
+            fi
+            ;;
+    esac
+    shift
+done
+
+fzf_args=()
+fzf_args+=("--preview-window=right:40%,wrap")
+fzf_args+=("--preview=cat '{}'")
+if [ -n "${query}" ]; then
+    fzf_args+=("--query=${query}")
+fi
+
+#echo "+ fzf ${fzf_args[*]}"
+file_path=$(fzf "${fzf_args[@]}")
+exit_code=$?
+
+if [ -n "${file_path}" ] && [ -f "${file_path}" ]; then
+    log "Editing ${file_path}..."
+    vi "${file_path}"
+    echo "vi \"${file_path}\"" | history_append
+fi
+
+exit ${exit_code}

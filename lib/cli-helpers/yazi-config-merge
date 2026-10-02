@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Merge the shipped yazi config into a user's yazi config directory.
+
+A config file that does not exist yet is copied as is. An existing one is
+merged, so everything else the user has in it is kept:
+
+- *.toml: the shipped keys are set, tables are merged recursively, and the
+  entries of arrays of tables (prepend_keymap, prepend_previewers, ...) are
+  updated or appended, matched by their identifying keys (on, url, mime, ...)
+- *.lua: the top-level statements are matched by what they define (function
+  NAME, variable NAME, require("NAME")) and replaced or appended
+- everything else (the plugins) is ours as a whole, so the file is replaced
+  when it differs
+"""
+import argparse
+import os
+import re
+import sys
+
+try:
+    import tomlkit
+    from tomlkit.items import AoT, Array, InlineTable, Table
+except ImportError as exc:
+    print(f"ERROR: python3-tomlkit is required to merge the yazi config: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+# the keys that identify an entry of an array of tables, e.g. a keymap entry by
+# its key, a previewer by its url or mime, a fetcher by its group and url
+ENTRY_ID_KEYS = ("on", "for", "name", "group", "id", "url", "mime", "use")
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def plain(value):
+    return value.unwrap() if hasattr(value, "unwrap") else value
+
+
+def is_table(value):
+    return isinstance(value, (Table, InlineTable, dict))
+
+
+def is_entry_list(value):
+    return isinstance(value, (AoT, Array, list)) and len(value) > 0 and all(is_table(item) for item in value)
+
+
+def entry_id(entry):
+    ident = []
+    for key in ENTRY_ID_KEYS:
+        if key in entry:
+            value = plain(entry[key])
+            # "<Esc>" and ["<Esc>"] are the same key
+            if isinstance(value, str) and key == "on":
+                value = [value]
+            ident.append((key, repr(value)))
+    return tuple(ident) or repr(plain(entry))
+
+
+def merge_entries(dst, src, path, changes):
+    for entry in src:
+        ident = entry_id(entry)
+        for index, existing in enumerate(dst):
+            if is_table(existing) and entry_id(existing) == ident:
+                if plain(existing) != plain(entry):
+                    dst[index] = entry
+                    changes.append(f"update {path} entry {describe_entry(entry)}")
+                break
+        else:
+            dst.append(entry)
+            changes.append(f"add {path} entry {describe_entry(entry)}")
+
+
+def describe_entry(entry):
+    for key in ENTRY_ID_KEYS:
+        if key in entry:
+            return f"{key}={plain(entry[key])!r}"
+    return repr(plain(entry))
+
+
+def merge_table(dst, src, path, changes):
+    for key, value in src.items():
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = value
+            changes.append(f"add {key_path}")
+        elif is_table(value) and is_table(dst[key]):
+            merge_table(dst[key], value, key_path, changes)
+        elif is_entry_list(value) and isinstance(dst[key], (AoT, Array, list)):
+            merge_entries(dst[key], value, key_path, changes)
+        elif plain(dst[key]) != plain(value):
+            dst[key] = value
+            changes.append(f"set {key_path}")
+
+
+def merge_toml(dst_text, src_text):
+    dst = tomlkit.parse(dst_text)
+    src = tomlkit.parse(src_text)
+    changes = []
+    merge_table(dst, src, "", changes)
+    return tomlkit.dumps(dst), changes
+
+
+# a statement starts at column 0; indented lines and closing lines belong to the
+# statement before them
+LUA_CONTINUATION = re.compile(r"^(\s|end\b|else\b|elseif\b|until\b|[}\])])")
+LUA_FUNCTION = re.compile(r"^(?:local\s+)?function\s+([\w.:]+)")
+LUA_REQUIRE = re.compile(r"""^require\s*\(?\s*["']([^"']+)["']""")
+LUA_VARIABLE = re.compile(r"^(?:local\s+)?([\w.]+(?:\[[^\]]+\])*)\s*=(?!=)")
+
+
+def lua_chunks(text):
+    """Split into top-level statements, each with its leading comment lines and
+    the range of its statement lines."""
+    chunks = []
+    comment = []
+    current = None
+    # blank lines inside a statement, e.g. in a function body, belong to it only
+    # when the statement goes on after them
+    blanks = []
+    gap = False
+    for index, line in enumerate(text.splitlines()):
+        if not line.strip():
+            if current is not None:
+                blanks.append(line)
+            else:
+                comment = []
+                gap = True
+            continue
+        if current is not None and LUA_CONTINUATION.match(line):
+            current["lines"].extend(blanks + [line])
+            blanks = []
+            continue
+        if current is not None:
+            chunks.append(current)
+            current = None
+            comment = []
+        if blanks:
+            blanks = []
+            comment = []
+            gap = True
+        if line.startswith("--"):
+            comment.append(line)
+        else:
+            current = {"comment": comment, "lines": [line], "start": index, "gap": gap}
+            comment = []
+            gap = False
+    if current is not None:
+        chunks.append(current)
+    for chunk in chunks:
+        chunk["end"] = chunk["start"] + len(chunk["lines"])
+        chunk["key"] = lua_key(chunk)
+    return chunks
+
+
+def lua_key(chunk):
+    first = chunk["lines"][0]
+    for kind, pattern in (("function", LUA_FUNCTION), ("require", LUA_REQUIRE), ("variable", LUA_VARIABLE)):
+        match = pattern.match(first)
+        if match:
+            return f"{kind} {match.group(1)}"
+    # an anonymous statement, e.g. Header:children_add(...): its comment names
+    # it, otherwise it is only found again when it is unchanged
+    if chunk["comment"]:
+        return "comment " + " ".join(" ".join(chunk["comment"]).split())
+    return "statement " + " ".join(" ".join(chunk["lines"]).split())
+
+
+def merge_lua(dst_text, src_text):
+    lines = dst_text.splitlines()
+    changes = []
+    replacements = {}
+    # a missing statement goes after the one it follows in the shipped file, so
+    # it keeps its place, e.g. after the table it fills; without one, at the end
+    inserts = {}
+    dst_chunks = {}
+    for chunk in lua_chunks(dst_text):
+        dst_chunks.setdefault(chunk["key"], chunk)
+
+    anchor = len(lines)
+    for chunk in lua_chunks(src_text):
+        existing = dst_chunks.get(chunk["key"])
+        if existing is None:
+            inserts.setdefault(anchor, []).append(chunk)
+            changes.append(f"add {chunk['key'][:70]}")
+            continue
+        if existing["lines"] != chunk["lines"]:
+            replacements[existing["start"]] = (existing["end"], chunk["lines"])
+            changes.append(f"update {chunk['key'][:70]}")
+        anchor = existing["end"]
+
+    if not changes:
+        return dst_text, changes
+
+    merged = []
+    index = 0
+    while index <= len(lines):
+        for position, chunk in enumerate(inserts.get(index, [])):
+            # what is appended is set apart from the user's own statements
+            gap = chunk["gap"] or (index == len(lines) and position == 0)
+            if merged and merged[-1].strip() and gap:
+                merged.append("")
+            merged.extend(chunk["comment"] + chunk["lines"])
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, new_lines = replacements[index]
+            merged.extend(new_lines)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
+def merge_file(src, dst, rel):
+    """Return the new content of dst and the list of changes, or None, []."""
+    with open(src, encoding="utf-8") as handle:
+        src_text = handle.read()
+    if not os.path.exists(dst):
+        return src_text, ["create"]
+    with open(dst, encoding="utf-8") as handle:
+        dst_text = handle.read()
+    if src.endswith(".toml"):
+        new_text, changes = merge_toml(dst_text, src_text)
+    elif rel.endswith(".lua") and not rel.startswith("plugins" + os.sep):
+        new_text, changes = merge_lua(dst_text, src_text)
+    else:
+        new_text, changes = src_text, ([] if src_text == dst_text else ["replace"])
+    if new_text == dst_text:
+        return None, []
+    return new_text, changes
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Merge the shipped yazi config into a yazi config directory.")
+    parser.add_argument("source", help="the shipped config directory")
+    parser.add_argument("target", help="the yazi config directory, e.g. ~/.config/yazi")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.source):
+        fail(f"Yazi config not found in {args.source}")
+
+    changed = False
+    for root, dirs, files in os.walk(args.source, followlinks=True):
+        dirs.sort()
+        for name in sorted(files):
+            src = os.path.join(root, name)
+            rel = os.path.relpath(src, args.source)
+            dst = os.path.join(args.target, rel)
+            new_text, changes = merge_file(src, dst, rel)
+            if new_text is None:
+                continue
+            changed = True
+            verb = "Would update" if args.dry_run else "Updating"
+            print(f"{verb} {dst}:", file=sys.stderr)
+            for change in changes:
+                print(f"  {change}", file=sys.stderr)
+            if args.dry_run:
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as handle:
+                handle.write(new_text)
+
+    if not changed:
+        print("yazi config is up to date", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

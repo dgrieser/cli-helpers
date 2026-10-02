@@ -29,9 +29,11 @@ EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
 EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
-SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place
+SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place yazi-config-merge
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
+# the yazi config and local plugins, merged into ~/.config/yazi by updater
+YAZIFILES := $(patsubst $(SHAREDDIR)/yazi/%,%,$(shell find $(SHAREDDIR)/yazi -type f | sort))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them
@@ -106,6 +108,9 @@ install: check-dirs
 	for app in $(APPSHORTCUTS); do \
 		install -m 0644 "$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
+	for file in $(YAZIFILES); do \
+		install -D -m 0644 "$(SHAREDDIR)/yazi/$$file" "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
+	done
 	for module in $(MODULES); do \
 		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
@@ -144,6 +149,10 @@ install-links: check-dirs
 	[ -d "$(DESTDIR)$(LIBDIR)/app-shortcuts" ] || mkdir -p "$(DESTDIR)$(LIBDIR)/app-shortcuts"
 	for app in $(APPSHORTCUTS); do \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
+	for file in $(YAZIFILES); do \
+		mkdir -p "$$(dirname "$(DESTDIR)$(LIBDIR)/yazi/$$file")"; \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/yazi/$$file" "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
 	done
 	for module in $(MODULES); do \
 		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
@@ -288,6 +297,10 @@ uninstall:
 		rm -f "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
 	rmdir "$(DESTDIR)$(LIBDIR)/app-shortcuts" 2>/dev/null || true
+	for file in $(YAZIFILES); do \
+		rm -f "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
+	done
+	[ ! -d "$(DESTDIR)$(LIBDIR)/yazi" ] || find "$(DESTDIR)$(LIBDIR)/yazi" -depth -type d -empty -delete
 	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
 	for module in $(MODULES); do \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
