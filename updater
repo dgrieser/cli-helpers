@@ -2053,7 +2053,6 @@ software-535-npm-tools@dev() {
         && npm_update parcel \
         && npm_update ynab
 }
-software-536-mudslide@comms() { npm_update mudslide; }
 software-537-kubelive@dev@k8s() { npm_update kubelive; }
 software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
 
