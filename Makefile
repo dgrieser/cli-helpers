@@ -29,14 +29,14 @@ EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
 EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
-SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages
+SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages chrome-profile
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
 # the data folders: the Terminator config of launcher, and what updater installs,
 # the configs merged into the user's config dirs (yazi with its local plugins,
-# powerline-shell, claude, codex, opencode, zed, terminator), systemd user units
-# and a cron file
-CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator systemd-user cron
+# powerline-shell, claude, codex, opencode, zed, terminator), the Chrome settings
+# and search engines, systemd user units and a cron file
+CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator chrome systemd-user cron
 CONFIGFILES := $(patsubst $(SHAREDDIR)/%,%,$(shell find $(addprefix $(SHAREDDIR)/,$(CONFIGDIRS)) -type f -not -path '*/__pycache__/*' | sort))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of

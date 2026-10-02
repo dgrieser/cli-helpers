@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Apply the shipped Google Chrome settings and search engines to a profile.
+
+- preferences.json is merged into the profile's Preferences: its keys are set,
+  objects merged recursively, everything else the profile has is kept
+- the search engines of search-engines.json that the profile has no engine for
+  (by keyword) are added to its Web Data database, as editable custom engines
+
+Chrome keeps both in memory and writes them back when it exits, so nothing is
+changed while it runs (exit code 3). A profile Chrome has not created yet is
+left alone as well, so a first start still sets up everything else.
+"""
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import sys
+import time
+import uuid
+
+
+# Chrome stores times as microseconds since 1601-01-01
+CHROME_EPOCH_OFFSET = 11644473600
+RUNNING = 3
+
+
+def log(message):
+    print(message, file=sys.stderr)
+
+
+def fail(message):
+    log(f"ERROR: {message}")
+    sys.exit(1)
+
+
+def chrome_running(user_data_dir):
+    """Chrome links SingletonLock to <hostname>-<pid> while it runs."""
+    try:
+        target = os.readlink(os.path.join(user_data_dir, "SingletonLock"))
+    except OSError:
+        return False
+    host, _, pid = target.rpartition("-")
+    if host != socket.gethostname() or not pid.isdigit():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def merge(dst, src, path, changes):
+    for key, value in src.items():
+        key_path = f"{path}.{key}" if path else key
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            merge(dst[key], value, key_path, changes)
+        elif dst.get(key) != value:
+            changes.append(f"{'set' if key in dst else 'add'} {key_path}")
+            dst[key] = value
+
+
+def update_preferences(profile_dir, preferences_file, dry_run):
+    path = os.path.join(profile_dir, "Preferences")
+    with open(path, encoding="utf-8") as handle:
+        preferences = json.load(handle)
+    with open(preferences_file, encoding="utf-8") as handle:
+        shipped = json.load(handle)
+    changes = []
+    merge(preferences, shipped, "", changes)
+    if not changes:
+        log("Chrome settings are up to date")
+        return
+    log(f"{'Would update' if dry_run else 'Updating'} {path}:")
+    for change in changes:
+        log(f"  {change}")
+    if dry_run:
+        return
+    tmp = path + ".cli-helpers"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        # as compact as Chrome writes it
+        json.dump(preferences, handle, separators=(",", ":"), ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def update_search_engines(profile_dir, engines_file, dry_run):
+    path = os.path.join(profile_dir, "Web Data")
+    with open(engines_file, encoding="utf-8") as handle:
+        engines = json.load(handle)
+    db = sqlite3.connect(path)
+    try:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(keywords)")}
+        if not {"keyword", "url", "short_name"} <= columns:
+            fail(f"unknown layout of the keywords table in {path}")
+        existing = {row[0] for row in db.execute("SELECT keyword FROM keywords")}
+        missing = [engine for engine in engines if engine["keyword"] not in existing]
+        if not missing:
+            log("Chrome search engines are up to date")
+            return
+        log(f"{'Would add' if dry_run else 'Adding'} {len(missing)} search engine(s) to {path}: "
+            + ", ".join(engine["keyword"] for engine in missing))
+        if dry_run:
+            return
+        now = int((time.time() + CHROME_EPOCH_OFFSET) * 1_000_000)
+        for engine in missing:
+            # a custom engine as Chrome creates one; it hashes the url itself
+            row = {
+                "favicon_url": "", "safe_for_autoreplace": 0, "originating_url": "",
+                "date_created": now, "last_modified": now, "usage_count": 0,
+                "input_encodings": "UTF-8", "suggest_url": "", "prepopulate_id": 0,
+                "created_by_policy": 0, "sync_guid": str(uuid.uuid4()), "alternate_urls": "[]",
+                "image_url": "", "search_url_post_params": "", "suggest_url_post_params": "",
+                "image_url_post_params": "", "new_tab_url": "", "last_visited": 0,
+                "created_from_play_api": 0, "is_active": 1, "starter_pack_id": 0,
+                "enforced_by_policy": 0, "featured_by_policy": 0,
+            }
+            row.update(engine)
+            row = {key: value for key, value in row.items() if key in columns}
+            names = ", ".join(row)
+            marks = ", ".join("?" for _ in row)
+            db.execute(f"INSERT INTO keywords ({names}) VALUES ({marks})", list(row.values()))
+        db.commit()
+    finally:
+        db.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Apply the shipped Chrome settings and search engines to a profile.")
+    parser.add_argument("data_dir", help="the shipped preferences.json and search-engines.json")
+    parser.add_argument("--profile", default=os.path.expanduser("~/.config/google-chrome/Default"),
+                        help="the Chrome profile (default: ~/.config/google-chrome/Default)")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
+    args = parser.parse_args()
+
+    profile_dir = os.path.abspath(args.profile)
+    if not os.path.isfile(os.path.join(profile_dir, "Preferences")):
+        log(f"{profile_dir} does not exist yet, start Chrome once")
+        return
+    if chrome_running(os.path.dirname(profile_dir)):
+        log("Chrome is running and would overwrite the changes, close it and run this again")
+        sys.exit(RUNNING)
+    update_preferences(profile_dir, os.path.join(args.data_dir, "preferences.json"), args.dry_run)
+    update_search_engines(profile_dir, os.path.join(args.data_dir, "search-engines.json"), args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+{
+  "browser": {
+    "theme": {
+      "color_scheme2": 2
+    }
+  },
+  "intl": {
+    "accept_languages": "en,en-US,de-DE,de",
+    "selected_languages": "en,en-US,de-DE,de"
+  },
+  "net": {
+    "network_prediction_options": 0
+  },
+  "spellcheck": {
+    "dictionaries": ["de", "en"]
+  },
+  "translate_blocked_languages": ["de", "en"]
+}

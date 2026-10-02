@@ -1500,7 +1500,22 @@ software-059-swagger-codegen@dev() {
 }
 
 software-060-chrome@dev() {
-    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    local profile_args=()
+    local status=0
+    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub" || return 1
+    tool_ready google-chrome || return $(( $? == 1 ? 0 : 1 ))
+    # the settings and custom search engines of the profile; Chrome writes them
+    # back when it exits, so only while it is closed
+    [ "${dry_run}" -eq 1 ] && profile_args+=("--dry-run")
+    verbose "${SUDO_USER} ${lib_dir}/chrome-profile ${profile_args[*]} ${lib_dir}/chrome"
+    ${SUDO_USER} "${lib_dir}/chrome-profile" "${profile_args[@]}" "${lib_dir}/chrome" || status=$?
+    if [ "${status}" -eq 3 ]; then
+        warning "Chrome is running, close it and run: ${APP_NAME} chrome"
+        return 0
+    fi
+    return "${status}"
 }
 
 software-070-mw@dev@mw() { npm_update @mittwald/cli; }
