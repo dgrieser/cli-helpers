@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge the shipped yazi config into a user's yazi config directory.
+"""Merge a shipped config directory, e.g. of yazi, into a user's config directory.
 
 A config file that does not exist yet is copied as is. An existing one is
 merged, so everything else the user has in it is kept:
@@ -7,22 +7,32 @@ merged, so everything else the user has in it is kept:
 - *.toml: the shipped keys are set, tables are merged recursively, and the
   entries of arrays of tables (prepend_keymap, prepend_previewers, ...) are
   updated or appended, matched by their identifying keys (on, url, mime, ...)
-- *.lua: the top-level statements are matched by what they define (function
+- *.json and *.jsonc (comments and trailing commas allowed, e.g. of Zed): the
+  shipped keys are set, objects are merged recursively, and the entries of
+  lists (the segments of powerline-shell, a Zed keymap) are merged or inserted
+  after the entry they follow in the shipped list, matched by their type and
+  command, or by context and bindings/unbind; a plain "cwd" is the same entry
+  as {"type": "cwd"}. A merged file is written as plain JSON, so it loses its
+  comments; a created one is copied as is
+- *.lua in the top directory: the top-level statements are matched by what they define (function
   NAME, variable NAME, require("NAME")) and replaced or appended
-- everything else (the plugins) is ours as a whole, so the file is replaced
-  when it differs
+- everything else (plugins, segments) is ours as a whole, so the file is
+  replaced when it differs
 """
 import argparse
+import json
 import os
 import re
 import sys
 
+# only needed to merge TOML, so a JSON-only config works without it
 try:
     import tomlkit
     from tomlkit.items import AoT, Array, InlineTable, Table
 except ImportError as exc:
-    print(f"ERROR: python3-tomlkit is required to merge the yazi config: {exc}", file=sys.stderr)
-    sys.exit(1)
+    tomlkit = None
+    TOMLKIT_ERROR = exc
+    AoT = Array = InlineTable = Table = ()
 
 
 # the keys that identify an entry of an array of tables, e.g. a keymap entry by
@@ -96,11 +106,136 @@ def merge_table(dst, src, path, changes):
 
 
 def merge_toml(dst_text, src_text):
+    if tomlkit is None:
+        fail(f"python3-tomlkit is required to merge TOML: {TOMLKIT_ERROR}")
     dst = tomlkit.parse(dst_text)
     src = tomlkit.parse(src_text)
     changes = []
     merge_table(dst, src, "", changes)
     return tomlkit.dumps(dst), changes
+
+
+# the keys that identify an entry of a JSON list, e.g. a powerline-shell segment
+# by type and command, a Zed keymap block by its context
+JSON_ID_KEYS = ("type", "command", "context")
+# a Zed keymap block binds or unbinds keys in its context, which are two blocks
+JSON_SECTION_KEYS = ("bindings", "unbind")
+
+
+def json_entry_id(entry):
+    if isinstance(entry, dict):
+        ident = tuple((key, json.dumps(entry[key], sort_keys=True)) for key in JSON_ID_KEYS if key in entry)
+        sections = tuple(key for key in JSON_SECTION_KEYS if key in entry)
+        if sections:
+            ident += (("sections", sections),)
+        return ident or json.dumps(entry, sort_keys=True)
+    # a plain "cwd" segment is {"type": "cwd"} without settings
+    return (("type", json.dumps(entry)),)
+
+
+def is_json_entry_list(value):
+    return isinstance(value, list) and all(isinstance(item, (str, dict)) for item in value)
+
+
+def merge_json_entries(dst, src, path, changes):
+    # a missing entry goes after the one it follows in the shipped list, so the
+    # order of e.g. the prompt segments is kept; without one, first
+    anchor = -1
+    for entry in src:
+        ident = json_entry_id(entry)
+        index = next((i for i, existing in enumerate(dst) if json_entry_id(existing) == ident), None)
+        if index is None:
+            anchor += 1
+            dst.insert(anchor, entry)
+            changes.append(f"add {path} entry {json.dumps(entry)[:70]}")
+            continue
+        if isinstance(dst[index], dict) and isinstance(entry, dict):
+            # e.g. the user's own bindings in the same keymap block are kept
+            merge_json_value(dst[index], entry, f"{path}[{index}]", changes)
+        elif dst[index] != entry:
+            dst[index] = entry
+            changes.append(f"update {path} entry {json.dumps(entry)[:70]}")
+        anchor = index
+
+
+def merge_json_value(dst, src, path, changes):
+    for key, value in src.items():
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = value
+            changes.append(f"add {key_path}")
+        elif isinstance(value, dict) and isinstance(dst[key], dict):
+            merge_json_value(dst[key], value, key_path, changes)
+        elif is_json_entry_list(value) and is_json_entry_list(dst[key]):
+            merge_json_entries(dst[key], value, key_path, changes)
+        elif dst[key] != value:
+            dst[key] = value
+            changes.append(f"set {key_path}")
+
+
+def strip_jsonc(text):
+    """JSON from JSONC: drops // and /* */ comments and trailing commas, but
+    not inside strings."""
+    out = []
+    index = 0
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\":
+                out.append(text[index + 1:index + 2])
+                index += 1
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif text.startswith("//", index):
+            index = text.find("\n", index)
+            if index < 0:
+                break
+            continue
+        elif text.startswith("/*", index):
+            index = text.find("*/", index)
+            if index < 0:
+                break
+            index += 2
+            continue
+        else:
+            if char in "}]":
+                # a trailing comma before the closing bracket
+                end = len(out) - 1
+                while end >= 0 and out[end].isspace():
+                    end -= 1
+                if end >= 0 and out[end] == ",":
+                    del out[end]
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def load_json(text, what):
+    try:
+        return json.loads(strip_jsonc(text))
+    except ValueError as exc:
+        fail(f"cannot merge {what}, it is no valid JSON: {exc}")
+
+
+def merge_json(dst_text, src_text):
+    dst = load_json(dst_text, "into the existing file")
+    src = load_json(src_text, "the shipped file")
+    changes = []
+    if isinstance(dst, dict) and isinstance(src, dict):
+        merge_json_value(dst, src, "", changes)
+    elif is_json_entry_list(dst) and is_json_entry_list(src):
+        merge_json_entries(dst, src, "", changes)
+    elif dst != src:
+        dst = src
+        changes.append("replace")
+    if not changes:
+        return dst_text, changes
+    return json.dumps(dst, indent=2, ensure_ascii=False) + "\n", changes
 
 
 # a statement starts at column 0; indented lines and closing lines belong to the
@@ -225,7 +360,9 @@ def merge_file(src, dst, rel):
         dst_text = handle.read()
     if src.endswith(".toml"):
         new_text, changes = merge_toml(dst_text, src_text)
-    elif rel.endswith(".lua") and not rel.startswith("plugins" + os.sep):
+    elif src.endswith((".json", ".jsonc")):
+        new_text, changes = merge_json(dst_text, src_text)
+    elif rel.endswith(".lua") and os.sep not in rel:
         new_text, changes = merge_lua(dst_text, src_text)
     else:
         new_text, changes = src_text, ([] if src_text == dst_text else ["replace"])
@@ -235,20 +372,22 @@ def merge_file(src, dst, rel):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge the shipped yazi config into a yazi config directory.")
+    parser = argparse.ArgumentParser(description="Merge a shipped config directory into a user's config directory.")
     parser.add_argument("source", help="the shipped config directory")
-    parser.add_argument("target", help="the yazi config directory, e.g. ~/.config/yazi")
+    parser.add_argument("target", help="the config directory, e.g. ~/.config/yazi")
     parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
     args = parser.parse_args()
 
     if not os.path.isdir(args.source):
-        fail(f"Yazi config not found in {args.source}")
+        fail(f"Config not found in {args.source}")
 
     changed = False
     for root, dirs, files in os.walk(args.source, followlinks=True):
         dirs.sort()
         for name in sorted(files):
             src = os.path.join(root, name)
+            if "__pycache__" in src.split(os.sep):
+                continue
             rel = os.path.relpath(src, args.source)
             dst = os.path.join(args.target, rel)
             new_text, changes = merge_file(src, dst, rel)
@@ -266,7 +405,7 @@ def main():
                 handle.write(new_text)
 
     if not changed:
-        print("yazi config is up to date", file=sys.stderr)
+        print(f"{args.target} is up to date", file=sys.stderr)
 
 
 if __name__ == "__main__":

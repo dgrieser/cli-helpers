@@ -1,0 +1,6 @@
+# installed by updater (software dotfile-backups) for the logged-in user
+0 8,10,12,14 * * * @USER@ /usr/local/bin/backup-single-file @HOME@/.bash_super_history
+0 8,10,12,14 * * * @USER@ /usr/local/bin/backup-single-file @HOME@/.bashrc
+0 8,10,12,14 * * * @USER@ /usr/local/bin/backup-single-file @HOME@/.historyrc
+0 8,10,12,14 * * * @USER@ /usr/local/bin/backup-single-file @HOME@/.colorrc
+0 8,10,12,14 * * * @USER@ /usr/local/bin/backup-single-file @HOME@/.bash_aliases

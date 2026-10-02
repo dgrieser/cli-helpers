@@ -17,7 +17,7 @@ DESKTOPDIR ?= $(HOME)/.local/share/applications
 DESKTOPSRCDIR := desktop
 DESKTOPS := browser-router.desktop
 # Chrome policy so Chrome never asks to become the default browser (browser-router is)
-CHROME_POLICY := $(DESKTOPSRCDIR)/chrome-policy-default-browser.json
+# written by browser-router --set-default, removed by uninstall
 CHROME_POLICY_DIR ?= /etc/opt/chrome/policies/managed
 # GNOME extension steps are skipped automatically when no GNOME Shell is
 # present; set ENABLE_GNOME_EXTENSION=1 to force them anyway
@@ -29,16 +29,20 @@ EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
 EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
 EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
 SHAREDDIR := lib/cli-helpers
-SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place yazi-config-merge
+SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
-# the yazi config and local plugins, merged into ~/.config/yazi by updater
-YAZIFILES := $(patsubst $(SHAREDDIR)/yazi/%,%,$(shell find $(SHAREDDIR)/yazi -type f | sort))
+# the data updater installs: the configs merged into the user's config dirs (yazi
+# with its local plugins, powerline-shell, claude, codex, opencode, zed), systemd user
+# units and a cron file
+CONFIGDIRS := yazi powerline-shell claude codex opencode zed systemd-user cron
+CONFIGFILES := $(patsubst $(SHAREDDIR)/%,%,$(shell find $(addprefix $(SHAREDDIR)/,$(CONFIGDIRS)) -type f -not -path '*/__pycache__/*' | sort))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them
 MODULES := toage
-SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -printf '%f\n' | sort)
+# setup.sh sets up a new machine from the repo, it is no command
+SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -not -name setup.sh -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 REPO_DIR := $(CURDIR)
@@ -108,8 +112,8 @@ install: check-dirs
 	for app in $(APPSHORTCUTS); do \
 		install -m 0644 "$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
-	for file in $(YAZIFILES); do \
-		install -D -m 0644 "$(SHAREDDIR)/yazi/$$file" "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
+	for file in $(CONFIGFILES); do \
+		install -D -m 0644 "$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
 	for module in $(MODULES); do \
 		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
@@ -150,9 +154,9 @@ install-links: check-dirs
 	for app in $(APPSHORTCUTS); do \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
-	for file in $(YAZIFILES); do \
-		mkdir -p "$$(dirname "$(DESTDIR)$(LIBDIR)/yazi/$$file")"; \
-		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/yazi/$$file" "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
+	for file in $(CONFIGFILES); do \
+		mkdir -p "$$(dirname "$(DESTDIR)$(LIBDIR)/$$file")"; \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
 	for module in $(MODULES); do \
 		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
@@ -253,17 +257,7 @@ gnome-settings:
 	./gnome-apply-settings
 
 set-default-browser:
-	@if [ "$$(id -u)" -eq 0 ]; then \
-		echo "ERROR: run make set-default-browser as your user, not as root" 1>&2; \
-		exit 1; \
-	fi
-	xdg-settings set default-web-browser browser-router.desktop
-	@echo "Default browser: $$(xdg-settings get default-web-browser)"
-	@# root only for the policy file, and only when Chrome is there and the file differs
-	@if [ -d /opt/google/chrome ] && ! cmp -s "$(CHROME_POLICY)" "$(CHROME_POLICY_DIR)/default-browser.json"; then \
-		echo "Installing Chrome policy (needs sudo): $(CHROME_POLICY_DIR)/default-browser.json"; \
-		sudo install -D -m 0644 "$(CHROME_POLICY)" "$(CHROME_POLICY_DIR)/default-browser.json"; \
-	fi
+	./browser-router --set-default
 
 default-browser-hint:
 	@if [ -z "$(DESTDIR)" ] && command -v xdg-settings >/dev/null 2>&1 && \
@@ -297,10 +291,12 @@ uninstall:
 		rm -f "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
 	rmdir "$(DESTDIR)$(LIBDIR)/app-shortcuts" 2>/dev/null || true
-	for file in $(YAZIFILES); do \
-		rm -f "$(DESTDIR)$(LIBDIR)/yazi/$$file"; \
+	for file in $(CONFIGFILES); do \
+		rm -f "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
-	[ ! -d "$(DESTDIR)$(LIBDIR)/yazi" ] || find "$(DESTDIR)$(LIBDIR)/yazi" -depth -type d -empty -delete
+	for dir in $(CONFIGDIRS); do \
+		[ ! -d "$(DESTDIR)$(LIBDIR)/$$dir" ] || find "$(DESTDIR)$(LIBDIR)/$$dir" -depth -type d -empty -delete; \
+	done
 	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
 	for module in $(MODULES); do \
 		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \

@@ -12,6 +12,13 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 
 ## Installation
 
+To set up a new machine, clone the repo and run `./setup.sh` from a terminal as your user. It installs what the
+`Makefile` needs, offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
+copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`, and
+then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
+apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
+
 The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
 ```bash
@@ -955,7 +962,7 @@ base64-find secrets.txt
 ## Format, Encoding and Conversion
 
 ### `csv2md`
-Parses one or more CSV files into Markdown tables (a launcher wrapper around the `csv2md` Python package).
+Parses one or more CSV files into Markdown tables. The command of the `csv2md` Python package, installed by `updater pip-tools`, not part of this repo.
 
 **Usage:** `csv2md [-d DELIMITER] [-q QUOTECHAR] [-C COLUMNS] [-c [COLS ...]] [-r [COLS ...]] [-H] [CSV_FILE ...]`
 
@@ -2099,19 +2106,26 @@ Updates a selectable set of system packages, desktop applications, and CLI tools
 
 | Argument / Flag | Description |
 |---|---|
-| `SOFTWARE` | One or more software types to update, or `all`; omit to process all supported types. |
+| `SOFTWARE` | One or more software types or groups to update, or `all`; omit to process all supported types. |
 | `-d, --dry-run` | Check for updates without installing them. |
+| `-l, --list` | List the groups with their software and exit. |
 | `-t, --types TYPES` | Deprecated comma-separated alternative to positional software types. |
 | `--verbose` | Print commands and additional update details. |
 | `-h, --help` | Show usage and the current list of supported software types. |
 | `--bash-completion` | Output completion candidates (flags plus software types). |
 
-The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`. Update methods have tool-specific dependencies such as `apt`, `flatpak`, `npm`, `curl`, `jq`, and `install-git-release`.
+The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`.
+
+Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed.
+
+A software whose tools are missing installs them first, once per run: e.g. `updater atoss-cli` on a new machine installs the base packages and `glab` before it, `npm` software gets `nodejs`, `go install` tools get `go`. Releases from GitHub need a `gh auth login`, those from private GitLab hosts a `glab auth login`; `updater` stops with that hint when the login is missing.
 
 **Examples:**
 ```bash
 updater --dry-run apt flatpak
 updater codex claude
+updater --list
+updater base k8s
 updater --verbose all
 make update UPDATE_ARGS='--dry-run apt'
 ```
@@ -2278,15 +2292,16 @@ A URL counts as an authentication URL when it is a loopback URL on one of the au
 
 The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
 
-Register it as the default browser with `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
+Register it as the default browser with `browser-router --set-default` or `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
 
-**Usage:** `browser-router [OPTIONS] [URL ...]`
+**Usage:** `browser-router [OPTIONS] [URL ...]` or `browser-router --set-default [--dry-run]`
 
 **Options:**
 - `-a`, `--auth` — treat every URL as an authentication URL
 - `-r`, `--regular` — treat every URL as a regular URL
 - `-d`, `--dry-run` — print the routing decision without opening anything
 - `-n`, `--no-probe` — never probe loopback URLs
+- `--set-default` — make browser-router the default browser of the current user and install the Chrome policy (with `--dry-run`, only show what it would do)
 - `-h`, `--help` — show the help message and exit
 
 **Configuration:** `~/.config/cli-helpers/browser-router.conf`, overridden by the environment:

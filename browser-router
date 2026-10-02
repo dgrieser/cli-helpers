@@ -6,13 +6,15 @@ SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [OPTIONS] [URL ...]
+       ${APP_NAME} --set-default [--dry-run]
 
 Open URLs in the regular browser, except interactive authentication
 (2FA/OIDC) URLs, which are opened in a small chromeless window that stays
 above other windows (see browser-2fa-window).
 
-Register this command as the default browser so that URLs opened by other
-programs, for example 'kubectl oidc-login', are routed through it.
+Register this command as the default browser (--set-default) so that URLs
+opened by other programs, for example 'kubectl oidc-login', are routed
+through it.
 
 A URL counts as an authentication URL when it is
 
@@ -31,6 +33,10 @@ Options:
   -r, --regular         Treat every URL as a regular URL
   -d, --dry-run         Print the routing decision without opening anything
   -n, --no-probe        Never probe loopback URLs
+  --set-default         Make ${APP_NAME} the default browser of the current user
+                        and, when Google Chrome is installed, install the Chrome
+                        policy that stops it asking to become the default
+                        (${CHROME_POLICY_FILE}, needs sudo)
   -h, --help            Show this help message and exit
 
 Configuration file:
@@ -194,6 +200,43 @@ is_auth_url() {
     return 1
 }
 
+# makes `xdg-settings set default-web-browser` refer to this command
+DESKTOP_FILE="browser-router.desktop"
+CHROME_DIR="/opt/google/chrome"
+CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/default-browser.json"
+CHROME_POLICY='{
+  "DefaultBrowserSettingEnabled": false
+}'
+
+set_default_browser() {
+    # the default browser is a setting of the user's session, never of root
+    [ "$(id -u)" -eq 0 ] && fail "Run --set-default as your user, not as root"
+    command -v xdg-settings >/dev/null 2>&1 || fail "xdg-settings not found (xdg-utils)"
+
+    if [ "$(xdg-settings get default-web-browser 2>/dev/null)" = "${DESKTOP_FILE}" ]; then
+        echo "Default browser: ${DESKTOP_FILE}" 1>&2
+    elif [ "${dry_run}" -eq 1 ]; then
+        echo "Would set the default browser to ${DESKTOP_FILE}" 1>&2
+    else
+        xdg-settings set default-web-browser "${DESKTOP_FILE}" \
+            || fail "Failed to set the default browser, is ${DESKTOP_FILE} installed (make install-desktop)?"
+        echo "Default browser: $(xdg-settings get default-web-browser)" 1>&2
+    fi
+
+    # root only for the policy file, and only when Chrome is there and the file differs
+    [ -d "${CHROME_DIR}" ] || return 0
+    [ "$(cat "${CHROME_POLICY_FILE}" 2>/dev/null)" = "${CHROME_POLICY}" ] && return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install the Chrome policy ${CHROME_POLICY_FILE}" 1>&2
+        return 0
+    fi
+    echo "Installing the Chrome policy (needs sudo): ${CHROME_POLICY_FILE}" 1>&2
+    sudo mkdir -p "$(dirname "${CHROME_POLICY_FILE}")" \
+        && printf '%s\n' "${CHROME_POLICY}" | sudo tee "${CHROME_POLICY_FILE}" > /dev/null \
+        && sudo chmod 0644 "${CHROME_POLICY_FILE}" \
+        || fail "Failed to install ${CHROME_POLICY_FILE}"
+}
+
 DEFAULT_AUTH_PORTS="47823 47824"
 DEFAULT_PROBE_PORTS="8000 18000"
 DEFAULT_AUTH_HOSTS="auth.mittwald.it auth.mittwald.m3-dev.services"
@@ -219,6 +262,7 @@ force_auth=0
 force_regular=0
 dry_run=0
 probe=1
+set_default=0
 urls=()
 
 while [ "${#}" -gt 0 ]; do
@@ -238,6 +282,9 @@ while [ "${#}" -gt 0 ]; do
         -n|--no-probe)
             probe=0
             ;;
+        --set-default)
+            set_default=1
+            ;;
         --)
             shift
             while [ "${#}" -gt 0 ]; do
@@ -256,6 +303,12 @@ while [ "${#}" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "${set_default}" -eq 1 ]; then
+    [ "${#urls[@]}" -gt 0 ] && fail "--set-default takes no URLs"
+    set_default_browser
+    exit 0
+fi
 
 if [ "${force_auth}" -eq 1 ] && [ "${force_regular}" -eq 1 ]; then
     fail "--auth and --regular are mutually exclusive"

@@ -1,0 +1,37 @@
+{
+  "segments": [
+    "ssh",
+    "cwd",
+    {
+      "type": "mycmd",
+      "command": ["kube-current", "-s"],
+      "fg_color": "$POWERLINE_KUBE_FG",
+      "bg_color": "$POWERLINE_KUBE_BG"
+    },
+    {
+      "type": "mycmd",
+      "command": ["openstack-current"],
+      "fg_color": "$POWERLINE_OPENSTACK_FG",
+      "bg_color": "$POWERLINE_OPENSTACK_BG"
+    },
+    "git",
+    {
+      "type": "git_stash",
+      "fg_color": "$POWERLINE_GIT_STASH_FG",
+      "bg_color": "$POWERLINE_GIT_STASH_BG"
+    },
+    {
+      "type": "virtual_env",
+      "fg_color": "$POWERLINE_VENV_FG",
+      "bg_color": "$POWERLINE_VENV_BG"
+    },
+    "root"
+  ],
+  "mode": "patched",
+  "vcs": {
+    "show_symbol": true
+  },
+  "cwd": {
+      "max_depth": 2
+  }
+} 

@@ -13,6 +13,10 @@ software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
 declare -A group_members=()
+# the software a step needed and that was run for it, so it is not run twice
+declare -A software_needed=()
+# the hosts install-git-release was checked to be logged in to
+declare -A release_host_checked=()
 selected=""
 
 error() {
@@ -62,6 +66,7 @@ Options:
   -h, --help          display this help and exit
   -d, --dry-run       dry-run mode
   -t, --types TYPES   comma separated list of install types (deprecated)
+  -l, --list          list the groups with their software and exit
   --verbose           verbose mode
   --bash-completion   print shell completion candidates and exit
 EOF
@@ -171,6 +176,9 @@ discover_software() {
         seen_orders["${order}"]="${name}"
         software_handlers["${name}"]="${handler}"
         software_disabled["${name}"]="${disabled}"
+        # every software belongs to a group, so selecting all groups (e.g. by setup.sh)
+        # leaves nothing out
+        [ "${disabled}" -eq 0 ] && [ -z "${groups}" ] && warning "Software ${name} is in no group"
         software_install_types+=("${name}")
 
         for group in ${groups}; do
@@ -197,14 +205,94 @@ discover_software() {
     mapfile -t possible_install_types < <(printf '%s\n' "${software_install_types[@]}" | sort)
 }
 
+# needs SOFTWARE [COMMAND|PATH]: a step that depends on another software runs it
+# first when the command (default: the software name) or the path it provides is
+# missing, e.g. glab for a release from GitLab. Each software runs once per run.
+# Returns 3 in dry-run mode when the software is missing, as the step cannot be
+# checked without it; callers use: needs ... || return $(( $? == 3 ? 0 : 1 ))
+needs() {
+    local software="${1}"
+    local check="${2:-${1}}"
+    local outer="${selected}"
+    local status
+
+    if [[ "${check}" == /* ]]; then
+        [ -e "${check}" ] && return 0
+    else
+        command -v "${check}" >/dev/null 2>&1 && return 0
+    fi
+    if [ -n "${software_needed[${software}]+ran}" ]; then
+        [ "${dry_run}" -eq 1 ] && return 3
+        error "${check} is still missing after ${software}"
+        return 1
+    fi
+    if [ -z "${software_handlers[${software}]+registered}" ]; then
+        error "${outer} needs ${check}, but there is no software ${software}"
+        return 1
+    fi
+    software_needed["${software}"]=1
+
+    local message="${UPDATE_MESSAGE//%PKGNAME%/${software}}"
+    echo "${APP_NAME}: ${outer} needs ${check}, ${message,} first" 1>&2
+    selected="${software}"
+    "${software_handlers[${software}]}"; status=$?
+    selected="${outer}"
+    if [ "${status}" -ne 0 ]; then
+        error "Failed to update ${software}, which ${outer} needs"
+        return 1
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "${APP_NAME}: ${outer} is checked once ${software} is installed" 1>&2
+        return 3
+    fi
+    hash -r
+    if [[ "${check}" == /* ]]; then
+        [ -e "${check}" ] && return 0
+    else
+        command -v "${check}" >/dev/null 2>&1 && return 0
+    fi
+    error "${check} is still missing after ${software}"
+    return 1
+}
+
+# the members of a group that only works on some systems are skipped elsewhere,
+# e.g. the gnome group without GNOME Shell
+group_unavailable_reason() {
+    case "${1}" in
+        gnome)
+            command -v gnome-shell >/dev/null 2>&1 || echo "GNOME Shell is not installed"
+            ;;
+    esac
+}
+
 run_selected_software() {
     local handler
     local item
+    local group
+    local reason
+    local -A unavailable=()
+
+    for group in gnome; do
+        reason="$(group_unavailable_reason "${group}")"
+        [ -n "${reason}" ] && unavailable["${group}"]="${reason}"
+    done
 
     for item in "${software_install_types[@]}"; do
         is_install_type_selected "${item}" || continue
         if [ "${software_disabled[${item}]}" -eq 1 ]; then
             warning "${item} is disabled"
+            continue
+        fi
+        if [ -n "${software_needed[${item}]+ran}" ]; then
+            echo "${APP_NAME}: ${item} was already updated for another software" 1>&2
+            continue
+        fi
+        reason=""
+        for group in "${!unavailable[@]}"; do
+            is_group_member "${group}" "${item}" && reason="${unavailable[${group}]}"
+        done
+        if [ -n "${reason}" ]; then
+            echo "${APP_NAME}: Skipping ${item}: ${reason}" 1>&2
             continue
         fi
 
@@ -294,6 +382,7 @@ apt_add_with_list_file() {
 }
 
 apt_add_with_repo() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl gpg apt-get || return 1
     local name="${1}"; shift
     local repo_url="${1%/}"; shift
@@ -450,7 +539,337 @@ helm_plugin_update() {
     fi
 }
 
+go_install_update() {
+    # go comes from the go step, the tools land in ~/go/bin of the user
+    local go_cmd="${CURRENT_USER_HOME}/.local/go/bin/go"
+    needs go "${go_cmd}" || return $(( $? == 3 ? 0 : 1 ))
+    local go_env=("env" "GOPRIVATE=gitlab.mittwald.it")
+    local updates=""
+    local pkg
+    local path
+    local name
+    local bin
+    local mod
+    local installed_version
+    local version
+
+    for pkg in "${@}"; do
+        path="${pkg%@*}"
+        # github.com/goreleaser/goreleaser/v2 installs as goreleaser
+        name="$(basename "$(echo "${path}" | sed -E 's#/v[0-9]+$##')")"
+        bin="${CURRENT_USER_HOME}/go/bin/${name}"
+        installed_version="<none>"
+        version="latest"
+        if [ -x "${bin}" ]; then
+            read -r mod installed_version < <(${SUDO_USER} "${go_cmd}" version -m "${bin}" 2>/dev/null | awk '$1 == "mod" { print $2, $3; exit }')
+            if [ -n "${mod}" ]; then
+                version="$(${SUDO_USER} "${go_env[@]}" "${go_cmd}" list -m -f '{{.Version}}' "${mod}@latest" 2>/dev/null)"
+                [ -z "${version}" ] && version="latest"
+            fi
+            [ "${version}" = "${installed_version}" ] && continue
+        fi
+        updates+="${name}\t${installed_version:-<unknown>}\t${version}\n"
+        [ "${dry_run}" -eq 1 ] && continue
+        verbose "${SUDO_USER} ${go_env[*]} ${go_cmd} install ${path}@latest"
+        ${SUDO_USER} "${go_env[@]}" "${go_cmd}" install "${path}@latest" || return 1
+    done
+    if [ -n "${updates}" ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\n${updates%\\n}" | column -t -s $'\t'
+    else
+        echo "${APP_NAME}: go tools are up to date" 1>&2
+    fi
+}
+
+cargo_install_update() {
+    local cargo_cmd="${CURRENT_USER_HOME}/.cargo/bin/cargo"
+    needs rustup "${cargo_cmd}" || return $(( $? == 3 ? 0 : 1 ))
+    local crate
+    for crate in "${@}"; do
+        if [ "${dry_run}" -eq 1 ]; then
+            if ${SUDO_USER} "${cargo_cmd}" install --list | grep -q "^${crate} "; then
+                echo "Would update ${crate} if outdated" 1>&2
+            else
+                echo "Would install ${crate}" 1>&2
+            fi
+            continue
+        fi
+        # cargo install skips a crate that is already up to date
+        verbose "${SUDO_USER} ${cargo_cmd} install --locked ${crate}"
+        ${SUDO_USER} "${cargo_cmd}" install --locked "${crate}" || return 1
+    done
+}
+
+pip_update() {
+    needs packages pip3 || return $(( $? == 3 ? 0 : 1 ))
+    # the packages apt has no python3-* package for; they go into one folder that
+    # is on sys.path after the apt packages, see lib/cli-helpers/pip-packages
+    local name="${1}"; shift
+    # rewritten by make install to $(LIBDIR)
+    local pip_packages="/usr/local/lib/cli-helpers/pip-packages"
+    local pip_args=()
+    [ "${dry_run}" -eq 1 ] && pip_args+=("--dry-run")
+    verbose "${SUDO} ${pip_packages} ${pip_args[*]} ${name} ${*}"
+    ${SUDO} "${pip_packages}" "${pip_args[@]}" "${name}" "${@}"
+}
+
+gnome_extension_update() {
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd curl jq gnome-shell gnome-extensions gsettings || return 1
+    local uuid="${1}"
+    local ego_url="https://extensions.gnome.org"
+    local ext_dir="${CURRENT_USER_HOME}/.local/share/gnome-shell/extensions/${uuid}"
+    local shell_version
+    local info
+    local version
+    local download_url
+    local installed_version
+    local tmp_zip
+
+    shell_version="$(gnome-shell --version | grep -oE '[0-9]+' | head -n 1)"
+    if ! info="$(curl -fsS "${ego_url}/extension-info/?uuid=${uuid}&shell_version=${shell_version}")"; then
+        error "No version of ${uuid} for GNOME Shell ${shell_version} on ${ego_url}"
+        return 1
+    fi
+    version="$(echo "${info}" | jq -r '.version')"
+    download_url="$(echo "${info}" | jq -r '.download_url')"
+    installed_version="$(jq -r '.version // empty' "${ext_dir}/metadata.json" 2>/dev/null)"
+    [ -z "${installed_version}" ] && installed_version="<none>"
+
+    if [ "${version}" != "${installed_version}" ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo -e "NAME\tCURRENT\tUPDATE\n${uuid}\t${installed_version}\t${version}" | column -t -s $'\t'
+        else
+            tmp_zip="$(mktemp --suffix .zip)" || return 1
+            trap 'rm -f "${tmp_zip}"; trap - RETURN' RETURN
+            verbose "curl -fsSL ${ego_url}${download_url} -o ${tmp_zip}"
+            curl -fsSL "${ego_url}${download_url}" -o "${tmp_zip}" || return 1
+            chmod 644 "${tmp_zip}"
+            verbose "${SUDO_USER} gnome-extensions install --force ${tmp_zip}"
+            ${SUDO_USER} gnome-extensions install --force "${tmp_zip}" || return 1
+        fi
+    else
+        echo "${APP_NAME}: ${uuid} ${installed_version} is up to date" 1>&2
+    fi
+
+    gnome_extension_enable "${uuid}"
+}
+
+gnome_extension_enable() {
+    require_cmd gsettings || return 1
+    local uuid="${1}"
+    # gsettings talks to the user's session
+    local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local enabled
+
+    # a new extension is only loaded by GNOME Shell after logging in again, so it
+    # is enabled in the settings rather than with gnome-extensions enable
+    enabled="$(${SUDO_USER} "${session_env[@]}" gsettings get org.gnome.shell enabled-extensions)"
+    [[ "${enabled}" == *"'${uuid}'"* ]] && return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would enable ${uuid}" 1>&2
+        return 0
+    fi
+    if [ "${enabled}" = "@as []" ] || [ "${enabled}" = "[]" ]; then
+        enabled="['${uuid}']"
+    else
+        enabled="${enabled%]}, '${uuid}']"
+    fi
+    verbose "${SUDO_USER} gsettings set org.gnome.shell enabled-extensions ${enabled}"
+    ${SUDO_USER} "${session_env[@]}" gsettings set org.gnome.shell enabled-extensions "${enabled}"
+}
+
+gnome_extension_from_git() {
+    # an extension that is not on extensions.gnome.org, installed by the make
+    # install of its repo into the user's extensions
+    needs packages git || return $(( $? == 3 ? 0 : 1 ))
+    needs packages make || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd git make || return 1
+    local url="${1}"
+    local uuid="${2}"
+    local ext_dir="${CURRENT_USER_HOME}/.local/share/gnome-shell/extensions/${uuid}"
+    # make install replaces the extension directory, so the commit is written after it
+    local commit_file="${ext_dir}/.git-commit"
+    local commit
+    local installed_commit
+    local tmp_dir
+
+    commit="$(git ls-remote "${url}" HEAD | cut -f 1)"
+    if [ -z "${commit}" ]; then
+        error "Failed to get the latest commit of ${url}"
+        return 1
+    fi
+    installed_commit="$(cat "${commit_file}" 2>/dev/null)"
+    [ -z "${installed_commit}" ] && installed_commit="<unknown>"
+
+    if [ "${commit}" = "${installed_commit}" ]; then
+        echo "${APP_NAME}: ${uuid} ${installed_commit:0:7} is up to date" 1>&2
+    elif [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\n${uuid}\t${installed_commit:0:9}\t${commit:0:7}" | column -t -s $'\t'
+    else
+        tmp_dir="$(${SUDO_USER} mktemp -d)" || return 1
+        trap '${SUDO_USER} rm -rf "${tmp_dir}"; trap - RETURN' RETURN
+        verbose "${SUDO_USER} git clone --depth 1 ${url} ${tmp_dir}"
+        ${SUDO_USER} git clone --quiet --depth 1 "${url}" "${tmp_dir}" || return 1
+        verbose "${SUDO_USER} make -s -C ${tmp_dir} install"
+        ${SUDO_USER} make -s -C "${tmp_dir}" install || return 1
+        commit="$(${SUDO_USER} git -C "${tmp_dir}" rev-parse HEAD)"
+        echo "${commit}" | ${SUDO_USER} tee "${commit_file}" > /dev/null
+    fi
+    gnome_extension_enable "${uuid}"
+}
+
+# user_link TARGET LINK: makes LINK in the user's home a symlink to TARGET, but
+# never replaces something that is not a symlink
+user_link() {
+    local target="${1}"
+    local link="${2}"
+    if [ -L "${link}" ] && [ "$(readlink "${link}")" = "${target}" ]; then
+        return 0
+    fi
+    if [ -e "${link}" ] && [ ! -L "${link}" ]; then
+        warning "${link} exists and is no symlink, not linking it to ${target}"
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would link ${link} -> ${target}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} ln -sfn ${target} ${link}"
+    ${SUDO_USER} ln -sfn "${target}" "${link}"
+}
+
+# git_repo_update REPO DIR: clones the GitHub repo into DIR with gh (it may be
+# private) or pulls it, unless it has local changes
+git_repo_update() {
+    local repo="${1}"
+    local dir="${2}"
+    local behind
+
+    if [ ! -d "${dir}/.git" ]; then
+        needs gh || return $(( $? == 3 ? 0 : 1 ))
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would clone ${repo} into ${dir}" 1>&2
+            return 0
+        fi
+        verbose "${SUDO_USER} gh repo clone ${repo} ${dir}"
+        ${SUDO_USER} mkdir -p "$(dirname "${dir}")" || return 1
+        ${SUDO_USER} gh repo clone "${repo}" "${dir}" -- --quiet
+        return
+    fi
+    if [ -n "$(${SUDO_USER} git -C "${dir}" status --porcelain)" ]; then
+        echo "${APP_NAME}: ${dir} has local changes, not pulling" 1>&2
+        return 0
+    fi
+    ${SUDO_USER} git -C "${dir}" fetch --quiet || return 1
+    behind="$(${SUDO_USER} git -C "${dir}" rev-list --count HEAD..@{upstream} 2>/dev/null)"
+    if [ -z "${behind}" ] || [ "${behind}" -eq 0 ]; then
+        echo "${APP_NAME}: ${dir} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would pull ${behind} commit(s) into ${dir}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} git -C ${dir} pull --ff-only"
+    ${SUDO_USER} git -C "${dir}" pull --ff-only --quiet
+}
+
+# user_service_enable UNIT [FILE]: installs the systemd user unit FILE (if given,
+# e.g. from $(LIBDIR)/systemd-user) and enables and starts UNIT for the user
+user_service_enable() {
+    local unit="${1}"
+    local src="${2}"
+    local unit_dir="${CURRENT_USER_HOME}/.config/systemd/user"
+    # systemctl --user talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local changed=0
+
+    if [ -n "${src}" ] && ! cmp -s "${src}" "${unit_dir}/${unit}"; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would install ${unit_dir}/${unit}" 1>&2
+        else
+            verbose "${SUDO_USER} install -D -m 0644 ${src} ${unit_dir}/${unit}"
+            ${SUDO_USER} install -D -m 0644 "${src}" "${unit_dir}/${unit}" || return 1
+            ${SUDO_USER} "${session_env[@]}" systemctl --user daemon-reload || return 1
+            changed=1
+        fi
+    fi
+    if ${SUDO_USER} "${session_env[@]}" systemctl --user is-enabled --quiet "${unit}" 2>/dev/null; then
+        if [ "${changed}" -eq 1 ]; then
+            verbose "${SUDO_USER} systemctl --user try-restart ${unit}"
+            ${SUDO_USER} "${session_env[@]}" systemctl --user try-restart "${unit}"
+        fi
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would enable and start the user service ${unit}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} systemctl --user enable --now ${unit}"
+    ${SUDO_USER} "${session_env[@]}" systemctl --user enable --now "${unit}"
+}
+
+# claude_plugins_update SETTINGS: adds the GitHub marketplaces and installs the
+# plugins that the Claude Code settings file enables but are missing
+claude_plugins_update() {
+    local settings="${1}"
+    local claude_cmd="${CURRENT_USER_HOME}/.local/bin/claude"
+    local installed_file="${CURRENT_USER_HOME}/.claude/plugins/installed_plugins.json"
+    local marketplaces
+    local installed
+    local name
+    local repo
+    local plugin
+
+    needs claude "${claude_cmd}" || return $(( $? == 3 ? 0 : 1 ))
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    marketplaces="$(${SUDO_USER} "${claude_cmd}" plugin marketplace list --json 2>/dev/null | jq -r '.[].name')"
+    while IFS=$'\t' read -r name repo; do
+        [ -z "${name}" ] && continue
+        grep -qFx "${name}" <<< "${marketplaces}" && continue
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would add the Claude Code marketplace ${name} (${repo})" 1>&2
+            continue
+        fi
+        verbose "${SUDO_USER} ${claude_cmd} plugin marketplace add ${repo}"
+        ${SUDO_USER} "${claude_cmd}" plugin marketplace add "${repo}" < /dev/null || return 1
+    done < <(jq -r '.extraKnownMarketplaces // {} | to_entries[] | select(.value.source.source == "github") | [.key, .value.source.repo] | @tsv' "${settings}")
+
+    installed="$(jq -r '.plugins // {} | keys[]' "${installed_file}" 2>/dev/null)"
+    while read -r plugin; do
+        [ -z "${plugin}" ] && continue
+        grep -qFx "${plugin}" <<< "${installed}" && continue
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would install the Claude Code plugin ${plugin}" 1>&2
+            continue
+        fi
+        verbose "${SUDO_USER} ${claude_cmd} plugin install ${plugin}"
+        ${SUDO_USER} "${claude_cmd}" plugin install "${plugin}" < /dev/null || return 1
+    done < <(jq -r '.enabledPlugins // {} | to_entries[] | select(.value) | .key' "${settings}")
+}
+
+# tool_ready COMMAND|PATH: after the install of a step, whether the rest of it (the
+# config) can go on; in dry-run mode the tool may not be installed yet, then
+# that is only checked once it is (returns 1), a real run fails (returns 2).
+# Callers use: tool_ready ... || return $(( $? == 1 ? 0 : 1 ))
+tool_ready() {
+    local check="${1}"
+    hash -r
+    if [[ "${check}" == /* ]]; then
+        [ -e "${check}" ] && return 0
+    else
+        command -v "${check}" >/dev/null 2>&1 && return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "${APP_NAME}: the config of ${selected} is checked once it is installed" 1>&2
+        return 1
+    fi
+    error "${check} is missing after installing ${selected}"
+    return 2
+}
+
 yazi_plugin_update() {
+    needs yazi ya || return $(( $? == 3 ? 0 : 1 ))
     require_cmd ya || return 1
     local pkg_toml="${CURRENT_USER_HOME}/.config/yazi/package.toml"
     local missing=()
@@ -476,15 +895,18 @@ yazi_plugin_update() {
     ${SUDO_USER} ya pkg upgrade
 }
 
-yazi_config_update() {
+config_update() {
+    # the shipped config in $(LIBDIR)/NAME into the user's config directory
+    local name="${1}"
+    local dst_dir="${2}"
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
     local merge_args=()
     [ "${dry_run}" -eq 1 ] && merge_args+=("--dry-run")
     # a missing config file is copied, an existing one only gets the shipped
-    # settings, keymap entries, functions and variables merged in
-    verbose "${SUDO_USER} ${lib_dir}/yazi-config-merge ${merge_args[*]} ${lib_dir}/yazi ${CURRENT_USER_HOME}/.config/yazi"
-    ${SUDO_USER} "${lib_dir}/yazi-config-merge" "${merge_args[@]}" "${lib_dir}/yazi" "${CURRENT_USER_HOME}/.config/yazi"
+    # settings, entries, functions and variables merged in
+    verbose "${SUDO_USER} ${lib_dir}/config-merge ${merge_args[*]} ${lib_dir}/${name} ${dst_dir}"
+    ${SUDO_USER} "${lib_dir}/config-merge" "${merge_args[@]}" "${lib_dir}/${name}" "${dst_dir}"
 }
 
 flatpak_list_updates() {
@@ -571,6 +993,7 @@ curl_update() {
     local url="${1}"; shift
     [ -z "${url}" ] && echo "ERROR: curl_update requires a URL" 1>&2 && return 1
     [ -z "${pkg}" ] && echo "ERROR: curl_update requires a package name" 1>&2 && return 1
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl || return 1
     curl_args=( "--fail" "--location" )
     [ "${verbose}" -eq 0 ] && curl_args+=( "--silent" "--show-error" )
@@ -603,6 +1026,7 @@ nvm_run() {
 }
 
 install_nodejs() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl || return 1
     local nvm_repo_url="https://github.com/nvm-sh/nvm"
     local node_version="lts/*"
@@ -669,6 +1093,7 @@ install_nodejs() {
 }
 
 npm_update() {
+    needs nodejs npm || return $(( $? == 3 ? 0 : 1 ))
     require_cmd npm npm-pkg-dir || return 1
     local pkg="${1}"; shift
     local force=0
@@ -726,7 +1151,12 @@ npm_update() {
         ${sudo} npm "${npm_args[@]}"
     else
         require_cmd jq || return 1
-        if ! npm_json="$(NODE_PATH="/usr/lib/node_modules" npm outdated -g "${pkg}" --json)"; then
+        # npm outdated lists only installed packages, so a missing one looked up to date
+        if [ -z "${target_dir}" ] || [ ! -d "${target_dir}" ]; then
+            local latest_version
+            latest_version="$(npm view "${pkg}" version 2>/dev/null)"
+            echo -e "NAME\tCURRENT\tUPDATE\n${pkg}\t<none>\t${latest_version:-<unknown>}" | column -t -s $'\t'
+        elif ! npm_json="$(NODE_PATH="/usr/lib/node_modules" npm outdated -g "${pkg}" --json)"; then
             npm_table="$(echo "${npm_json}" | \
                          jq -r 'to_entries[] | [.key, (.value.current // "<unknown>"), .value.wanted] | @tsv')"
             echo -e "NAME\tCURRENT\tUPDATE\n${npm_table}" | column -t -s $'\t'
@@ -736,9 +1166,54 @@ npm_update() {
     fi 
 }
 
+# gh and glab need a login to fetch releases, except for public gitlab.com
+# projects; checked once per host, as logging in is interactive
+release_host_login_check() {
+    local host="${1}"
+    [ -n "${release_host_checked[${host}]+checked}" ] && return "${release_host_checked[${host}]}"
+    local status=0
+    case "${host}" in
+        github.com)
+            if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+                error "Not logged in to github.com, run: gh auth login"
+                status=1
+            fi
+            ;;
+        gitlab.com)
+            ;;
+        *gitlab*)
+            if ! glab auth status --hostname "${host}" >/dev/null 2>&1; then
+                error "Not logged in to ${host}, run: glab auth login --hostname ${host}"
+                status=1
+            fi
+            ;;
+    esac
+    release_host_checked["${host}"]="${status}"
+    return "${status}"
+}
+
 install_git_release() {
     require_cmd install-git-release || return 1
     local url="${1}"; shift
+    local host
+    host="$(echo "${url}" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')"
+    # the archive tools install-git-release unpacks with
+    needs packages unzip || return $(( $? == 3 ? 0 : 1 ))
+    needs packages file || return $(( $? == 3 ? 0 : 1 ))
+    # install-git-release falls back to the REST API without gh or glab, which is
+    # enough for public projects (glab itself comes from gitlab.com); gh avoids the
+    # low rate limit of the anonymous GitHub API, and private GitLab hosts need glab
+    case "${host}" in
+        github.com)
+            needs gh || return $(( $? == 3 ? 0 : 1 ))
+            ;;
+        gitlab.com)
+            ;;
+        *gitlab*)
+            needs glab || return $(( $? == 3 ? 0 : 1 ))
+            ;;
+    esac
+    release_host_login_check "${host}" || return 1
     local install_git_args=()
     while [ $# -gt 0 ]; do
         install_git_args+=("${1}")
@@ -747,80 +1222,6 @@ install_git_release() {
     [ "${dry_run}" -eq 1 ] && install_git_args+=("--dry-run")
     [ "${dry_run}" -eq 0 ] && install_git_args+=("--yes")
     install-git-release "${url}" "${install_git_args[@]}"
-}
-
-install_from_git() {
-    local url=""
-    local branch=""
-    local script=""
-    local script_args=()
-    while [ $# -gt 0 ]; do
-        case "${1}" in
-            -b|--branch)
-                if [ -z "${branch}" ]; then
-                    shift
-                    branch="${1}"
-                else
-                    script_args+=("${1}")
-                fi
-                ;;
-            *)
-                if [ -z "${url}" ]; then
-                    url="${1}"
-                elif [ -z "${script}" ]; then
-                    script="${1}"
-                else
-                    script_args+=("${1}")
-                fi
-                ;;
-        esac
-        shift
-    done
-    [ -z "${url}" ] && echo "ERROR: install_from_git requires a URL" 1>&2 && return 1
-    [ -z "${script}" ] && echo "ERROR: install_from_git requires a script to run" 1>&2 && return 1
-    require_cmd git || return 1
-
-    local tmp_dir
-    verbose "mktemp -d"
-    tmp_dir="$(mktemp -d)"
-    local file_args=()
-    [ "${verbose}" -eq 1 ] && file_args+=("-v")
-    trap 'rm -rf "${tmp_dir}"; trap - RETURN' RETURN
-    verbose "git clone ${url} ${tmp_dir}"
-    LC_ALL=C git clone "${url}" "${tmp_dir}"; exit_code=$?
-    [ "${exit_code}" -ne 0 ] && error "Failed to clone ${url}" && return 1
-    (
-        verbose "cd ${tmp_dir}"
-        cd "${tmp_dir}" || exit 1
-        if [ -n "${branch}" ]; then
-            verbose "git checkout ${branch}"
-            LC_ALL=C git checkout "${branch}"; exit_code=$?
-            [ "${exit_code}" -ne 0 ] && error "Failed to checkout ${branch}" && exit 1
-        else
-            verbose "git describe --abbrev=0 --tags"
-            latest_tag="$(LC_ALL=C git describe --abbrev=0 --tags)"; exit_code=$?
-            [ "${exit_code}" -ne 0 ] && error "Failed to get latest tag" && exit 1
-            verbose "latest_tag=${latest_tag}"
-            verbose "git checkout ${latest_tag}"
-            result="$(LC_ALL=C git checkout "${latest_tag}" 2>&1)"; exit_code=$?
-            verbose "${result}"
-            [ "${exit_code}" -ne 0 ] && error "Failed to checkout ${latest_tag}" && exit 1
-        fi
-
-        local cmd=()
-        [[ "${script}" != *"/bash" ]] && [[ "${script}" != "bash" ]] && cmd+=("bash")
-        cmd+=("${script}")
-
-        if [ "${dry_run}" -eq 0 ]; then
-            verbose "${cmd[*]} ${script_args[*]}"
-            "${cmd[@]}" "${script_args[@]}"; exit_code=$?
-            [ "${exit_code}" -ne 0 ] && error "Failed to run ${script}" && exit 1
-        else
-            echo "Would run: ${cmd[*]} ${script_args[*]}"
-        fi
-        # the "[ ... ] && ... && exit 1" check above leaves status 1 on success
-        exit 0
-    ) || return 1
 }
 
 install_adb() {
@@ -893,7 +1294,7 @@ install_adb() {
 # Group names are lowercase and "all" is reserved. A group may carry the name of a
 # software only if that software is a member of it (e.g. mw is both the mittwald CLI
 # and the group of all mittwald tools); "updater mw" then updates the whole group.
-software-010-firmware() {
+software-010-firmware@base() {
     require_cmd fwupdmgr || return 1
     ${SUDO} fwupdmgr get-devices --force \
         && ${SUDO} fwupdmgr refresh --force \
@@ -903,13 +1304,41 @@ software-010-firmware() {
         yes | ${SUDO} fwupdmgr update
     fi
 }
+software-015-git@base() {
+    # the git-core PPA has newer git releases than Ubuntu
+    apt_add_with_repo "git" "https://ppa.launchpadcontent.net/git-core/ppa/ubuntu" "${OS_RELEASE_VERSION_CODENAME}" "main" \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF911AB184317630C59970973E363C90F8F1B6217" "F911AB184317630C59970973E363C90F8F1B6217"
+}
 
+software-016-bash-aliases@base() {
+    # linkme sources the alias files of ~/bash_aliases.d, see its README
+    needs packages git || return $(( $? == 3 ? 0 : 1 ))
+    git_repo_update "dgrieser/bash_aliases.d" "${CURRENT_USER_HOME}/workspace/dgrieser/bash_aliases.d" || return 1
+    user_link "workspace/dgrieser/bash_aliases.d" "${CURRENT_USER_HOME}/bash_aliases.d" \
+        && user_link "bash_aliases.d/linkme" "${CURRENT_USER_HOME}/.bash_aliases"
+}
 software-020-apt@base() { apt_upgrade; }
-software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit 7zip; }
+software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging jq unzip file 7zip; }
 software-022-glow@base() { apt_upgrade glow; }
 software-023-sshpass@base() { apt_upgrade sshpass; }
 software-024-secret-tool@base() { apt_upgrade libsecret-tools; }
 software-025-nodejs@dev@base() { install_nodejs; }
+software-026-cli-tools@base() {
+    apt_upgrade ripgrep fd-find zoxide tree htop tmux tig gitk meld shellcheck \
+        parallel pv pigz lz4 lzip lzop unrar rlwrap expect inotify-tools gawk dialog ncal at \
+        recode wdiff fdupes symlinks reptyr
+}
+software-027-network-tools@base() {
+    apt_upgrade nmap net-tools traceroute whois ipcalc sipcalc prips ldnsutils socat sshfs \
+        apache2-utils ntpsec-ntpdate
+}
+software-028-data-tools@base() {
+    apt_upgrade sqlite3 mysql-client csvkit xmlstarlet xsltproc pandoc graphviz gnuplot
+}
+software-029-media-tools@base@media() {
+    apt_upgrade ffmpeg imagemagick sox mp3gain mpg123 vorbis-tools tesseract-ocr tesseract-ocr-deu \
+        qrencode mupdf-tools pdftk-java netpbm pngcheck catdoc uudeview barcode
+}
 software-030-npm@dev@base() {
     if ! command -v npm >/dev/null 2>&1; then
         install_nodejs || return 1
@@ -917,19 +1346,136 @@ software-030-npm@dev@base() {
     fi
     npm_update npm
 }
+software-031-desktop-tools@base() {
+    apt_upgrade xclip xdotool wmctrl xinput xkbset v4l-utils pamixer \
+        w3m w3m-img lynx ranger colorized-logs ansifilter
+}
+software-032-disk-tools@base() {
+    apt_upgrade gparted partclone gddrescue sdparm mmc-utils fio genisoimage xorriso zsync \
+        lm-sensors msr-tools ipmitool cpu-checker acct autofs smartmontools
+}
+software-033-dev-tools@dev() {
+    apt_upgrade devscripts equivs gdebi-core lintian help2man scdoc mandoc gperf patchelf upx-ucl \
+        rpm2cpio wabt gcovr pycodestyle maven musl-dev php-cli php-curl php-sqlite3 php-bz2 \
+        isympy3 mkdocs oidc-agent
+}
+software-034-desktop-apps@base() {
+    apt_upgrade eog evince clapper drawing vlc keepassxc terminator dconf-editor qdirstat filezilla
+}
+software-035-office@base() { apt_upgrade libreoffice evolution evolution-ews evolution-plugin-pstimport; }
+software-036-media-apps@media() { apt_upgrade audacity kdenlive blender calibre puddletag glabels; }
+software-037-wireshark@dev() { apt_upgrade wireshark; }
+software-038-java@dev() { apt_upgrade openjdk-21-jre; }
+software-039-qemu@dev() { apt_upgrade qemu-system qemu-utils ovmf swtpm spice-client-gtk quickemu; }
 software-040-flatpak@base() { flatpak_update; }
+software-042-power-trigger@base() {
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    # the lid and power events of cli-helpers' power-trigger, as a user service
+    apt_upgrade python3-pydbus python3-gi || return 1
+    user_service_enable power-trigger.service "${lib_dir}/systemd-user/power-trigger.service"
+}
+software-043-dotfile-backups@base() {
+    # rewritten by make install to $(LIBDIR)
+    local template="/usr/local/lib/cli-helpers/cron/single-file-backups"
+    local cron_file="/etc/cron.d/single-file-backups"
+    local content
+    apt_upgrade cron || return 1
+    content="$(sed -e "s#@USER@#${CURRENT_USER_NAME}#g" -e "s#@HOME@#${CURRENT_USER_HOME}#g" "${template}")" || return 1
+    if [ "$(cat "${cron_file}" 2>/dev/null)" = "${content}" ]; then
+        echo "${APP_NAME}: ${cron_file} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would write ${cron_file} (backup-single-file of the dotfiles)" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} tee ${cron_file}"
+    echo "${content}" | ${SUDO} tee "${cron_file}" > /dev/null && ${SUDO} chmod 0644 "${cron_file}"
+}
 software-045-sublime@base() { apt_add_with_repo "sublime-text" "https://download.sublimetext.com/" "apt/stable/" "" "https://download.sublimetext.com/sublimehq-pub.gpg"; }
 software-050-adb@dev() { install_adb; }
+software-051-android-sdk@dev() { apt_upgrade google-android-platform-36-installer google-android-build-tools-36.0.0-installer; }
+software-055-docker@dev() {
+    apt_add_with_repo "docker-ce" "https://download.docker.com/linux/ubuntu" "${OS_RELEASE_VERSION_CODENAME}" "stable" \
+        "https://download.docker.com/linux/ubuntu/gpg" "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" || return 1
+    apt_upgrade docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+    if ! id -nG "${CURRENT_USER_NAME}" | tr ' ' '\n' | grep -qFx docker; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would add ${CURRENT_USER_NAME} to the docker group" 1>&2
+        else
+            verbose "${SUDO} usermod -aG docker ${CURRENT_USER_NAME}"
+            ${SUDO} usermod -aG docker "${CURRENT_USER_NAME}"
+        fi
+    fi
+}
+software-056-vault@dev() {
+    apt_add_with_repo "vault" "https://apt.releases.hashicorp.com" "${OS_RELEASE_VERSION_CODENAME}" "main" \
+        "https://apt.releases.hashicorp.com/gpg" "D55C0D1AC78A8D8126CB631CFC9CA96ACA026560"
+}
+software-057-conda@dev() {
+    apt_add_with_repo "conda" "https://repo.anaconda.com/pkgs/misc/debrepo/conda" "stable" "main" \
+        "https://repo.anaconda.com/pkgs/misc/gpgkeys/anaconda.asc" "34161F5BF5EB1D4BFBBB8F0A8AEB4F8B29D82806"
+}
+software-058-docker-compose@dev() {
+    install_git_release "https://github.com/docker/compose" --pattern "docker-compose-linux-x86_64" --name "docker-compose"
+}
+software-059-swagger-codegen@dev() {
+    needs java || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd curl java || return 1
+    local maven_url="https://repo1.maven.org/maven2/io/swagger/codegen/v3/swagger-codegen-cli"
+    local lib_dir="/usr/local/lib/swagger-codegen"
+    local jar_path="${lib_dir}/swagger-codegen-cli.jar"
+    local bin_path="/usr/local/bin/swagger-codegen"
+    local version
+    local installed_version
+    local tmp_jar
+
+    version="$(curl -fsSL "${maven_url}/maven-metadata.xml" | grep -oP '(?<=<release>)[^<]+')"
+    if [ -z "${version}" ]; then
+        error "Failed to get latest version of swagger-codegen from ${maven_url}"
+        return 1
+    fi
+    installed_version="$(cat "${lib_dir}/version" 2>/dev/null)"
+    [ -z "${installed_version}" ] && installed_version="<none>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: swagger-codegen ${installed_version} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\nswagger-codegen\t${installed_version}\t${version}" | column -t -s $'\t'
+        return 0
+    fi
+
+    tmp_jar="$(mktemp --suffix .jar)" || return 1
+    trap 'rm -f "${tmp_jar}"; trap - RETURN' RETURN
+    verbose "curl -fsSL ${maven_url}/${version}/swagger-codegen-cli-${version}.jar -o ${tmp_jar}"
+    curl -fsSL "${maven_url}/${version}/swagger-codegen-cli-${version}.jar" -o "${tmp_jar}" || return 1
+    ${SUDO} install -D -m 0644 "${tmp_jar}" "${jar_path}" || return 1
+    printf '#!/bin/sh\nexec java -jar %s "$@"\n' "${jar_path}" | ${SUDO} tee "${bin_path}" > /dev/null || return 1
+    ${SUDO} chmod 755 "${bin_path}" || return 1
+    echo "${version}" | ${SUDO} tee "${lib_dir}/version" > /dev/null
+}
 
 software-060-chrome@dev() {
     apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub"
 }
 
 software-070-mw@dev@mw() { npm_update @mittwald/cli; }
-software-080-claude@dev@agents() { curl_update "claude" "https://claude.ai/install.sh"; }
+software-080-claude@dev@agents() {
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    curl_update "claude" "https://claude.ai/install.sh" || return 1
+    tool_ready "${CURRENT_USER_HOME}/.local/bin/claude" || return $(( $? == 1 ? 0 : 1 ))
+    # settings, CLAUDE.md and the status line; settings.local.json and the plugin
+    # store stay the machine's own
+    config_update claude "${CURRENT_USER_HOME}/.claude" || return 1
+    claude_plugins_update "${lib_dir}/claude/settings.json"
+}
 software-090-code@dev() { apt_upgrade "code"; }
 software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
-software-110-nerd-fonts() {
+software-110-nerd-fonts@base() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl tar fc-cache || return 1
     local repo_url="https://github.com/ryanoasis/nerd-fonts"
     local -a fonts=("JetBrainsMono" "Agave" "0xProto" "FiraCode" "Hack")
@@ -976,9 +1522,30 @@ software-110-nerd-fonts() {
     echo "${version}" | ${SUDO_USER} tee "${version_file}" > /dev/null
 }
 software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
-software-121-mittwald-outlook-bridge@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*"; }
+software-121-mittwald-outlook-bridge@mw() {
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    local env_file="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge/env"
+    local package_unit="/usr/lib/systemd/user/mittwald-outlook-bridge.service"
+    # the WebKitGTK runtime of the webview build's sign-in window; its deb depends
+    # on them, the tarball does not
+    apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
+    # prefers the deb of the release, falls back to the tarball of older ones
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*" || return 1
+    # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
+    if [ ! -f "${env_file}" ]; then
+        warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
+        return 0
+    fi
+    # the deb/rpm brings the unit, a tarball install takes the copy of cli-helpers
+    if [ -f "${package_unit}" ]; then
+        user_service_enable mittwald-outlook-bridge.service
+    else
+        user_service_enable mittwald-outlook-bridge.service "${lib_dir}/systemd-user/mittwald-outlook-bridge.service"
+    fi
+}
 software-122-git-commit-ai@dev@agents() { curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh"; }
-software-130-slack() {
+software-130-slack@comms() {
     # jessie is the only supported version
     apt_add_with_list_file "slack-desktop" \
         "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
@@ -987,54 +1554,84 @@ software-130-slack() {
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
-software-170-gitlab_trackr@dev() { install_git_release "https://github.com/BjarneSeger/gitlab_trackr"; }
+software-170-gitlab_trackr@dev() {
+    # the package brings the gitlab-trackrd user service
+    install_git_release "https://github.com/BjarneSeger/gitlab_trackr" && user_service_enable gitlab-trackrd.service
+}
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
+software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
+software-182-patchzwoelf@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/patchzwoelf"; }
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
 software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
-software-210-himalaya() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
+software-210-himalaya@comms() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
 
-software-230-zed@dev() { curl_update "zed" "https://zed.dev/install.sh"; }
+software-230-zed@dev() {
+    curl_update "zed" "https://zed.dev/install.sh" || return 1
+    tool_ready "${CURRENT_USER_HOME}/.local/bin/zed" || return $(( $? == 1 ? 0 : 1 ))
+    # settings and keymap; a merged file is rewritten without its comments
+    config_update zed "${CURRENT_USER_HOME}/.config/zed"
+}
 software-240-hwatch@dev() { install_git_release "https://github.com/blacknon/hwatch"; }
-software-250-gradia() { flatpak_update "be.alexandervanhee.gradia" flathub; }
-software-251-obs() {
+software-250-gradia@desktop() { flatpak_update "be.alexandervanhee.gradia" flathub; }
+software-251-obs@media() {
     flatpak_update "com.obsproject.Studio" flathub \
         && flatpak_update "com.obsproject.Studio.Plugin.BackgroundRemoval" flathub \
         && flatpak_update "com.obsproject.Studio.Plugin.DroidCam" flathub
 }
 # only plugins built for GIMP 3 (branch 3); the 2-40 ones (BIMP, FocusBlur, Lensfun,
 # LiquidRescale) install fine but are never loaded by GIMP 3
-software-252-gimp() {
+software-252-gimp@media() {
     flatpak_update "org.gimp.GIMP" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.Fourier//3" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.GMic//3" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.Resynthesizer//3" flathub
 }
-software-253-cobang() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
+software-253-cobang@desktop() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
+software-254-inkscape@media() {
+    # the Inkscape PPA has newer releases than Ubuntu
+    apt_add_with_repo "inkscape" "https://ppa.launchpadcontent.net/inkscape.dev/stable/ubuntu" "${OS_RELEASE_VERSION_CODENAME}" "main" \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38" "56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38"
+}
+software-255-losslesscut@media() {
+    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-x64.tar.bz2" --bundle --binary "losslesscut"
+}
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
-software-280-spotify() {
+software-280-spotify@media() {
     apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
 }
 
 software-290-trivy@dev@k8s() {
     apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
 }
+software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_amd64.deb"; }
 
-software-300-threema() {
+software-300-threema@comms() {
     flatpak_update "ch.threema.threema-desktop" --from "https://releases.threema.ch/flatpak/threema-desktop/ch.threema.threema-desktop.flatpakref" || return 1
     [ "${dry_run}" -eq 1 ] && return 0
     # access to all files, e.g. to send attachments from anywhere (system-wide override, needs root)
     verbose "${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host"
     ${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host
 }
-software-disabled-310-gnome-ext-hanabi() { install_from_git "https://github.com/jeffshee/gnome-ext-hanabi.git" "./run.sh" "install"; }
-software-311-gnome-extension-manager@base() { apt_upgrade "gnome-shell-extension-manager"; }
-software-312-gnome-tweaks@base() { apt_upgrade "gnome-tweaks"; }
-software-320-opencode@dev@agents() { install_git_release "https://github.com/anomalyco/opencode" --exclude "*desktop*"; }
+software-311-gnome-extension-manager@base@gnome() { apt_upgrade "gnome-shell-extension-manager"; }
+software-312-gnome-tweaks@base@gnome() { apt_upgrade "gnome-tweaks"; }
+software-313-randomwallpaper@gnome@gnome-extensions() { gnome_extension_update "randomwallpaper@iflow.space"; }
+software-314-unblank@gnome@gnome-extensions() { gnome_extension_update "unblank@sun.wxg@gmail.com"; }
+software-315-user-theme-x@gnome@gnome-extensions() { gnome_extension_update "user-theme-x@tuberry.github.io"; }
+software-316-window-is-ready-filter@gnome@gnome-extensions() {
+    gnome_extension_from_git "https://github.com/dgrieser/window-is-ready-filter.git" "window-is-ready-filter@david-grieser.de"
+}
+software-320-opencode@dev@agents() {
+    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-x64.tar.gz" || return 1
+    tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
+    config_update opencode "${CURRENT_USER_HOME}/.config/opencode"
+}
 
-software-330-zoom() {
+
+software-330-zoom@comms() {
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq dpkg apt-get || return 1
     local zoom_package_name="zoom"
     local zoom_deb_file_name="${zoom_package_name}_${PLATFORM}.deb"
@@ -1075,6 +1672,10 @@ software-330-zoom() {
     fi
     LC_ALL=C ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y "${zoom_deb_file_path}"
 }
+software-335-teamviewer@desktop() {
+    apt_add_with_repo "teamviewer" "https://linux.teamviewer.com/deb" "stable" "main" \
+        "https://linux.teamviewer.com/pubkey/currentkey.asc" "AB2985BDE164897BA46EA69A234FAACB575B15D1"
+}
 
 software-340-glab@dev() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
 software-350-gh@dev() { apt_add_with_repo "gh" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"; }
@@ -1098,6 +1699,17 @@ software-360-helm@dev@k8s() {
         && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
         && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
 }
+software-361-helmfile@dev@k8s() { install_git_release "https://github.com/helmfile/helmfile"; }
+software-362-jsonnet@dev@k8s() {
+    install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnet-go_*_amd64.deb" \
+        && install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnetfmt-go_*_amd64.deb"
+}
+software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_amd64.deb"; }
+software-364-operator-sdk@dev@k8s() {
+    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_amd64" --name "operator-sdk"
+}
+software-366-promql@dev@k8s() { install_git_release "https://github.com/nalbury/promql-cli"; }
+software-367-kubectl-neat@dev@k8s() { install_git_release "https://github.com/itaysk/kubectl-neat"; }
 # pkgs.k8s.io has one repo per minor version, so follow the latest stable minor
 software-365-kubectl@dev@k8s() {
     require_cmd curl || return 1
@@ -1122,7 +1734,7 @@ software-365-kubectl@dev@k8s() {
     apt_add_with_repo "kubectl" "https://pkgs.k8s.io/core:/stable:/${minor}/deb/"
 }
 
-software-370-wezterm() {
+software-370-wezterm@desktop() {
     local wezterm_distribution
     case "${OS_RELEASE_ID}" in
         ubuntu)
@@ -1141,6 +1753,10 @@ software-370-wezterm() {
         --release "nightly" \
         --pattern "wezterm-nightly.${wezterm_distribution}.deb"
 }
+software-376-samba@desktop() {
+    # folders shared from Files (usershares), as before
+    apt_upgrade samba nautilus-share
+}
 software-380-dive@dev@k8s() { install_git_release "https://github.com/wagoodman/dive"; }
 software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubecolor/kubecolor"; }
 # the kubectl-oidc_login symlink makes it available as "kubectl oidc-login", which the kubeconfigs call
@@ -1150,8 +1766,62 @@ software-391-kubelogin@dev@k8s() {
         --post-install 'ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
 }
 software-420-qwen@dev@agents() { npm_update @qwen-code/qwen-code --force --allow-scripts=@qwen-code/audio-capture; }
-software-430-codex@dev@agents() { npm_update @openai/codex; }
+software-430-codex@dev@agents() {
+    npm_update @openai/codex || return 1
+    tool_ready codex || return $(( $? == 1 ? 0 : 1 ))
+    needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
+    # the settings, profiles, providers and the caveman SessionStart hook; the
+    # trusted projects, approved commands (rules) and logins stay the machine's own
+    config_update codex "${CURRENT_USER_HOME}/.codex" || return 1
+    codex_caveman_update
+}
+
+codex_caveman_update() {
+    # caveman dropped its codex marketplace, codex gets the skill instead (the
+    # hook in hooks.json makes it always on); npx is nvm's, so as the user
+    needs nodejs npx || return $(( $? == 3 ? 0 : 1 ))
+    local npx_cmd=("npx" "-y")
+    [ -n "${SUDO_USER}" ] && npx_cmd=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}" "npx" "-y")
+    if (cd /tmp && "${npx_cmd[@]}" skills list -g 2>/dev/null) | grep -qiw caveman; then
+        echo "${APP_NAME}: the caveman skill of codex is installed" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install the caveman skill for codex (npx skills add JuliusBrussee/caveman -a codex -g)" 1>&2
+        return 0
+    fi
+    verbose "${npx_cmd[*]} skills add JuliusBrussee/caveman -a codex -g -y"
+    (cd /tmp && "${npx_cmd[@]}" skills add JuliusBrussee/caveman -a codex -g -y)
+}
 software-440-kilocode@dev@agents() { npm_update @kilocode/cli --allow-scripts=@kilocode/cli; }
+software-445-ollama@agents() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd curl || return 1
+    local latest_url
+    local version
+    local installed_version
+
+    latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/ollama/ollama/releases/latest")" || return 1
+    version="${latest_url##*/v}"
+    if [[ ! "${version}" =~ ^[0-9.]+$ ]]; then
+        error "Failed to get latest version of Ollama from ${latest_url}"
+        return 1
+    fi
+    # without a running server the version comes as a warning on stderr
+    installed_version="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+    [ -z "${installed_version}" ] && installed_version="<none>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: ollama ${installed_version} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo -e "NAME\tCURRENT\tUPDATE\nollama\t${installed_version}\t${version}" | column -t -s $'\t'
+        return 0
+    fi
+    # the install script sets up /usr/local and the ollama systemd service, so it runs as root
+    verbose "curl -fsSL https://ollama.com/install.sh | ${SUDO} sh"
+    curl -fsSL "https://ollama.com/install.sh" | ${SUDO} sh
+}
 
 software-450-aws@dev() {
     require_cmd curl unzip || return 1
@@ -1217,22 +1887,50 @@ software-disabled-480-ueberzugpp() {
     apt_add_with_repo "ueberzugpp" "http://download.opensuse.org/repositories/home:/justkidding/x${OS_RELEASE_NAME}_${OS_RELEASE_VERSION_ID}"
 }
 
-software-490-yazi@base() { install_git_release "https://github.com/sxyazi/yazi"; }
-software-491-yazi-plugins@base() {
+software-490-yazi@base() {
+    install_git_release "https://github.com/sxyazi/yazi" || return 1
+    tool_ready ya || return $(( $? == 1 ? 0 : 1 ))
     yazi_plugin_update \
         "yazi-rs/plugins:smart-enter" \
         "yazi-rs/plugins:piper" \
         "yazi-rs/plugins:git" \
-        "AnirudhG07/plugins-yazi:copy-file-contents"
+        "AnirudhG07/plugins-yazi:copy-file-contents" || return 1
+    needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
+    config_update yazi "${CURRENT_USER_HOME}/.config/yazi"
 }
-software-492-yazi-config@base() { yazi_config_update; }
+software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_amd64.deb"; }
+software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_amd64.deb"; }
+software-495-r-quick-share@desktop() {
+    local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
+    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_amd64.deb" || return 1
+    # started at login, so the phone finds it
+    [ -f "${autostart}" ] && return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would start RQuickShare at login (${autostart})" 1>&2
+        return 0
+    fi
+    ${SUDO_USER} mkdir -p "$(dirname "${autostart}")" || return 1
+    printf '%s\n' "[Desktop Entry]" "Type=Application" "Version=1.0" "Name=RQuickShare" \
+        "Comment=RQuickShare startup script" "Exec=/usr/bin/rquickshare" "StartupNotify=false" "Terminal=false" \
+        | ${SUDO_USER} tee "${autostart}" > /dev/null
+}
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
-software-510-jw-cli() { install_git_release "https://github.com/dgrieser/jw-cli"; }
+software-510-jw-cli@media() { install_git_release "https://github.com/dgrieser/jw-cli"; }
 software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
 software-530-wscat@dev() { npm_update wscat; }
+software-535-npm-tools@dev() {
+    npm_update @electron/asar \
+        && npm_update chrome-remote-interface \
+        && npm_update oas-reducer \
+        && npm_update parcel \
+        && npm_update ynab
+}
+software-536-mudslide@comms() { npm_update mudslide; }
+software-537-kubelive@dev@k8s() { npm_update kubelive; }
 software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
 
 software-550-go@dev() {
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq tar sha256sum || return 1
     local go_dl_url="https://go.dev/dl"
     local go_root="${CURRENT_USER_HOME}/.local/go"
@@ -1291,6 +1989,74 @@ software-550-go@dev() {
     done
     ${SUDO_USER} "${go_root}/bin/go" version 1>&2 || return 1
 }
+software-560-go-tools@dev() {
+    go_install_update \
+        golang.org/x/tools/gopls \
+        golang.org/x/tools/cmd/goimports \
+        github.com/go-delve/delve/cmd/dlv \
+        github.com/golangci/golangci-lint/v2/cmd/golangci-lint \
+        honnef.co/go/tools/cmd/staticcheck \
+        github.com/goreleaser/goreleaser/v2 \
+        github.com/cweill/gotests/gotests \
+        github.com/fatih/gomodifytags \
+        github.com/josharian/impl \
+        github.com/haya14busa/goplay/cmd/goplay \
+        github.com/cosmos72/gomacro \
+        github.com/wader/jq-lsp
+}
+software-561-go-k8s-tools@dev@k8s() {
+    go_install_update \
+        sigs.k8s.io/controller-tools/cmd/controller-gen \
+        sigs.k8s.io/controller-runtime/tools/setup-envtest \
+        github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb
+}
+# their release downloads are gone, so they are built from source
+software-562-diffkijker@mw() { go_install_update gitlab.mittwald.it/asylum/gereedschappen/diffkijker; }
+software-563-komparator@mw() { go_install_update gitlab.mittwald.it/asylum/gereedschappen/komparator; }
+software-565-rustup@dev() {
+    local rustup_cmd="${CURRENT_USER_HOME}/.cargo/bin/rustup"
+    if [ -x "${rustup_cmd}" ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            ${SUDO_USER} "${rustup_cmd}" check
+            return 0
+        fi
+        verbose "${SUDO_USER} ${rustup_cmd} update"
+        ${SUDO_USER} "${rustup_cmd}" update
+        return
+    fi
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install rustup and the stable toolchain into ${CURRENT_USER_HOME}/.cargo" 1>&2
+        return 0
+    fi
+    # ~/.profile and ~/.bashrc already source ~/.cargo/env
+    verbose "curl -fsSL https://sh.rustup.rs | ${SUDO_USER} sh -s -- -y --no-modify-path"
+    curl -fsSL "https://sh.rustup.rs" | ${SUDO_USER} sh -s -- -y --no-modify-path
+}
+software-570-gitlab-timelogs@dev() { cargo_install_update gitlab-timelogs; }
+software-580-python-libs@base() {
+    apt_upgrade python3-anthropic python3-openai python3-pandas python3-pyautogui python3-sounddevice \
+        python3-soundfile python3-piexif python3-croniter python3-parse python3-sh
+}
+software-581-python-tools@base() { apt_upgrade glances weasyprint goobook python3-msoffcrypto-tool python3-shtab; }
+software-582-python-dev-tools@dev() { apt_upgrade python3-pyinstrument mkdocs-material; }
+# the libraries of the own scripts
+software-583-pip-libs@base() {
+    pip_update pip-libs elevenlabs perplexityai pyht slack-bolt keyboard playsound pytapo environs
+}
+software-584-pip-tools@base() {
+    # the own fork, with the mycmd segment the prompt config uses
+    pip_update pip-tools streamdown "powerline-shell @ git+https://github.com/dgrieser/powerline-shell.git" \
+        csv2md markdown-to-mrkdwn oletools || return 1
+    # the prompt config, with the fork's mycmd and virtual_env segments
+    config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell"
+}
+software-585-pip-dev-tools@dev() {
+    # mkdocs-drawio-file pins lxml<5, which is built from source
+    apt_upgrade libxml2-dev libxslt1-dev python3-dev || return 1
+    pip_update pip-dev-tools snakeviz mkdocs-drawio-file mkdocs-git-authors-plugin mkdocs-git-revision-date-localized-plugin
+}
+software-586-nbcli@mw() { pip_update nbcli nbcli; }
 
 selected_install_types=()
 dry_run=0
@@ -1304,11 +2070,17 @@ discover_software
 while [ $# -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "-h --help -d --dry-run -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
+            echo "-h --help -d --dry-run -l --list -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
             exit 0
             ;;
         -h|--help)
             usage
+            ;;
+        -l|--list)
+            for group in "${possible_groups[@]}"; do
+                printf '%s\t%s\n' "${group}" "${group_members[${group}]}"
+            done
+            exit 0
             ;;
         -d|--dry-run)
             dry_run=1

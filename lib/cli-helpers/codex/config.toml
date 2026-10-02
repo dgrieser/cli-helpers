@@ -1,0 +1,59 @@
+model = "gpt-6-sol"
+model_reasoning_effort = "medium"
+personality = "pragmatic"
+web_search = "cached"
+plan_mode_reasoning_effort = "medium"
+
+[features]
+hooks = true
+
+[profiles.mini]
+model = "gpt-5-nano"
+model_reasoning_effort = "none"
+
+[profiles.mittwald]
+model_provider = "mittwald"
+model = "gpt-oss-120b"
+model_reasoning_effort = "high"
+
+[profiles.openrouter]
+model_provider = "openrouter"
+model = "stepfun/step-3.5-flash:free"
+model_reasoning_effort = "none"
+
+[profiles.groq]
+model_provider = "groq"
+model = "moonshotai/kimi-k2-instruct-0905"
+
+[model_providers.mittwald]
+name = "mittwald"
+base_url = "https://llm.aihosting.mittwald.de/v1"
+env_key = "MITTWALD_LLM_API_KEY"
+wire_api = "responses"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+wire_api = "responses"
+
+[model_providers.groq]
+name = "groq"
+base_url = "https://api.groq.com/openai/v1"
+env_key = "GROQ_API_KEY"
+wire_api = "responses"
+query_params = {}
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[tui]
+screen_reader_detection_done = true
+session_picker_view = "comfortable"
+
+[tui.keymap.composer]
+queue = []
+submit = "enter"
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"

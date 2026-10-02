@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Keep pip packages for the system python3 in one target folder.
+
+The folder is put on sys.path by a .pth file, after the apt packages, so nothing
+pip installs there can break Ubuntu's own tools. pip itself cannot manage such a
+folder: with --target it reinstalls everything on every run, leaves the metadata
+of old versions behind and never removes a dependency that is no longer needed.
+So the folder is never upgraded in place:
+
+- every caller (an updater step) keeps its packages in a manifest, the folder
+  holds the union of all manifests
+- pip resolves the union in a dry run; when that differs from what is installed,
+  or the folder was built for another python version, all pinned versions are
+  installed into a fresh folder, which then replaces the old one
+- the commands of the packages are linked into the bin dir, replacing only
+  links into the folder or dangling ones, so a command of the same name from
+  elsewhere wins
+- a requirement that apt shadows with an unsuitable version is reported
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+DEFAULT_TARGET = "/usr/local/lib/python3/pip-packages"
+DEFAULT_MANIFESTS = "/usr/local/lib/python3/pip-packages.d"
+DEFAULT_PTH = "/usr/lib/python3/dist-packages/usr-local-pip-packages.pth"
+DEFAULT_BIN_DIR = "/usr/local/bin"
+PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
+VERSION_FILE = ".python-version"
+
+# run in a fresh interpreter, so sys.path has the folder in its final place; checks
+# the requirements of every package that is used from the folder against the
+# version that is actually imported, which may be an apt one earlier on sys.path
+CHECK_SHADOWED = r"""
+import sys
+import importlib.metadata as md
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
+target = sys.argv[1]
+active = {}
+for dist in md.distributions():
+    active.setdefault(canonicalize_name(dist.metadata["Name"]), dist)
+for name, dist in sorted(active.items()):
+    if not str(getattr(dist, "_path", "")).startswith(target + "/"):
+        continue
+    for requirement in dist.requires or []:
+        req = Requirement(requirement)
+        if req.marker and not req.marker.evaluate({"extra": ""}):
+            continue
+        used = active.get(canonicalize_name(req.name))
+        if used is None:
+            print(f"{name} needs {req}, which is missing")
+        elif not req.specifier.contains(used.version, prereleases=True):
+            where = getattr(used, "_path", None)
+            where = f" from {where.parent}" if where else ""
+            print(f"{name} needs {req}, but {used.metadata['Name']} {used.version}{where} is imported")
+"""
+
+
+def log(message):
+    print(message, file=sys.stderr)
+
+
+def fail(message):
+    log(f"ERROR: {message}")
+    sys.exit(1)
+
+
+def canonical(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def read_manifests(manifest_dir):
+    manifests = {}
+    if os.path.isdir(manifest_dir):
+        for entry in sorted(os.listdir(manifest_dir)):
+            if entry.endswith(".txt"):
+                with open(os.path.join(manifest_dir, entry), encoding="utf-8") as handle:
+                    manifests[entry[:-4]] = [line.strip() for line in handle if line.strip()]
+    return manifests
+
+
+def write_manifest(manifest_dir, name, packages):
+    path = os.path.join(manifest_dir, f"{name}.txt")
+    if not packages:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(manifest_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(packages) + "\n")
+
+
+def pip(*args, quiet=True):
+    command = [sys.executable, "-m", "pip", "--disable-pip-version-check", *args]
+    if quiet:
+        command.append("--quiet")
+    env = dict(os.environ, PIP_ROOT_USER_ACTION="ignore")
+    return subprocess.run(command, env=env, check=False)
+
+
+def direct_ref(download_info):
+    """The pip requirement source of a package not from the index, e.g. a git fork."""
+    vcs = download_info.get("vcs_info")
+    if vcs:
+        return f"{vcs['vcs']}+{download_info['url']}@{vcs['commit_id']}"
+    return download_info.get("url")
+
+
+def describe(entry):
+    """The version for the change table, with the commit of a git package."""
+    _, version, ref = entry
+    if ref and "@" in ref.rsplit("/", 1)[-1]:
+        return f"{version} ({ref.rsplit('@', 1)[1][:7]})"
+    return version
+
+
+def resolve(packages):
+    """Return {name: (display name, version, direct ref)} pip would install for the packages."""
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "report.json")
+        # --target also skips the externally-managed check, nothing is written
+        result = pip("install", "--dry-run", "--ignore-installed", "--target", os.path.join(tmp, "target"),
+                     "--report", report, *packages)
+        if result.returncode != 0:
+            fail(f"pip could not resolve {' '.join(packages)}")
+        with open(report, encoding="utf-8") as handle:
+            data = json.load(handle)
+    resolved = {}
+    for item in data.get("install", []):
+        metadata = item["metadata"]
+        ref = direct_ref(item.get("download_info", {})) if item.get("is_direct") else None
+        resolved[canonical(metadata["name"])] = (metadata["name"], metadata["version"], ref)
+    return resolved
+
+
+def installed(target):
+    found = {}
+    if os.path.isdir(target):
+        for entry in os.listdir(target):
+            if not entry.endswith(".dist-info"):
+                continue
+            name = version = None
+            with open(os.path.join(target, entry, "METADATA"), encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("Name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("Version:"):
+                        version = line.split(":", 1)[1].strip()
+                    elif not line.strip():
+                        break
+            ref = None
+            try:
+                with open(os.path.join(target, entry, "direct_url.json"), encoding="utf-8") as handle:
+                    ref = direct_ref(json.load(handle))
+            except (OSError, ValueError, KeyError):
+                pass
+            if name and version:
+                found[canonical(name)] = (name, version, ref)
+    return found
+
+
+def built_for(target):
+    try:
+        with open(os.path.join(target, VERSION_FILE), encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def print_changes(current, wanted):
+    rows = []
+    for key in sorted(set(current) | set(wanted)):
+        old = describe(current[key]) if key in current else "<none>"
+        new = describe(wanted[key]) if key in wanted else "<removed>"
+        if old != new:
+            name = (wanted.get(key) or current.get(key))[0]
+            rows.append((name, old, new))
+    if rows:
+        widths = [max(len(row[i]) for row in rows + [("NAME", "CURRENT", "UPDATE")]) for i in range(3)]
+        for row in [("NAME", "CURRENT", "UPDATE")] + rows:
+            print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+
+
+def rebuild(target, wanted):
+    stage = target + ".new"
+    old = target + ".old"
+    for path in (stage, old):
+        shutil.rmtree(path, ignore_errors=True)
+    if wanted:
+        pins = [f"{name} @ {ref}" if ref else f"{name}=={version}" for name, version, ref in sorted(wanted.values(), key=str)]
+        # pinned and without dependencies: exactly what was resolved, nothing else
+        if pip("install", "--no-deps", "--no-warn-script-location", "--target", stage, *pins).returncode != 0:
+            shutil.rmtree(stage, ignore_errors=True)
+            fail("pip failed to install the packages, the installed ones are unchanged")
+        with open(os.path.join(stage, VERSION_FILE), "w", encoding="utf-8") as handle:
+            handle.write(PYTHON_VERSION + "\n")
+    if os.path.isdir(target):
+        os.rename(target, old)
+    if wanted:
+        os.rename(stage, target)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def update_pth(pth, target, dry_run):
+    content = target + "\n"
+    try:
+        with open(pth, encoding="utf-8") as handle:
+            if handle.read() == content:
+                return
+    except OSError:
+        pass
+    if dry_run:
+        log(f"Would write {target} to {pth}")
+        return
+    with open(pth, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def update_links(target, bin_dir, dry_run):
+    target_bin = os.path.join(target, "bin")
+    commands = sorted(os.listdir(target_bin)) if os.path.isdir(target_bin) else []
+    for command in commands:
+        link = os.path.join(bin_dir, command)
+        source = os.path.join(target_bin, command)
+        if os.path.islink(link) and os.readlink(link) == source:
+            continue
+        # only links into the folder are ours, and dangling ones that point nowhere;
+        # a command of the same name from elsewhere is kept
+        ours = os.path.islink(link) and (os.readlink(link).startswith(target_bin + "/") or not os.path.exists(link))
+        if os.path.lexists(link) and not ours:
+            log(f"{link} is not from {target}, not linking {source}")
+            continue
+        if dry_run:
+            log(f"Would link {link} -> {source}")
+            continue
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(source, link)
+    # links to commands that are gone with an old version
+    for entry in sorted(os.listdir(bin_dir)):
+        link = os.path.join(bin_dir, entry)
+        if os.path.islink(link) and os.readlink(link).startswith(target_bin + "/") and not os.path.exists(link):
+            if dry_run:
+                log(f"Would remove the dangling link {link}")
+            else:
+                os.remove(link)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Keep pip packages for the system python3 in one target folder.")
+    parser.add_argument("name", help="the name of the manifest, e.g. the updater step")
+    parser.add_argument("packages", nargs="*", help="the packages of this manifest, none removes it")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
+    parser.add_argument("--target", default=DEFAULT_TARGET, help=f"the package folder (default: {DEFAULT_TARGET})")
+    parser.add_argument("--manifests", default=DEFAULT_MANIFESTS, help=f"the manifest folder (default: {DEFAULT_MANIFESTS})")
+    parser.add_argument("--pth", default=DEFAULT_PTH, help=f"the .pth file that puts the folder on sys.path (default: {DEFAULT_PTH})")
+    parser.add_argument("--bin-dir", default=DEFAULT_BIN_DIR, help=f"where the commands are linked (default: {DEFAULT_BIN_DIR})")
+    args = parser.parse_args()
+    target = os.path.abspath(args.target)
+
+    manifests = read_manifests(args.manifests)
+    manifests[args.name] = args.packages
+    requested = sorted({package for packages in manifests.values() for package in packages})
+
+    wanted = resolve(requested) if requested else {}
+    current = installed(target)
+    stale = bool(current) and built_for(target) != PYTHON_VERSION
+    changed = stale or current != wanted
+
+    if changed:
+        if stale:
+            log(f"{target} was built for python {built_for(target)}, rebuilding for {PYTHON_VERSION}")
+        print_changes(current, wanted)
+        if args.dry_run:
+            log(f"Would rebuild {target}")
+        else:
+            rebuild(target, wanted)
+    else:
+        log("pip packages are up to date")
+
+    if not args.dry_run:
+        write_manifest(args.manifests, args.name, args.packages)
+    update_pth(args.pth, target, args.dry_run)
+    if os.path.isdir(args.bin_dir):
+        update_links(target, args.bin_dir, args.dry_run)
+
+    if not args.dry_run and wanted:
+        result = subprocess.run([sys.executable, "-c", CHECK_SHADOWED, target], capture_output=True, text=True, check=False)
+        for line in result.stdout.splitlines():
+            log(f"WARNING: {line}")
+        if result.returncode != 0:
+            log(f"WARNING: could not check the requirements: {result.stderr.strip()}")
+
+
+if __name__ == "__main__":
+    main()

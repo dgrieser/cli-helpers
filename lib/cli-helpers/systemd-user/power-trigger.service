@@ -1,0 +1,11 @@
+[Unit]
+Description=Power Trigger
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/power-trigger
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

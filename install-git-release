@@ -126,6 +126,61 @@ function success() {
     exit 0
 }
 
+# downloads the release assets matching the patterns through the REST API, for
+# when gh or glab is missing or fails; public projects need no login, a token
+# from the environment is used if set (GH_TOKEN/GITHUB_TOKEN, GITLAB_TOKEN)
+function download_with_api() {
+    local project="${1}"
+    local api_url
+    local release_json
+    local assets
+    local name
+    local url
+    local pattern
+    local downloaded=0
+    local curl_args=( "-fsSL" )
+
+    command -v curl &> /dev/null || { error "curl is required to download without gh or glab"; return 1; }
+    command -v jq &> /dev/null || { error "jq is required to download without gh or glab"; return 1; }
+
+    if [[ "${project}" == "https://github.com/"* ]]; then
+        local repo="${project#https://github.com/}"
+        repo="${repo%/}"
+        repo="${repo%.git}"
+        api_url="https://api.github.com/repos/${repo}/releases/latest"
+        [ -n "${RELEASE}" ] && api_url="https://api.github.com/repos/${repo}/releases/tags/${RELEASE}"
+        local token="${GH_TOKEN:-${GITHUB_TOKEN}}"
+        [ -n "${token}" ] && curl_args+=( "-H" "Authorization: Bearer ${token}" )
+        release_json="$(curl "${curl_args[@]}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        assets="$(echo "${release_json}" | jq -r '.assets[] | [.name, .browser_download_url] | @tsv')"
+    else
+        local host
+        local path
+        host="$(echo "${project}" | cut -d/ -f1-3)"
+        path="${project#"${host}"/}"
+        path="${path%/}"
+        path="${path%.git}"
+        api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/permalink/latest"
+        [ -n "${RELEASE}" ] && api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/$(jq -rn --arg tag "${RELEASE}" '$tag | @uri')"
+        [ -n "${GITLAB_TOKEN}" ] && curl_args+=( "-H" "PRIVATE-TOKEN: ${GITLAB_TOKEN}" )
+        release_json="$(curl "${curl_args[@]}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        assets="$(echo "${release_json}" | jq -r '.assets.links[] | [.name, (.direct_asset_url // .url)] | @tsv')"
+    fi
+
+    while IFS=$'\t' read -r name url; do
+        [ -z "${name}" ] && continue
+        for pattern in "${PATTERNS[@]}"; do
+            # shellcheck disable=SC2053
+            [[ "${name}" == ${pattern} ]] || continue
+            echo "Downloading ${name}..." 1>&2
+            curl "${curl_args[@]}" -o "${tmpfolder}/${name}" "${url}" || { error "Failed to download ${url}"; return 1; }
+            downloaded=1
+            break
+        done
+    done <<< "${assets}"
+    [ "${downloaded}" -eq 1 ] || { error "No release asset of ${project} matches ${PATTERNS[*]}"; return 1; }
+}
+
 function manual_download() {
     echo 1>&2
     download_url="$(prompt-input "Please provide download URL:")"
@@ -1071,9 +1126,12 @@ if [[ "${project}" == "https://github.com"* ]]; then
     for pattern in "${PATTERNS[@]}"; do
         gh_args+=( "-p" "${pattern}" )
     done
-    if ! gh "${gh_args[@]}" 1>&2; then
-        error "Failed to retrieve artifact from '${project}'"
-        manual_download
+    if ! command -v gh &> /dev/null; then
+        echo "gh not found, using the GitHub API..." 1>&2
+        download_with_api "${project}" || manual_download
+    elif ! gh "${gh_args[@]}" 1>&2; then
+        echo "gh failed, trying the GitHub API..." 1>&2
+        download_with_api "${project}" || { error "Failed to retrieve artifact from '${project}'"; manual_download; }
     fi
 else
     if [[ "${project}" == "https://"* ]]; then
@@ -1088,9 +1146,12 @@ else
     for pattern in "${PATTERNS[@]}"; do
         glab_args+=( "-n" "${pattern}" )
     done
-    if ! glab "${glab_args[@]}" 1>&2; then
-        error "Failed to retrieve artifact from '${project}'"
-        manual_download
+    if ! command -v glab &> /dev/null; then
+        echo "glab not found, using the GitLab API..." 1>&2
+        download_with_api "${project}" || manual_download
+    elif ! glab "${glab_args[@]}" 1>&2; then
+        echo "glab failed, trying the GitLab API..." 1>&2
+        download_with_api "${project}" || { error "Failed to retrieve artifact from '${project}'"; manual_download; }
     fi
 fi
 
