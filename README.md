@@ -2116,7 +2116,7 @@ Updates a selectable set of system packages, desktop applications, and CLI tools
 
 The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`.
 
-Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed.
+Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed.
 
 A software whose tools are missing installs them first, once per run: e.g. `updater atoss-cli` on a new machine installs the base packages and `glab` before it, `npm` software gets `nodejs`, `go install` tools get `go`. Releases from GitHub need a `gh auth login`, those from private GitLab hosts a `glab auth login`; `updater` stops with that hint when the login is missing.
 

@@ -9,7 +9,7 @@ REPO_DIR="$(cd "$(dirname "${0}")" && pwd)"
 
 # the categories asked for after base, in this order, with what they are about;
 # every group of updater has to be here or in SPECIAL_GROUPS
-CATEGORIES=(dev k8s mw agents media comms desktop)
+CATEGORIES=(dev k8s mw agents media comms desktop personal)
 declare -A CATEGORY_DESCRIPTIONS=(
     [dev]="development tools, languages and containers"
     [k8s]="Kubernetes tools"
@@ -18,6 +18,7 @@ declare -A CATEGORY_DESCRIPTIONS=(
     [media]="audio, video and image apps"
     [comms]="chat, mail and video calls"
     [desktop]="desktop apps"
+    [personal]="your own tools and automations"
 )
 SPECIAL_GROUPS=(base gnome gnome-extensions)
 MITTWALD_GITLAB="gitlab.mittwald.it"

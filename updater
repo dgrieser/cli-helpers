@@ -738,25 +738,38 @@ user_link() {
     ${SUDO_USER} ln -sfn "${target}" "${link}"
 }
 
-# git_repo_update REPO DIR: clones the GitHub repo into DIR with gh (it may be
-# private) or pulls it, unless it has local changes
+# git_repo_update REPO DIR: clones the repo into DIR or pulls it, unless it has
+# local changes; OWNER/NAME is a GitHub repo cloned with gh, HOST/OWNER/NAME a
+# GitLab one cloned with glab, as both may be private
 git_repo_update() {
     local repo="${1}"
     local dir="${2}"
     local behind
 
     if [ ! -d "${dir}/.git" ]; then
-        needs gh || return $(( $? == 3 ? 0 : 1 ))
+        case "${repo}" in
+            */*/*) needs glab || return $(( $? == 3 ? 0 : 1 )) ;;
+            *) needs gh || return $(( $? == 3 ? 0 : 1 )) ;;
+        esac
         if [ "${dry_run}" -eq 1 ]; then
             echo "Would clone ${repo} into ${dir}" 1>&2
             return 0
         fi
-        verbose "${SUDO_USER} gh repo clone ${repo} ${dir}"
         ${SUDO_USER} mkdir -p "$(dirname "${dir}")" || return 1
-        ${SUDO_USER} gh repo clone "${repo}" "${dir}" -- --quiet
+        case "${repo}" in
+            */*/*)
+                verbose "${SUDO_USER} glab repo clone https://${repo} ${dir}"
+                ${SUDO_USER} glab repo clone "https://${repo}" "${dir}" -- --quiet
+                ;;
+            *)
+                verbose "${SUDO_USER} gh repo clone ${repo} ${dir}"
+                ${SUDO_USER} gh repo clone "${repo}" "${dir}" -- --quiet
+                ;;
+        esac
         return
     fi
-    if [ -n "$(${SUDO_USER} git -C "${dir}" status --porcelain)" ]; then
+    # untracked files, e.g. of an editor or agent, do not stop the pull
+    if [ -n "$(${SUDO_USER} git -C "${dir}" status --porcelain --untracked-files=no)" ]; then
         echo "${APP_NAME}: ${dir} has local changes, not pulling" 1>&2
         return 0
     fi
@@ -866,6 +879,21 @@ tool_ready() {
     fi
     error "${check} is missing after installing ${selected}"
     return 2
+}
+
+# helper_repo_update REPO: one of the own repos of commands, cloned or pulled into
+# ~/workspace/dgrieser and linked into /usr/local/bin by its make install-links
+helper_repo_update() {
+    local repo="${1}"
+    local dir="${CURRENT_USER_HOME}/workspace/dgrieser/${repo##*/}"
+    needs packages make || return $(( $? == 3 ? 0 : 1 ))
+    git_repo_update "${repo}" "${dir}" || return 1
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would link the commands of ${dir} (make install-links)" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} make -s -C ${dir} install-links"
+    ${SUDO_USER} make -s -C "${dir}" install-links > /dev/null
 }
 
 yazi_plugin_update() {
@@ -1317,6 +1345,9 @@ software-016-bash-aliases@base() {
     user_link "workspace/dgrieser/bash_aliases.d" "${CURRENT_USER_HOME}/bash_aliases.d" \
         && user_link "bash_aliases.d/linkme" "${CURRENT_USER_HOME}/.bash_aliases"
 }
+software-017-dev-helpers@dev() { helper_repo_update "dgrieser/dev-helpers"; }
+software-018-kubectl-helpers@k8s() { helper_repo_update "dgrieser/kubectl-helpers"; }
+software-019-mw-helpers@mw() { helper_repo_update "gitlab.mittwald.it/dgrieser/mw-helpers"; }
 software-020-apt@base() { apt_upgrade; }
 software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging jq unzip file 7zip; }
 software-022-glow@base() { apt_upgrade glow; }
@@ -1523,26 +1554,23 @@ software-110-nerd-fonts@base() {
 }
 software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
 software-121-mittwald-outlook-bridge@mw() {
-    # rewritten by make install to $(LIBDIR)
-    local lib_dir="/usr/local/lib/cli-helpers"
     local env_file="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge/env"
     local package_unit="/usr/lib/systemd/user/mittwald-outlook-bridge.service"
     # the WebKitGTK runtime of the webview build's sign-in window; its deb depends
     # on them, the tarball does not
     apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
-    # prefers the deb of the release, falls back to the tarball of older ones
+    # the deb of the release, which brings the systemd user unit
     install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*" || return 1
     # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
     if [ ! -f "${env_file}" ]; then
         warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
         return 0
     fi
-    # the deb/rpm brings the unit, a tarball install takes the copy of cli-helpers
-    if [ -f "${package_unit}" ]; then
-        user_service_enable mittwald-outlook-bridge.service
-    else
-        user_service_enable mittwald-outlook-bridge.service "${lib_dir}/systemd-user/mittwald-outlook-bridge.service"
+    if [ ! -f "${package_unit}" ] && [ "${dry_run}" -eq 0 ]; then
+        warning "${package_unit} is missing, the release installed no deb with the systemd user unit"
+        return 0
     fi
+    user_service_enable mittwald-outlook-bridge.service
 }
 software-122-git-commit-ai@dev@agents() { curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh"; }
 software-130-slack@comms() {
@@ -1561,6 +1589,43 @@ software-170-gitlab_trackr@dev() {
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
 software-182-patchzwoelf@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/patchzwoelf"; }
+software-185-bahn-probonio-bot@personal() {
+    # uploads the Deutschland-Ticket bill to Probonio; its make install copies it to
+    # /usr/local/lib/bahn-probonio-bot with its own node_modules
+    local dir="${CURRENT_USER_HOME}/workspace/dgrieser/bahn-probonio-bot"
+    local lib_dir="/usr/local/lib/bahn-probonio-bot"
+    local file
+    local changed=0
+    needs packages make || return $(( $? == 3 ? 0 : 1 ))
+    needs nodejs npm || return $(( $? == 3 ? 0 : 1 ))
+    needs chrome google-chrome || return $(( $? == 3 ? 0 : 1 ))
+    needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
+    apt_upgrade poppler-utils || return 1
+    git_repo_update "dgrieser/bahn-probonio-bot" "${dir}" || return 1
+    [ -d "${dir}" ] || return 0
+
+    # npm ci reinstalls playwright, so only when the installed copy is outdated
+    [ -d "${lib_dir}/node_modules" ] || changed=1
+    for file in paths.js package.json package-lock.json probonio-submit-bill probonio-store-credentials; do
+        cmp -s "${dir}/${file}" "${lib_dir}/${file}" || changed=1
+    done
+    if [ "${changed}" -eq 0 ]; then
+        echo "${APP_NAME}: ${lib_dir} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install ${dir} into ${lib_dir} (make install)" 1>&2
+        return 0
+    fi
+    # npm is nvm's, so as the user with this PATH
+    local make_cmd=("make")
+    [ -n "${SUDO_USER}" ] && make_cmd=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}" "make")
+    verbose "${make_cmd[*]} -C ${dir} install"
+    "${make_cmd[@]}" -C "${dir}" install || return 1
+    if ! secret-tool lookup service bahn-probonio-bot key bahn-username > /dev/null 2>&1; then
+        echo "${APP_NAME}: no bahn-probonio-bot credentials in the keyring yet, run: probonio-store-credentials; probonio-submit-bill --login" 1>&2
+    fi
+}
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
 software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
@@ -1695,8 +1760,10 @@ software-360-helm@dev@k8s() {
         "any" \
         "main" \
         "https://packages.buildkite.com/helm-linux/helm-debian/gpgkey" \
-        "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" \
-        && helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
+        "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" || return 1
+    # the secrets plugin encrypts with sops
+    needs sops || return $(( $? == 3 ? 0 : 1 ))
+    helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
         && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
 }
 software-361-helmfile@dev@k8s() { install_git_release "https://github.com/helmfile/helmfile"; }
@@ -1915,7 +1982,7 @@ software-495-r-quick-share@desktop() {
         | ${SUDO_USER} tee "${autostart}" > /dev/null
 }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
-software-510-jw-cli@media() { install_git_release "https://github.com/dgrieser/jw-cli"; }
+software-510-jw-cli@personal() { install_git_release "https://github.com/dgrieser/jw-cli"; }
 software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
 software-530-wscat@dev() { npm_update wscat; }
 software-535-npm-tools@dev() {
