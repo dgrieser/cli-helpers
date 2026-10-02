@@ -2108,6 +2108,7 @@ Updates a selectable set of system packages, desktop applications, and CLI tools
 |---|---|
 | `SOFTWARE` | One or more software types or groups to update, or `all`; omit to process all supported types. |
 | `-d, --dry-run` | Check for updates without installing them. |
+| `-x, --exclude NAME` | Leave out a software or a whole group; repeatable, e.g. `updater base -x firmware`. |
 | `-l, --list` | List the groups with their software and exit. |
 | `-t, --types TYPES` | Deprecated comma-separated alternative to positional software types. |
 | `--verbose` | Print commands and additional update details. |

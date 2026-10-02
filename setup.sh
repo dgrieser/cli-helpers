@@ -51,7 +51,21 @@ run() {
 
 run_updater() {
     # the installed one, so a copy install uses its rewritten paths
-    run /usr/local/bin/updater "${@}" || failed+=("updater ${*}")
+    run /usr/local/bin/updater "${@}" && return 0
+    failed+=("updater ${*}")
+    info "updater ${*} failed, see the errors above and /var/log/updater.log"
+    ask "Continue with the setup anyway?" || finish
+}
+
+# the summary of what failed, then the end
+finish() {
+    if [ "${#failed[@]}" -gt 0 ]; then
+        info "Done, but these failed or were skipped, see /var/log/updater.log:"
+        printf '  %s\n' "${failed[@]}" 1>&2
+        exit 1
+    fi
+    info "Done"
+    exit 0
 }
 
 bootstrap() {
@@ -195,7 +209,8 @@ install_cli_helpers
 install_gh_glab
 
 info "Installing base"
-run_updater base
+# firmware updates are not part of setting up the software
+run_updater base --exclude firmware
 
 check_categories
 select_categories
@@ -209,10 +224,4 @@ gnome_settings
 
 # new GNOME extensions and group memberships (docker) only apply to a new session
 info "Log out and back in, so new GNOME extensions and groups take effect"
-
-if [ "${#failed[@]}" -gt 0 ]; then
-    info "Done, but these failed or were skipped, see /var/log/updater.log:"
-    printf '  %s\n' "${failed[@]}" 1>&2
-    exit 1
-fi
-info "Done"
+finish

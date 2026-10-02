@@ -66,6 +66,7 @@ Options:
   -h, --help          display this help and exit
   -d, --dry-run       dry-run mode
   -t, --types TYPES   comma separated list of install types (deprecated)
+  -x, --exclude NAME  leave out a software or group (repeatable), e.g. base -x firmware
   -l, --list          list the groups with their software and exit
   --verbose           verbose mode
   --bash-completion   print shell completion candidates and exit
@@ -308,6 +309,32 @@ run_selected_software() {
     done
 }
 
+# repo_key_expiry FILE: when the keys in FILE expire, 0 for never; a keyring may
+# hold a rotated key next to the expired old one (e.g. GitHub CLI's), so the
+# latest expiry of all of them counts
+repo_key_expiry() {
+    gpg --with-colons --import-options show-only --import "${1}" 2>/dev/null \
+        | awk -F: '$1 == "pub" { if ($7 == "") never = 1; else if ($7 > latest) latest = $7 } END { print (never ? 0 : latest + 0) }'
+}
+
+# apt_repo_configured_elsewhere URL OWN_FILE: the other enabled source file that
+# already configures the repo, e.g. one the vendor's package or a manual setup
+# wrote; a second entry for it with another key makes apt-get update fail
+apt_repo_configured_elsewhere() {
+    local url="${1%/}"
+    local own="${2}"
+    local file
+    for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "${file}" ] && [ "${file}" != "${own}" ] || continue
+        grep -qiE '^[[:space:]]*Enabled:[[:space:]]*no' "${file}" && continue
+        if grep -v '^[[:space:]]*#' "${file}" | grep -qF "${url}"; then
+            echo "${file}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 apt_add_with_list_file() {
     require_cmd curl gpg apt-get || return 1
     local name="${1}"; shift
@@ -343,7 +370,7 @@ apt_add_with_list_file() {
         curl -fsSL "${repo_key_url}" > "${tmp_key_file}" || return 1
 
         [ "${verbose}" -eq 1 ] && echo "+ gpg --with-colons --import-options show-only --import ${tmp_key_file} | awk -F: '\$1 == \"pub\" { print \$7; exit }" 1>&2
-        expiry_timestamp="$(gpg --with-colons --import-options show-only --import "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "pub" { print $7; exit }')"
+        expiry_timestamp="$(repo_key_expiry "${tmp_key_file}")"
         [ -z "${expiry_timestamp}" ] && expiry_timestamp="0" && echo "WARNING: Failed to get expiry timestamp of ${repo_key_url}" 1>&2
         expiry_date="$([ "${expiry_timestamp}" -gt "0" ] && date --date=@"${expiry_timestamp}" +%Y-%m-%d || echo "No expiry date" )"
         now_timestamp="$(date +%s)"
@@ -406,6 +433,13 @@ apt_add_with_repo() {
     local repo_line="deb [signed-by=${repo_gpg_path}] ${repo_url}/ ${repo_suite}"
     [ -n "${repo_components}" ] && repo_line="${repo_line} ${repo_components}"
 
+    local other_list_path
+    if other_list_path="$(apt_repo_configured_elsewhere "${repo_url}" "${repo_list_path}")"; then
+        echo "${APP_NAME}: ${repo_url} is configured in ${other_list_path} already, using that" 1>&2
+        apt_upgrade "${name}"
+        return
+    fi
+
     if [ "${dry_run}" -eq 0 ]; then
         ${SUDO} mkdir -p /etc/apt/keyrings
         local tmp_key_file
@@ -416,21 +450,22 @@ apt_add_with_repo() {
             return 1
         fi
 
-        local repo_key_fingerprint
-        repo_key_fingerprint="$(gpg --show-keys --with-colons "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
-        if [ -z "${repo_key_fingerprint}" ]; then
+        local repo_key_fingerprints
+        # the primary keys only, a keyring may hold several
+        repo_key_fingerprints="$(gpg --show-keys --with-colons "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "pub" { primary = 1; next } $1 == "fpr" && primary { print $10; primary = 0 }')"
+        if [ -z "${repo_key_fingerprints}" ]; then
             error "No valid OpenPGP key found at ${repo_key_url}"
             rm -f "${tmp_key_file}"
             return 1
         fi
-        if [ -n "${expected_repo_key_fingerprint}" ] && [ "${repo_key_fingerprint}" != "${expected_repo_key_fingerprint}" ]; then
-            error "Unexpected key fingerprint from ${repo_key_url}: ${repo_key_fingerprint}"
+        if [ -n "${expected_repo_key_fingerprint}" ] && ! grep -qFx "${expected_repo_key_fingerprint}" <<< "${repo_key_fingerprints}"; then
+            error "Unexpected key fingerprint from ${repo_key_url}: $(echo ${repo_key_fingerprints})"
             rm -f "${tmp_key_file}"
             return 1
         fi
 
         [ "${verbose}" -eq 1 ] && echo "+ gpg --with-colons --import-options show-only --import ${tmp_key_file} | awk -F: '\$1 == \"pub\" { print \$7; exit }" 1>&2
-        expiry_timestamp="$(gpg --with-colons --import-options show-only --import "${tmp_key_file}" 2>/dev/null | awk -F: '$1 == "pub" { print $7; exit }')"
+        expiry_timestamp="$(repo_key_expiry "${tmp_key_file}")"
         [ -z "${expiry_timestamp}" ] && expiry_timestamp="0"
         expiry_date="$([ "${expiry_timestamp}" -gt "0" ] && date --date=@"${expiry_timestamp}" +%Y-%m-%d || echo "No expiry date" )"
         now_timestamp="$(date +%s)"
@@ -1504,7 +1539,7 @@ software-060-chrome@dev() {
     local lib_dir="/usr/local/lib/cli-helpers"
     local profile_args=()
     local status=0
-    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub" || return 1
+    apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome-stable/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub" || return 1
     tool_ready google-chrome || return $(( $? == 1 ? 0 : 1 ))
     # the settings and custom search engines of the profile; Chrome writes them
     # back when it exits, so only while it is closed
@@ -2152,6 +2187,7 @@ software-585-pip-dev-tools@dev() {
 software-586-nbcli@mw() { pip_update nbcli nbcli; }
 
 selected_install_types=()
+excluded_install_types=()
 dry_run=0
 verbose=0
 update_failed=0
@@ -2163,11 +2199,24 @@ discover_software
 while [ $# -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "-h --help -d --dry-run -l --list -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
+            echo "-h --help -d --dry-run -x --exclude -l --list -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
             exit 0
             ;;
         -h|--help)
             usage
+            ;;
+        -x|--exclude)
+            shift
+            [ -z "${1}" ] && usage
+            if is_group "${1,,}"; then
+                # shellcheck disable=SC2206
+                excluded_install_types+=(${group_members[${1,,}]})
+            elif is_install_type "${1,,}"; then
+                excluded_install_types+=("${1,,}")
+            else
+                error "Unknown software or group to exclude: ${1}"
+                usage
+            fi
             ;;
         -l|--list)
             for group in "${possible_groups[@]}"; do
@@ -2210,6 +2259,14 @@ CURRENT_USER_HOME="$(getent passwd "${CURRENT_USER_NAME}" | cut -d: -f6)"
 
 if [ "${#selected_install_types[@]}" -eq 0 ]; then
     selected_install_types=("${possible_install_types[@]}")
+fi
+if [ "${#excluded_install_types[@]}" -gt 0 ]; then
+    remaining_install_types=()
+    for item in "${selected_install_types[@]}"; do
+        printf '%s\n' "${excluded_install_types[@]}" | grep -qFx "${item}" || remaining_install_types+=("${item}")
+    done
+    selected_install_types=("${remaining_install_types[@]}")
+    unset remaining_install_types
 fi
 
 SUDO=""
