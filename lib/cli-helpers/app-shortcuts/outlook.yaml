@@ -1,7 +1,7 @@
-# the Outlook web app installed through Chrome
+# the Outlook web app installed through Chrome, found by name: its app ID and
+# profile directory (chrome-<id>-<profile>.desktop) differ between systems
 description: Outlook
 bindings: ['<Shift><Control>m']
-focus:
-  class: [chrome-faolnafnngnfdaknnbpnkhgohbobgegn-Default]
-launch:
-  desktop: chrome-faolnafnngnfdaknnbpnkhgohbobgegn-Default
+find:
+  file: 'chrome-*.desktop'
+  name: 'Outlook*'

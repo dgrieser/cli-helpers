@@ -16,6 +16,11 @@ copying its file there and editing it. Keys of a file:
     desktop: slack                    #   gtk-launch <desktop> [args...]
     command: [amixer-mic-toggle]      #   or run a command as is
     args: ['~/Downloads']             #   arguments; ~ and $VARS are expanded
+  default: terminal                   # instead of focus/launch: whatever terminal is the
+                                      #   default (xdg-terminal-exec) when the shortcut runs
+  find:                               # or: the first desktop entry that matches, so an ID
+    file: 'chrome-*.desktop'          #   that differs per system needs no edit (glob)
+    name: 'Outlook*'                  #   its Name=, a glob ignoring case
 
 --bind creates a GNOME custom shortcut per binding that runs `app-shortcut <app>`.
 Those shortcuts live under their own paths (custom-keybindings/app-shortcut-<app>-<n>/),
@@ -24,7 +29,7 @@ A key GNOME already uses itself (Print for the screenshot UI, the media key) is 
 away from that GNOME shortcut, which keeps its other keys.
 """
 
-import argparse
+import fnmatch
 import os
 import re
 import subprocess
@@ -82,6 +87,89 @@ def as_list(value):
 
 def expand(arg):
     return os.path.expandvars(os.path.expanduser(str(arg)))
+
+
+def entry_fields(path):
+    """The keys of the [Desktop Entry] group of a desktop file ({} when unreadable)."""
+    fields = {}
+    try:
+        with open(path) as f:
+            group = None
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    group = line
+                elif group == "[Desktop Entry]" and "=" in line:
+                    key, value = line.split("=", 1)
+                    fields.setdefault(key.strip(), value.strip())
+    except OSError:
+        pass
+    return fields
+
+
+def entry_classes(entry_id, path):
+    """What windows of a desktop entry carry: its ID as app id (Wayland) or its StartupWMClass."""
+    classes = [entry_id[:-len(".desktop")] if entry_id.endswith(".desktop") else entry_id]
+    wm_class = entry_fields(path).get("StartupWMClass")
+    if wm_class and wm_class not in classes:
+        classes.append(wm_class)
+    return classes
+
+
+def default_terminal():
+    """focus/launch of the default terminal, resolved now so changing it needs no edit"""
+    try:
+        out = subprocess.run(["xdg-terminal-exec", "--print-id", "--print-path"],
+                             capture_output=True, text=True, check=True).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        sys.exit("ERROR: default: terminal needs xdg-terminal-exec to find a terminal")
+    # "org.gnome.Ptyxis.desktop:new-window" and its path, each with the action appended
+    entry_id = out[0].split(":", 1)[0]
+    entry_path = out[1].split(":", 1)[0] if len(out) > 1 else ""
+    return {"class": entry_classes(entry_id, entry_path)}, {"command": ["xdg-terminal-exec"]}
+
+
+DEFAULTS = {"terminal": default_terminal}
+
+
+def application_dirs():
+    # the XDG lookup order: a user's entries before the system ones
+    data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+    return [os.path.join(d, "applications") for d in [data_home, *data_dirs] if d]
+
+
+def find_entry(find, path):
+    """focus/launch of the first desktop entry whose file and Name= match FIND's globs"""
+    file_glob = str(find.get("file", "*.desktop"))
+    name_glob = str(find.get("name", "*")).lower()
+    for d in application_dirs():
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(fnmatch.filter(os.listdir(d), file_glob)):
+            entry = os.path.join(d, name)
+            if name.endswith(".desktop") and fnmatch.fnmatchcase(entry_fields(entry).get("Name", "").lower(), name_glob):
+                return {"class": entry_classes(name, entry)}, {"desktop": name[:-len(".desktop")]}
+    sys.exit(f"ERROR: {path}: no desktop entry {file_glob} named {find.get('name', '*')} "
+             f"in {', '.join(application_dirs())}")
+
+
+def resolve(config, path):
+    """Fill focus and launch of a config with `default: <kind>` or `find:`."""
+    if config.get("find"):
+        find = config["find"]
+        if not isinstance(find, dict):
+            sys.exit(f"ERROR: {path}: find must be a mapping")
+        focus, launch = find_entry(find, path)
+        # args given under launch still apply to the entry found
+        return {**config, "focus": focus, "launch": {**(config.get("launch") or {}), **launch}}
+    kind = config.get("default")
+    if kind is None:
+        return config
+    if kind not in DEFAULTS:
+        sys.exit(f"ERROR: {path}: unknown default '{kind}' (known: {', '.join(DEFAULTS)})")
+    focus, launch = DEFAULTS[kind]()
+    return {**config, "focus": focus, "launch": launch}
 
 
 def focus_command(config):
@@ -194,7 +282,40 @@ def bind(apps, dry_run):
     return 0
 
 
+def run(app, dry_run=False):
+    """Focus APP's window or launch it, the action of its shortcut."""
+    path = find(app)
+    if path is None:
+        print(f"ERROR: no app shortcut '{app}' in {', '.join(search_dirs())}", file=sys.stderr)
+        return 1
+    config = resolve(load(path), path)
+    focus = focus_command(config)
+    launch = launch_command(config, path)
+
+    if dry_run:
+        if focus:
+            print("focus: " + " ".join(focus))
+        if launch:
+            print(("else " if focus else "") + "launch: " + " ".join(launch))
+        return 0
+
+    if focus and subprocess.run(focus, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return 0
+    if launch:
+        # detached, so the shortcut returns at once and the app outlives it
+        subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return 0
+    return 1
+
+
 def main():
+    # a shortcut runs `app-shortcut <app>`: skip argparse there, its import is
+    # about half of the startup (Python 3.14 pulls in _colorize, dataclasses, inspect)
+    if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
+        return run(sys.argv[1])
+
+    import argparse
+
     parser = argparse.ArgumentParser(description="Focus an app's window or launch it, for keyboard shortcuts.")
     parser.add_argument("app", nargs="?", help="name of the app (its YAML file without .yaml)")
     parser.add_argument("-l", "--list", action="store_true", help="list the apps with their file and bindings")
@@ -227,32 +348,15 @@ def main():
         parser.print_usage(sys.stderr)
         return 1
 
-    path = find(args.app)
-    if path is None:
-        print(f"ERROR: no app shortcut '{args.app}' in {', '.join(search_dirs())}", file=sys.stderr)
-        return 1
     if args.path:
+        path = find(args.app)
+        if path is None:
+            print(f"ERROR: no app shortcut '{args.app}' in {', '.join(search_dirs())}", file=sys.stderr)
+            return 1
         print(path)
         return 0
 
-    config = load(path)
-    focus = focus_command(config)
-    launch = launch_command(config, path)
-
-    if args.dry_run:
-        if focus:
-            print("focus: " + " ".join(focus))
-        if launch:
-            print(("else " if focus else "") + "launch: " + " ".join(launch))
-        return 0
-
-    if focus and subprocess.run(focus, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        return 0
-    if launch:
-        # detached, so the shortcut returns at once and the app outlives it
-        subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        return 0
-    return 1
+    return run(args.app, args.dry_run)
 
 
 if __name__ == "__main__":

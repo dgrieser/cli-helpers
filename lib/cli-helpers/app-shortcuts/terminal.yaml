@@ -1,6 +1,4 @@
+# whatever terminal is the default (xdg-terminal-exec), looked up each time
 description: Terminal
 bindings: ['<Shift><Control>t']
-focus:
-  class: [terminator]
-launch:
-  desktop: terminator
+default: terminal

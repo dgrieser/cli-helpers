@@ -2265,7 +2265,17 @@ launch:                                     # ... otherwise start it
   args: ['~/Downloads']                     #   ~ and $VARS are expanded
 ```
 
-Shipped apps: `chrome`, `chrome-new`, `files`, `launcher`, `mic-toggle`, `outlook`, `paste-primary`, `screenshot`, `slack`, `terminal`, `wallpaper`, `zed`.
+Instead of `focus` and `launch`, `default: terminal` stands for the default terminal as `xdg-terminal-exec` picks it (`~/.config/xdg-terminals.list`), looked up each time the shortcut runs: it focuses a window of that terminal (its desktop ID or `StartupWMClass`) and otherwise starts it with `xdg-terminal-exec`. `terminal.yaml` uses it.
+
+For an app whose desktop entry ID differs between systems, such as a Chrome web app (`chrome-<id>-<profile>.desktop`), `find` picks the first entry in the applications directories (`~/.local/share/applications` first) whose file name and `Name=` match its globs (the name ignoring case). It focuses the entry's windows the same way and otherwise starts it with `gtk-launch`; `launch.args` still apply. `outlook.yaml` uses it:
+
+```yaml
+find:
+  file: 'chrome-*.desktop'
+  name: 'Outlook*'
+```
+
+Shipped apps: `chrome`, `chrome-new`, `files`, `launcher`, `mic-toggle`, `outlook`, `screenshot`, `slack`, `terminal`, `wallpaper`, `zed`.
 
 **Usage:** `app-shortcut [-l] [-p] [-b] [-n] [APP]`
 
