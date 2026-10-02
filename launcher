@@ -10,7 +10,17 @@ fi
 name="Launcher"
 bin_path="${0}"
 bin_name="$(basename "${bin_path}")"
+# the launcher's own Terminator config: ~/.config/terminator/config_<name> when the
+# user keeps one, else the one shipped with cli-helpers (the repo's when run from it)
 config_path="${HOME}/.config/terminator/config_${bin_name}"
+if [ ! -f "${config_path}" ]; then
+    for lib_dir in "${SCRIPT_DIR}/lib/cli-helpers" "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}"; do
+        if [ -f "${lib_dir}/launcher/terminator.config" ]; then
+            config_path="${lib_dir}/launcher/terminator.config"
+            break
+        fi
+    done
+fi
 max_seconds=3
 # height of the GNOME top bar, so the launcher sits flush below it
 dock_height=32

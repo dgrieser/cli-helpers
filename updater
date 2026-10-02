@@ -881,19 +881,21 @@ tool_ready() {
     return 2
 }
 
-# helper_repo_update REPO: one of the own repos of commands, cloned or pulled into
-# ~/workspace/dgrieser and linked into /usr/local/bin by its make install-links
+# helper_repo_update REPO [TARGET]: one of the own repos, cloned or pulled into
+# ~/workspace/dgrieser and installed by its make TARGET, by default
+# install-links (for the repos of commands, linked into /usr/local/bin)
 helper_repo_update() {
     local repo="${1}"
+    local target="${2:-install-links}"
     local dir="${CURRENT_USER_HOME}/workspace/dgrieser/${repo##*/}"
     needs packages make || return $(( $? == 3 ? 0 : 1 ))
     git_repo_update "${repo}" "${dir}" || return 1
     if [ "${dry_run}" -eq 1 ]; then
-        echo "Would link the commands of ${dir} (make install-links)" 1>&2
+        echo "Would install ${dir} (make ${target})" 1>&2
         return 0
     fi
-    verbose "${SUDO_USER} make -s -C ${dir} install-links"
-    ${SUDO_USER} make -s -C "${dir}" install-links > /dev/null
+    verbose "${SUDO_USER} make -s -C ${dir} ${target}"
+    ${SUDO_USER} make -s -C "${dir}" "${target}" > /dev/null
 }
 
 yazi_plugin_update() {
@@ -1391,7 +1393,7 @@ software-033-dev-tools@dev() {
         isympy3 mkdocs oidc-agent
 }
 software-034-desktop-apps@base() {
-    apt_upgrade eog evince clapper drawing vlc keepassxc terminator dconf-editor qdirstat filezilla
+    apt_upgrade eog evince clapper drawing vlc keepassxc dconf-editor qdirstat filezilla
 }
 software-035-office@base() { apt_upgrade libreoffice evolution evolution-ews evolution-plugin-pstimport; }
 software-036-media-apps@media() { apt_upgrade audacity kdenlive blender calibre puddletag glabels; }
@@ -1423,6 +1425,15 @@ software-043-dotfile-backups@base() {
     fi
     verbose "${SUDO} tee ${cron_file}"
     echo "${content}" | ${SUDO} tee "${cron_file}" > /dev/null && ${SUDO} chmod 0644 "${cron_file}"
+}
+software-044-terminator@base() {
+    apt_upgrade terminator || return 1
+    tool_ready terminator || return $(( $? == 1 ? 0 : 1 ))
+    # the launcher's own config comes with cli-helpers (lib/cli-helpers/launcher)
+    config_update terminator "${CURRENT_USER_HOME}/.config/terminator" || return 1
+    # the own plugins, from their repos
+    helper_repo_update "dgrieser/terminator-focus-alpha" install \
+        && helper_repo_update "dgrieser/terminator-plugin-balance-splits" install
 }
 software-045-sublime@base() { apt_add_with_repo "sublime-text" "https://download.sublimetext.com/" "apt/stable/" "" "https://download.sublimetext.com/sublimehq-pub.gpg"; }
 software-050-adb@dev() { install_adb; }

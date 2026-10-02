@@ -1,0 +1,128 @@
+[global_config]
+  handle_size = 2
+  inactive_color_offset = 1.0
+  enabled_plugins = MouseFreeURLHandler, MavenPluginURLHandler, LaunchpadBugURLHandler, LaunchpadCodeURLHandler, APTURLHandler, Logger, TerminalShot, BalanceSplitsPlugin
+  invert_search = True
+[keybindings]
+  plugin_balance_splits = <Primary><Alt>Up
+  new_tab = ""
+  go_up = <Shift><Alt>Up
+  go_down = <Shift><Alt>Down
+  go_left = <Shift><Alt>Left
+  go_right = <Shift><Alt>Right
+  split_horiz = <Primary><Alt>Down
+  split_vert = <Primary><Alt>Right
+  close_term = <Primary><Alt>d
+  paste_selection = <Shift><Alt>v
+  page_up_half = <Shift>Page_Up
+  page_down_half = <Shift>Page_Down
+  move_tab_right = ""
+  move_tab_left = ""
+  toggle_zoom = <Primary><Shift>F11
+  scaled_zoom = <Primary><Alt>Left
+  next_tab = ""
+  reset = ""
+  reset_clear = <Primary><Alt>l
+  hide_window = ""
+  group_all = ""
+  group_tab = ""
+  new_window = ""
+  new_terminator = ""
+  layout_launcher = ""
+  preferences_keybindings = ""
+  help = ""
+[profiles]
+  [[default]]
+    icon_bell = False
+    background_color = "#3b4551"
+    background_darkness = 0.86
+    cursor_fg_color = "#ffffff"
+    cursor_bg_color = "#000000"
+    font = Agave Nerd Font Mono 14
+    foreground_color = "#d7dde5"
+    scrollback_infinite = True
+    palette = "#000000:#d23f3f:#00cd00:#cdcd00:#3584e4:#cd00cd:#00cdcd:#e5e5e5:#7f7f7f:#ff0000:#00ff00:#ffff00:#7886ff:#ff00ff:#00ffff:#ffffff"
+    use_system_font = False
+    copy_on_selection = True
+    title_hide_sizetext = True
+    title_transmit_fg_color = "#d7dde5"
+    title_transmit_bg_color = "#3b4551"
+    title_inactive_fg_color = "#9099a5"
+    title_inactive_bg_color = "#3b4551"
+    title_use_system_font = False
+    title_font = Agave Nerd Font Mono 13
+  [[launcher]]
+    icon_bell = False
+    background_color = "#f6f5f4"
+    background_darkness = 0.95
+    background_type = transparent
+    cursor_fg_color = "#ffffff"
+    cursor_bg_color = "#000000"
+    font = Cousine for Powerline 14
+    foreground_color = "#000000"
+    show_titlebar = False
+    scrollbar_position = hidden
+    scrollback_infinite = True
+    palette = "#000000:#cd0000:#00cd00:#cdcd00:#0000ee:#cd00cd:#00cdcd:#e5e5e5:#7f7f7f:#ff0000:#00ff00:#ffff00:#5c5cff:#ff00ff:#00ffff:#ffffff"
+    copy_on_selection = True
+  [[default_light]]
+    icon_bell = False
+    background_color = "#3b4551"
+    background_darkness = 0.86
+    cursor_fg_color = "#ffffff"
+    cursor_bg_color = "#000000"
+    font = Agave Nerd Font Mono 14
+    foreground_color = "#d7dde5"
+    scrollback_infinite = True
+    palette = "#000000:#d23f3f:#00cd00:#cdcd00:#3584e4:#cd00cd:#00cdcd:#e5e5e5:#7f7f7f:#ff0000:#00ff00:#ffff00:#7886ff:#ff00ff:#00ffff:#ffffff"
+    use_system_font = False
+    copy_on_selection = True
+    title_hide_sizetext = True
+    title_transmit_fg_color = "#d7dde5"
+    title_transmit_bg_color = "#3b4551"
+    title_inactive_fg_color = "#9099a5"
+    title_inactive_bg_color = "#3b4551"
+    title_use_system_font = False
+    title_font = Agave Nerd Font Mono 13
+[layouts]
+  [[default]]
+    [[[child0]]]
+      type = Window
+      parent = ""
+      order = 0
+      position = 400:200
+      maximised = False
+      fullscreen = False
+      size = 1400, 900
+      title = ""
+      last_active_term = ef7fc29b-2db4-4b72-b238-1e8e0cda40c7
+      last_active_window = False
+    [[[terminal1]]]
+      type = Terminal
+      parent = child0
+      order = 0
+      profile = default
+      uuid = ef7fc29b-2db4-4b72-b238-1e8e0cda40c7
+  [[launcher]]
+    [[[child1]]]
+      type = Window
+      parent = ""
+      order = 0
+      position = 1000:200
+      maximised = False
+      fullscreen = False
+      size = 400, 400
+      last_active_term = ef7fc29b-2db4-4b72-b238-1e8e0cda40c8
+      last_active_window = False
+    [[[terminal2]]]
+      type = Terminal
+      parent = child1
+      order = 0
+      profile = launcher
+      uuid = ef7fc29b-2db4-4b72-b238-1e8e0cda40c8
+[plugins]
+  [[AutoTheme]]
+    light = default_light
+    dark = default
+    mode = Dark
+    variant = dark

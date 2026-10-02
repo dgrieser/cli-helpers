@@ -32,10 +32,11 @@ SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
-# the data updater installs: the configs merged into the user's config dirs (yazi
-# with its local plugins, powerline-shell, claude, codex, opencode, zed), systemd user
-# units and a cron file
-CONFIGDIRS := yazi powerline-shell claude codex opencode zed systemd-user cron
+# the data folders: the Terminator config of launcher, and what updater installs,
+# the configs merged into the user's config dirs (yazi with its local plugins,
+# powerline-shell, claude, codex, opencode, zed, terminator), systemd user units
+# and a cron file
+CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator systemd-user cron
 CONFIGFILES := $(patsubst $(SHAREDDIR)/%,%,$(shell find $(addprefix $(SHAREDDIR)/,$(CONFIGDIRS)) -type f -not -path '*/__pycache__/*' | sort))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of

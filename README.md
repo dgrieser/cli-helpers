@@ -2205,6 +2205,8 @@ remapkeys
 ### `launcher`
 Opens a Terminator-based quick-launch terminal window that auto-closes after a few idle seconds, refocusing the existing window instead of spawning a new one if already running.
 
+Its Terminator config (borderless, always on top, faded while unfocused with the FocusAlpha plugin) comes with cli-helpers in `$(LIBDIR)/launcher/terminator.config`; a `~/.config/terminator/config_launcher` of your own takes precedence.
+
 **Usage:** `launcher`
 
 Takes no arguments.

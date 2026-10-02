@@ -14,6 +14,9 @@ merged, so everything else the user has in it is kept:
   command, or by context and bindings/unbind; a plain "cwd" is the same entry
   as {"type": "cwd"}. A merged file is written as plain JSON, so it loses its
   comments; a created one is copied as is
+- config and config_* without an extension (Terminator's ConfigObj files): the
+  shipped keys are set and the [sections] merged recursively, e.g. the user's
+  own profiles and layouts are kept; values are compared as written
 - *.lua in the top directory: the top-level statements are matched by what they define (function
   NAME, variable NAME, require("NAME")) and replaced or appended
 - everything else (plugins, segments) is ours as a whole, so the file is
@@ -238,6 +241,48 @@ def merge_json(dst_text, src_text):
     return json.dumps(dst, indent=2, ensure_ascii=False) + "\n", changes
 
 
+def is_configobj(rel):
+    name = os.path.basename(rel)
+    return "." not in name and (name == "config" or name.startswith("config_"))
+
+
+def merge_configobj_section(dst, src, path, changes):
+    for key in src.scalars:
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = src[key]
+            changes.append(f"add {key_path}")
+        elif dst[key] != src[key]:
+            dst[key] = src[key]
+            changes.append(f"set {key_path}")
+    for key in src.sections:
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = src[key].dict()
+            changes.append(f"add [{key_path}]")
+        else:
+            merge_configobj_section(dst[key], src[key], key_path, changes)
+
+
+def merge_configobj(dst_text, src_text):
+    try:
+        import configobj
+    except ImportError as exc:
+        fail(f"python3-configobj is required to merge Terminator's config: {exc}")
+    # list_values=False keeps every value as written, quotes and commas included
+    options = {"interpolation": False, "list_values": False}
+    try:
+        dst = configobj.ConfigObj(dst_text.splitlines(), **options)
+        src = configobj.ConfigObj(src_text.splitlines(), **options)
+    except configobj.ConfigObjError as exc:
+        fail(f"cannot merge the config: {exc}")
+    changes = []
+    merge_configobj_section(dst, src, "", changes)
+    if not changes:
+        return dst_text, changes
+    return "\n".join(dst.write()) + "\n", changes
+
+
 # a statement starts at column 0; indented lines and closing lines belong to the
 # statement before them
 LUA_CONTINUATION = re.compile(r"^(\s|end\b|else\b|elseif\b|until\b|[}\])])")
@@ -362,6 +407,8 @@ def merge_file(src, dst, rel):
         new_text, changes = merge_toml(dst_text, src_text)
     elif src.endswith((".json", ".jsonc")):
         new_text, changes = merge_json(dst_text, src_text)
+    elif is_configobj(rel):
+        new_text, changes = merge_configobj(dst_text, src_text)
     elif rel.endswith(".lua") and os.sep not in rel:
         new_text, changes = merge_lua(dst_text, src_text)
     else:
