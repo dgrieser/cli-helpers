@@ -1,0 +1,799 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [COMMAND] [OPTIONS] [DEVICE]
+
+Mount and unmount the volumes of external drives safely, picking the device
+from a menu. Encrypted volumes (LUKS, BitLocker) are unlocked and LVM volume
+groups activated on the way to the filesystem, and locked and deactivated again
+on the way back, so a drive is only reported safe to unplug once nothing on it
+is in use. Without COMMAND a menu asks for the action.
+
+Commands:
+  mount [DEVICE]        Mount a volume, unlocking and activating what it sits on
+  unmount [DEVICE]      Unmount a volume, or every volume of a drive, and lock
+                        and deactivate what it sits on; DEVICE can also be a
+                        mount point
+  eject [DRIVE]         Unmount every volume of a drive and power it off
+  cleanup               Remove stale device mappings and mounts left behind by
+                        drives that were unplugged without unmounting; they
+                        make unlocking the drive again fail with "File exists"
+  list                  List the drives, their volumes and stale mappings
+
+Options:
+  -a, --all             Include internal drives (never the ones holding the
+                        running system)
+  -c, --check           mount only: check the filesystem with fsck before
+                        mounting (ext2/3/4, vfat and exfat)
+  -y, --yes             cleanup only: remove without asking for confirmation
+  -h, --help            Show this help message and exit
+
+Mounting, unlocking and powering off go through udisks; LVM, fsck and the
+cleanup need sudo.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+# exits after a cancelled prompt, keeping Ctrl-C's status
+cancelled() {
+    [ "${1}" -eq 130 ] && exit 130
+    abort
+}
+
+# runs a command after printing it, so it is clear what a sudo password is for
+run() {
+    echo "+ ${*}" 1>&2
+    "${@}"
+}
+
+completion() {
+    local prev="${1}" word i
+    shift
+    for word in "${@}"; do
+        case "${word}" in
+            -a|--all)
+                all=1
+                ;;
+        esac
+    done
+    case "${prev}" in
+        mount|unmount|eject)
+            load_state
+            for i in "${!rec_path[@]}"; do
+                case "${prev}" in
+                    mount)
+                        is_mount_candidate "${i}" && echo "${rec_path[i]}"
+                        ;;
+                    unmount)
+                        { is_in_use "${i}" || [ "${rec_depth[i]}" -eq 0 ]; } && echo "${rec_path[i]}"
+                        ;;
+                    eject)
+                        [ "${rec_depth[i]}" -eq 0 ] && echo "${rec_path[i]}"
+                        ;;
+                esac
+            done
+            ;;
+        *)
+            echo "mount unmount eject cleanup list -a --all -c --check -y --yes -h --help"
+            ;;
+    esac
+    exit 0
+}
+
+# Prints the drives to work on: hotplug or removable disks (every disk with
+# --all), but never one holding a mount of the running system.
+list_drives() {
+    lsblk -J -p -o NAME,PATH,TYPE,HOTPLUG,RM,MOUNTPOINTS | jq -r --argjson all "${all}" '
+        def flag: . == true or . == "1" or . == 1;
+        def system_mount: . == "/" or . == "/boot" or . == "/boot/efi" or . == "/home" or . == "/usr" or . == "/var";
+        .blockdevices[]
+        | select(.type == "disk" and (.path | test("^/dev/(zram|ram|loop)") | not))
+        | select($all == 1 or (.hotplug | flag) or (.rm | flag))
+        | select([.. | objects | .mountpoints? // [] | .[] | select(. != null) | system_mount] | any | not)
+        | .path'
+}
+
+# Prints one record per block device on the given drives, fields separated by
+# \x1f: drive, volume (the partition, or the drive for a volume without a
+# partition table), parent, depth, path, type, fstype, size, label, uuid, drive
+# model and mount points (comma separated).
+list_volumes() {
+    [ "${#}" -eq 0 ] && return 0
+    lsblk -J -p -o NAME,PATH,TYPE,FSTYPE,SIZE,LABEL,UUID,MODEL,MOUNTPOINTS "${@}" | jq -r '
+        def flat($drive; $model; $volume; $parent; $depth):
+            [$drive, $volume, $parent, $depth, .path, .type, .fstype, .size, .label, .uuid, $model,
+             ((.mountpoints // []) | map(select(. != null)) | join(","))],
+            (.path as $path | (.fstype // "") as $fstype | .children[]?
+                | flat($drive; $model; (if $depth == 0 and $fstype == "" then .path else $volume end); $path; $depth + 1));
+        .blockdevices[] | flat(.path; .model; .path; ""; 0) | map(. // "" | tostring) | join("\u001f")'
+}
+
+load_state() {
+    local drive volume parent depth path type fstype size label uuid model mounts i=0
+    mapfile -t drives < <(list_drives)
+    rec_drive=()
+    rec_volume=()
+    rec_parent=()
+    rec_depth=()
+    rec_path=()
+    rec_type=()
+    rec_fstype=()
+    rec_size=()
+    rec_label=()
+    rec_uuid=()
+    rec_model=()
+    rec_mounts=()
+    index_by_path=()
+    index_by_device=()
+    child_count=()
+    while IFS=$'\x1f' read -r drive volume parent depth path type fstype size label uuid model mounts; do
+        rec_drive[i]="${drive}"
+        rec_volume[i]="${volume}"
+        rec_parent[i]=""
+        [ -n "${parent}" ] && rec_parent[i]="${index_by_path[${parent}]}"
+        rec_depth[i]="${depth}"
+        rec_path[i]="${path}"
+        rec_type[i]="${type}"
+        rec_fstype[i]="${fstype}"
+        rec_size[i]="${size}"
+        rec_label[i]="${label}"
+        rec_uuid[i]="${uuid}"
+        rec_model[i]="${model}"
+        rec_mounts[i]="${mounts}"
+        index_by_path["${path}"]="${i}"
+        index_by_device["$(readlink -f -- "${path}")"]="${i}"
+        [ -n "${rec_parent[i]}" ] && child_count[${rec_parent[i]}]=$(( ${child_count[${rec_parent[i]}]:-0} + 1 ))
+        i=$(( i + 1 ))
+    done < <(list_volumes "${drives[@]}")
+}
+
+# prints the record index of a device path, also for /dev/dm-N style aliases
+record_index() {
+    local device
+    device="$(readlink -f -- "${1}")"
+    [ -n "${index_by_device[${device}]}" ] || return 1
+    echo "${index_by_device[${device}]}"
+}
+
+is_encrypted() {
+    case "${rec_fstype[${1}]}" in
+        crypto_LUKS|BitLocker)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+is_lvm() {
+    [ "${rec_fstype[${1}]}" = "LVM2_member" ]
+}
+
+is_container() {
+    is_encrypted "${1}" || is_lvm "${1}"
+}
+
+# an unlocked encrypted volume or an active LVM physical volume has children
+is_open() {
+    [ -n "${child_count[${1}]}" ]
+}
+
+is_filesystem() {
+    case "${rec_fstype[${1}]}" in
+        ""|crypto_LUKS|BitLocker|LVM2_member|swap|linux_raid_member|zfs_member)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+is_mount_candidate() {
+    if is_filesystem "${1}"; then
+        [ -z "${rec_mounts[${1}]}" ]
+        return
+    fi
+    is_container "${1}" && ! is_open "${1}"
+}
+
+is_in_use() {
+    [ -n "${rec_mounts[${1}]}" ] && return 0
+    is_container "${1}" && is_open "${1}"
+}
+
+any_in_use() {
+    local i
+    for i in "${@}"; do
+        is_in_use "${i}" && return 0
+    done
+    return 1
+}
+
+# is_below INDEX ANCESTOR_INDEX
+is_below() {
+    local i="${rec_parent[${1}]}"
+    while [ -n "${i}" ]; do
+        [ "${i}" = "${2}" ] && return 0
+        i="${rec_parent[i]}"
+    done
+    return 1
+}
+
+# records_of drive|volume PATH: prints the record indices on that drive or volume
+records_of() {
+    local i
+    for i in "${!rec_path[@]}"; do
+        if [ "${1}" = "drive" ]; then
+            [ "${rec_drive[i]}" = "${2}" ] && echo "${i}"
+        else
+            [ "${rec_volume[i]}" = "${2}" ] && echo "${i}"
+        fi
+    done
+}
+
+volume_state() {
+    local i="${1}"
+    if [ -n "${rec_mounts[i]}" ]; then
+        echo "${rec_mounts[i]}"
+    elif is_encrypted "${i}"; then
+        is_open "${i}" && echo "unlocked" || echo "locked"
+    elif is_lvm "${i}"; then
+        is_open "${i}" && echo "active" || echo "inactive"
+    else
+        echo "-"
+    fi
+}
+
+# prints the mount points of the given records, or what else keeps them in use
+in_use_summary() {
+    local i mounts="" state=""
+    for i in "${@}"; do
+        if [ -n "${rec_mounts[i]}" ]; then
+            mounts="${mounts:+${mounts},}${rec_mounts[i]}"
+        elif [ -z "${state}" ] && is_in_use "${i}"; then
+            state="$(volume_state "${i}")"
+        fi
+    done
+    echo "${mounts:-${state:--}}"
+}
+
+# volume_row INDEX STATE: prints a tab separated menu row
+volume_row() {
+    local i="${1}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${rec_path[i]}" "${rec_size[i]}" "${rec_fstype[i]:-${rec_type[i]}}" \
+        "${rec_label[i]:--}" "${2}" "${rec_model[i]:--}"
+}
+
+# select_device PROMPT ROW...: prints the device path of the selected row
+select_device() {
+    local prompt="${1}"
+    shift
+    {
+        printf 'DEVICE\tSIZE\tTYPE\tLABEL\tSTATE\tDRIVE\n'
+        printf '%s\n' "${@}"
+    } | column -t -s $'\t' | prompt-select --header-lines 1 --key-regex '^\S+' --prompt "${prompt}"
+}
+
+not_found() {
+    local hint=""
+    [ "${all}" -eq 0 ] && hint=" (internal drives need --all)"
+    fail "Not a volume of an external drive: ${1}${hint}"
+}
+
+# Collects device-mapper devices that sit on a device which is gone, and mounts
+# of devices which are gone, both left behind by unplugging without unmounting.
+find_stale() {
+    local dm slave devno mountpoint source
+    stale_dms=()
+    stale_mounts=()
+    stale_sources=()
+    for dm in /sys/block/dm-*; do
+        [ -e "${dm}" ] || continue
+        for slave in "${dm}"/slaves/*; do
+            if [ -L "${slave}" ] && [ ! -e "${slave}" ]; then
+                stale_dms+=("${dm##*/}")
+                break
+            fi
+        done
+    done
+    while IFS=$'\t' read -r devno mountpoint source; do
+        [[ "${source}" == /dev/* ]] || continue
+        [[ "${devno}" == 0:* ]] && continue
+        [ -e "/sys/dev/block/${devno}" ] && continue
+        stale_mounts+=("$(printf '%b' "${mountpoint}")")
+        stale_sources+=("${source}")
+    done < <(awk '{ for (i = 7; i < NF; i++) if ($i == "-") { print $3 "\t" $5 "\t" $(i + 2); break } }' /proc/self/mountinfo)
+}
+
+has_stale() {
+    [ "${#stale_dms[@]}" -gt 0 ] || [ "${#stale_mounts[@]}" -gt 0 ]
+}
+
+# a device-mapper device is stale when a device below it is gone
+is_stale_dm() {
+    local slave
+    for slave in "/sys/block/${1}/slaves/"*; do
+        [ -L "${slave}" ] || continue
+        [ -e "${slave}" ] || return 0
+        [ -d "${slave}/dm" ] && is_stale_dm "${slave##*/}" && return 0
+    done
+    return 1
+}
+
+mounts_of_devno() {
+    awk -v devno="${1}" '$3 == devno { print $5 }' /proc/self/mountinfo | while read -r mountpoint; do
+        printf '%b\n' "${mountpoint}"
+    done
+}
+
+print_stale_tree() {
+    local kname="${1}" indent="${2}" slave holder mounts gone=""
+    for slave in "/sys/block/${kname}/slaves/"*; do
+        [ -L "${slave}" ] && [ ! -e "${slave}" ] && gone=" (on disconnected ${slave##*/})"
+    done
+    mounts="$(mounts_of_devno "$(cat "/sys/block/${kname}/dev")" | paste -sd ',')"
+    echo "${indent}$(cat "/sys/block/${kname}/dm/name")${gone}${mounts:+, mounted at ${mounts}}"
+    for holder in "/sys/block/${kname}/holders/"*; do
+        [ -d "${holder}/dm" ] && print_stale_tree "${holder##*/}" "${indent}  "
+    done
+}
+
+print_stale() {
+    local kname i
+    if [ "${#stale_dms[@]}" -gt 0 ]; then
+        echo "Stale mappings of disconnected drives:"
+        for kname in "${stale_dms[@]}"; do
+            print_stale_tree "${kname}" "  "
+        done
+    fi
+    if [ "${#stale_mounts[@]}" -gt 0 ]; then
+        echo "Stale mounts of disconnected drives:"
+        for i in "${!stale_mounts[@]}"; do
+            echo "  ${stale_mounts[i]} (was ${stale_sources[i]})"
+        done
+    fi
+}
+
+warn_stale() {
+    find_stale
+    has_stale || return 0
+    warning "Found stale mappings of disconnected drives, they make unlocking fail with \"File exists\"; run '${APP_NAME} cleanup' to remove them"
+}
+
+# Removes a stale device-mapper device after the devices stacked on it, lazily
+# unmounting what is still mounted from them; the device below is gone, so
+# there is nothing left to flush.
+remove_stale_dm() {
+    local kname="${1}" holder mountpoint name
+    for holder in "/sys/block/${kname}/holders/"*; do
+        [ -d "${holder}/dm" ] || continue
+        remove_stale_dm "${holder##*/}" || return 1
+    done
+    while read -r mountpoint; do
+        run sudo umount -l "${mountpoint}" || return 1
+    done < <(mounts_of_devno "$(cat "/sys/block/${kname}/dev")")
+    name="$(cat "/sys/block/${kname}/dm/name")"
+    run sudo dmsetup remove "${name}" && return 0
+    warning "${name} is still held open by:"
+    sudo fuser -v "/dev/${kname}"
+    prompt-no-yes "Force the removal of ${name}" || return 1
+    run sudo dmsetup remove --force "${name}"
+}
+
+# waits for an LVM physical volume to get activated by udev after an unlock
+wait_for_holders() {
+    local kname
+    kname="$(basename "$(readlink -f -- "${1}")")"
+    for _ in 1 2 3 4; do
+        [ -n "$(ls -A "/sys/class/block/${kname}/holders" 2>/dev/null)" ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+volume_group_of() {
+    run sudo pvs --noheadings -o vg_name "${1}" | tr -d '[:space:]'
+}
+
+activate_volume_group() {
+    local vg
+    wait_for_holders "${1}" && return 0
+    vg="$(volume_group_of "${1}")"
+    [ -z "${vg}" ] && fail "No volume group found on ${1}"
+    run sudo vgchange -ay "${vg}" || fail "Failed to activate volume group ${vg}"
+}
+
+deactivate_volume_group() {
+    local vg
+    vg="$(volume_group_of "${1}")"
+    if [ -z "${vg}" ]; then
+        error "No volume group found on ${1}"
+        return 1
+    fi
+    run sudo vgchange -an "${vg}" && return 0
+    error "Failed to deactivate volume group ${vg}"
+    return 1
+}
+
+unlock_volume() {
+    local i="${1}" mapping kname
+    if [ "${rec_fstype[i]}" = "crypto_LUKS" ]; then
+        mapping="luks-${rec_uuid[i]}"
+        if [ -e "/dev/mapper/${mapping}" ]; then
+            kname="$(basename "$(readlink -f "/dev/mapper/${mapping}")")"
+            is_stale_dm "${kname}" || fail "${mapping} already exists on a connected device, is a copy of this volume unlocked?"
+            warning "A stale mapping of a disconnected drive blocks the unlock:"
+            print_stale_tree "${kname}" "  " 1>&2
+            prompt-yes-no "Remove it" || abort
+            remove_stale_dm "${kname}" || fail "Failed to remove ${mapping}"
+        fi
+    fi
+    udisksctl unlock -b "${rec_path[i]}" || fail "Failed to unlock ${rec_path[i]}"
+}
+
+mount_filesystem() {
+    local i="${1}" path="${rec_path[${1}]}" status
+    if [ "${check}" -eq 1 ]; then
+        case "${rec_fstype[i]}" in
+            ext2|ext3|ext4|vfat|exfat)
+                run sudo fsck -p "${path}"
+                status="${?}"
+                [ "${status}" -ge 4 ] && fail "fsck could not repair ${path} on its own, run 'sudo fsck ${path}'"
+                ;;
+            *)
+                warning "No filesystem check for ${rec_fstype[i]}, mounting unchecked"
+                ;;
+        esac
+    fi
+    udisksctl mount -b "${path}" || fail "Failed to mount ${path}"
+}
+
+# Mounts a filesystem, or opens a container (unlock, activate) and continues
+# with what turns up inside it, asking when there is more than one choice.
+open_volume() {
+    local i path opened=0 j rows=() candidates=() device
+    i="$(record_index "${1}")" || not_found "${1}"
+    path="${rec_path[i]}"
+    if is_filesystem "${i}"; then
+        [ -n "${rec_mounts[i]}" ] && fail "${path} is already mounted at ${rec_mounts[i]}"
+        mount_filesystem "${i}"
+        return
+    fi
+    if is_encrypted "${i}" && ! is_open "${i}"; then
+        unlock_volume "${i}"
+        opened=1
+    elif is_lvm "${i}" && ! is_open "${i}"; then
+        activate_volume_group "${path}"
+        opened=1
+    fi
+    udevadm settle --timeout=10 2>/dev/null
+    load_state
+    i="$(record_index "${path}")" || not_found "${path}"
+    for j in "${!rec_path[@]}"; do
+        is_below "${j}" "${i}" && is_mount_candidate "${j}" || continue
+        candidates+=("${rec_path[j]}")
+        rows+=("$(volume_row "${j}" "$(volume_state "${j}")")")
+    done
+    if [ "${#candidates[@]}" -eq 0 ]; then
+        [ "${opened}" -eq 1 ] && echo "Opened ${path}, nothing on it to mount." && return 0
+        fail "Nothing to mount on ${path}"
+    fi
+    if [ "${#candidates[@]}" -eq 1 ]; then
+        device="${candidates[0]}"
+    else
+        device="$(select_device "Volume to mount:" "${rows[@]}")" || cancelled "${?}"
+    fi
+    open_volume "${device}"
+}
+
+# unmounts a record, or locks or deactivates it when it is an open container
+release_record() {
+    local i="${1}" path="${rec_path[${1}]}" mountpoint
+    if [ "${rec_mounts[i]}" = "[SWAP]" ]; then
+        run sudo swapoff "${path}" || return 1
+    elif [ -n "${rec_mounts[i]}" ]; then
+        if ! udisksctl unmount -b "${path}"; then
+            error "${path} is busy, close what still uses it:"
+            while read -r -d ',' mountpoint; do
+                fuser -vm "${mountpoint}"
+            done <<< "${rec_mounts[i]},"
+            return 1
+        fi
+    fi
+    is_open "${i}" || return 0
+    if is_lvm "${i}"; then
+        deactivate_volume_group "${path}"
+    elif is_encrypted "${i}"; then
+        udisksctl lock -b "${path}"
+    fi
+}
+
+# releases the given records from the deepest level up
+release_records() {
+    local i depth max=0
+    for i in "${@}"; do
+        [ "${rec_depth[i]}" -gt "${max}" ] && max="${rec_depth[i]}"
+    done
+    sync
+    for (( depth = max; depth >= 0; depth-- )); do
+        for i in "${@}"; do
+            [ "${rec_depth[i]}" -eq "${depth}" ] || continue
+            release_record "${i}" || return 1
+        done
+    done
+}
+
+# releases a drive (every volume on it) or the volume holding the device
+release_target() {
+    local i="${1}" scope path indices=()
+    if [ "${rec_depth[i]}" -eq 0 ]; then
+        scope="drive"
+        path="${rec_path[i]}"
+    else
+        scope="volume"
+        path="${rec_volume[i]}"
+    fi
+    mapfile -t indices < <(records_of "${scope}" "${path}")
+    release_records "${indices[@]}" || fail "Failed to release ${path}"
+}
+
+mount_command() {
+    local device="${1}" i rows=()
+    load_state
+    warn_stale
+    if [ -z "${device}" ]; then
+        for i in "${!rec_path[@]}"; do
+            is_mount_candidate "${i}" && rows+=("$(volume_row "${i}" "$(volume_state "${i}")")")
+        done
+        [ "${#rows[@]}" -eq 0 ] && fail "No volume to mount"
+        device="$(select_device "Volume to mount:" "${rows[@]}")" || cancelled "${?}"
+    fi
+    open_volume "${device}"
+}
+
+unmount_command() {
+    local target="${1}" drive i indices=() volume_indices=() rows=()
+    load_state
+    if [ -z "${target}" ]; then
+        for drive in "${drives[@]}"; do
+            mapfile -t indices < <(records_of drive "${drive}")
+            any_in_use "${indices[@]}" || continue
+            rows+=("$(volume_row "${index_by_path[${drive}]}" "all volumes: $(in_use_summary "${indices[@]}")")")
+            for i in "${indices[@]}"; do
+                [ "${rec_depth[i]}" -eq 1 ] && [ "${rec_volume[i]}" = "${rec_path[i]}" ] || continue
+                mapfile -t volume_indices < <(records_of volume "${rec_path[i]}")
+                any_in_use "${volume_indices[@]}" || continue
+                rows+=("$(volume_row "${i}" "$(in_use_summary "${volume_indices[@]}")")")
+            done
+        done
+        [ "${#rows[@]}" -eq 0 ] && fail "No volume of an external drive is in use"
+        target="$(select_device "Volume or drive to unmount:" "${rows[@]}")" || cancelled "${?}"
+    elif [ -d "${target}" ]; then
+        target="$(findmnt -n -o SOURCE --mountpoint "${target}")" || fail "Not a mount point: ${1}"
+    fi
+    i="$(record_index "${target}")" || not_found "${target}"
+    drive="${rec_drive[i]}"
+    if [ "${rec_depth[i]}" -eq 0 ]; then
+        mapfile -t indices < <(records_of drive "${drive}")
+    else
+        mapfile -t indices < <(records_of volume "${rec_volume[i]}")
+    fi
+    any_in_use "${indices[@]}" || fail "Nothing on ${target} is in use"
+    release_target "${i}"
+    load_state
+    mapfile -t indices < <(records_of drive "${drive}")
+    if any_in_use "${indices[@]}"; then
+        echo "Released ${target}, other volumes of ${drive} are still in use."
+    else
+        echo "Released ${target}, ${drive} is safe to unplug."
+    fi
+}
+
+eject_command() {
+    local target="${1}" drive i indices=() rows=()
+    load_state
+    if [ -z "${target}" ]; then
+        for drive in "${drives[@]}"; do
+            mapfile -t indices < <(records_of drive "${drive}")
+            rows+=("$(volume_row "${index_by_path[${drive}]}" "$(in_use_summary "${indices[@]}")")")
+        done
+        [ "${#rows[@]}" -eq 0 ] && fail "No external drive found"
+        target="$(select_device "Drive to eject:" "${rows[@]}")" || cancelled "${?}"
+    fi
+    i="$(record_index "${target}")" || not_found "${target}"
+    drive="${rec_drive[i]}"
+    release_target "${index_by_path[${drive}]}"
+    if udisksctl power-off -b "${drive}"; then
+        echo "Powered off ${drive}, safe to unplug."
+    else
+        warning "Could not power off ${drive}, but all its volumes are released, so it is safe to unplug"
+    fi
+}
+
+cleanup_command() {
+    local mountpoint kname
+    find_stale
+    if ! has_stale; then
+        echo "No stale mappings or mounts found."
+        return 0
+    fi
+    print_stale
+    if [ "${yes}" -eq 0 ]; then
+        prompt-yes-no "Remove them" || abort
+    fi
+    for mountpoint in "${stale_mounts[@]}"; do
+        run sudo umount -l "${mountpoint}" || fail "Failed to unmount ${mountpoint}"
+    done
+    for kname in "${stale_dms[@]}"; do
+        [ -e "/sys/block/${kname}" ] || continue
+        remove_stale_dm "${kname}" || fail "Failed to remove $(cat "/sys/block/${kname}/dm/name")"
+    done
+    echo "Removed the stale mappings and mounts."
+}
+
+list_command() {
+    mapfile -t drives < <(list_drives)
+    if [ "${#drives[@]}" -gt 0 ]; then
+        lsblk -p -o NAME,MODEL,SIZE,FSTYPE,LABEL,MOUNTPOINTS "${drives[@]}"
+    else
+        echo "No external drives found."
+    fi
+    find_stale
+    if has_stale; then
+        echo
+        print_stale
+    fi
+}
+
+menu_command() {
+    local default="mount" items=() i can_mount=0 in_use=0
+    load_state
+    find_stale
+    for i in "${!rec_path[@]}"; do
+        is_mount_candidate "${i}" && can_mount=1
+        is_in_use "${i}" && in_use=1
+    done
+    [ "${can_mount}" -eq 0 ] && [ "${in_use}" -eq 1 ] && default="unmount"
+    items+=("mount=Mount a volume")
+    items+=("unmount=Unmount a volume or a drive")
+    items+=("eject=Unmount a drive and power it off")
+    if has_stale; then
+        items+=("cleanup=Remove stale mappings of disconnected drives")
+        default="cleanup"
+    fi
+    items+=("list=List drives and volumes")
+    command="$(prompt-select --prompt "Action:" --default "${default}" "${items[@]}")" || cancelled "${?}"
+}
+
+drives=()
+rec_drive=()
+rec_volume=()
+rec_parent=()
+rec_depth=()
+rec_path=()
+rec_type=()
+rec_fstype=()
+rec_size=()
+rec_label=()
+rec_uuid=()
+rec_model=()
+rec_mounts=()
+declare -A index_by_path
+declare -A index_by_device
+declare -A child_count
+stale_dms=()
+stale_mounts=()
+stale_sources=()
+
+command=""
+device=""
+all=0
+check=0
+yes=0
+
+if [ "${1}" = "--bash-completion" ]; then
+    shift
+    completion "${@}"
+fi
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -a|--all)
+            all=1
+            ;;
+        -c|--check)
+            check=1
+            ;;
+        -y|--yes)
+            yes=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        mount|unmount|eject|cleanup|list)
+            if [ -n "${command}" ] || [ -n "${device}" ]; then
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            command="${1}"
+            ;;
+        *)
+            if [ -z "${command}" ]; then
+                error "Unknown command: ${1}"
+                usage
+            fi
+            if [ -n "${device}" ]; then
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            device="${1}"
+            ;;
+    esac
+    shift
+done
+
+case "${command}" in
+    cleanup|list)
+        [ -n "${device}" ] && error "Unexpected argument: ${device}" && usage
+        ;;
+esac
+case "${command}" in
+    ""|mount)
+        ;;
+    *)
+        [ "${check}" -eq 1 ] && fail "--check only works with mount"
+        ;;
+esac
+case "${command}" in
+    ""|cleanup)
+        ;;
+    *)
+        [ "${yes}" -eq 1 ] && fail "--yes only works with cleanup"
+        ;;
+esac
+for tool in lsblk jq column udisksctl prompt-select; do
+    command -v "${tool}" &>/dev/null || fail "'${tool}' is required"
+done
+
+[ -z "${command}" ] && menu_command
+
+case "${command}" in
+    mount)
+        mount_command "${device}"
+        ;;
+    unmount)
+        unmount_command "${device}"
+        ;;
+    eject)
+        eject_command "${device}"
+        ;;
+    cleanup)
+        cleanup_command
+        ;;
+    list)
+        list_command
+        ;;
+esac

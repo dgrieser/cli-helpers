@@ -2172,6 +2172,39 @@ power-trigger
 systemctl --user start power-trigger.service
 ```
 
+### `disk-mount`
+Mounts and unmounts the volumes of external drives safely, picking the device from a [prompt](#prompt) select menu (or a menu for the action when no command is given). On the way to a filesystem it unlocks encrypted volumes (LUKS, BitLocker) and activates LVM volume groups; on the way back it unmounts from the deepest level up, deactivates the volume groups and locks the encrypted volumes, and only then reports the drive safe to unplug. When a filesystem is busy, it lists the processes that still use it (`fuser -vm`). It also finds and removes the stale device mappings that a drive unplugged without unmounting leaves behind, which make unlocking it again fail with `Failed to activate device: File exists`; the unlock offers this removal itself when such a mapping is in the way.
+
+Mounting, unlocking, locking and powering off go through `udisksctl`, so they need no root; LVM (`pvs`, `vgchange`), `fsck`, `swapoff` and the cleanup (`dmsetup remove`, `umount -l`) run with `sudo`, and each `sudo` command is printed before it runs.
+
+**Usage:** `disk-mount [COMMAND] [OPTIONS] [DEVICE]`
+
+| Argument / Flag | Description |
+|---|---|
+| `mount [DEVICE]` | Mount a volume, unlocking and activating what it sits on; asks when a container holds more than one volume. |
+| `unmount [DEVICE]` | Unmount a volume, or every volume of a drive, and lock and deactivate what it sits on. `DEVICE` can also be a mount point. |
+| `eject [DRIVE]` | Unmount every volume of a drive and power it off. |
+| `cleanup` | Remove stale device mappings and mounts of drives that were unplugged without unmounting. |
+| `list` | List the drives, their volumes and stale mappings. |
+| `-a, --all` | Include internal drives; drives holding a mount of the running system (`/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`) are always left out. |
+| `-c, --check` | `mount` only: run `fsck -p` before mounting (ext2/3/4, vfat and exfat). |
+| `-y, --yes` | `cleanup` only: remove without asking for confirmation. |
+| `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output completion candidates (commands, options, and the devices that fit the command) for shell completion. |
+
+External drives are the hotplug or removable disks reported by `lsblk`.
+
+**Examples:**
+```bash
+disk-mount
+disk-mount mount
+disk-mount mount --check /dev/sdb3
+disk-mount unmount /run/media/$USER/data
+disk-mount eject /dev/sdb
+disk-mount cleanup
+disk-mount list
+```
+
 ### `set-slack-profile`
 Sets your Slack status via a webhook, either automatically based on the current network connection (Wi-Fi SSID or Ethernet domain) or by a manual override, with optional time-limited persistence.
 
