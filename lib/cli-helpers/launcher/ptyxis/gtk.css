@@ -1,0 +1,13 @@
+/* launcher-terminal: Ptyxis without its header bar. Only the launcher's own Ptyxis
+   process loads this file (its XDG_CONFIG_HOME), other windows keep theirs. */
+
+/* the header bar is 46 px high in libadwaita; pulling its revealer up by exactly
+   that collapses it, pulling further makes GTK warn about negative sizes */
+toolbarview > revealer.top-bar {
+  margin-top: -46px;
+}
+
+/* no "80 × 24" overlay while the launcher is moved into place */
+vte-terminal > revealer.size {
+  opacity: 0;
+}

@@ -109,14 +109,13 @@ def parse_geometry(value):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wait for a window and place it as soon as it is mapped",
+        description="Wait for a window and place it (or only raise and focus it) as soon as it is mapped",
     )
     parser.add_argument("--title", help="title of the window to place")
     parser.add_argument("--class", dest="window_class", help="WM_CLASS of the window to place")
     parser.add_argument(
         "--geometry",
-        required=True,
-        help="target geometry as <width>x<height>+<x>+<y>",
+        help="target geometry as <width>x<height>+<x>+<y>; without it the window stays where it is",
     )
     parser.add_argument("--above", action="store_true", help="keep the window above others")
     parser.add_argument("--focus", action="store_true", help="focus the window once placed")
@@ -131,7 +130,7 @@ def main():
     if args.title is None and args.window_class is None:
         fail("Either --title or --class is required")
 
-    x, y, width, height = parse_geometry(args.geometry)
+    geometry = parse_geometry(args.geometry) if args.geometry is not None else None
     deadline = time.monotonic() + args.timeout
     proxy = bridge_proxy()
 
@@ -150,7 +149,8 @@ def main():
     if window is None:
         fail("Timed out waiting for the window to be mapped")
 
-    call(proxy, "SetWindowGeometry", "(siiii)", window["id"], x, y, width, height)
+    if geometry is not None:
+        call(proxy, "SetWindowGeometry", "(siiii)", window["id"], *geometry)
     if args.above and mapped:
         call(proxy, "SetWindowAbove", "(s)", window["id"])
     # the window manager may have denied the fresh window focus, and with it the

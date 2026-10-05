@@ -1,0 +1,7 @@
+# launcher in the default terminal; no binding of its own, launcher keeps the keys
+description: Terminal launcher
+bindings: []
+focus:
+  title: Launcher-Terminal
+launch:
+  desktop: launcher-terminal

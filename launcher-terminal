@@ -1,0 +1,208 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+# one word, so window-by-title also finds it on X11 (it compares wmctrl's first title word)
+name="Launcher-Terminal"
+bin_path="${0}"
+bin_name="$(basename "${bin_path}")"
+
+# inside the terminal window: the launcher calls itself as the terminal's command,
+# because a single-instance terminal (Ptyxis, GNOME Terminal) hands the window to
+# its already running process, so the pid of the started terminal says nothing.
+# The shell runs as a child instead of being exec'd: the window has to close when
+# the launcher hangs the shell up, and terminals like Ptyxis keep a window open
+# whose process died from a signal, but close it on a clean exit
+if [ "${1}" = "--shell" ]; then
+    echo "$$" > "${2}"
+    # so a command run in the launcher can close it once it is done
+    export LAUNCHER_EXIT_FILE="${3}"
+    export TERM_SIMPLE="▶ "
+    "${SHELL:-/bin/bash}"
+    exit 0
+fi
+
+pid=$(pidof -x "${bin_path}")
+if [ "${pid}" != "$$" ]; then
+    window-focus-by-title "${name}"
+    echo "Focus on ${bin_name}"
+    exit 0
+fi
+
+cli_helpers_require_command xdg-terminal-exec || exit 1
+
+max_seconds=3
+
+PID_FILE="/tmp/${bin_name}-$$.pid"
+EXIT_FILE="/tmp/${bin_name}-$$.exit"
+rm -rf "${PID_FILE}" "${EXIT_FILE}"
+trap 'rm -rf "${PID_FILE}" "${EXIT_FILE}"' EXIT
+
+real_config="${XDG_CONFIG_HOME:-${HOME}/.config}"
+real_data="${XDG_DATA_HOME:-${HOME}/.local/share}"
+ptyxis_dir="${XDG_RUNTIME_DIR:-/tmp}/${bin_name}"
+
+# a stand-in for one of the user's directories: every entry links to the real one,
+# except the ones named, which the launcher's Ptyxis gets of its own
+shadow_dir() {
+    local real="${1}" shadow="${2}" entry skip
+    local entries=()
+    shift 2
+    mkdir -p "${shadow}" || return 1
+    for entry in "${real}"/* "${real}"/.[!.]*; do
+        [ -e "${entry}" ] || continue
+        for skip in "${@}"; do
+            [ "${entry##*/}" = "${skip}" ] && continue 2
+        done
+        entries+=("${entry}")
+    done
+    # one ln for all of them, one per entry costs a second; -n: should a link exist
+    # already, fail instead of creating the new one inside the real directory it
+    # points to
+    [ "${#entries[@]}" -eq 0 ] || ln -sn -t "${shadow}" "${entries[@]}"
+}
+
+# a file of the launcher's Ptyxis: ~/.config/cli-helpers/launcher-terminal/<name> when
+# the user keeps one, else the one shipped with cli-helpers (the repo's when run from it)
+ptyxis_file() {
+    local dir
+    for dir in "${real_config}/cli-helpers/${bin_name}" "${SCRIPT_DIR}/lib/cli-helpers/launcher/ptyxis" \
+        "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/ptyxis"; do
+        if [ -f "${dir}/${1}" ]; then
+            echo "${dir}/${1}"
+            return 0
+        fi
+    done
+    echo "ERROR: ${1} of the launcher's Ptyxis not found" >&2
+    return 1
+}
+
+# Ptyxis can neither hide its header bar nor open a window with another profile from
+# its command line, so the launcher runs a Ptyxis process of its own on stand-ins for
+# the config and data directories: settings in a keyfile instead of dconf (the
+# launcher's profile and font), its own palette and session, and a stylesheet that
+# collapses the header bar. Everything else links to the real directories, and
+# nothing of the user's Ptyxis is touched. Rebuilt on every start, as only one
+# launcher runs at a time
+ptyxis_prepare() {
+    local css keyfile palette
+    css="$(ptyxis_file gtk.css)" && keyfile="$(ptyxis_file settings.keyfile)" \
+        && palette="$(ptyxis_file launcher.palette)" || return 1
+    rm -rf "${ptyxis_dir}"
+    shadow_dir "${real_config}" "${ptyxis_dir}/config" gtk-4.0 glib-2.0 dconf org.gnome.Ptyxis \
+        && shadow_dir "${real_config}/gtk-4.0" "${ptyxis_dir}/config/gtk-4.0" gtk.css \
+        && shadow_dir "${real_data}" "${ptyxis_dir}/data" org.gnome.Ptyxis \
+        && mkdir -p "${ptyxis_dir}/config/glib-2.0/settings" "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes" \
+        || return 1
+    {
+        # the user's own stylesheet still applies
+        [ -f "${real_config}/gtk-4.0/gtk.css" ] && echo "@import url(\"file://${real_config}/gtk-4.0/gtk.css\");"
+        cat "${css}"
+    } > "${ptyxis_dir}/config/gtk-4.0/gtk.css" \
+        && cp "${keyfile}" "${ptyxis_dir}/config/glib-2.0/settings/keyfile" \
+        && cp "${palette}" "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes/launcher.palette"
+}
+
+terminal_id="$(xdg-terminal-exec --print-id 2>/dev/null)"
+if [ "${terminal_id%%:*}" = "org.gnome.Ptyxis.desktop" ] && command -v ptyxis >/dev/null 2>&1 && ptyxis_prepare; then
+    terminal_cmd=(env "XDG_CONFIG_HOME=${ptyxis_dir}/config" "XDG_DATA_HOME=${ptyxis_dir}/data" GSETTINGS_BACKEND=keyfile
+        ptyxis --standalone --new-window "--title=${name}" "--working-directory=${PWD}" --)
+    # the shell gets the user's directories back, or what it starts would read the
+    # stand-ins (and a GTK app would lose its header bar as well)
+    shell_env=(env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u GSETTINGS_BACKEND)
+    [ -n "${XDG_CONFIG_HOME}" ] && shell_env+=("XDG_CONFIG_HOME=${XDG_CONFIG_HOME}")
+    [ -n "${XDG_DATA_HOME}" ] && shell_env+=("XDG_DATA_HOME=${XDG_DATA_HOME}")
+    [ -n "${GSETTINGS_BACKEND}" ] && shell_env+=("GSETTINGS_BACKEND=${GSETTINGS_BACKEND}")
+else
+    # xdg-terminal-exec cannot pass a size, nor any of the terminal's own options, so
+    # the window looks like any other window of the default terminal
+    terminal_cmd=(xdg-terminal-exec "--title=${name}" "--dir=${PWD}" --)
+    shell_env=()
+fi
+shell_cmd=("${shell_env[@]}" "${SCRIPT_DIR}/${bin_name}" --shell "${PID_FILE}" "${EXIT_FILE}")
+echo "+ ${terminal_cmd[*]} ${shell_cmd[*]}" >&2
+"${terminal_cmd[@]}" "${shell_cmd[@]}" &
+
+# the window stays where the window manager puts it; it is only kept above the
+# others and focused, which the window manager may have denied a fresh window
+# while another always-on-top window was in front
+if cli_helpers_is_wayland; then
+    cli_helpers_gnome_window_place --title "${name}" --above --focus --timeout 5 >/dev/null
+else
+    attempts=1
+    while ! wmctrl -F -r "${name}" -b add,above 2>/dev/null; do
+        ((attempts++))
+        sleep 0.5
+        [ "${attempts}" -gt 10 ] && break
+    done
+    window-focus-by-title "${name}" >/dev/null 2>&1
+fi
+
+# the pid of the launcher's own process in the terminal, the parent of its shell
+attempts=1
+while [ ! -s "${PID_FILE}" ]; do
+    ((attempts++))
+    if [ "${attempts}" -gt 50 ]; then
+        echo "ERROR: ${name} did not start in the default terminal" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+pid="$(cat "${PID_FILE}")"
+
+# a command is running when the shell inside the launcher window has children
+# of its own
+launcher_command_running() {
+    local shell
+    for shell in $(pgrep -P "${pid}" 2>/dev/null); do
+        [ -n "$(pgrep -P "${shell}" 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
+counter=0
+interval=0.5
+ignore_active=0
+max_seconds_after_kill=${interval}
+max_seconds_after_command=5
+command_was_running=0
+while true; do
+    kill -0 ${pid} 2>/dev/null || exit 0
+
+    # kill file exists, wait only for process
+    # and already exit immediately
+    if [ -f "${EXIT_FILE}" ]; then
+        rm -rf "${EXIT_FILE}"
+        counter=0
+        max_seconds=${max_seconds_after_kill}
+        ignore_active=1
+    fi
+
+    counter=$(echo "${counter}+${interval}" | bc)
+
+    # launcher in focus resets the counter
+    launcher_window="$(window-by-title "${name}")"
+    [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "${launcher_window}" ]] && counter=0
+
+    # running process in launcher resets the counter; once it finishes the
+    # launcher stays open a bit longer so the output can still be read
+    if launcher_command_running; then
+        counter=0
+        command_was_running=1
+    elif [ "${command_was_running}" -eq 1 ]; then
+        command_was_running=0
+        counter=0
+        [ "${ignore_active}" -eq 0 ] && max_seconds=${max_seconds_after_command}
+    fi
+
+    # otherwise exit launcher after max_seconds: hanging up the shell lets the
+    # launcher's process in the terminal exit cleanly, which closes the window
+    (( $(echo "${counter} >= ${max_seconds}" | bc -l) )) && pkill -HUP -P ${pid} && exit 0
+
+    sleep ${interval}
+done

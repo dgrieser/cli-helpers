@@ -1,0 +1,27 @@
+# launcher-terminal: the settings of the launcher's own Ptyxis process
+# (GSETTINGS_BACKEND=keyfile), copied fresh on every start, so changes made in its
+# preferences do not stick. The look is the one launcher has in Terminator.
+[org/gnome/Ptyxis]
+profile-uuids=['c6190f9e42f345c298e61b3c2c2400a4']
+default-profile-uuid='c6190f9e42f345c298e61b3c2c2400a4'
+use-system-font=false
+font-name='Agave Nerd Font Mono 13'
+scrollbar-policy='never'
+interface-style='dark'
+audible-bell=false
+visual-bell=false
+toast-on-copy-clipboard=false
+prompt-on-close=false
+restore-session=false
+restore-window-size=false
+# the size of the window in cells, as nothing resizes it afterwards
+default-columns=109
+default-rows=16
+# the window is found by its title, so programs in it must not change it
+ignore-osc-title=true
+
+[org/gnome/Ptyxis/Profiles/c6190f9e42f345c298e61b3c2c2400a4]
+label='Launcher'
+palette='launcher'
+limit-scrollback=false
+exit-action='close'

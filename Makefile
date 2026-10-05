@@ -15,7 +15,7 @@ COMPLETION := bash_completion/cli-helpers
 # desktop entries are per-user, like the GNOME extension
 DESKTOPDIR ?= $(HOME)/.local/share/applications
 DESKTOPSRCDIR := desktop
-DESKTOPS := browser-router.desktop ssh-terminal.desktop
+DESKTOPS := browser-router.desktop ssh-terminal.desktop launcher-terminal.desktop
 # Chrome policy so Chrome never asks to become the default browser (browser-router is)
 # written by browser-router --set-default, removed by uninstall
 CHROME_POLICY_DIR ?= /etc/opt/chrome/policies/managed
@@ -32,7 +32,8 @@ SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages chrome-profile
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
-# the data folders: the Terminator config of launcher, and what updater installs,
+# the data folders: the Terminator config of launcher and the Ptyxis files of
+# launcher-terminal, and what updater installs,
 # the configs merged into the user's config dirs (yazi with its local plugins,
 # powerline-shell, claude, codex, opencode, zed, terminator, gradia, gimp, vim,
 # rquickshare, cam-settings, screen-color, git, streamdown, mimeapps, zoom,
@@ -64,7 +65,7 @@ list:
 	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
 	@printf '  make install-gnome-extension  Install the packaged GNOME extension (skipped without GNOME)\n'
 	@printf '  sudo make install-completions Install bash completion for all commands\n'
-	@printf '  sudo make install-desktop     Install desktop entries (URL handlers)\n'
+	@printf '  sudo make install-desktop     Install desktop entries (URL handlers, launcher-terminal)\n'
 	@printf '  make set-default-browser      Make browser-router the default browser, stop Chrome asking (as your user)\n'
 	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
 	@printf '  make bind-shortcuts           Bind every app-shortcut binding as a GNOME custom shortcut (as your user)\n'

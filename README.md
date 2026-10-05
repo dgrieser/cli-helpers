@@ -2256,6 +2256,26 @@ Takes no arguments.
 launcher
 ```
 
+### `launcher-terminal`
+The same quick-launch window as `launcher`, opened in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`) instead of Terminator: always on top, with the short `TERM_SIMPLE` prompt, and left where GNOME places new windows (unlike `launcher`, it is not moved below the top bar). It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
+
+When Ptyxis is the default terminal, the launcher runs a Ptyxis process of its own (`ptyxis --standalone`) without a header bar and with its own profile: the look `launcher` has in Terminator (background `#32383f`, Agave Nerd Font Mono 13, the xterm colors, no scrollbar), 109x16 cells. Ptyxis takes neither from its command line, so that process runs on stand-ins for `~/.config` and `~/.local/share` in `$XDG_RUNTIME_DIR/launcher-terminal`, rebuilt on every start: every entry links to the real one, except its settings (a GSettings keyfile instead of dconf), its palette, its session (`org.gnome.Ptyxis`) and a `gtk-4.0/gtk.css` that collapses the header bar (your own `gtk.css` is imported). Your Ptyxis settings, profiles and session stay untouched, and the shell inside gets the real directories back. The three files come with cli-helpers in `$(LIBDIR)/launcher/ptyxis` (`gtk.css`, `settings.keyfile`, `launcher.palette`); one of the same name in `~/.config/cli-helpers/launcher-terminal` takes precedence. Changes made in the preferences of the launcher's Ptyxis do not stick. The stylesheet pulls the header bar up by its height in libadwaita (46 px), so a libadwaita that changes it can leave a strip of it visible.
+
+Any other terminal is started with `xdg-terminal-exec`, which passes no terminal options, so the window looks like any other window of that terminal and has its default size.
+
+Either way the window has no borderless mode, hidden taskbar entry or fade while unfocused. The launcher runs itself as the terminal's command and starts your `$SHELL` from there, because a single-instance terminal (Ptyxis, GNOME Terminal) leaves no process of its own to watch; it closes the window by hanging up that shell. A command run in it can close it right after it finishes with `touch "$LAUNCHER_EXIT_FILE"`.
+
+The desktop entry is installed by `make install-desktop`; `app-shortcut launcher-terminal` starts it through that entry and has no key binding, so bind one in `~/.config/cli-helpers/app-shortcuts/launcher-terminal.yaml` to use it instead of `launcher`.
+
+**Usage:** `launcher-terminal`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+launcher-terminal
+```
+
 ### `cron-to-ical`
 Generates an iCalendar (`.ics`) feed on stdout containing an event for each occurrence of a cron expression over a date range, converting times to UTC.
 
@@ -2315,7 +2335,7 @@ find:
   name: 'Outlook*'
 ```
 
-Shipped apps: `chrome`, `chrome-new`, `files`, `launcher`, `mic-toggle`, `outlook`, `screenshot`, `slack`, `terminal`, `wallpaper`, `zed`.
+Shipped apps: `chrome`, `chrome-new`, `files`, `launcher`, `launcher-terminal`, `mic-toggle`, `outlook`, `screenshot`, `slack`, `terminal`, `wallpaper`, `zed`.
 
 **Usage:** `app-shortcut [-l] [-p] [-b] [-n] [APP]`
 
