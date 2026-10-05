@@ -1,5 +1,8 @@
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+# the real location: linked into $(BINDIR) by make install-links, the launcher uses
+# the shared files of the checkout it comes from (its Ptyxis files, the window
+# helpers), even while $(LIBDIR) links to another checkout
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
     . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
 elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
