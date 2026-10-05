@@ -1676,9 +1676,41 @@ software-041-vim@base() {
 software-042-power-trigger@base() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
+    local logind_conf="/etc/systemd/logind.conf.d/50-power-trigger.conf"
+    local content
     # the lid and power events of cli-helpers' power-trigger, as a user service
     apt_upgrade python3-pydbus python3-gi || return 1
-    user_service_enable power-trigger.service "${lib_dir}/systemd-user/power-trigger.service"
+    user_service_enable power-trigger.service "${lib_dir}/systemd-user/power-trigger.service" || return 1
+    # logind leaves the lid to power-trigger (lock on close, suspend only when it stays
+    # closed on battery); a drop-in, so the packaged logind.conf stays untouched
+    content="$(cat <<EOF
+# Written by ${APP_NAME}. power-trigger locks the screen when the lid closes and
+# suspends when it stays closed on battery, so logind ignores the lid. The power
+# button suspends (in a GNOME session its power-button-action decides), a long
+# press powers off
+[Login]
+HandlePowerKey=suspend
+HandlePowerKeyLongPress=poweroff
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+)"
+    if [ "$(cat "${logind_conf}" 2>/dev/null)" = "${content}" ]; then
+        echo "${APP_NAME}: ${logind_conf} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would write ${logind_conf} (logind ignores the lid, the power button suspends)" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} tee ${logind_conf}"
+    ${SUDO} mkdir -p "$(dirname "${logind_conf}")" \
+        && echo "${content}" | ${SUDO} tee "${logind_conf}" > /dev/null \
+        && ${SUDO} chmod 0644 "${logind_conf}" || return 1
+    # a reload rereads logind.conf without ending the sessions, a restart would not
+    verbose "${SUDO} systemctl reload systemd-logind.service"
+    ${SUDO} systemctl reload systemd-logind.service
 }
 software-043-dotfile-backups@base() {
     # rewritten by make install to $(LIBDIR)
