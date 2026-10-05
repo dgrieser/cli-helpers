@@ -2280,7 +2280,7 @@ cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 These tools work on both X11 (via `xdotool`/`wmctrl`/`xrandr`) and Wayland/GNOME (via the bundled `cli-helpers-window-bridge` GNOME Shell extension installed by `make install`).
 
 ### `gnome-apply-settings`
-Applies a personal set of GNOME settings for the current user with `gsettings`/`dconf`: keyboard layout, dark Yaru theme and monospace font, clock and panel, mouse/touchpad, power (no suspend, no dimming), dock (layout, behavior, pinned Settings > Displays), Files list view, extensions (no desktop icons, tiling assistant) and Ptyxis. Pinning only adds what is missing, so other pinned apps stay. Refuses to run as root, since that would change root's settings. Run it with `make gnome-settings`.
+Applies a personal set of GNOME settings for the current user with `gsettings`/`dconf`: keyboard layout and NumLock, shortcuts (no workspace, input source or window group switching keys, show desktop on Super+D, Shift+Print records the screen), dark Yaru theme and monospace font, clock and panel, mouse/touchpad, power (no suspend, no dimming), dock (layout, behavior, pinned Settings > Displays), Files (list view columns, icon captions) and hidden files in the GTK 4 file chooser, extensions (no desktop icons, tiling assistant), Ptyxis, and app settings of Evolution, Evince, Meld, gedit and Drawing. Pinning only adds what is missing, so other pinned apps stay. Refuses to run as root, since that would change root's settings. Run it with `make gnome-settings`.
 
 **Usage:** `gnome-apply-settings [-h|--help]`
 

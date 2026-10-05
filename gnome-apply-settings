@@ -4,8 +4,8 @@ usage()
 {
     echo "Usage: gnome-apply-settings [-h|--help]"
     echo
-    echo "Applies personal GNOME settings (keyboard, appearance, dock, power, Files,"
-    echo "Ptyxis, extensions) for the current user with gsettings/dconf."
+    echo "Applies personal GNOME settings (keyboard, shortcuts, appearance, dock, power,"
+    echo "Files, Ptyxis, extensions, apps) for the current user with gsettings/dconf."
     exit "${1:-1}"
 }
 
@@ -32,6 +32,17 @@ gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-up "['']"
 gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-down "['']"
 gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "['']"
 gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left "['']"
+# Super+Space and Super+` stay free (no input source or window group switching),
+# show desktop only on Super+D
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-group "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-group-backward "@as []"
+gsettings set org.gnome.desktop.wm.keybindings show-desktop "['<Super>d']"
+# screenshots: Print belongs to app-shortcut screenshot, Shift+Print records the screen
+gsettings set org.gnome.shell.keybindings screenshot "@as []"
+gsettings set org.gnome.shell.keybindings screenshot-window "@as []"
+gsettings set org.gnome.shell.keybindings show-screen-recording-ui "['<Shift>Print']"
 gsettings set org.gnome.shell disable-extension-version-validation true
 gsettings set org.gnome.desktop.remote-desktop.rdp screen-share-mode extend
 gsettings set org.gnome.shell.extensions.dash-to-dock show-icons-emblems false
@@ -41,8 +52,10 @@ gsettings set org.gnome.mutter attach-modal-dialogs false
 
 dconf write /org/gnome/desktop/notifications/application/solaar/enable false
 
-# keyboard: German without dead keys, so ` and ^ type immediately
+# keyboard: German without dead keys, so ` and ^ type immediately; NumLock on (GNOME
+# keeps its state across logins)
 gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de+nodeadkeys')]"
+gsettings set org.gnome.desktop.peripherals.keyboard numlock-state true
 
 # appearance
 gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
@@ -63,7 +76,7 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 
 gsettings set org.gnome.settings-daemon.plugins.color night-light-schedule-automatic false
 
 # dock
-gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 24
+gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 26
 gsettings set org.gnome.shell.extensions.dash-to-dock multi-monitor true
 gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
 # pin Settings > Displays, keeping whatever else is pinned
@@ -108,6 +121,13 @@ gsettings set org.gnome.desktop.interface monospace-font-name 'Agave Nerd Font M
 gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,close'
 gsettings set org.gnome.desktop.sound event-sounds false
 gsettings set org.gnome.desktop.sound allow-volume-above-100-percent true
+# system sounds muted: no input feedback sounds (Ubuntu turns them on), and the System
+# Sounds volume of Settings muted; WirePlumber keeps it from the route-settings metadata
+gsettings set org.gnome.desktop.sound input-feedback-sounds false
+if command -v pw-metadata >/dev/null 2>&1; then
+    pw-metadata -n route-settings 0 'restore.stream.Output/Audio.media.role:Notification' \
+        '{"volume":1.0, "mute":true, "volumes":[1.0, 1.0], "channels":["FL", "FR"]}' 'Spa:String:JSON' > /dev/null
+fi
 gsettings set org.gnome.desktop.session idle-delay 'uint32 0'
 
 # power: no dimming, power button suspends, never suspend on battery either
@@ -125,10 +145,28 @@ gsettings set org.gnome.shell.extensions.dash-to-dock apply-custom-theme true
 gsettings set org.gnome.shell.extensions.dash-to-dock shortcut-timeout 5.0
 gsettings set org.gnome.shell.extensions.dash-to-dock preferred-monitor-by-connector 'eDP'
 
-# Files: list view, thumbnails also for remote files
+# Files: list view with owner and type, thumbnails also for remote files; icons captioned
+# with type, size and date; the GTK 4 file chooser shows hidden files
 gsettings set org.gnome.nautilus.preferences default-folder-viewer 'list-view'
 gsettings set org.gnome.nautilus.preferences show-image-thumbnails 'always'
+gsettings set org.gnome.nautilus.list-view default-visible-columns "['name', 'owner', 'size', 'date_modified', 'type']"
+gsettings set org.gnome.nautilus.list-view default-column-order "['name', 'permissions', 'owner', 'group', 'size', 'date_modified', 'type', 'mime_type', 'where', 'date_modified_with_time', 'date_accessed', 'date_created', 'recency', 'starred']"
+gsettings set org.gnome.nautilus.icon-view captions "['type', 'size', 'date_modified']"
+gsettings set org.gtk.gtk4.Settings.FileChooser show-hidden true
 
 # tiling assistant: no popup, no example layouts
 gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
 gsettings set org.gnome.shell.extensions.tiling-assistant import-layout-examples false
+
+# apps, with dconf so it also works before they are installed: Evolution with a 24-hour
+# clock and reminders without sound or notification, Evince with free zoom and odd pages
+# on the left, Meld, gedit and Drawing dark, Drawing with big icons
+dconf write /org/gnome/evolution/calendar/use-24hour-format true
+dconf write /org/gnome/evolution-data-server/calendar/notify-enable-audio false
+dconf write /org/gnome/evolution-data-server/calendar/notify-enable-display false
+dconf write /org/gnome/evince/default/sizing-mode "'free'"
+dconf write /org/gnome/evince/default/dual-page-odd-left true
+dconf write /org/gnome/meld/prefer-dark-theme true
+dconf write /org/gnome/gedit/preferences/editor/scheme "'Yaru-dark'"
+dconf write /com/github/maoschanz/drawing/dark-theme-variant true
+dconf write /com/github/maoschanz/drawing/big-icons true
