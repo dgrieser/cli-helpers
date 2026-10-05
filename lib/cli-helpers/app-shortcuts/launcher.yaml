@@ -1,7 +1,0 @@
-# the Terminator-only launcher; no binding of its own, launcher-terminal has the keys
-description: Launcher
-bindings: []
-focus:
-  title: Launcher
-launch:
-  desktop: launcher

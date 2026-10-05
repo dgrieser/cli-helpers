@@ -51,20 +51,6 @@
     title_inactive_bg_color = "#3b4551"
     title_use_system_font = False
     title_font = Agave Nerd Font Mono 13
-  [[launcher]]
-    icon_bell = False
-    background_color = "#f6f5f4"
-    background_darkness = 0.95
-    background_type = transparent
-    cursor_fg_color = "#ffffff"
-    cursor_bg_color = "#000000"
-    font = Cousine for Powerline 14
-    foreground_color = "#000000"
-    show_titlebar = False
-    scrollbar_position = hidden
-    scrollback_infinite = True
-    palette = "#000000:#cd0000:#00cd00:#cdcd00:#0000ee:#cd00cd:#00cdcd:#e5e5e5:#7f7f7f:#ff0000:#00ff00:#ffff00:#5c5cff:#ff00ff:#00ffff:#ffffff"
-    copy_on_selection = True
   [[default_light]]
     icon_bell = False
     background_color = "#3b4551"
@@ -103,23 +89,6 @@
       order = 0
       profile = default
       uuid = ef7fc29b-2db4-4b72-b238-1e8e0cda40c7
-  [[launcher]]
-    [[[child1]]]
-      type = Window
-      parent = ""
-      order = 0
-      position = 1000:200
-      maximised = False
-      fullscreen = False
-      size = 400, 400
-      last_active_term = ef7fc29b-2db4-4b72-b238-1e8e0cda40c8
-      last_active_window = False
-    [[[terminal2]]]
-      type = Terminal
-      parent = child1
-      order = 0
-      profile = launcher
-      uuid = ef7fc29b-2db4-4b72-b238-1e8e0cda40c8
 [plugins]
   [[AutoTheme]]
     light = default_light

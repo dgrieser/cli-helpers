@@ -11,7 +11,7 @@ copying its file there and editing it. Keys of a file:
   bindings: ['<Shift><Control>k']     # what --bind turns into GNOME custom shortcuts
   focus:                              # optional: focus an existing window ...
     class: [Slack]                    #   any of these WM classes
-    title: Launcher                   #   or a window title
+    title: Launcher-Terminal          #   or a window title
   launch:                             # ... otherwise (or without focus) start it
     desktop: slack                    #   gtk-launch <desktop> [args...]
     command: [amixer-mic-toggle]      #   or run a command as is

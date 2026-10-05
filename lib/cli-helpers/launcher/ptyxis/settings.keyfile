@@ -1,6 +1,6 @@
 # launcher-terminal: the settings of the launcher's own Ptyxis process
 # (GSETTINGS_BACKEND=keyfile), copied fresh on every start, so changes made in its
-# preferences do not stick. The look is the one launcher has in Terminator.
+# preferences do not stick. The look is the one of the launcher's Terminator config.
 [org/gnome/Ptyxis]
 profile-uuids=['c6190f9e42f345c298e61b3c2c2400a4']
 default-profile-uuid='c6190f9e42f345c298e61b3c2c2400a4'

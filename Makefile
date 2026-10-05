@@ -32,8 +32,8 @@ SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge pip-packages chrome-profile
 # the app definitions of app-shortcut, one YAML file per app
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
-# the data folders: the Terminator config of launcher and the Ptyxis and Terminator
-# files of launcher-terminal, and what updater installs,
+# the data folders: the Ptyxis and Terminator files of launcher-terminal, and what
+# updater installs,
 # the configs merged into the user's config dirs (yazi with its local plugins,
 # powerline-shell, claude, codex, opencode, zed, terminator, gradia, gimp, vim,
 # rquickshare, cam-settings, screen-color, git, streamdown, mimeapps, zoom,
