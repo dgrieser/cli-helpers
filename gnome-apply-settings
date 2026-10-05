@@ -98,15 +98,27 @@ gsettings set org.gnome.shell.extensions.ding show-home false
 gsettings set org.gnome.shell.extensions.tiling-assistant focus-hint-color 'rgb(203,67,20)'
 gsettings set org.gnome.shell.extensions.tiling-assistant tiling-popup-all-workspace true
 
-# Ptyxis: no bells, nord palette and unlimited scrollback on the default profile
+# Ptyxis: no bells, the system's monospace font, new tabs next to the current one; nord
+# palette and unlimited scrollback on the default profile
 gsettings set org.gnome.Ptyxis audible-bell false
 gsettings set org.gnome.Ptyxis visual-bell false
 gsettings set org.gnome.Ptyxis use-system-font true
+gsettings set org.gnome.Ptyxis new-tab-position 'next'
 ptyxis_profile="$(gsettings get org.gnome.Ptyxis default-profile-uuid 2>/dev/null | tr -d "'")"
 if [ -n "${ptyxis_profile}" ]; then
+    gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" label 'Dave'
     gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" palette 'nord'
     gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" limit-scrollback false
 fi
+# Ptyxis shortcuts: Ctrl+Alt+Down opens a tab, Ctrl+Alt+Up the tab overview; the ones
+# for closing, moving and switching tabs and windows, menus and preferences are off, so
+# their keys reach the programs in the terminal
+gsettings set org.gnome.Ptyxis.Shortcuts new-tab '<Control><Alt>Down'
+gsettings set org.gnome.Ptyxis.Shortcuts tab-overview '<Control><Alt>Up'
+for shortcut in close-tab close-window move-next-tab move-previous-tab move-tab-left move-tab-right \
+    new-window popup-menu preferences tab-menu undo-close-tab; do
+    gsettings set org.gnome.Ptyxis.Shortcuts "${shortcut}" ''
+done
 
 # from the old system: clock and panel
 gsettings set org.gnome.desktop.interface clock-show-seconds true

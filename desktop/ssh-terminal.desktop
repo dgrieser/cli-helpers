@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SSH
+Comment=Open ssh:// links in a terminal
+Exec=/usr/local/bin/ssh-terminal %u
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=false
+MimeType=x-scheme-handler/ssh;

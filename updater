@@ -1029,6 +1029,96 @@ dconf_update() {
     return 0
 }
 
+# module_blacklist MODULE REASON: keeps the kernel module MODULE from loading, but only
+# when the machine has a device it drives (a PCI or USB modalias matching one of the
+# module's aliases), e.g. a built-in WWAN modem that is never used
+module_blacklist() {
+    local module="${1}"
+    local reason="${2}"
+    local conf="/etc/modprobe.d/blacklist-${module}.conf"
+    local content
+    local aliases
+    local alias
+    local modalias
+    local device=""
+
+    content="$(printf '%s\n' "# ${reason} (written by ${APP_NAME})" "blacklist ${module}")"
+    aliases="$(modinfo -F alias "${module}" 2>/dev/null)"
+    if [ -z "${aliases}" ]; then
+        echo "${APP_NAME}: no kernel module ${module}, nothing to blacklist" 1>&2
+        return 0
+    fi
+    for modalias in /sys/bus/pci/devices/*/modalias /sys/bus/usb/devices/*/modalias; do
+        [ -r "${modalias}" ] || continue
+        while IFS= read -r alias; do
+            # the aliases are globs, e.g. pci:v00008086d00007360sv*sd*bc*sc*i*
+            # shellcheck disable=SC2053
+            if [[ "$(cat "${modalias}")" == ${alias} ]]; then
+                device="$(dirname "${modalias}")"
+                break 2
+            fi
+        done <<< "${aliases}"
+    done
+    if [ -z "${device}" ]; then
+        echo "${APP_NAME}: no device for ${module} on this machine, not blacklisting it" 1>&2
+        return 0
+    fi
+    if [ "$(cat "${conf}" 2>/dev/null)" = "${content}" ]; then
+        echo "${APP_NAME}: ${module} is blacklisted (${device##*/})" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would blacklist ${module} for ${device##*/} in ${conf}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} tee ${conf}"
+    echo "${content}" | ${SUDO} tee "${conf}" > /dev/null || return 1
+    # takes effect at the next boot; unloaded now if it is loaded
+    if lsmod | awk '{ print $1 }' | grep -qFx "${module}"; then
+        verbose "${SUDO} modprobe -r ${module}"
+        ${SUDO} modprobe -r "${module}" || warning "${module} stays loaded until the next boot"
+    fi
+}
+
+# wireplumber_update NAME: merges the WirePlumber config $(LIBDIR)/NAME into the user's
+# and restarts WirePlumber when it changed, as it only reads its config at start
+wireplumber_update() {
+    local name="${1}"
+    # rewritten by make install to $(LIBDIR)
+    local src_dir="/usr/local/lib/cli-helpers/${name}"
+    local dst_dir="${CURRENT_USER_HOME}/.config/wireplumber"
+    # systemctl --user talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local file
+    local changed=0
+
+    while IFS= read -r file; do
+        cmp -s "${src_dir}/${file}" "${dst_dir}/${file}" || changed=1
+    done < <(find -L "${src_dir}" -type f -printf '%P\n')
+    config_update "${name}" "${dst_dir}" || return 1
+    if [ "${changed}" -eq 0 ] || [ "${dry_run}" -eq 1 ]; then
+        return 0
+    fi
+    verbose "${SUDO_USER} systemctl --user restart wireplumber"
+    ${SUDO_USER} "${session_env[@]}" systemctl --user restart wireplumber
+}
+
+# helm_repo_add NAME URL: adds the chart repository NAME, unless the user has one of
+# that name already
+helm_repo_add() {
+    local name="${1}"
+    local url="${2}"
+    if ${SUDO_USER} helm repo list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qFx "${name}"; then
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would add the helm repository ${name} (${url})" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} helm repo add ${name} ${url}"
+    ${SUDO_USER} helm repo add "${name}" "${url}" > /dev/null
+}
+
 flatpak_list_updates() {
     local pkg="${1}"
     # by application id, which is what the handlers pass; plugins are runtimes, not apps
@@ -1478,10 +1568,24 @@ software-010-firmware@base() {
         yes | ${SUDO} fwupdmgr update
     fi
 }
+software-011-hardware@base() {
+    # the built-in WWAN modem (Intel XMM7360 or 5G) is never used, so its driver stays
+    # unloaded; only on a laptop that has one
+    module_blacklist iosm "built-in Intel WWAN modem, never used" || return 1
+    # no audio from the ThinkPad USB-C dock and the Aukey webcam (watching their hotplug
+    # spun WirePlumber at 100% CPU), nor from the HDMI of an AMD GPU if the laptop has one
+    wireplumber_update wireplumber || return 1
+    if lspci -d 1002::0403 2>/dev/null | grep -q .; then
+        wireplumber_update wireplumber-radeon
+    fi
+}
 software-015-git@base() {
     # the git-core PPA has newer git releases than Ubuntu
     apt_add_with_repo "git" "https://ppa.launchpadcontent.net/git-core/ppa/ubuntu" "${OS_RELEASE_VERSION_CODENAME}" "main" \
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF911AB184317630C59970973E363C90F8F1B6217" "F911AB184317630C59970973E363C90F8F1B6217"
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF911AB184317630C59970973E363C90F8F1B6217" "F911AB184317630C59970973E363C90F8F1B6217" \
+        || return 1
+    # the global ignore and the settings of gitk
+    config_update git "${CURRENT_USER_HOME}/.config/git"
 }
 
 software-016-bash-aliases@base() {
@@ -1525,7 +1629,10 @@ software-030-npm@dev@base() {
 }
 software-031-desktop-tools@base() {
     apt_upgrade xclip xdotool wmctrl xinput xkbset v4l-utils pamixer \
-        w3m w3m-img lynx ranger colorized-logs ansifilter
+        w3m w3m-img lynx ranger colorized-logs ansifilter || return 1
+    # the presets of cam-settings (v4l2-ctl) and the monitor colors of screen-color
+    config_update cam-settings "${CURRENT_USER_HOME}/.config/cam-settings" \
+        && config_update screen-color "${CURRENT_USER_HOME}/.config/screen-color"
 }
 software-032-disk-tools@base() {
     apt_upgrade gparted partclone gddrescue sdparm mmc-utils fio genisoimage xorriso zsync \
@@ -1537,7 +1644,10 @@ software-033-dev-tools@dev() {
         isympy3 mkdocs oidc-agent
 }
 software-034-desktop-apps@base() {
-    apt_upgrade eog evince clapper drawing vlc keepassxc dconf-editor qdirstat filezilla
+    apt_upgrade eog evince clapper drawing vlc keepassxc dconf-editor qdirstat filezilla || return 1
+    # the default apps: VLC for audio, Image Viewer for images, Sublime Text for text,
+    # ssh://, tel: and webcal: links (video stays with the system's player)
+    config_update mimeapps "${CURRENT_USER_HOME}/.config"
 }
 software-035-office@base() { apt_upgrade libreoffice evolution evolution-ews evolution-plugin-pstimport; }
 software-036-media-apps@media() { apt_upgrade audacity kdenlive blender calibre puddletag glabels; }
@@ -1545,6 +1655,24 @@ software-037-wireshark@dev() { apt_upgrade wireshark; }
 software-038-java@dev() { apt_upgrade openjdk-21-jre; }
 software-039-qemu@dev() { apt_upgrade qemu-system qemu-utils ovmf swtpm spice-client-gtk quickemu; }
 software-040-flatpak@base() { flatpak_update; }
+software-041-vim@base() {
+    local plug="${CURRENT_USER_HOME}/.vim/autoload/plug.vim"
+    needs packages vim || return $(( $? == 3 ? 0 : 1 ))
+    # the plugins the vimrc uses: Codeium (its status in the statusline, sign in
+    # once with :Codeium Auth) and vim-plug, which updates itself with :PlugUpgrade
+    git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
+    if [ ! -f "${plug}" ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would download vim-plug to ${plug}" 1>&2
+        else
+            needs packages curl || return $(( $? == 3 ? 0 : 1 ))
+            verbose "${SUDO_USER} curl -fsSL --create-dirs -o ${plug} https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim"
+            ${SUDO_USER} curl -fsSL --create-dirs -o "${plug}" "https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim" || return 1
+        fi
+    fi
+    # ~/.vimrc and ~/.vim/plugin/jq-lsp.vim, merged into the user's
+    config_update vim "${CURRENT_USER_HOME}"
+}
 software-042-power-trigger@base() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
@@ -1757,6 +1885,7 @@ software-130-slack@comms() {
         "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
         "https://packagecloud.io/slacktechnologies/slack/gpgkey"
 }
+software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_amd64.deb"; }
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
@@ -1807,7 +1936,19 @@ software-185-bahn-probonio-bot@personal() {
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
 software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
-software-210-himalaya@comms() { install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya; }
+software-210-himalaya@comms() {
+    local account="mail@david-grieser.de"
+    # secret-tool talks to the keyring of the user's session
+    local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return 1
+    # the mail account; its password comes from the GNOME keyring through secret-tool
+    needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
+    config_update himalaya "${CURRENT_USER_HOME}/.config/himalaya" || return 1
+    if ! ${SUDO_USER} "${session_env[@]}" secret-tool lookup service himalaya account "${account}" > /dev/null 2>&1; then
+        echo "${APP_NAME}: store the password of ${account} once in the keyring:" 1>&2
+        echo "  secret-tool store --label=\"himalaya ${account}\" service himalaya account ${account}" 1>&2
+    fi
+}
 
 software-230-zed@dev() {
     curl_update "zed" "https://zed.dev/install.sh" || return 1
@@ -1873,7 +2014,21 @@ software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffie
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
 software-280-spotify@media() {
-    apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc"
+    local user_dir
+    local found=0
+    apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc" \
+        || return 1
+    # not started at login; Spotify writes its prefs when it quits, so they are merged
+    # best while it is closed
+    config_update spotify "${CURRENT_USER_HOME}/.config/spotify" || return 1
+    # the highest audio quality and no home page takeover, for every account logged in
+    for user_dir in "${CURRENT_USER_HOME}"/.config/spotify/Users/*-user; do
+        [ -d "${user_dir}" ] || continue
+        found=1
+        config_update spotify-user "${user_dir}" || return 1
+    done
+    [ "${found}" -eq 1 ] || echo "${APP_NAME}: log in to Spotify once, then run ${APP_NAME} spotify again for the account settings" 1>&2
+    return 0
 }
 
 software-290-trivy@dev@k8s() {
@@ -1935,25 +2090,27 @@ software-330-zoom@comms() {
     [ -z "${installed_version}" ] && installed_version="<unknown>"
     if [ "${version}" = "${installed_version}" ]; then
         echo "${APP_NAME}: Zoom ${installed_version} is up to date" 1>&2
-        return 0
-    fi
-
-    echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
-    if [ "${dry_run}" -eq 1 ]; then
+    elif [ "${dry_run}" -eq 1 ]; then
+        echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
         echo -e "NAME\tCURRENT\tUPDATE\nZoom\t${installed_version}\t${version}" | column -t -s $'\t'
-        return 0
+    else
+        echo "${APP_NAME}: Update available for Zoom ${installed_version} -> ${version}" 1>&2
+        trap 'rm -f "${zoom_deb_file_path}"; trap - RETURN' RETURN
+        if ! curl -L "${zoom_client_url}/${version}/${zoom_deb_file_name}" -o "${zoom_deb_file_path}"; then
+            error "Failed to download latest version of Zoom from ${zoom_client_url}"
+            return 1
+        fi
+        apt_get_noninteractive install "${zoom_deb_file_path}" || return 1
     fi
-
-    trap 'rm -f "${zoom_deb_file_path}"; trap - RETURN' RETURN
-    if ! curl -L "${zoom_client_url}/${version}/${zoom_deb_file_name}" -o "${zoom_deb_file_path}"; then
-        error "Failed to download latest version of Zoom from ${zoom_client_url}"
-        return 1
-    fi
-    apt_get_noninteractive install "${zoom_deb_file_path}"
+    # English, tray icon, mini window, no sound or GIFs in chats, no global screenshot keys
+    config_update zoom "${CURRENT_USER_HOME}/.config"
 }
 software-335-teamviewer@desktop() {
     apt_add_with_repo "teamviewer" "https://linux.teamviewer.com/deb" "stable" "main" \
-        "https://linux.teamviewer.com/pubkey/currentkey.asc" "AB2985BDE164897BA46EA69A234FAACB575B15D1"
+        "https://linux.teamviewer.com/pubkey/currentkey.asc" "AB2985BDE164897BA46EA69A234FAACB575B15D1" \
+        || return 1
+    # dark, the classic UI
+    config_update teamviewer "${CURRENT_USER_HOME}/.config/teamviewer"
 }
 
 software-340-glab@dev() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
@@ -1978,7 +2135,27 @@ software-360-helm@dev@k8s() {
     # the secrets plugin encrypts with sops
     needs sops || return $(( $? == 3 ? 0 : 1 ))
     helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
-        && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git"
+        && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git" \
+        || return 1
+    # the chart repositories; nickpit's is a git one, read by helm-git
+    local name
+    local url
+    local failed=0
+    while read -r name url; do
+        helm_repo_add "${name}" "${url}" || failed=1
+    done <<'REPOS'
+nickpit git+https://github.com/dgrieser/nickpit@deploy/helm?ref=v0.0.13&sparse=0
+coredns https://coredns.github.io/helm
+mittwald-public https://helm.mittwald.de
+bitnami https://charts.bitnami.com/bitnami
+wikimedia https://helm-charts.wikimedia.org/stable
+ingressNginx https://kubernetes.github.io/ingress-nginx
+prometheus-community https://prometheus-community.github.io/helm-charts
+haproxy-ingress https://haproxy-ingress.github.io/charts
+jaegertracing https://jaegertracing.github.io/helm-charts
+grafana https://grafana.github.io/helm-charts
+REPOS
+    return "${failed}"
 }
 software-361-helmfile@dev@k8s() { install_git_release "https://github.com/helmfile/helmfile"; }
 software-362-jsonnet@dev@k8s() {
@@ -2331,7 +2508,9 @@ software-584-pip-tools@base() {
     pip_update pip-tools streamdown "powerline-shell @ git+https://github.com/dgrieser/powerline-shell.git" \
         csv2md markdown-to-mrkdwn oletools || return 1
     # the prompt config, with the fork's mycmd and virtual_env segments
-    config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell"
+    config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell" || return 1
+    # the look of streamdown
+    config_update streamdown "${CURRENT_USER_HOME}/.config/streamdown"
 }
 software-585-pip-dev-tools@dev() {
     # mkdocs-drawio-file pins lxml<5, which is built from source

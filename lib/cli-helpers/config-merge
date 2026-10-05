@@ -7,7 +7,8 @@ merged, so everything else the user has in it is kept:
 - *.toml: the shipped keys are set, tables are merged recursively, and the
   entries of arrays of tables (prepend_keymap, prepend_previewers, ...) are
   updated or appended, matched by their identifying keys (on, url, mime, ...)
-- *.json and *.jsonc (comments and trailing commas allowed, e.g. of Zed): the
+- *.json, *.jsonc (comments and trailing commas allowed, e.g. of Zed) and
+  *.config holding JSON (screen-color): the
   shipped keys are set, objects are merged recursively, and the entries of
   lists (the segments of powerline-shell, a Zed keymap) are merged or inserted
   after the entry they follow in the shipped list, matched by their type and
@@ -20,11 +21,21 @@ merged, so everything else the user has in it is kept:
 - *.lua in the top directory: the top-level statements are matched by what they define (function
   NAME, variable NAME, require("NAME")) and replaced or appended
 - keyfile (GLib's keyfile settings backend, e.g. of a Flatpak app in
-  ~/.var/app/ID/config/glib-2.0/settings): the shipped keys are set in their
-  [groups], every other line stays as it is
+  ~/.var/app/ID/config/glib-2.0/settings), mimeapps.list and zoomus.conf: the
+  shipped keys are set in their [groups], every other line stays as it is
+- one setting per line: git's ignore matched by the whole pattern, gitk's
+  "set NAME ..." by NAME, and the KEY=VALUE lines of Spotify's prefs,
+  TeamViewer's client.conf and *.preset (cam-settings) by KEY; a changed line
+  is replaced, a missing one appended
 - gimprc and shortcutsrc (GIMP's S-expressions): the top-level forms are
   matched by their name, an (action "NAME" ...) by its action, and replaced or
   added before the closing "# end of" comment
+- .vimrc and vimrc: the top-level statements, blocks (augroup, if, function,
+  the vim-plug block) and continued lines included, are matched by what they
+  define (:set of one option, :let, a mapping or abbreviation by its mode and
+  keys, :command, :highlight, :function, :augroup), others by their comment or
+  text, and replaced, or added with their comment after the statement they
+  follow in the shipped file, without one first
 - everything else (plugins, segments) is ours as a whole, so the file is
   replaced when it differs
 """
@@ -401,8 +412,12 @@ def merge_lua(dst_text, src_text):
     return "\n".join(merged) + "\n", changes
 
 
+# GLib key files, and the like: the default apps of mimeapps.list, Zoom's QSettings
+KEYFILES = ("keyfile", "mimeapps.list", "zoomus.conf")
+
+
 def is_keyfile(rel):
-    return os.path.basename(rel) == "keyfile"
+    return os.path.basename(rel) in KEYFILES
 
 
 def keyfile_groups(lines):
@@ -449,6 +464,54 @@ def merge_keyfile(dst_text, src_text):
         merged.append(line)
         merged.extend(inserts.get(index, []))
     return "\n".join(merged + appended) + "\n", changes
+
+
+def assignment_key(line):
+    return line.split("=", 1)[0].strip() if "=" in line else None
+
+
+# files of one setting per line, and what identifies a line
+LINE_SETTINGS = {
+    "ignore": lambda line: line.strip(),
+    "gitk": lambda line: line.split()[1] if line.startswith("set ") else None,
+    "prefs": assignment_key,
+    "client.conf": assignment_key,
+}
+
+
+def line_settings_key(rel):
+    name = os.path.basename(rel)
+    if name.endswith(".preset"):
+        return assignment_key
+    return LINE_SETTINGS.get(name)
+
+
+def merge_line_settings(dst_text, src_text, key):
+    def line_key(line):
+        if not line.strip() or line.lstrip().startswith("#"):
+            return None
+        return key(line)
+
+    lines = dst_text.splitlines()
+    dst = {}
+    for index, line in enumerate(lines):
+        dst.setdefault(line_key(line), index)
+    changes = []
+    appended = []
+    for line in src_text.splitlines():
+        ident = line_key(line)
+        if ident is None:
+            continue
+        index = dst.get(ident)
+        if index is None:
+            appended.append(line)
+            changes.append(f"add {ident}")
+        elif lines[index] != line:
+            lines[index] = line
+            changes.append(f"set {ident}")
+    if not changes:
+        return dst_text, changes
+    return "\n".join(lines + appended) + "\n", changes
 
 
 GIMP_RC = ("gimprc", "shortcutsrc")
@@ -547,6 +610,158 @@ def merge_gimp_rc(dst_text, src_text):
     return "\n".join(merged) + "\n", changes
 
 
+VIM_RC = (".vimrc", "vimrc")
+# what a top-level statement is matched by: a :set of one option by the option
+# ("set encoding=utf-8", "set nowrap"; a "set ts=4 sw=4" by its text), a :let
+# by its variable, a mapping or abbreviation by its mode and keys, a :command,
+# :highlight, :function and :augroup by their name, the vim-plug block as one
+VIM_KEYS = (
+    ("augroup", re.compile(r"^\s*aug(?:roup)?\s+(?!END\b)(\S+)")),
+    ("plug", re.compile(r"^\s*call\s+(plug)#begin\(")),
+    ("function", re.compile(r"^\s*(?:fu(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?|def)!?\s+([\w:#.<>]+)")),
+    ("set", re.compile(r'^\s*se(?:t)?\s+(?:no|inv)?(\w+)(?:[!&]|[-+^]?=(?:\\.|\S)*)?\s*(?:".*)?$')),
+    ("let", re.compile(r"^\s*let\s+([\w:#.]+)\s*[-+.]?=")),
+    ("map", re.compile(r"^\s*([nvxsoilct]?)(?:nore)?map(!?)\s+(?:<(?:buffer|nowait|silent|special|script|expr|unique)>\s*)*(\S+)")),
+    ("abbrev", re.compile(r"^\s*([ci]?)(?:nore)?ab\w*\s+(?:<(?:buffer|expr)>\s*)*(\S+)")),
+    ("command", re.compile(r"^\s*com(?:m(?:a(?:n(?:d)?)?)?)?!?\s+(?:-\S+\s+)*([A-Z]\w*)")),
+    ("highlight", re.compile(r"^\s*hi(?:g(?:h(?:l(?:i(?:g(?:h(?:t)?)?)?)?)?)?)?!?\s+(?:default\s+)?(?:link\s+)?(\w+)")),
+)
+# the statements that take more lines, up to their closing one: the opening and
+# closing patterns
+VIM_BLOCKS = (
+    (re.compile(r"^\s*if\b"), re.compile(r"^\s*en(?:d(?:i(?:f)?)?)?\b")),
+    (re.compile(r"^\s*for\b"), re.compile(r"^\s*endfo\w*\b")),
+    (re.compile(r"^\s*wh(?:i(?:l(?:e)?)?)?\b"), re.compile(r"^\s*endw\w*\b")),
+    (re.compile(r"^\s*try\b"), re.compile(r"^\s*endt\w*\b")),
+    (re.compile(r"^\s*fu\w*!?\s"), re.compile(r"^\s*endf(?:u\w*)?\s*$")),
+    (re.compile(r"^\s*def!?\s"), re.compile(r"^\s*enddef\b")),
+    (re.compile(r"^\s*aug(?:roup)?\s+(?!END\b)\S"), re.compile(r"^\s*aug(?:roup)?\s+END\b")),
+    (re.compile(r"^\s*call\s+plug#begin\("), re.compile(r"^\s*call\s+plug#end\(")),
+)
+# a continuation line starts with a backslash
+VIM_CONTINUATION = re.compile(r"^\s*\\")
+
+
+def is_vimrc(rel):
+    return os.path.basename(rel) in VIM_RC
+
+
+def vim_block(line, closers):
+    """Keep track of the open blocks: CLOSERS are the closing patterns still
+    expected, the innermost last."""
+    if closers and closers[-1].match(line):
+        closers.pop()
+        return
+    for opener, closer in VIM_BLOCKS:
+        if opener.match(line):
+            # a block on one line, e.g. if x | y | endif
+            if "|" not in line or not closer.match(line.rsplit("|", 1)[1]):
+                closers.append(closer)
+            return
+
+
+def vim_key(chunk):
+    first = chunk["lines"][0]
+    for kind, pattern in VIM_KEYS:
+        match = pattern.match(first)
+        if not match:
+            continue
+        if kind == "map":
+            return f"{match.group(1)}map{match.group(2)} {match.group(3)}"
+        if kind == "abbrev":
+            return f"{match.group(1)}abbrev {match.group(2)}"
+        if kind == "highlight":
+            return f"highlight {match.group(1).lower()}"
+        if kind == "plug":
+            return "vim-plug block"
+        return f"{kind} {match.group(1)}"
+    # anything else, e.g. an autocmd or an if block: its comment names it,
+    # otherwise it is only found again when it is unchanged
+    if chunk["comment"]:
+        return "comment " + " ".join(" ".join(chunk["comment"]).split())
+    return "statement " + " ".join(" ".join(chunk["lines"]).split())
+
+
+def vim_chunks(text):
+    """Split into top-level statements, each with its key, the comment lines
+    right before it and the range of its lines; a block and the continuation
+    lines belong to the statement they start in."""
+    chunks = []
+    comment = []
+    gap = False
+    current = None
+    closers = []
+    for index, line in enumerate(text.splitlines()):
+        if current is not None and (closers or VIM_CONTINUATION.match(line)):
+            current["lines"].append(line)
+            current["end"] = index + 1
+            vim_block(line, closers)
+            continue
+        current = None
+        if not line.strip():
+            comment = []
+            gap = True
+            continue
+        if line.lstrip().startswith('"'):
+            comment.append(line)
+            continue
+        current = {"comment": comment, "lines": [line], "start": index, "end": index + 1, "gap": gap}
+        chunks.append(current)
+        vim_block(line, closers)
+        comment = []
+        gap = False
+    for chunk in chunks:
+        chunk["key"] = vim_key(chunk)
+    return chunks
+
+
+def merge_vimrc(dst_text, src_text):
+    lines = dst_text.splitlines()
+    # the last of the same, e.g. of two definitions of a command, is the one vim uses
+    dst = {chunk["key"]: chunk for chunk in vim_chunks(dst_text)}
+    changes = []
+    replacements = {}
+    # a missing statement goes after the one it follows in the shipped file;
+    # without one, first, as e.g. 'encoding' is set before anything reads text
+    inserts = {}
+    anchor = 0
+    for chunk in vim_chunks(src_text):
+        existing = dst.get(chunk["key"])
+        if existing is None:
+            inserts.setdefault(anchor, []).append(chunk)
+            changes.append(f"add {chunk['key'][:70]}")
+            continue
+        if lines[existing["start"]:existing["end"]] != chunk["lines"]:
+            replacements[existing["start"]] = (existing["end"], chunk["lines"])
+            changes.append(f"update {chunk['key'][:70]}")
+        anchor = existing["end"]
+    if not changes:
+        return dst_text, changes
+    merged = []
+    index = 0
+    while index <= len(lines):
+        added = inserts.get(index, [])
+        for position, chunk in enumerate(added):
+            # set apart as in the shipped file, and from the user's lines above
+            gap = chunk["gap"] or (index == len(lines) and position == 0)
+            if merged and merged[-1].strip() and gap:
+                merged.append("")
+            merged.extend(chunk["comment"] + chunk["lines"])
+        # what goes first is set apart from the user's own lines
+        if added and index == 0 and lines and lines[0].strip():
+            merged.append("")
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, new_lines = replacements[index]
+            merged.extend(new_lines)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
 def merge_file(src, dst, rel):
     """Return the new content of dst and the list of changes, or None, []."""
     with open(src, encoding="utf-8") as handle:
@@ -557,7 +772,7 @@ def merge_file(src, dst, rel):
         dst_text = handle.read()
     if src.endswith(".toml"):
         new_text, changes = merge_toml(dst_text, src_text)
-    elif src.endswith((".json", ".jsonc")):
+    elif src.endswith((".json", ".jsonc")) or (src.endswith(".config") and src_text.lstrip().startswith("{")):
         new_text, changes = merge_json(dst_text, src_text)
     elif is_configobj(rel):
         new_text, changes = merge_configobj(dst_text, src_text)
@@ -567,6 +782,10 @@ def merge_file(src, dst, rel):
         new_text, changes = merge_keyfile(dst_text, src_text)
     elif is_gimp_rc(rel):
         new_text, changes = merge_gimp_rc(dst_text, src_text)
+    elif is_vimrc(rel):
+        new_text, changes = merge_vimrc(dst_text, src_text)
+    elif line_settings_key(rel) is not None:
+        new_text, changes = merge_line_settings(dst_text, src_text, line_settings_key(rel))
     else:
         new_text, changes = src_text, ([] if src_text == dst_text else ["replace"])
     if new_text == dst_text:

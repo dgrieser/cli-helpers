@@ -2119,7 +2119,9 @@ The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to p
 
 Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed.
 
-Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder).
+Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder).
+
+`updater hardware` blacklists the driver of a built-in device that is never used (the WWAN modem's `iosm`) only on a machine that has such a device, and keeps WirePlumber away from the audio of the USB-C dock and the webcam, and from an AMD GPU's HDMI audio where there is one.
 
 A software whose tools are missing installs them first, once per run: e.g. `updater atoss-cli` on a new machine installs the base packages and `glab` before it, `npm` software gets `nodejs`, `go install` tools get `go`. Releases from GitHub need a `gh auth login`, those from private GitLab hosts a `glab auth login`; `updater` stops with that hint when the login is missing.
 
