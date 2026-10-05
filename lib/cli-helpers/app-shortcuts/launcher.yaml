@@ -1,5 +1,6 @@
+# the Terminator-only launcher; no binding of its own, launcher-terminal has the keys
 description: Launcher
-bindings: ['<Shift><Control>l', 'AudioMedia']
+bindings: []
 focus:
   title: Launcher
 launch:

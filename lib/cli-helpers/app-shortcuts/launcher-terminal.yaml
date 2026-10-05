@@ -1,6 +1,6 @@
-# launcher in the default terminal; no binding of its own, launcher keeps the keys
+# launcher in the default terminal
 description: Terminal launcher
-bindings: []
+bindings: ['<Shift><Control>l', 'AudioMedia']
 focus:
   title: Launcher-Terminal
 launch:
