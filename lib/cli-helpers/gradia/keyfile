@@ -1,0 +1,15 @@
+[be/alexandervanhee/gradia]
+gradient-state='{"mode": "linear", "steps": [[0.0, "rgb(87,227,137)"], [1.0, "rgb(53,132,228)"]], "angle": 135}'
+trained-data='eng'
+draw-mode='ARROW'
+image-padding=5
+exit-method='none'
+tool-config={'tool_highlighter': '{"mode": "HIGHLIGHTER", "size": 18, "primary_color": [0.9599999785423279, 0.8299999833106995, 0.18000000715255737, 0.4000000059604645], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_number': '{"mode": "NUMBER", "size": 10, "primary_color": [0.0, 0.0, 0.0, 1.0], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 0.0], "font": "Adwaita Sans"}', 'tool_circle': '{"mode": "CIRCLE", "size": 5, "primary_color": [0.8799999952316284, 0.10999999940395355, 0.14000000059604645, 1.0], "fill_color": [0.0, 0.0, 0.0, 0.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_square': '{"mode": "SQUARE", "size": 7, "primary_color": [0.8799999952316284, 0.10999999940395355, 0.14000000059604645, 1.0], "fill_color": [0.0, 0.0, 0.0, 0.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_arrow': '{"mode": "ARROW", "size": 4, "primary_color": [0.8799999952316284, 0.10999999940395355, 0.14000000059604645, 1.0], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_line': '{"mode": "LINE", "size": 8, "primary_color": [0.8799999952316284, 0.10999999940395355, 0.14000000059604645, 1.0], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_pen': '{"mode": "PEN", "size": 8, "primary_color": [0.18000000715255737, 0.7599999904632568, 0.49000000953674316, 1.0], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 1.0], "font": "Adwaita Sans"}', 'tool_text': '{"mode": "TEXT", "size": 14, "primary_color": [0.6499999761581421, 0.10999999940395355, 0.18000000715255737, 1.0], "fill_color": [0.0, 0.0, 0.0, 0.0], "border_color": [0.0, 0.0, 0.0, 0.0], "font": "Adwaita Sans"}', 'tool_select': '{"mode": "SELECT", "size": 11, "primary_color": [0.0, 0.0, 0.0, 1.0], "fill_color": [1.0, 1.0, 1.0, 1.0], "border_color": [0.0, 0.0, 0.0, 0.0], "font": "Adwaita Sans"}'}
+image-auto-balance=false
+background-mode='none'
+overwrite-screenshot=true
+custom-export-command='f="$(xdg-user-dir PICTURES)/gradia-$(date +%s).png"; cp "$1" "$f" || exit 1; (flatpak-spawn --host flatpak run org.gimp.GIMP "$f" >/dev/null 2>&1 &); echo "$f"'
+show-export-confirm-dialog=false
+
+[org/gtk/gtk4/settings/color-chooser]
+custom-colors=[(0.87999999523162842, 0.10999999940395355, 0.14000000059604645, 1.0), (0.95999997854232788, 0.82999998331069946, 0.18000000715255737, 0.40000000596046448)]

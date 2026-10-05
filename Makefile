@@ -34,9 +34,10 @@ SHARED := lib-desktop gnome-clipboard-bridge gnome-display-config gnome-window-b
 APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
 # the data folders: the Terminator config of launcher, and what updater installs,
 # the configs merged into the user's config dirs (yazi with its local plugins,
-# powerline-shell, claude, codex, opencode, zed, terminator), the Chrome settings
+# powerline-shell, claude, codex, opencode, zed, terminator, gradia, gimp,
+# rquickshare), the dconf settings of extensions and apps, the Chrome settings
 # and search engines, systemd user units and a cron file
-CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator chrome systemd-user cron
+CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator gradia gimp rquickshare dconf chrome systemd-user cron
 CONFIGFILES := $(patsubst $(SHAREDDIR)/%,%,$(shell find $(addprefix $(SHAREDDIR)/,$(CONFIGDIRS)) -type f -not -path '*/__pycache__/*' | sort))
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of

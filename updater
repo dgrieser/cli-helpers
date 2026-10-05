@@ -983,12 +983,62 @@ config_update() {
     ${SUDO_USER} "${lib_dir}/config-merge" "${merge_args[@]}" "${lib_dir}/${name}" "${dst_dir}"
 }
 
+# dconf_update NAME: sets the keys of the shipped dconf dump $(LIBDIR)/dconf/NAME.ini
+# (written like dconf dump /) that differ in the user's dconf, e.g. the settings of an
+# extension; @HOME@ and @PICTURES@ in a value are the user's home and pictures folder
+dconf_update() {
+    local name="${1}"
+    # rewritten by make install to $(LIBDIR)
+    local file="/usr/local/lib/cli-helpers/dconf/${name}.ini"
+    # dconf talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local pictures
+    local line
+    local dir=""
+    local key
+    local value
+    local changed=0
+
+    require_cmd dconf || return 1
+    if [ ! -f "${file}" ]; then
+        error "${file} is missing, run make install"
+        return 1
+    fi
+    pictures="$(${SUDO_USER} xdg-user-dir PICTURES 2>/dev/null)"
+    [ -z "${pictures}" ] && pictures="${CURRENT_USER_HOME}/Pictures"
+    # read from fd 3, so sudo does not eat the file on stdin
+    while IFS= read -r line <&3 || [ -n "${line}" ]; do
+        case "${line}" in
+            ""|"#"*) continue ;;
+            "["*"]") dir="/${line:1:-1}/"; continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        value="${value//@HOME@/${CURRENT_USER_HOME}}"
+        value="${value//@PICTURES@/${pictures}}"
+        [ "$(${SUDO_USER} "${session_env[@]}" dconf read "${dir}${key}")" = "${value}" ] && continue
+        changed=1
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would set ${dir}${key} to ${value}" 1>&2
+            continue
+        fi
+        verbose "${SUDO_USER} dconf write ${dir}${key} ${value}"
+        ${SUDO_USER} "${session_env[@]}" dconf write "${dir}${key}" "${value}" || return 1
+    done 3< "${file}"
+    [ "${changed}" -eq 0 ] && echo "${APP_NAME}: the dconf settings of ${name} are up to date" 1>&2
+    return 0
+}
+
 flatpak_list_updates() {
     local pkg="${1}"
     # by application id, which is what the handlers pass; plugins are runtimes, not apps
     local -a kind=("--app")
     [ -n "${pkg}" ] && kind=()
-    all_updates="$(join -t $'\t' -j 1 <(flatpak list "${kind[@]}" --columns=application,version | sort) <(flatpak remote-ls --updates "${kind[@]}" --columns=application,version | sort))"
+    # join needs both sorted by the id alone and in its own collation: a locale sort of
+    # the whole line puts org.freedesktop.Platform.codecs-extra before org.freedesktop.Platform
+    all_updates="$(LC_ALL=C join -t $'\t' -j 1 \
+        <(flatpak list "${kind[@]}" --columns=application,version | LC_ALL=C sort -t $'\t' -k 1,1) \
+        <(flatpak remote-ls --updates "${kind[@]}" --columns=application,version | LC_ALL=C sort -t $'\t' -k 1,1))"
     if [ -n "${pkg}" ]; then
         updates="$(echo "${all_updates}" | grep -F -w "${pkg%%//*}")"
     else
@@ -1521,10 +1571,18 @@ software-043-dotfile-backups@base() {
     echo "${content}" | ${SUDO} tee "${cron_file}" > /dev/null && ${SUDO} chmod 0644 "${cron_file}"
 }
 software-044-terminator@base() {
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    local applications_dir="${CURRENT_USER_HOME}/.local/share/applications"
     apt_upgrade terminator || return 1
     tool_ready terminator || return $(( $? == 1 ? 0 : 1 ))
     # the launcher's own config comes with cli-helpers (lib/cli-helpers/launcher)
     config_update terminator "${CURRENT_USER_HOME}/.config/terminator" || return 1
+    # its desktop entry, which app-shortcut launches it by
+    if [ "${dry_run}" -eq 0 ]; then
+        ${SUDO_USER} mkdir -p "${applications_dir}" || return 1
+    fi
+    user_link "${lib_dir}/launcher/launcher.desktop" "${applications_dir}/launcher.desktop" || return 1
     # the own plugins, from their repos
     helper_repo_update "dgrieser/terminator-focus-alpha" install \
         && helper_repo_update "dgrieser/terminator-plugin-balance-splits" install
@@ -1758,7 +1816,21 @@ software-230-zed@dev() {
     config_update zed "${CURRENT_USER_HOME}/.config/zed"
 }
 software-240-hwatch@dev() { install_git_release "https://github.com/blacknon/hwatch"; }
-software-250-gradia@desktop() { flatpak_update "be.alexandervanhee.gradia" flathub; }
+software-250-gradia@desktop() {
+    local app="be.alexandervanhee.gradia"
+    flatpak_update "${app}" flathub || return 1
+    # its custom export command opens the image in GIMP on the host (flatpak-spawn --host)
+    if ! ${SUDO_USER} flatpak override --user --show "${app}" 2>/dev/null | grep -qx "org.freedesktop.Flatpak=talk"; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would let ${app} talk to org.freedesktop.Flatpak" 1>&2
+        else
+            verbose "${SUDO_USER} flatpak override --user --talk-name=org.freedesktop.Flatpak ${app}"
+            ${SUDO_USER} flatpak override --user --talk-name=org.freedesktop.Flatpak "${app}" || return 1
+        fi
+    fi
+    # its settings live in the keyfile of the sandbox, not in dconf
+    config_update gradia "${CURRENT_USER_HOME}/.var/app/${app}/config/glib-2.0/settings"
+}
 software-251-obs@media() {
     flatpak_update "com.obsproject.Studio" flathub \
         && flatpak_update "com.obsproject.Studio.Plugin.BackgroundRemoval" flathub \
@@ -1767,10 +1839,25 @@ software-251-obs@media() {
 # only plugins built for GIMP 3 (branch 3); the 2-40 ones (BIMP, FocusBlur, Lensfun,
 # LiquidRescale) install fine but are never loaded by GIMP 3
 software-252-gimp@media() {
+    local version
     flatpak_update "org.gimp.GIMP" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.Fourier//3" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.GMic//3" flathub \
-        && flatpak_update "org.gimp.GIMP.Plugin.Resynthesizer//3" flathub
+        && flatpak_update "org.gimp.GIMP.Plugin.Resynthesizer//3" flathub \
+        || return 1
+    # the Flatpak keeps its config in ~/.config/GIMP/<major.minor>, like a GIMP from apt
+    version="$(${SUDO_USER} flatpak list --app --columns=application,version \
+        | awk '$1 == "org.gimp.GIMP" { split($2, v, "."); print v[1] "." v[2]; exit }')"
+    if [ -z "${version}" ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "${APP_NAME}: the config of ${selected} is checked once it is installed" 1>&2
+            return 0
+        fi
+        error "org.gimp.GIMP is missing after installing ${selected}"
+        return 1
+    fi
+    config_update gimp "${CURRENT_USER_HOME}/.config/GIMP/${version}" || return 1
+    dconf_update gimp
 }
 software-253-cobang@desktop() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
 software-254-inkscape@media() {
@@ -1803,8 +1890,14 @@ software-300-threema@comms() {
 }
 software-311-gnome-extension-manager@base@gnome() { apt_upgrade "gnome-shell-extension-manager"; }
 software-312-gnome-tweaks@base@gnome() { apt_upgrade "gnome-tweaks"; }
-software-313-randomwallpaper@gnome@gnome-extensions() { gnome_extension_update "randomwallpaper@iflow.space"; }
-software-314-unblank@gnome@gnome-extensions() { gnome_extension_update "unblank@sun.wxg@gmail.com"; }
+software-313-randomwallpaper@gnome@gnome-extensions() {
+    gnome_extension_update "randomwallpaper@iflow.space" || return 1
+    dconf_update randomwallpaper
+}
+software-314-unblank@gnome@gnome-extensions() {
+    gnome_extension_update "unblank@sun.wxg@gmail.com" || return 1
+    dconf_update unblank
+}
 software-315-user-theme-x@gnome@gnome-extensions() { gnome_extension_update "user-theme-x@tuberry.github.io"; }
 software-316-window-is-ready-filter@gnome@gnome-extensions() {
     gnome_extension_from_git "https://github.com/dgrieser/window-is-ready-filter.git" "window-is-ready-filter@david-grieser.de"
@@ -2091,6 +2184,8 @@ software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftp
 software-495-r-quick-share@desktop() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
     install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_amd64.deb" || return 1
+    # its settings: started minimized at login, closing the window keeps it running
+    config_update rquickshare "${CURRENT_USER_HOME}/.local/share/dev.mandre.rquickshare" || return 1
     # started at login, so the phone finds it
     [ -f "${autostart}" ] && return 0
     if [ "${dry_run}" -eq 1 ]; then

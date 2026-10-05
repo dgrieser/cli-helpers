@@ -77,9 +77,11 @@ if [[ "${favorites}" != *"'${favorite}'"* ]]; then
     fi
 fi
 
-# extensions: no desktop icons; tiling assistant look and popup
+# extensions: no desktop icons, and no home folder icon should DING be enabled again;
+# tiling assistant look and popup
 gnome-extensions disable ding@rastersoft.com 2>/dev/null \
     || gsettings set org.gnome.shell disabled-extensions "['ding@rastersoft.com']"
+gsettings set org.gnome.shell.extensions.ding show-home false
 gsettings set org.gnome.shell.extensions.tiling-assistant focus-hint-color 'rgb(203,67,20)'
 gsettings set org.gnome.shell.extensions.tiling-assistant tiling-popup-all-workspace true
 

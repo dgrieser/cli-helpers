@@ -19,6 +19,12 @@ merged, so everything else the user has in it is kept:
   own profiles and layouts are kept; values are compared as written
 - *.lua in the top directory: the top-level statements are matched by what they define (function
   NAME, variable NAME, require("NAME")) and replaced or appended
+- keyfile (GLib's keyfile settings backend, e.g. of a Flatpak app in
+  ~/.var/app/ID/config/glib-2.0/settings): the shipped keys are set in their
+  [groups], every other line stays as it is
+- gimprc and shortcutsrc (GIMP's S-expressions): the top-level forms are
+  matched by their name, an (action "NAME" ...) by its action, and replaced or
+  added before the closing "# end of" comment
 - everything else (plugins, segments) is ours as a whole, so the file is
   replaced when it differs
 """
@@ -395,6 +401,152 @@ def merge_lua(dst_text, src_text):
     return "\n".join(merged) + "\n", changes
 
 
+def is_keyfile(rel):
+    return os.path.basename(rel) == "keyfile"
+
+
+def keyfile_groups(lines):
+    """[group] -> its keys (key -> line index) and the index of its last line."""
+    groups = {}
+    group = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            group = groups.setdefault(stripped, {"keys": {}, "end": index})
+        elif group is not None and "=" in stripped and not stripped.startswith("#"):
+            group["keys"].setdefault(stripped.split("=", 1)[0].strip(), index)
+        if group is not None and stripped:
+            group["end"] = index
+    return groups
+
+
+def merge_keyfile(dst_text, src_text):
+    lines = dst_text.splitlines()
+    src_lines = src_text.splitlines()
+    dst = keyfile_groups(lines)
+    changes = []
+    # a missing key goes to the end of its group, a missing group to the end
+    inserts = {}
+    appended = []
+    for name, group in keyfile_groups(src_lines).items():
+        entries = [(key, src_lines[index].strip()) for key, index in group["keys"].items()]
+        if name not in dst:
+            appended += ([""] if lines or appended else []) + [name] + [line for _, line in entries]
+            changes.append(f"add {name}")
+            continue
+        for key, line in entries:
+            index = dst[name]["keys"].get(key)
+            if index is None:
+                inserts.setdefault(dst[name]["end"], []).append(line)
+                changes.append(f"add {name} {key}")
+            elif lines[index].strip() != line:
+                lines[index] = line
+                changes.append(f"set {name} {key}")
+    if not changes:
+        return dst_text, changes
+    merged = []
+    for index, line in enumerate(lines):
+        merged.append(line)
+        merged.extend(inserts.get(index, []))
+    return "\n".join(merged + appended) + "\n", changes
+
+
+GIMP_RC = ("gimprc", "shortcutsrc")
+# forms that repeat, told apart by their first argument
+GIMP_RC_ENTRIES = ("action",)
+GIMP_RC_FORM = re.compile(r'^\(\s*([^\s()"]+)(?:\s+"((?:[^"\\]|\\.)*)")?')
+
+
+def is_gimp_rc(rel):
+    return os.path.basename(rel) in GIMP_RC
+
+
+def paren_depth(line, in_string):
+    """The change of the parenthesis depth over LINE, outside of strings."""
+    depth = 0
+    escaped = False
+    for char in line:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+    return depth, in_string
+
+
+def gimp_rc_forms(lines):
+    """The top-level forms: key -> (index of the first line, index after the last)."""
+    forms = {}
+    start = None
+    depth = 0
+    in_string = False
+    for index, line in enumerate(lines):
+        if start is None:
+            if not line.startswith("("):
+                continue
+            start = index
+        change, in_string = paren_depth(line, in_string)
+        depth += change
+        if depth <= 0:
+            match = GIMP_RC_FORM.match(lines[start])
+            key = lines[start].strip()
+            if match:
+                key = match.group(1)
+                if key in GIMP_RC_ENTRIES and match.group(2) is not None:
+                    key = f'{key} "{match.group(2)}"'
+            forms.setdefault(key, (start, index + 1))
+            start = None
+            depth = 0
+            in_string = False
+    return forms
+
+
+def merge_gimp_rc(dst_text, src_text):
+    lines = dst_text.splitlines()
+    src_lines = src_text.splitlines()
+    dst = gimp_rc_forms(lines)
+    changes = []
+    replacements = {}
+    added = []
+    for key, (start, end) in gimp_rc_forms(src_lines).items():
+        form = src_lines[start:end]
+        if key not in dst:
+            added.extend(form)
+            changes.append(f"add {key}")
+        elif lines[dst[key][0]:dst[key][1]] != form:
+            replacements[dst[key][0]] = (dst[key][1], form)
+            changes.append(f"set {key}")
+    if not changes:
+        return dst_text, changes
+    # GIMP closes the file with "# end of gimprc"
+    closing = next((index for index in range(len(lines) - 1, -1, -1) if lines[index].startswith("# end of")), len(lines))
+    merged = []
+    index = 0
+    while index <= len(lines):
+        if index == closing and added:
+            if merged and merged[-1].strip():
+                merged.append("")
+            merged.extend(added + ([""] if closing < len(lines) else []))
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, form = replacements[index]
+            merged.extend(form)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
 def merge_file(src, dst, rel):
     """Return the new content of dst and the list of changes, or None, []."""
     with open(src, encoding="utf-8") as handle:
@@ -411,6 +563,10 @@ def merge_file(src, dst, rel):
         new_text, changes = merge_configobj(dst_text, src_text)
     elif rel.endswith(".lua") and os.sep not in rel:
         new_text, changes = merge_lua(dst_text, src_text)
+    elif is_keyfile(rel):
+        new_text, changes = merge_keyfile(dst_text, src_text)
+    elif is_gimp_rc(rel):
+        new_text, changes = merge_gimp_rc(dst_text, src_text)
     else:
         new_text, changes = src_text, ([] if src_text == dst_text else ["replace"])
     if new_text == dst_text:
