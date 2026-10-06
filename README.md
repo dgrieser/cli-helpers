@@ -2285,6 +2285,30 @@ cron-to-ical "30 8 * * *" --duration "1h 30m" --end_date 2026-12-31
 cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 ```
 
+### `keyring-cli`
+Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, and merges all items of one keyring into another with `secret-tool`. Needs `secret-tool`, `busctl` and `jq`; `create` also needs PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), since `secret-tool` cannot create a keyring.
+
+`merge` keeps label and attributes of each item. A target item with the same attributes is the same entry: it is kept, unless `--overwrite` is given and its label or secret differs. The source keyring is not changed. Locked keyrings are unlocked first through the keyring's unlock prompt, also with `--dry-run`. Items without attributes cannot be read by `secret-tool` and are skipped.
+
+**Usage:** `keyring-cli COMMAND [OPTIONS]`
+
+| Command / Flag | Description |
+|---|---|
+| `list` | List the keyrings with label, lock state and item count. |
+| `create NAME` | Create the keyring `NAME`; the keyring service asks for its password. |
+| `merge SOURCE TARGET` | Copy all items of `SOURCE` into `TARGET`. Both are a keyring name (e.g. `old-login`), label, alias (e.g. `default`) or D-Bus object path. |
+| `-n, --dry-run` | `merge`: show what would be copied, without writing. |
+| `-o, --overwrite` | `merge`: replace target items with the same attributes whose label or secret differs. |
+| `-h, --help` | Show the usage message. |
+
+**Examples:**
+```bash
+keyring-cli list
+keyring-cli create work
+keyring-cli merge --dry-run old-login login
+keyring-cli merge old-login default
+```
+
 ---
 
 ## Window and Display Management

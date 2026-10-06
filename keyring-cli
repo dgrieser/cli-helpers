@@ -1,0 +1,349 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+SECRETS_SERVICE="org.freedesktop.secrets"
+SECRETS_PATH="/org/freedesktop/secrets"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [OPTIONS]
+
+Manage keyrings (Secret Service collections, e.g. GNOME keyring).
+
+Commands:
+  list                  List the keyrings with label, lock state and item count
+  create NAME           Create the keyring NAME; the keyring service asks for
+                        its password
+  merge SOURCE TARGET   Copy all items of the keyring SOURCE into the keyring
+                        TARGET with secret-tool, e.g. to merge an old login
+                        keyring into the current one. Items keep their label
+                        and attributes. A TARGET item with the same attributes
+                        as a SOURCE item is the same entry: it is kept unless
+                        --overwrite is given. SOURCE is not changed.
+
+SOURCE and TARGET are a keyring name (e.g. old-login), its label, an alias
+(e.g. default) or its D-Bus object path. Locked keyrings are unlocked first,
+which shows the unlock prompt of the keyring, also with --dry-run.
+
+Options:
+  -n, --dry-run         merge: Show what would be copied, without writing
+  -o, --overwrite       merge: Replace TARGET items with the same attributes
+                        whose label or secret differs
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# get_property PATH INTERFACE PROPERTY: print the property value as JSON
+get_property() {
+    busctl --user --json=short get-property "${SECRETS_SERVICE}" "${1}" "org.freedesktop.Secret.${2}" "${3}" \
+        | jq -c '.data'
+}
+
+collection_paths() {
+    get_property "${SECRETS_PATH}" Service Collections | jq -r '.[]'
+}
+
+# collection_name PATH: the keyring name, i.e. the unescaped last path element
+# (D-Bus object paths escape other characters than [A-Za-z0-9] as _XX)
+collection_name() {
+    printf '%b' "$(sed 's/_\([0-9a-fA-F]\{2\}\)/\\x\1/g' <<< "${1##*/}")"
+}
+
+list_collections() {
+    local path name label locked count
+    printf '%-20s %-20s %-8s %s\n' "NAME" "LABEL" "LOCKED" "ITEMS"
+    while read -r path; do
+        name="$(collection_name "${path}")"
+        label="$(get_property "${path}" Collection Label | jq -r '.')"
+        locked="$(get_property "${path}" Collection Locked)"
+        count="$(get_property "${path}" Collection Items | jq 'length')"
+        printf '%-20s %-20s %-8s %s\n' "${name}" "${label}" "${locked}" "${count}"
+    done < <(collection_paths)
+}
+
+# resolve_collection NAME: print the object path of the collection with that
+# path, alias, name or label
+resolve_collection() {
+    local path alias_path
+    if [[ "${1}" == /* ]]; then
+        collection_paths | grep -qxF -- "${1}" && echo "${1}" && return 0
+        return 1
+    fi
+    alias_path="$(busctl --user --json=short call "${SECRETS_SERVICE}" "${SECRETS_PATH}" \
+        org.freedesktop.Secret.Service ReadAlias s "${1}" 2>/dev/null | jq -r '.data[0]')"
+    if [ -n "${alias_path}" ] && [ "${alias_path}" != "/" ]; then
+        echo "${alias_path}"
+        return 0
+    fi
+    while read -r path; do
+        if [ "$(collection_name "${path}")" = "${1}" ] || [ "${path##*/}" = "${1}" ]; then
+            echo "${path}"
+            return 0
+        fi
+    done < <(collection_paths)
+    while read -r path; do
+        if [ "$(get_property "${path}" Collection Label | jq -r '.')" = "${1}" ]; then
+            echo "${path}"
+            return 0
+        fi
+    done < <(collection_paths)
+    return 1
+}
+
+# unlock_collection PATH: a locked collection only shows hashed attributes, so
+# search for one of its items with --unlock, which shows the unlock prompt
+unlock_collection() {
+    local schema
+    [ "$(get_property "${1}" Collection Locked)" = "false" ] && return 0
+    while read -r item; do
+        schema="$(get_property "${item}" Item Attributes | jq -r '."xdg:schema" // empty')"
+        [ -n "${schema}" ] && break
+    done < <(get_property "${1}" Collection Items | jq -r '.[]')
+    [ -z "${schema}" ] && return 1
+    echo "Unlocking keyring $(collection_name "${1}") ..." 1>&2
+    secret-tool search --unlock xdg:schema "${schema}" > /dev/null 2>&1
+    [ "$(get_property "${1}" Collection Locked)" = "false" ]
+}
+
+# item_attributes PATH: print the attributes as "key value" argument list,
+# NUL separated, without the hashed compatibility attributes of gnome-keyring
+item_attributes() {
+    get_property "${1}" Item Attributes \
+        | jq -j 'to_entries | map(select(.key | startswith("gkr:compat:") | not))
+            | sort_by(.key)[] | .key, "\u0000", .value, "\u0000"'
+}
+
+# item_secret PATH: print the secret of the item. secret-tool search cannot
+# limit the search to one collection and prints only the item number, so the
+# result is matched by item number, label and timestamps (printed in UTC).
+item_secret() {
+    local path="${1}" label created modified
+    local -a attributes
+    mapfile -d '' -t attributes < <(item_attributes "${path}")
+    [ "${#attributes[@]}" -eq 0 ] && return 1
+    label="$(get_property "${path}" Item Label | jq -r '.')"
+    created="$(date -u -d "@$(get_property "${path}" Item Created)" '+%Y-%m-%d %H:%M:%S')"
+    modified="$(date -u -d "@$(get_property "${path}" Item Modified)" '+%Y-%m-%d %H:%M:%S')"
+    secret-tool search --all --unlock "${attributes[@]}" 2>/dev/null \
+        | LC_ALL=C awk -v id="[/${path##*/}]" -v label="label = ${label}" \
+            -v created="created = ${created}" -v modified="modified = ${modified}" '
+            function finish() {
+                if (header == id && lbl == label && cre == created && $0 == modified) {
+                    matches++
+                    result = secret
+                }
+            }
+            /^\[\/[^]]*\]$/ && state == 0 { header = $0; state = 1; next }
+            state == 1 { lbl = $0; state = 2; next }
+            state == 2 { secret = substr($0, 10); state = 3; next }
+            state == 3 && /^created = / { cre = $0; state = 4; next }
+            state == 3 { secret = secret "\n" $0; next }
+            state == 4 { finish(); state = 0; next }
+            END {
+                if (matches != 1) exit 1
+                printf "%s", result
+            }'
+}
+
+# attributes_key PATH: print the attributes as sorted JSON for comparison.
+# secret-tool store adds the generic schema to items without xdg:schema.
+attributes_key() {
+    get_property "${1}" Item Attributes \
+        | jq -cS 'with_entries(select(.key | startswith("gkr:compat:") | not))
+            | {"xdg:schema": "org.freedesktop.Secret.Generic"} + .'
+}
+
+# find_target_item KEY: print the TARGET item with these attributes (see attributes_key)
+find_target_item() {
+    local item
+    while read -r item; do
+        if [ "$(attributes_key "${item}")" = "${1}" ]; then
+            echo "${item}"
+            return 0
+        fi
+    done < <(get_property "${target}" Collection Items | jq -r '.[]')
+    return 1
+}
+
+merge_item() {
+    local item="${1}" label attributes_json target_item secret target_secret action
+    local -a attributes
+
+    label="$(get_property "${item}" Item Label | jq -r '.')"
+    mapfile -d '' -t attributes < <(item_attributes "${item}")
+    if [ "${#attributes[@]}" -eq 0 ]; then
+        warning "skip ${label}: no attributes, secret-tool cannot read it"
+        return 1
+    fi
+    attributes_json="$(attributes_key "${item}")"
+
+    # append and strip a marker to keep trailing newlines of the secret
+    secret="$(item_secret "${item}" && echo x)" || {
+        warning "skip ${label}: cannot read secret"
+        return 1
+    }
+    secret="${secret%x}"
+
+    action="copy"
+    if target_item="$(find_target_item "${attributes_json}")"; then
+        target_secret="$(item_secret "${target_item}" && echo x)"
+        target_secret="${target_secret%x}"
+        if [ "${secret}" = "${target_secret}" ] \
+            && [ "$(get_property "${target_item}" Item Label | jq -r '.')" = "${label}" ]; then
+            echo "exists:    ${label}"
+            exists=$(( exists + 1 ))
+            return 0
+        fi
+        if [ "${overwrite}" -eq 0 ]; then
+            echo "differs:   ${label} (use --overwrite to replace)"
+            differs=$(( differs + 1 ))
+            return 0
+        fi
+        action="overwrite"
+    fi
+
+    printf '%-10s %s\n' "${action}:" "${label}"
+    if [ "${dry_run}" -eq 0 ]; then
+        if ! printf '%s' "${secret}" | secret-tool store --collection="${target}" --label="${label}" "${attributes[@]}"; then
+            error "cannot store ${label}"
+            return 1
+        fi
+    fi
+    copied=$(( copied + 1 ))
+}
+
+# create_collection NAME: secret-tool cannot create a keyring, and the password
+# prompt of CreateCollection only answers the D-Bus connection that asked for
+# it, so libsecret (PyGObject) creates it in one process
+create_collection() {
+    python3 -I -c '
+import sys
+import gi
+gi.require_version("Secret", "1")
+from gi.repository import Secret
+try:
+    collection = Secret.Collection.create_sync(None, sys.argv[1], None, Secret.CollectionCreateFlags.NONE, None)
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+if collection is None:
+    sys.exit(1)
+print(collection.get_object_path())
+' "${1}"
+}
+
+dry_run=0
+overwrite=0
+command=""
+arguments=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "list create merge -n --dry-run -o --overwrite -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -n|--dry-run)
+            dry_run=1
+            ;;
+        -o|--overwrite)
+            overwrite=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -z "${command}" ]; then
+                command="${1}"
+            else
+                arguments+=( "${1}" )
+            fi
+            ;;
+    esac
+    shift
+done
+
+case "${command}" in
+    list|create|merge)
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        error "Unknown command: ${command}"
+        usage
+        ;;
+esac
+if [ "${command}" != "merge" ] && { [ "${dry_run}" -eq 1 ] || [ "${overwrite}" -eq 1 ]; }; then
+    error "--dry-run and --overwrite only apply to merge"
+    usage
+fi
+case "${command}" in
+    list) expected=0 ;;
+    create) expected=1 ;;
+    merge) expected=2 ;;
+esac
+if [ "${#arguments[@]}" -ne "${expected}" ]; then
+    error "${command} needs ${expected} argument(s)"
+    usage
+fi
+
+for tool in secret-tool busctl jq; do
+    command -v "${tool}" > /dev/null 2>&1 || fail "${tool} not found"
+done
+busctl --user status "${SECRETS_SERVICE}" > /dev/null 2>&1 || fail "no Secret Service (${SECRETS_SERVICE}) running"
+
+if [ "${command}" = "list" ]; then
+    list_collections
+    exit 0
+fi
+
+if [ "${command}" = "create" ]; then
+    [ -z "${arguments[0]}" ] && fail "keyring name is empty"
+    resolve_collection "${arguments[0]}" > /dev/null && fail "keyring exists: ${arguments[0]}"
+    path="$(create_collection "${arguments[0]}")" || fail "cannot create keyring: ${arguments[0]}"
+    echo "Created keyring $(collection_name "${path}") (${path})"
+    exit 0
+fi
+
+source_name="${arguments[0]}"
+target_name="${arguments[1]}"
+source="$(resolve_collection "${source_name}")" || fail "keyring not found: ${source_name}"
+target="$(resolve_collection "${target_name}")" || fail "keyring not found: ${target_name}"
+[ "${source}" = "${target}" ] && fail "SOURCE and TARGET are the same keyring: ${source}"
+
+unlock_collection "${source}" || fail "cannot unlock keyring: ${source_name}"
+if [ "$(get_property "${target}" Collection Items | jq 'length')" -gt 0 ]; then
+    unlock_collection "${target}" || fail "cannot unlock keyring: ${target_name}"
+fi
+
+copied=0
+exists=0
+differs=0
+failed=0
+while read -r item; do
+    merge_item "${item}" || failed=$(( failed + 1 ))
+done < <(get_property "${source}" Collection Items | jq -r '.[]')
+
+[ "${dry_run}" -eq 1 ] && copied_text="to copy" || copied_text="copied"
+echo "${copied} ${copied_text}, ${exists} already present, ${differs} differing, ${failed} failed" 1>&2
+
+[ "${failed}" -eq 0 ]
