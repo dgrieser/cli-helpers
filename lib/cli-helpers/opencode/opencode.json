@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "mittwald/Qwen3.8-27B-NVFP4",
   "provider": {
     "mittwald": {
       "options": {

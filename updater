@@ -2082,7 +2082,53 @@ software-316-window-is-ready-filter@gnome@gnome-extensions() {
 software-320-opencode@dev@agents() {
     install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-x64.tar.gz" || return 1
     tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
-    config_update opencode "${CURRENT_USER_HOME}/.config/opencode"
+    config_update opencode "${CURRENT_USER_HOME}/.config/opencode" || return 1
+    opencode_auth_update
+}
+
+# opencode_auth_update: the API keys of opencode's providers, stored in the GNOME keyring
+# (secret-tool store --label="opencode PROVIDER" service opencode provider PROVIDER), are
+# written into ~/.local/share/opencode/auth.json; other entries there (e.g. logins) are kept
+opencode_auth_update() {
+    # secret-tool talks to the keyring of the user's session
+    local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local file="${CURRENT_USER_HOME}/.local/share/opencode/auth.json"
+    local providers
+    local provider
+    local key
+    local auth
+    local updated
+
+    needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    # the attributes of the found items are printed on stderr, the secrets on stdout
+    providers="$(${SUDO_USER} "${session_env[@]}" secret-tool search --all service opencode 2>&1 >/dev/null \
+        | sed -n 's/^attribute\.provider = //p' | sort -u)"
+    if [ -z "${providers}" ]; then
+        echo "${APP_NAME}: no opencode API keys in the keyring yet, store each once with:" 1>&2
+        echo "  secret-tool store --label=\"opencode PROVIDER\" service opencode provider PROVIDER" 1>&2
+        return 0
+    fi
+    auth="{}"
+    [ -f "${file}" ] && { auth="$(${SUDO_USER} cat "${file}")" || return 1; }
+    updated="${auth}"
+    while IFS= read -r provider; do
+        key="$(${SUDO_USER} "${session_env[@]}" secret-tool lookup service opencode provider "${provider}")" || return 1
+        # the key goes in through the environment, so it never shows up in the process list
+        updated="$(KEY="${key}" jq --arg provider "${provider}" '.[$provider] = {"type": "api", "key": env.KEY}' <<< "${updated}")" \
+            || return 1
+    done <<< "${providers}"
+    if [ "$(jq -S . <<< "${auth}")" = "$(jq -S . <<< "${updated}")" ]; then
+        echo "${APP_NAME}: ${file} is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would write the API keys of ${providers//$'\n'/ } into ${file}" 1>&2
+        return 0
+    fi
+    verbose "write the API keys of ${providers//$'\n'/ } into ${file}"
+    # only readable by the user
+    ${SUDO_USER} install -D -m 600 /dev/stdin "${file}" <<< "${updated}"
 }
 
 
