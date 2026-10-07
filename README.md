@@ -19,9 +19,15 @@ keys, the SSH config and the network connections stored in the keyring (`keyring
 Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
 copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`,
 runs `make install` of bash_aliases.d once more with a terminal (it asks for missing SSH keys and history backups,
-which `updater` cannot), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+which `updater` cannot), offers to import a backup of the reminders of `reminder`, and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx` (`k-ctx shell-init`, sourced by bash_aliases.d) and offers to set up `netbox-cli` (`NETBOX_URL`, and `NETBOX_TOKEN` stored in the keyring for the
+dotfiles) and to fetch a kubeconfig for every NetBox cluster that has none in `~/.kube` (`k-ctx add --yes`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
+
+Run `setup-backup` on the old machine first: it copies every file `setup.sh` asks for into a new folder
+`setup-backup-<host>-<date>` (the keyring files, the reminders, the shell histories and the `Keys` folder of the documents
+folder with the SSH keys of the SSH config), after offering to store the current SSH config in the keyring.
 
 The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
@@ -2336,6 +2342,26 @@ keyring-cli ssh-store ~/.ssh/id_ed25519
 keyring-cli ssh-list
 keyring-cli ssh-load id_ed25519
 keyring-cli ssh-restore id_ed25519
+```
+
+---
+
+### `setup-backup`
+Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` in the keyring when the stored copy is missing or differs, since `setup.sh` restores the SSH config from there. The backup holds private keys and the keyring files: keep it somewhere safe.
+
+| Folder | What | Where `setup.sh` asks for it |
+|---|---|---|
+| `keyrings/` | `~/.local/share/keyrings/*.keyring`, with the SSH keys, SSH config and network connections stored in them | "Keyring file or folder" |
+| `reminder/` | `~/.cache/reminder`, modification times kept | "Reminder folder or archive" |
+| `history/` | `~/.bash_super_history`, `~/.kube_history` | dotfiles: "Path of a backup of ~/..." |
+| `Keys/` | the `Keys` folder of the documents folder (without editor swap files), plus the SSH keys `~/.ssh/config` names that are in neither it nor the keyring | dotfiles: copy it to `Documents/Keys` |
+
+**Usage:** `setup-backup [-h] [FOLDER]`
+
+**Examples:**
+```bash
+setup-backup
+setup-backup /media/usb
 ```
 
 ---

@@ -2,8 +2,10 @@
 # Sets up a new machine from this repo: the keyring from a backup with its SSH
 # keys, SSH config and network connections, the install folders, cli-helpers itself,
 # the base software, gh and glab with their logins, the dotfiles of
-# bash_aliases.d (asking for missing SSH keys and history backups), the categories of updater
-# the user picks, browser-router as the default browser and, on GNOME, the
+# bash_aliases.d (asking for missing SSH keys and history backups), the reminders
+# of reminder from a backup, the categories of updater
+# the user picks, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
+# NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
 
 APP_NAME="$(basename "${0}")"
@@ -24,6 +26,10 @@ declare -A CATEGORY_DESCRIPTIONS=(
 )
 SPECIAL_GROUPS=(base gnome gnome-extensions)
 MITTWALD_GITLAB="gitlab.mittwald.it"
+# the shorthands of k-ctx: c switches the cluster, s goes to an identifier, n
+# switches the namespace, "for" loops over clusters and bm is the baremetal parent
+K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-prefix for
+    --alias-evileye-loop-prefix for --alias-netbox-env-parent bm)
 
 failed=()
 
@@ -251,6 +257,58 @@ install_dotfiles() {
     run make -s -C "${dir}" install || failed+=("make -C ${dir} install")
 }
 
+# the reminders of the reminder tool from a backup: a copy of ~/.cache/reminder
+# as a folder, or that folder in a .tar.gz, .tgz or .zip; a reminder that is
+# here already is kept, and so is the display order
+restore_reminders() {
+    local dir="${HOME}/.cache/reminder"
+    local path src tmp file name
+    info "Reminders: restore a backup of ${dir} (the *.md reminders, the done ones and their order)"
+    ask "Import a backup of the reminders?" || return 0
+    path="$("${REPO_DIR}/prompt-file" "Reminder folder or archive:")"
+    path="${path/#\~/${HOME}}"
+    [ -z "${path}" ] && return 0
+
+    if [ -d "${path}" ]; then
+        src="${path}"
+    elif [ -f "${path}" ]; then
+        tmp="$(mktemp -d)" || { failed+=("reminders ${path}"); return 0; }
+        case "${path}" in
+            *.tar.gz|*.tgz) tar -xzf "${path}" -C "${tmp}" ;;
+            *.zip)          command -v unzip > /dev/null 2>&1 || run sudo apt-get install -y unzip
+                            unzip -q "${path}" -d "${tmp}" ;;
+            *)              warning "Not a folder, .tar.gz, .tgz or .zip: ${path}"; false ;;
+        esac || { rm -rf "${tmp}"; failed+=("reminders ${path}"); return 0; }
+        # the archive may hold the folder itself or only what is in it
+        src="$(find "${tmp}" \( -name '*.md' -o -name '*.md_*' -o -name .order \) -type f \
+            -printf '%h\n' | sort | head -n 1)"
+    else
+        warning "No such file or folder: ${path}"
+        failed+=("reminders ${path}")
+        return 0
+    fi
+
+    if [ -z "${src}" ] || ! compgen -G "${src}/*.md*" > /dev/null; then
+        warning "No reminders in ${path}"
+        failed+=("reminders ${path}")
+    else
+        mkdir -p "${dir}"
+        for file in "${src}"/*.md "${src}"/*.md_* "${src}/.order"; do
+            [ -f "${file}" ] || continue
+            name="$(basename "${file}")"
+            if [ -e "${dir}/${name}" ]; then
+                echo "Kept ${dir}/${name}" 1>&2
+                continue
+            fi
+            # the reminders without an order are listed by their modification time
+            cp -p "${file}" "${dir}/${name}" || failed+=("reminders ${name}")
+        done
+        echo "Restored the reminders to ${dir}" 1>&2
+    fi
+    [ -n "${tmp}" ] && rm -rf "${tmp}"
+    return 0
+}
+
 check_categories() {
     local group
     local known
@@ -280,6 +338,89 @@ select_categories() {
         info "${category}${description:+: ${description}}"
         echo "$(members "${category}")" 1>&2
         ask "Install ${category}?" && selected+=("${category}")
+    done
+}
+
+# the shell shorthands of k-ctx, which .kube_aliases of bash_aliases.d sources;
+# the file is generated, so it is written again rather than kept
+setup_k_ctx_shell() {
+    command -v k-ctx > /dev/null 2>&1 || return 0
+    info "k-ctx shell shorthands: ${K_CTX_SHELL_INIT[*]}"
+    run k-ctx shell-init "${K_CTX_SHELL_INIT[@]}" || failed+=("k-ctx shell-init")
+}
+
+# netbox-cli reads NETBOX_URL and NETBOX_TOKEN from the environment, which the
+# .bashrc of bash_aliases.d exports with the token from the keyring; a shell
+# started before the dotfiles has neither, so they are set here for this run
+setup_netbox() {
+    local block="${HOME}/workspace/dgrieser/bash_aliases.d/home/blocks/.bashrc"
+    local url token
+    netbox-cli get clusters -oname > /dev/null 2>&1 && return 0
+    info "netbox-cli is not set up, it names the clusters and fetches their kubeconfigs"
+    ask "Set up netbox-cli now (NETBOX_URL and NETBOX_TOKEN)?" || return 1
+
+    url="${NETBOX_URL}"
+    [ -z "${url}" ] && [ -f "${block}" ] \
+        && url="$(sed -n 's/^export NETBOX_URL="\(.*\)"$/\1/p' "${block}" | head -n 1)"
+    url="$("${REPO_DIR}/prompt-input" --prompt "NetBox URL:" --default "${url}")"
+    [ -z "${url}" ] && return 1
+
+    token="$(secret-tool lookup type dotfile-secret name NETBOX_TOKEN 2>/dev/null)"
+    if [ -z "${token}" ]; then
+        token="$("${REPO_DIR}/prompt-input" --protected --prompt "NetBox API token:")"
+        [ -z "${token}" ] && return 1
+        # stored where the dotfiles look for it, so the next shell has it too
+        if printf '%s' "${token}" | secret-tool store --label="dotfile NETBOX_TOKEN" \
+            type dotfile-secret name NETBOX_TOKEN; then
+            install_dotfiles
+        else
+            warning "Could not store NETBOX_TOKEN in the keyring, it is only set for this run"
+        fi
+    fi
+
+    export NETBOX_URL="${url}" NETBOX_TOKEN="${token}"
+    # its error stays visible: a missing VPN or CA shows up as an SSL error
+    netbox-cli get clusters -oname > /dev/null && return 0
+    warning "netbox-cli still cannot reach ${url}"
+    return 1
+}
+
+# a kubeconfig for every cluster NetBox knows, through k-ctx add of
+# kubectl-helpers; a cluster with a kubeconfig in ~/.kube already is kept
+setup_kubeconfigs() {
+    local tool cluster
+    local -a existing
+    local -a missing=() clusters=()
+    for tool in k-ctx kubectl kubelogin yq jq netbox-cli; do
+        command -v "${tool}" > /dev/null 2>&1 || missing+=("${tool}")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        # only worth saying when the kubectl-helpers are there at all
+        command -v k-ctx > /dev/null 2>&1 \
+            && warning "Skipping the kubeconfigs, missing: ${missing[*]} (the k8s and mw categories)"
+        return 0
+    fi
+    info "Kubeconfigs: fetch one for every cluster NetBox knows (k-ctx add)"
+    if ! setup_netbox; then
+        failed+=("netbox-cli setup, no kubeconfigs")
+        return 0
+    fi
+
+    while IFS= read -r cluster; do
+        [ -z "${cluster}" ] && continue
+        existing=("${HOME}/.kube/${cluster,,}-m3-"*.config)
+        [ -e "${existing[0]}" ] && continue
+        clusters+=("${cluster}")
+    done < <(netbox-cli get clusters -oname 2>/dev/null | sort -u)
+    if [ "${#clusters[@]}" -eq 0 ]; then
+        echo "Every cluster has a kubeconfig in ${HOME}/.kube" 1>&2
+        return 0
+    fi
+
+    echo "${clusters[*]}" 1>&2
+    ask "Fetch the kubeconfigs of these ${#clusters[@]} clusters?" || return 0
+    for cluster in "${clusters[@]}"; do
+        run k-ctx add --yes "${cluster}" || failed+=("k-ctx add ${cluster}")
     done
 }
 
@@ -321,6 +462,7 @@ info "Installing base"
 # firmware updates are not part of setting up the software
 run_updater base --exclude firmware
 install_dotfiles
+restore_reminders
 
 check_categories
 select_categories
@@ -329,6 +471,9 @@ if [ "${#selected[@]}" -gt 0 ]; then
     run_updater "${selected[@]}"
 fi
 
+hash -r
+setup_k_ctx_shell
+setup_kubeconfigs
 set_default_browser
 gnome_settings
 
