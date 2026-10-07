@@ -1,7 +1,9 @@
 #!/bin/bash
 
 APP_NAME="$(basename "${0}")"
-PLATFORM="$(dpkg --print-architecture)"
+# the userland's architecture (amd64, arm64, armhf, ...), which dpkg installs for;
+# uname -m names the kernel's, which is aarch64 under a 32-bit Raspberry Pi OS
+PLATFORM="$(dpkg --print-architecture 2>/dev/null)"
 UPDATE_MESSAGE="Running %PKGNAME% upgrade"
 FLATHUB_REPO_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
 # shellcheck disable=SC1090
@@ -13,10 +15,40 @@ software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
 declare -A group_members=()
+# the architectures (dpkg names) a software from a vendor's repository or
+# installer is built for, as nothing tells it beforehand; one missing here runs
+# everywhere. Software from a release is not listed: install-git-release tells
+# when a release has no build for the architecture, and it is skipped then;
+# unless its step changes something before the install that has to wait for a
+# build to exist, like forskap stopping the daemon it replaces.
+declare -A software_arches=(
+    [android-sdk]="amd64"
+    [chrome]="amd64"
+    [slack]="amd64"
+    [spotify]="amd64"
+    [threema]="amd64"
+    [zoom]="amd64"
+    [aws]="amd64 arm64"
+    [claude]="amd64 arm64"
+    [ollama]="amd64 arm64"
+    [opencode]="amd64 arm64"
+    [sublime]="amd64 arm64"
+    [wezterm]="amd64 arm64"
+    [zed]="amd64 arm64"
+    [forskap]="amd64 arm64"
+    [teamviewer]="amd64 arm64 armhf"
+)
 # the software a step needed and that was run for it, so it is not run twice
 declare -A software_needed=()
 # the hosts install-git-release was checked to be logged in to
 declare -A release_host_checked=()
+# the status of a step whose release has no build for the architecture, which
+# install_git_release returns and the step passes on: it is skipped, not failed
+NO_BUILD=4
+# set when install_git_release returned NO_BUILD, so no other status 4 counts
+release_no_build=0
+# the user units user_service_disable stopped: "ENABLED ACTIVE UNIT", 1 or 0
+user_units_stopped=()
 selected=""
 
 error() {
@@ -191,6 +223,10 @@ discover_software() {
         done
     done < <(printf '%s\n' "${entries[@]}" | sort -n -k1,1)
 
+    for name in "${!software_arches[@]}"; do
+        [ -n "${software_handlers[${name}]+registered}" ] || fail "Unknown software in software_arches: ${name}"
+    done
+
     if [ "${#group_members[@]}" -gt 0 ]; then
         mapfile -t possible_groups < <(printf '%s\n' "${!group_members[@]}" | sort)
     fi
@@ -231,13 +267,24 @@ needs() {
         error "${outer} needs ${check}, but there is no software ${software}"
         return 1
     fi
+    local reason
+    reason="$(software_unavailable_reason "${software}")"
+    if [ -n "${reason}" ]; then
+        error "${outer} needs ${check}, but ${software} is ${reason}"
+        return 1
+    fi
     software_needed["${software}"]=1
 
     local message="${UPDATE_MESSAGE//%PKGNAME%/${software}}"
     echo "${APP_NAME}: ${outer} needs ${check}, ${message,} first" 1>&2
     selected="${software}"
+    release_no_build=0
     "${software_handlers[${software}]}"; status=$?
     selected="${outer}"
+    if [ "${status}" -eq "${NO_BUILD}" ] && [ "${release_no_build}" -eq 1 ]; then
+        error "${outer} needs ${check}, but the release of ${software} has no build for ${PLATFORM}"
+        return 1
+    fi
     if [ "${status}" -ne 0 ]; then
         error "Failed to update ${software}, which ${outer} needs"
         return 1
@@ -256,6 +303,15 @@ needs() {
     return 1
 }
 
+# software_unavailable_reason NAME: why the software is not built for this
+# architecture, empty when it is
+software_unavailable_reason() {
+    local arches="${software_arches[${1}]}"
+    [ -z "${arches}" ] && return 0
+    [[ " ${arches} " == *" ${PLATFORM} "* ]] && return 0
+    echo "only built for ${arches// /, }, not ${PLATFORM}"
+}
+
 # the members of a group that only works on some systems are skipped elsewhere,
 # e.g. the gnome group without GNOME Shell
 group_unavailable_reason() {
@@ -268,6 +324,7 @@ group_unavailable_reason() {
 
 run_selected_software() {
     local handler
+    local status
     local item
     local group
     local reason
@@ -288,7 +345,7 @@ run_selected_software() {
             echo "${APP_NAME}: ${item} was already updated for another software" 1>&2
             continue
         fi
-        reason=""
+        reason="$(software_unavailable_reason "${item}")"
         for group in "${!unavailable[@]}"; do
             is_group_member "${group}" "${item}" && reason="${unavailable[${group}]}"
         done
@@ -302,7 +359,11 @@ run_selected_software() {
         selected="${item}"
         export selected
         handler="${software_handlers[${item}]}"
-        if ! "${handler}"; then
+        release_no_build=0
+        "${handler}"; status=$?
+        if [ "${status}" -eq "${NO_BUILD}" ] && [ "${release_no_build}" -eq 1 ]; then
+            echo "${APP_NAME}: Skipping ${item}: its release has no build for ${PLATFORM}" 1>&2
+        elif [ "${status}" -ne 0 ]; then
             error "Failed to update ${item}"
             update_failed=1
         fi
@@ -809,6 +870,58 @@ git_repo_update() {
     fi
     verbose "${SUDO_USER} git -C ${dir} pull --ff-only"
     ${SUDO_USER} git -C "${dir}" pull --ff-only --quiet
+}
+
+# user_service_disable UNIT...: stops and disables the systemd user units that
+# are enabled or running, e.g. the old ones of a renamed software; what each was
+# goes to user_units_stopped, for user_service_restore
+user_service_disable() {
+    # systemctl --user talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local unit
+    local enabled
+    local active
+    for unit in "${@}"; do
+        enabled=0
+        active=0
+        ${SUDO_USER} "${session_env[@]}" systemctl --user is-enabled --quiet "${unit}" 2>/dev/null && enabled=1
+        ${SUDO_USER} "${session_env[@]}" systemctl --user is-active --quiet "${unit}" 2>/dev/null && active=1
+        [ "${enabled}" -eq 0 ] && [ "${active}" -eq 0 ] && continue
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would stop and disable the user service ${unit}" 1>&2
+            continue
+        fi
+        verbose "${SUDO_USER} systemctl --user disable --now ${unit}"
+        ${SUDO_USER} "${session_env[@]}" systemctl --user disable --now "${unit}" || return 1
+        user_units_stopped+=("${enabled} ${active} ${unit}")
+    done
+}
+
+# user_service_restore: enables and starts again what user_service_disable
+# stopped, the last first, e.g. the old daemon when its successor failed to
+# install
+user_service_restore() {
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local index
+    local enabled
+    local active
+    local unit
+    local failed=0
+    for (( index = ${#user_units_stopped[@]} - 1; index >= 0; index-- )); do
+        read -r enabled active unit <<< "${user_units_stopped[${index}]}"
+        echo "${APP_NAME}: Starting the user service ${unit} again" 1>&2
+        if [ "${enabled}" -eq 1 ]; then
+            verbose "${SUDO_USER} systemctl --user enable ${unit}"
+            ${SUDO_USER} "${session_env[@]}" systemctl --user enable "${unit}" || failed=1
+        fi
+        if [ "${active}" -eq 1 ]; then
+            verbose "${SUDO_USER} systemctl --user start ${unit}"
+            ${SUDO_USER} "${session_env[@]}" systemctl --user start "${unit}" || failed=1
+        fi
+    done
+    user_units_stopped=()
+    [ "${failed}" -eq 0 ] || warning "Failed to start the user services again that were stopped"
+    return "${failed}"
 }
 
 # user_service_enable UNIT [FILE]: installs the systemd user unit FILE (if given,
@@ -1420,6 +1533,14 @@ install_git_release() {
     [ "${dry_run}" -eq 1 ] && install_git_args+=("--dry-run")
     [ "${dry_run}" -eq 0 ] && install_git_args+=("--yes")
     install-git-release "${url}" "${install_git_args[@]}"
+    local status=$?
+    # install-git-release exits with 4 when the release is not built for this
+    # architecture
+    if [ "${status}" -eq 4 ]; then
+        release_no_build=1
+        return "${NO_BUILD}"
+    fi
+    return "${status}"
 }
 
 # Ubuntu lets a program create user namespaces only when its AppArmor profile allows
@@ -1637,8 +1758,11 @@ software-041-vim@base() {
     local plug="${CURRENT_USER_HOME}/.vim/autoload/plug.vim"
     needs packages vim || return $(( $? == 3 ? 0 : 1 ))
     # the plugins the vimrc uses: Codeium (its status in the statusline, sign in
-    # once with :Codeium Auth) and vim-plug, which updates itself with :PlugUpgrade
-    git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
+    # once with :Codeium Auth), only on amd64 like the vimrc, and vim-plug, which
+    # updates itself with :PlugUpgrade
+    if [ "${PLATFORM}" = "amd64" ]; then
+        git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
+    fi
     if [ ! -f "${plug}" ]; then
         if [ "${dry_run}" -eq 1 ]; then
             echo "Would download vim-plug to ${plug}" 1>&2
@@ -1718,8 +1842,18 @@ software-044-terminator@base() {
 software-045-sublime@base() {
     apt_add_with_repo "sublime-text" "https://download.sublimetext.com/" "apt/stable/" "" "https://download.sublimetext.com/sublimehq-pub.gpg" \
         || return 1
+    local package_control="${CURRENT_USER_HOME}/.config/sublime-text/Packages/User/Package Control.sublime-settings"
     # the settings, keymap and theme of the User package
-    config_update sublime-text "${CURRENT_USER_HOME}/.config/sublime-text/Packages/User"
+    config_update sublime-text "${CURRENT_USER_HOME}/.config/sublime-text/Packages/User" || return 1
+    # Codeium only on amd64, so Package Control does not install it elsewhere
+    [ "${PLATFORM}" = "amd64" ] && return 0
+    grep -qE '^[[:space:]]*"Codeium",?[[:space:]]*$' "${package_control}" 2>/dev/null || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would remove Codeium from ${package_control}, it is only used on amd64" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} sed -i '/^[[:space:]]*\"Codeium\",\?[[:space:]]*$/d' ${package_control}"
+    ${SUDO_USER} sed -i '/^[[:space:]]*"Codeium",\?[[:space:]]*$/d' "${package_control}"
 }
 software-050-adb@dev() { install_adb; }
 software-051-android-sdk@dev() { apt_upgrade google-android-platform-36-installer google-android-build-tools-36.0.0-installer; }
@@ -1745,7 +1879,7 @@ software-057-conda@dev() {
         "https://repo.anaconda.com/pkgs/misc/gpgkeys/anaconda.asc" "34161F5BF5EB1D4BFBBB8F0A8AEB4F8B29D82806"
 }
 software-058-docker-compose@dev() {
-    install_git_release "https://github.com/docker/compose" --pattern "docker-compose-linux-x86_64" --name "docker-compose"
+    install_git_release "https://github.com/docker/compose" --pattern "docker-compose-linux-{arch}" --name "docker-compose"
 }
 software-059-swagger-codegen@dev() {
     needs java || return $(( $? == 3 ? 0 : 1 ))
@@ -1871,7 +2005,7 @@ software-121-mittwald-outlook-bridge@mw() {
     # on them, the tarball does not
     apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
     # the deb of the release, which brings the systemd user unit
-    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*" || return 1
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*{arch}*webview*" || return $?
     # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
     if [ ! -f "${env_file}" ]; then
         warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
@@ -1890,13 +2024,30 @@ software-130-slack@comms() {
         "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
         "https://packagecloud.io/slacktechnologies/slack/gpgkey"
 }
-software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_amd64.deb"; }
+software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
-software-170-gitlab_trackr@dev() {
-    # the package brings the gitlab-trackrd user service
-    install_git_release "https://github.com/BjarneSeger/gitlab_trackr" && user_service_enable gitlab-trackrd.service
+# formerly gitlab-trackr, whose package forskap-utils replaces; as its upgrade
+# notes say, the old daemon is stopped and disabled, first, while its units are
+# still there, and the new one is started through its socket. When the install
+# fails, the old daemon runs again as it did.
+software-170-forskap@dev() {
+    local status
+    user_units_stopped=()
+    if ! user_service_disable gitlab-trackrd.service gitlab-trackrd.socket; then
+        user_service_restore
+        return 1
+    fi
+    # the package brings the forskapd user units
+    install_git_release "https://github.com/BjarneSeger/forskap" --pattern "forskap-utils_*_linux_{arch}.deb"
+    status=$?
+    if [ "${status}" -ne 0 ]; then
+        user_service_restore
+        return "${status}"
+    fi
+    user_units_stopped=()
+    user_service_enable forskapd.socket
 }
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
@@ -1939,13 +2090,13 @@ software-185-bahn-probonio-bot@personal() {
     fi
 }
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
-software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
+software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya@comms() {
     local account="mail@david-grieser.de"
     # secret-tool talks to the keyring of the user's session
     local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
-    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return 1
+    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return $?
     # the mail account; its password comes from the GNOME keyring through secret-tool
     needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
     config_update himalaya "${CURRENT_USER_HOME}/.config/himalaya" || return 1
@@ -2014,7 +2165,7 @@ software-254-inkscape@media() {
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38" "56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38"
 }
 software-255-losslesscut@media() {
-    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-x64.tar.bz2" --bundle --binary "losslesscut" \
+    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-{arch}.tar.bz2" --bundle --binary "losslesscut" \
         && apparmor_allow_userns losslesscut losslesscut
 }
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
@@ -2041,7 +2192,7 @@ software-280-spotify@media() {
 software-290-trivy@dev@k8s() {
     apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
 }
-software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_amd64.deb"; }
+software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_{arch}.deb"; }
 
 software-300-threema@comms() {
     flatpak_update "ch.threema.threema-desktop" --from "https://releases.threema.ch/flatpak/threema-desktop/ch.threema.threema-desktop.flatpakref" || return 1
@@ -2065,7 +2216,7 @@ software-316-window-is-ready-filter@gnome@gnome-extensions() {
     gnome_extension_from_git "https://github.com/dgrieser/window-is-ready-filter.git" "window-is-ready-filter@david-grieser.de"
 }
 software-320-opencode@dev@agents() {
-    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-x64.tar.gz" || return 1
+    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-{arch}.tar.gz" || return $?
     tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
     config_update opencode "${CURRENT_USER_HOME}/.config/opencode" || return 1
     opencode_auth_update
@@ -2212,12 +2363,12 @@ REPOS
 }
 software-361-helmfile@dev@k8s() { install_git_release "https://github.com/helmfile/helmfile"; }
 software-362-jsonnet@dev@k8s() {
-    install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnet-go_*_amd64.deb" \
-        && install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnetfmt-go_*_amd64.deb"
+    install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnet-go_*_{arch}.deb" \
+        && install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnetfmt-go_*_{arch}.deb"
 }
-software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_amd64.deb"; }
+software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_{arch}.deb"; }
 software-364-operator-sdk@dev@k8s() {
-    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_amd64" --name "operator-sdk"
+    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_{arch}" --name "operator-sdk"
 }
 software-366-promql@dev@k8s() { install_git_release "https://github.com/nalbury/promql-cli"; }
 software-367-kubectl-neat@dev@k8s() { install_git_release "https://github.com/itaysk/kubectl-neat"; }
@@ -2260,6 +2411,9 @@ software-370-wezterm@desktop() {
             ;;
     esac
 
+    # the amd64 package has no architecture in its name, the arm64 one does
+    [ "${PLATFORM}" = "arm64" ] && wezterm_distribution+=".arm64"
+
     install_git_release "https://github.com/wez/wezterm" \
         --release "nightly" \
         --pattern "wezterm-nightly.${wezterm_distribution}.deb"
@@ -2273,7 +2427,7 @@ software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubec
 # the kubectl-oidc_login symlink makes it available as "kubectl oidc-login", which the kubeconfigs call
 software-391-kubelogin@dev@k8s() {
     install_git_release "https://github.com/int128/kubelogin" \
-        --pattern "kubelogin_linux_amd64.zip" \
+        --pattern "kubelogin_linux_{arch}.zip" \
         --post-install 'ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
 }
 software-420-qwen@dev@agents() {
@@ -2341,7 +2495,9 @@ software-445-ollama@agents() {
 software-450-aws@dev() {
     require_cmd curl unzip || return 1
     local aws_name="aws"
-    local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+    local aws_arch="x86_64"
+    [ "${PLATFORM}" = "arm64" ] && aws_arch="aarch64"
+    local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip"
     local aws_file_name
     local aws_file_path
     local aws_folder_path
@@ -2403,7 +2559,7 @@ software-disabled-480-ueberzugpp() {
 }
 
 software-490-yazi@base() {
-    install_git_release "https://github.com/sxyazi/yazi" || return 1
+    install_git_release "https://github.com/sxyazi/yazi" || return $?
     tool_ready ya || return $(( $? == 1 ? 0 : 1 ))
     yazi_plugin_update \
         "yazi-rs/plugins:smart-enter" \
@@ -2413,11 +2569,11 @@ software-490-yazi@base() {
     needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
     config_update yazi "${CURRENT_USER_HOME}/.config/yazi"
 }
-software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_amd64.deb"; }
-software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_amd64.deb"; }
+software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_{arch}.deb"; }
+software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb"; }
 software-495-r-quick-share@desktop() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
-    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_amd64.deb" || return 1
+    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return $?
     # its settings: started minimized at login, closing the window keeps it running
     config_update rquickshare "${CURRENT_USER_HOME}/.local/share/dev.mandre.rquickshare" || return 1
     # started at login, so the phone finds it
@@ -2433,7 +2589,7 @@ software-495-r-quick-share@desktop() {
 }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 software-510-jw-cli@personal() { install_git_release "https://github.com/dgrieser/jw-cli"; }
-software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
+software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_{arch}*"; }
 software-530-wscat@dev() { npm_update wscat; }
 software-535-npm-tools@dev() {
     npm_update @electron/asar \
@@ -2443,7 +2599,7 @@ software-535-npm-tools@dev() {
         && npm_update ynab
 }
 software-537-kubelive@dev@k8s() { npm_update kubelive; }
-software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
+software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*{arch}*linux*"; }
 
 software-550-go@dev() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
@@ -2459,10 +2615,17 @@ software-550-go@dev() {
     local staging_dir
     local bin
 
+    local go_arch="${PLATFORM}"
+    # Go names its 32-bit builds differently from Debian
+    case "${PLATFORM}" in
+        armhf|armel) go_arch="armv6l" ;;
+        i386) go_arch="386" ;;
+    esac
+
     release_json="$(curl -fsSL "${go_dl_url}/?mode=json")" || return 1
     version="$(echo "${release_json}" | jq -r '.[0].version')"
-    file_name="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .filename')"
-    sha256="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .sha256')"
+    file_name="$(echo "${release_json}" | jq -r --arg arch "${go_arch}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .filename')"
+    sha256="$(echo "${release_json}" | jq -r --arg arch "${go_arch}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .sha256')"
     if [[ ! "${version}" =~ ^go[0-9.]+$ ]] || [ -z "${file_name}" ] || [ -z "${sha256}" ]; then
         error "Failed to get latest version of Go from ${go_dl_url}"
         return 1

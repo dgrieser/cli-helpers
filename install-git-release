@@ -13,8 +13,14 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
     Options:
         -h, --help          Display this help and exit
 
-        -p, --pattern       Pattern of the artifact to install
-                            Default: *linux*64*
+        -p, --pattern       Pattern of the artifact to install. {arch} stands
+                            for each name of the architecture (amd64, x86_64,
+                            x64, ...), one pattern per name.
+                            Default: Linux builds for the architecture
+
+        -a, --arch          Architecture to install for (amd64, arm64, armhf,
+                            armel, i386 or a uname -m name like armv7l)
+                            Default: the userland's, from dpkg or uname -m
 
         -x, --exclude       Pattern of artifacts to exclude. Neither gh nor
                             glab can exclude, so this is applied after the
@@ -49,6 +55,8 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
         -d, --dry-run       Perform a trial run with no changes made
 
         --bash-completion   Print completion candidates and exit
+
+    Exit status 4: the release has no build for the architecture.
 EOF
     exit 1
 }
@@ -60,7 +68,7 @@ function completion() {
     local skip_next=0
 
     if [ "${previous}" != "-r" ] && [ "${previous}" != "--release" ]; then
-        echo "-h --help -p --pattern -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
+        echo "-h --help -p --pattern -a --arch -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
         return
     fi
     shift
@@ -73,7 +81,7 @@ function completion() {
             continue
         fi
         case "${argument}" in
-            -p|--pattern|-x|--exclude|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
+            -p|--pattern|-a|--arch|-x|--exclude|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
                 skip_next=1
                 ;;
             -*)
@@ -114,6 +122,14 @@ function fail() {
     exit 1
 }
 
+# fail_no_build MESSAGE: the release is not built for the architecture, which
+# is exit status 4, so a caller can skip it
+function fail_no_build() {
+    error "${1}"
+    cleanup
+    exit 4
+}
+
 function abort() {
     echo "Abort." 1>&2
     cleanup
@@ -126,32 +142,68 @@ function success() {
     exit 0
 }
 
-# downloads the release assets matching the patterns through the REST API, for
-# when gh or glab is missing or fails; public projects need no login, a token
-# from the environment is used if set (GH_TOKEN/GITHUB_TOKEN, GITLAB_TOKEN)
-function download_with_api() {
+# api_curl PROJECT ARGS...: curl for the project's host; public projects need
+# no login, a token from the environment (GH_TOKEN/GITHUB_TOKEN, GITLAB_TOKEN)
+# is used if set, else the one gh or glab stored at their login
+function api_curl() {
+    local project="${1}"; shift
+    local curl_args=( "-fsSL" )
+    local token
+    local host
+    if [[ "${project}" == "https://github.com/"* ]]; then
+        token="${GH_TOKEN:-${GITHUB_TOKEN}}"
+        [ -z "${token}" ] && command -v gh &> /dev/null && token="$(gh auth token 2> /dev/null)"
+        [ -n "${token}" ] && curl_args+=( "-H" "Authorization: Bearer ${token}" )
+    else
+        token="${GITLAB_TOKEN}"
+        host="$(echo "${project}" | cut -d/ -f3)"
+        [ -z "${token}" ] && command -v glab &> /dev/null && token="$(glab config get token --host "${host}" 2> /dev/null)"
+        [ -n "${token}" ] && curl_args+=( "-H" "PRIVATE-TOKEN: ${token}" )
+    fi
+    curl "${curl_args[@]}" "${@}"
+}
+
+# api_get PROJECT ENDPOINT: the response of the REST API of the project's host
+# to a GET of the endpoint (relative to the API root), through gh or glab where
+# installed, so their login counts also when it is in the keyring, else curl
+function api_get() {
+    local project="${1}"
+    local endpoint="${2}"
+    local host
+    local response
+    if [[ "${project}" == "https://github.com/"* ]]; then
+        if command -v gh &> /dev/null && response="$(gh api "${endpoint}" 2> /dev/null)"; then
+            echo "${response}"
+            return 0
+        fi
+        api_curl "${project}" "https://api.github.com/${endpoint}"
+    else
+        host="$(echo "${project}" | cut -d/ -f1-3)"
+        if command -v glab &> /dev/null && response="$(glab api --hostname "${host#*://}" "${endpoint}" 2> /dev/null)"; then
+            echo "${response}"
+            return 0
+        fi
+        api_curl "${project}" "${host}/api/v4/${endpoint}"
+    fi
+}
+
+# release_assets PROJECT: the name and download URL of each asset of the
+# release, tab-separated, from the REST API
+function release_assets() {
     local project="${1}"
     local api_url
     local release_json
     local assets
-    local name
-    local url
-    local pattern
-    local downloaded=0
-    local curl_args=( "-fsSL" )
 
-    command -v curl &> /dev/null || { error "curl is required to download without gh or glab"; return 1; }
-    command -v jq &> /dev/null || { error "jq is required to download without gh or glab"; return 1; }
+    command -v jq &> /dev/null || { error "jq is required to read the release"; return 1; }
 
     if [[ "${project}" == "https://github.com/"* ]]; then
         local repo="${project#https://github.com/}"
         repo="${repo%/}"
         repo="${repo%.git}"
-        api_url="https://api.github.com/repos/${repo}/releases/latest"
-        [ -n "${RELEASE}" ] && api_url="https://api.github.com/repos/${repo}/releases/tags/${RELEASE}"
-        local token="${GH_TOKEN:-${GITHUB_TOKEN}}"
-        [ -n "${token}" ] && curl_args+=( "-H" "Authorization: Bearer ${token}" )
-        release_json="$(curl "${curl_args[@]}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        api_url="repos/${repo}/releases/latest"
+        [ -n "${RELEASE}" ] && api_url="repos/${repo}/releases/tags/${RELEASE}"
+        release_json="$(api_get "${project}" "${api_url}")" || { error "Failed to get the release of ${project} from GitHub"; return 1; }
         assets="$(echo "${release_json}" | jq -r '.assets[] | [.name, .browser_download_url] | @tsv')"
     else
         local host
@@ -160,12 +212,26 @@ function download_with_api() {
         path="${project#"${host}"/}"
         path="${path%/}"
         path="${path%.git}"
-        api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/permalink/latest"
-        [ -n "${RELEASE}" ] && api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/$(jq -rn --arg tag "${RELEASE}" '$tag | @uri')"
-        [ -n "${GITLAB_TOKEN}" ] && curl_args+=( "-H" "PRIVATE-TOKEN: ${GITLAB_TOKEN}" )
-        release_json="$(curl "${curl_args[@]}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        api_url="projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/permalink/latest"
+        [ -n "${RELEASE}" ] && api_url="projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/$(jq -rn --arg tag "${RELEASE}" '$tag | @uri')"
+        release_json="$(api_get "${project}" "${api_url}")" || { error "Failed to get the release of ${project} from ${host}"; return 1; }
         assets="$(echo "${release_json}" | jq -r '.assets.links[] | [.name, (.direct_asset_url // .url)] | @tsv')"
     fi
+    echo "${assets}"
+}
+
+# downloads the release assets matching the patterns through the REST API, for
+# when gh or glab is missing or fails
+function download_with_api() {
+    local project="${1}"
+    local assets
+    local name
+    local url
+    local pattern
+    local downloaded=0
+
+    command -v curl &> /dev/null || { error "curl is required to download without gh or glab"; return 1; }
+    assets="$(release_assets "${project}")" || return 1
 
     while IFS=$'\t' read -r name url; do
         [ -z "${name}" ] && continue
@@ -173,12 +239,16 @@ function download_with_api() {
             # shellcheck disable=SC2053
             [[ "${name}" == ${pattern} ]] || continue
             echo "Downloading ${name}..." 1>&2
-            curl "${curl_args[@]}" -o "${tmpfolder}/${name}" "${url}" || { error "Failed to download ${url}"; return 1; }
+            api_curl "${project}" -o "${tmpfolder}/${name}" "${url}" || { error "Failed to download ${url}"; return 1; }
             downloaded=1
             break
         done
     done <<< "${assets}"
-    [ "${downloaded}" -eq 1 ] || { error "No release asset of ${project} matches ${PATTERNS[*]}"; return 1; }
+    if [ "${downloaded}" -eq 0 ]; then
+        built_for_other_arch "$(cut -f1 <<< "${assets}")" && fail_no_build "The release of ${project} has no build for ${ARCH}"
+        error "No release asset of ${project} matches ${PATTERNS[*]}"
+        return 1
+    fi
 }
 
 function manual_download() {
@@ -358,16 +428,6 @@ function reduce_artifacts() {
     return 0
 }
 
-function reduce_unsupported_artifacts() {
-    local list="${1}"
-    local reduced=""
-    reduced="$(echo "${list}" | grep -vEi 'AppImage$' || true)"
-    if [[ "${ARCH_UNAME}" != "arm"* ]] && [[ "${ARCH_DPKG}" != "arm"* ]]; then
-        reduced="$(echo "${reduced}" | grep -vE 'arm64|aarch64|armhf|armel|armv7|armv6' || true)"
-    fi
-    echo "${reduced}"
-}
-
 function prefer_without() {
     local marker="${1}"; shift
     local list="${1}"; shift
@@ -410,44 +470,253 @@ function prefer_supported_cpu_variant() {
     return $?
 }
 
-function prefer_linux_over_darwin() {
+# prefer_linux LIST: drops the builds for other operating systems, when a
+# release names its Linux builds by architecture only (x86_64.tar.gz next to
+# macos-x86_64.tar.gz) unless nothing else is left
+function prefer_linux() {
     local list="${1}"; shift
-    prefer_a_over_b "linux" "darwin" "${list}"
-    return $?
+    local reduced
+    local item
+    reduced="$(while IFS= read -r item; do
+        basename "${item}" | tr '[:upper:]' '[:lower:]' \
+            | grep -qP '(?<![a-z0-9])(darwin|macos|mac|osx|apple|windows|win32|win64|freebsd|openbsd|netbsd|android|illumos|solaris)(?![a-z0-9])|\.(exe|msi|dmg|pkg)$' \
+            || echo "${item}"
+    done <<< "${list}")"
+    [ -n "${reduced}" ] && echo "${reduced}" && return 0
+    echo "${list}"
 }
 
-function prefer_a_over_b() {
-    local a="${1}"; shift
-    local b="${1}"; shift
-    local list="${1}"; shift
-    local has_a=0
-    local has_b=0
+# The architectures by their Debian name (what dpkg --print-architecture says),
+# then the names release artifacts give them, the preferred first, and after a
+# "|" the names of older instruction sets it runs too, taken only when nothing
+# is built for it. A name maps to the first architecture that prefers it, for
+# --arch and uname -m.
+ARCH_TABLE=(
+    "amd64 amd64 x86_64 x86-64 x64"
+    "arm64 arm64 aarch64 armv8"
+    "armhf armhf armv7l armv7 armv7hf armv8l arm32 | armv6l armv6 armv6hf arm"
+    "armel armel armv6l armv6 armv6hf armv5tel armv5te armv5 arm"
+    "i386 i386 i686 i586 i486 386 ia32 x86"
+    "ppc64el ppc64el ppc64le"
+    "ppc64 ppc64"
+    "s390x s390x"
+    "riscv64 riscv64"
+    "mips64el mips64el mips64le"
+    "mipsel mipsel mipsle"
+    "mips mips"
+    "loong64 loong64 loongarch64"
+)
 
-    echo "${list}" | grep -q "${a}" && has_a=1
-    echo "${list}" | grep -q "${b}" && has_b=1
-    if [ ${has_a} -eq 1 ] && [ ${has_b} -eq 1 ]; then
-        echo "${list}" | grep -i "${a}"
+# arch_names ARCH [preferred|fallback|all]: the names of ARCH from the table
+function arch_names() {
+    local arch="${1}"
+    local part="${2:-all}"
+    local row
+    local names
+    local -a words
+    for row in "${ARCH_TABLE[@]}"; do
+        [ "${row%% *}" = "${arch}" ] || continue
+        names="${row#* }"
+        case "${part}" in
+            preferred) names="${names%%|*}" ;;
+            fallback) [[ "${names}" == *"|"* ]] && names="${names#*|}" || names="" ;;
+            all) names="${names/|/}" ;;
+        esac
+        read -ra words <<< "${names}"
+        echo "${words[*]}"
+        return 0
+    done
+    # not in the table: only its own name
+    [ "${part}" = "fallback" ] || echo "${arch}"
+}
+
+# normalize_arch NAME: the Debian name of a dpkg, uname -m or artifact name
+function normalize_arch() {
+    local name="${1,,}"
+    local row
+    for row in "${ARCH_TABLE[@]}"; do
+        if [[ " $(arch_names "${row%% *}" preferred) " == *" ${name} "* ]]; then
+            echo "${row%% *}"
+            return 0
+        fi
+    done
+    echo "${name}"
+}
+
+# detect_arch: the architecture of the userland, which is what has to run the
+# binaries. dpkg knows it; uname -m only names the kernel, and a Raspberry Pi OS
+# with a 32-bit (armhf) userland boots a 64-bit (aarch64) kernel on a Pi 3/4/5.
+function detect_arch() {
+    local arch
+    arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    if [ -z "${arch}" ]; then
+        arch="$(normalize_arch "$(uname -m 2>/dev/null)")"
+        if [ "$(getconf LONG_BIT 2>/dev/null)" = "32" ]; then
+            case "${arch}" in
+                arm64) arch="armhf" ;;
+                amd64) arch="i386" ;;
+            esac
+        fi
+    fi
+    echo "${arch}"
+}
+
+# arch_aliases [ARCH]: how release artifacts name the architecture (default:
+# ARCH), the preferred names first, then the fallback ones
+function arch_aliases() {
+    local -a words
+    read -ra words <<< "$(arch_preferred_aliases "${@}") $(arch_fallback_aliases "${@}")"
+    echo "${words[*]}"
+}
+
+# arch_preferred_aliases [ARCH]: the names of builds for the architecture itself.
+# A 32-bit ARM userland on an ARMv6 CPU (Pi 1/Zero) cannot run ARMv7 builds, so
+# there the ARMv6 ones are its own.
+function arch_preferred_aliases() {
+    local arch="${1:-${ARCH}}"
+    if [ "${arch}" = "armhf" ] && [ "${arch}" = "${ARCH}" ] && [[ "$(uname -m 2>/dev/null)" == armv6* ]]; then
+        echo "armhf $(arch_names armhf fallback | sed -E 's/(^| )arm( |$)/ /')"
         return 0
     fi
+    arch_names "${arch}" preferred
+}
 
-    echo "${list}"
+# arch_fallback_aliases [ARCH]: the names of older instruction sets the
+# architecture runs too
+function arch_fallback_aliases() {
+    local arch="${1:-${ARCH}}"
+    if [ "${arch}" = "armhf" ] && [ "${arch}" = "${ARCH}" ] && [[ "$(uname -m 2>/dev/null)" == armv6* ]]; then
+        echo "arm"
+        return 0
+    fi
+    arch_names "${arch}" fallback
+}
+
+# all_arch_aliases: every name an artifact may carry, to spot builds for other
+# architectures
+function all_arch_aliases() {
+    local row
+    for row in "${ARCH_TABLE[@]}"; do
+        arch_names "${row%% *}"
+    done | tr ' ' '\n' | sort -u | paste -sd' '
+}
+
+# arch_regex ALIASES...: a PCRE that matches any of the aliases as a whole word
+# of a file name, so "arm" matches arm-unknown-linux-gnueabihf but not arm64,
+# and "x86" not x86_64
+function arch_regex() {
+    local aliases
+    # the longest first, so x86_64 is tried before x86
+    aliases="$(echo "${*}" | tr ' ' '\n' | grep -v '^$' | awk '{ print length(), $0 }' | sort -rn | cut -d' ' -f2- \
+        | sed 's/[.]/\\./g' | paste -sd'|')"
+    echo "(?<![a-z0-9])(${aliases})(?![a-z0-9]|[-_]64)"
+}
+
+# matches_arch FILE ALIASES...: whether the file name carries one of the aliases
+function matches_arch() {
+    local file="${1}"; shift
+    basename "${file}" | tr '[:upper:]' '[:lower:]' | grep -qP "$(arch_regex "${@}")"
+}
+
+# reduce_unsupported_artifacts LIST: drops AppImages and artifacts built only
+# for other architectures; artifacts naming no architecture stay
+function reduce_unsupported_artifacts() {
+    local list="${1}"
+    local reduced=""
+    local item
+    local native
+    local all
+    native="$(arch_aliases)"
+    all="$(all_arch_aliases)"
+    while IFS= read -r item; do
+        [ -z "${item}" ] && continue
+        [[ "${item}" =~ AppImage$ ]] && continue
+        # shellcheck disable=SC2086
+        if matches_arch "${item}" ${all} && ! matches_arch "${item}" ${native}; then
+            continue
+        fi
+        if [ -z "${reduced}" ]; then
+            reduced="${item}"
+        else
+            reduced="${reduced}"$'\n'"${item}"
+        fi
+    done <<< "${list}"
+    echo "${reduced}"
+}
+
+# filter_native_arch LIST: the artifacts built for this architecture, else the
+# ones for an older instruction set it runs too; empty when none names one
+function filter_native_arch() {
+    local list="${1}"
+    local filtered
+    local aliases
+    local item
+    for aliases in "$(arch_preferred_aliases)" "$(arch_fallback_aliases)"; do
+        [ -z "${aliases}" ] && continue
+        # shellcheck disable=SC2086
+        filtered="$(while IFS= read -r item; do
+            [ -n "${item}" ] && matches_arch "${item}" ${aliases} && echo "${item}"
+        done <<< "${list}")"
+        [ -n "${filtered}" ] && echo "${filtered}" && return 0
+    done
     return 0
 }
 
-function arch_pattern() {
-    local parts=()
-    [ -n "${ARCH_UNAME}" ] && parts+=("${ARCH_UNAME}")
-    [ -n "${ARCH_DPKG}" ] && [ "${ARCH_DPKG}" != "${ARCH_UNAME}" ] && parts+=("${ARCH_DPKG}")
-    case "${ARCH_UNAME}|${ARCH_DPKG}" in
-        *x86_64*|*amd64*)
-            parts+=("x64")
-            ;;
-        *aarch64*|*arm64*)
-            parts+=("arm64" "aarch64")
-            ;;
-    esac
-    local IFS="|"
-    echo "${parts[*]}"
+# arch_patterns ARCH PATTERNS...: the patterns for an architecture: {arch}
+# replaced with each of its names, one pattern per name; without patterns its
+# Linux builds, where the Debian name needs no "linux" next to it, as in the
+# name of a package (foo_1.0_amd64.deb)
+function arch_patterns() {
+    local arch="${1}"; shift
+    local pattern
+    local alias
+    if [ $# -eq 0 ]; then
+        [ "${arch}" = "amd64" ] && echo "*linux*64*"
+        echo "*${arch}*"
+        for alias in $(arch_aliases "${arch}"); do
+            echo "*linux*${alias}*"
+            echo "*${alias}*linux*"
+        done
+        return 0
+    fi
+    for pattern in "${@}"; do
+        if [[ "${pattern}" == *"{arch}"* ]]; then
+            for alias in $(arch_aliases "${arch}"); do
+                echo "${pattern//\{arch\}/${alias}}"
+            done
+        else
+            echo "${pattern}"
+        fi
+    done
+}
+
+# built_for_other_arch NAMES: whether one of the asset names is what the
+# patterns pick on another architecture, so the release has no build for this
+# one rather than a pattern that is wrong
+function built_for_other_arch() {
+    local names="${1}"
+    local row
+    local arch
+    local pattern
+    local name
+    # only patterns that depend on the architecture tell
+    if [ ${#PATTERN_TEMPLATES[@]} -gt 0 ] && [[ "${PATTERN_TEMPLATES[*]}" != *"{arch}"* ]]; then
+        return 1
+    fi
+    for row in "${ARCH_TABLE[@]}"; do
+        arch="${row%% *}"
+        [ "${arch}" = "${ARCH}" ] && continue
+        while IFS= read -r pattern; do
+            while IFS= read -r name; do
+                [ -z "${name}" ] && continue
+                # shellcheck disable=SC2053
+                [[ "${name}" == ${pattern} ]] || continue
+                # shellcheck disable=SC2046
+                matches_arch "${name}" $(arch_aliases "${arch}") && return 0
+            done <<< "${names}"
+        done < <(arch_patterns "${arch}" "${PATTERN_TEMPLATES[@]}")
+    done
+    return 1
 }
 
 function archive_ls() {
@@ -994,8 +1263,7 @@ BINARY_NAME=""
 POST_INSTALL_CMDS=()
 ARTIFACT_KIND=""
 TMP_DIR=""
-ARCH_UNAME="$(uname -m 2>/dev/null || true)"
-ARCH_DPKG="$(dpkg --print-architecture 2>/dev/null || true)"
+ARCH=""
 
 while [ $# -gt 0 ]; do
     case "${1}" in
@@ -1053,6 +1321,11 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             POST_INSTALL_CMDS+=("${1}")
             ;;
+        -a|--arch)
+            shift
+            [ -z "${1}" ] && usage
+            ARCH="$(normalize_arch "${1}")"
+            ;;
         -y|--yes)
             YES=1
             ;;
@@ -1068,7 +1341,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -z "${project}" ] && usage
-[ ${#PATTERNS[@]} -eq 0 ] && PATTERNS=( "*linux*64*" "*amd64*" "*x86_64*linux*" "*x64*linux*" )
+[ -z "${ARCH}" ] && ARCH="$(detect_arch)"
+[ -z "${ARCH}" ] && fail "Failed to detect the architecture, pass it with --arch"
+# the patterns as given, {arch} still in them
+PATTERN_TEMPLATES=( "${PATTERNS[@]}" )
+mapfile -t PATTERNS < <(arch_patterns "${ARCH}" "${PATTERN_TEMPLATES[@]}")
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     echo "Running in dry-run mode..." 1>&2
@@ -1094,7 +1371,7 @@ release_description=""
 [ -n "${RELEASE}" ] && release_description=" (release '${RELEASE}')"
 exclude_description=""
 [ ${#EXCLUDES[@]} -gt 0 ] && exclude_description=", excluding ${EXCLUDES[*]}"
-echo "Retrieving artifact from '${project}'${release_description} with patterns ${PATTERNS[*]}${exclude_description}..." 1>&2
+echo "Retrieving ${ARCH} artifact from '${project}'${release_description} with patterns ${PATTERNS[*]}${exclude_description}..." 1>&2
 
 if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     echo 1>&2
@@ -1165,16 +1442,28 @@ if [ ${#EXCLUDES[@]} -gt 0 ]; then
     artifact="$(filter_excluded_patterns "${artifact}")"
     [ -z "${artifact}" ] && error "All downloaded artifacts excluded by ${EXCLUDES[*]}"
 fi
-[ -z "${artifact}" ] && error "Artifact not found" && manual_download
+if [ -z "${artifact}" ]; then
+    # gh and glab say only that nothing matched
+    assets="$(release_assets "${project}" 2> /dev/null)" \
+        && built_for_other_arch "$(cut -f1 <<< "${assets}")" \
+        && fail_no_build "The release of ${project} has no build for ${ARCH}"
+    error "Artifact not found"
+    manual_download
+fi
 
 # sort reverse and make unique
 artifact="$(echo "${artifact}" | sort -ur)"
 
-if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
-    # remove unsupported artifacts early
+# remove unsupported artifacts early, a lone one built for another architecture too
+if [ -n "${artifact}" ]; then
     artifact_list="$(reduce_unsupported_artifacts "${artifact}")"
+    [ -z "${artifact_list}" ] && fail_no_build "No artifact for ${ARCH} among: $(echo "${artifact}" | xargs -rd '\n' -n1 basename | paste -sd' ')"
+    artifact="${artifact_list}"
+fi
+
+if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
     # os first: the arch filter alone would happily settle on a darwin build
-    artifact_list="$(prefer_linux_over_darwin "${artifact_list}")"
+    artifact_list="$(prefer_linux "${artifact_list}")"
     best=""
     echo 1>&2
     echo "Found multiple artifacts matching ${PATTERNS[*]}:" 1>&2
@@ -1184,8 +1473,9 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
 
 
     # try filtering by architecture, original list stays intact
-    filtered="$(echo "${artifact_list}" | grep -E "($(arch_pattern))")"
-    count=$(echo "${filtered}" | wc -l)
+    filtered="$(filter_native_arch "${artifact_list}")"
+    count=0
+    [ -n "${filtered}" ] && count=$(echo "${filtered}" | wc -l)
 
     if [ "${count}" -eq 1 ]; then
         # reduced to one, use it
