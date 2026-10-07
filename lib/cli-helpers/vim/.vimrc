@@ -42,7 +42,7 @@ imap <Insert> <Nop>
 inoremap <S-Insert> <Insert>
 hi statusline guibg=LightGrey ctermfg=8 guifg=White ctermbg=15
 set laststatus=2
-set statusline=%<%f\ \{…\}\ \%{codeium#GetStatusString()}\ %h%m%r%=%-14.(%l,%c%V%)\ %P
+set statusline=%<%f\ \{…\}\ \%{get(g:,'codeium_enabled',1)?codeium#GetStatusString():''}\ %h%m%r%=%-14.(%l,%c%V%)\ %P
 
 " reopen a file at the last cursor position, but a commit message at the top
 augroup RestoreCursor
@@ -84,11 +84,14 @@ cnoreabbrev <expr> X (getcmdtype() ==# ':' && getcmdline() ==# 'X') ? 'x' : 'X'
 " BufEnter. Each one drops the terminal out of raw mode and back, which
 " swallows any keystroke typed at that moment -- typically the ':' of ':x',
 " leaving the following 'x' to run as a normal-mode delete. Presetting these
-" skips the probe entirely (see autoload/codeium/server.vim). The kernel
-" names its architecture (what uname -m prints) in /proc, read without a shell.
+" skips the probe entirely (see autoload/codeium/server.vim).
 let g:codeium_os = 'Linux'
-let g:codeium_arch = filereadable('/proc/sys/kernel/arch')
-    \ ? get(readfile('/proc/sys/kernel/arch', '', 1), 0, 'x86_64') : 'x86_64'
+let g:codeium_arch = 'x86_64'
+" Codeium only on amd64, which the updater installs it on; elsewhere a leftover
+" install stays switched off. The kernel names its architecture (what uname -m
+" prints) in /proc, read without a shell.
+let g:codeium_enabled = filereadable('/proc/sys/kernel/arch')
+    \ && get(readfile('/proc/sys/kernel/arch', '', 1), 0, '') ==# 'x86_64'
 
 let g:codeium_filetypes = {
     \ "gitcommit": v:true,

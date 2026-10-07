@@ -15,6 +15,23 @@ software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
 declare -A group_members=()
+# the architectures (dpkg names) a software is built for; one missing here runs everywhere
+declare -A software_arches=(
+    [android-sdk]="amd64"
+    [chrome]="amd64"
+    [slack]="amd64"
+    [spotify]="amd64"
+    [threema]="amd64"
+    [zoom]="amd64"
+    [aws]="amd64 arm64"
+    [claude]="amd64 arm64"
+    [ollama]="amd64 arm64"
+    [opencode]="amd64 arm64"
+    [sublime]="amd64 arm64"
+    [wezterm]="amd64 arm64"
+    [zed]="amd64 arm64"
+    [teamviewer]="amd64 arm64 armhf"
+)
 # the software a step needed and that was run for it, so it is not run twice
 declare -A software_needed=()
 # the hosts install-git-release was checked to be logged in to
@@ -193,6 +210,10 @@ discover_software() {
         done
     done < <(printf '%s\n' "${entries[@]}" | sort -n -k1,1)
 
+    for name in "${!software_arches[@]}"; do
+        [ -n "${software_handlers[${name}]+registered}" ] || fail "Unknown software in software_arches: ${name}"
+    done
+
     if [ "${#group_members[@]}" -gt 0 ]; then
         mapfile -t possible_groups < <(printf '%s\n' "${!group_members[@]}" | sort)
     fi
@@ -233,6 +254,12 @@ needs() {
         error "${outer} needs ${check}, but there is no software ${software}"
         return 1
     fi
+    local reason
+    reason="$(software_unavailable_reason "${software}")"
+    if [ -n "${reason}" ]; then
+        error "${outer} needs ${check}, but ${software} is ${reason}"
+        return 1
+    fi
     software_needed["${software}"]=1
 
     local message="${UPDATE_MESSAGE//%PKGNAME%/${software}}"
@@ -256,6 +283,15 @@ needs() {
     fi
     error "${check} is still missing after ${software}"
     return 1
+}
+
+# software_unavailable_reason NAME: why the software is not built for this
+# architecture, empty when it is
+software_unavailable_reason() {
+    local arches="${software_arches[${1}]}"
+    [ -z "${arches}" ] && return 0
+    [[ " ${arches} " == *" ${PLATFORM} "* ]] && return 0
+    echo "only built for ${arches// /, }, not ${PLATFORM}"
 }
 
 # the members of a group that only works on some systems are skipped elsewhere,
@@ -290,7 +326,7 @@ run_selected_software() {
             echo "${APP_NAME}: ${item} was already updated for another software" 1>&2
             continue
         fi
-        reason=""
+        reason="$(software_unavailable_reason "${item}")"
         for group in "${!unavailable[@]}"; do
             is_group_member "${group}" "${item}" && reason="${unavailable[${group}]}"
         done
@@ -1639,8 +1675,11 @@ software-041-vim@base() {
     local plug="${CURRENT_USER_HOME}/.vim/autoload/plug.vim"
     needs packages vim || return $(( $? == 3 ? 0 : 1 ))
     # the plugins the vimrc uses: Codeium (its status in the statusline, sign in
-    # once with :Codeium Auth) and vim-plug, which updates itself with :PlugUpgrade
-    git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
+    # once with :Codeium Auth), only on amd64 like the vimrc, and vim-plug, which
+    # updates itself with :PlugUpgrade
+    if [ "${PLATFORM}" = "amd64" ]; then
+        git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
+    fi
     if [ ! -f "${plug}" ]; then
         if [ "${dry_run}" -eq 1 ]; then
             echo "Would download vim-plug to ${plug}" 1>&2
@@ -1720,8 +1759,18 @@ software-044-terminator@base() {
 software-045-sublime@base() {
     apt_add_with_repo "sublime-text" "https://download.sublimetext.com/" "apt/stable/" "" "https://download.sublimetext.com/sublimehq-pub.gpg" \
         || return 1
+    local package_control="${CURRENT_USER_HOME}/.config/sublime-text/Packages/User/Package Control.sublime-settings"
     # the settings, keymap and theme of the User package
-    config_update sublime-text "${CURRENT_USER_HOME}/.config/sublime-text/Packages/User"
+    config_update sublime-text "${CURRENT_USER_HOME}/.config/sublime-text/Packages/User" || return 1
+    # Codeium only on amd64, so Package Control does not install it elsewhere
+    [ "${PLATFORM}" = "amd64" ] && return 0
+    grep -qE '^[[:space:]]*"Codeium",?[[:space:]]*$' "${package_control}" 2>/dev/null || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would remove Codeium from ${package_control}, it is only used on amd64" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER} sed -i '/^[[:space:]]*\"Codeium\",\?[[:space:]]*$/d' ${package_control}"
+    ${SUDO_USER} sed -i '/^[[:space:]]*"Codeium",\?[[:space:]]*$/d' "${package_control}"
 }
 software-050-adb@dev() { install_adb; }
 software-051-android-sdk@dev() { apt_upgrade google-android-platform-36-installer google-android-build-tools-36.0.0-installer; }
@@ -2263,14 +2312,7 @@ software-370-wezterm@desktop() {
     esac
 
     # the amd64 package has no architecture in its name, the arm64 one does
-    case "${PLATFORM}" in
-        amd64) ;;
-        arm64) wezterm_distribution+=".arm64" ;;
-        *)
-            error "No WezTerm nightly package for ${PLATFORM}"
-            return 1
-            ;;
-    esac
+    [ "${PLATFORM}" = "arm64" ] && wezterm_distribution+=".arm64"
 
     install_git_release "https://github.com/wez/wezterm" \
         --release "nightly" \
@@ -2353,15 +2395,8 @@ software-445-ollama@agents() {
 software-450-aws@dev() {
     require_cmd curl unzip || return 1
     local aws_name="aws"
-    local aws_arch
-    case "${PLATFORM}" in
-        amd64) aws_arch="x86_64" ;;
-        arm64) aws_arch="aarch64" ;;
-        *)
-            error "No AWS CLI v2 build for ${PLATFORM}"
-            return 1
-            ;;
-    esac
+    local aws_arch="x86_64"
+    [ "${PLATFORM}" = "arm64" ] && aws_arch="aarch64"
     local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip"
     local aws_file_name
     local aws_file_path
