@@ -87,11 +87,26 @@ cnoreabbrev <expr> X (getcmdtype() ==# ':' && getcmdline() ==# 'X') ? 'x' : 'X'
 " skips the probe entirely (see autoload/codeium/server.vim).
 let g:codeium_os = 'Linux'
 let g:codeium_arch = 'x86_64'
-" Codeium only on amd64, which the updater installs it on; elsewhere a leftover
-" install stays switched off. The kernel names its architecture (what uname -m
-" prints) in /proc, read without a shell.
-let g:codeium_enabled = filereadable('/proc/sys/kernel/arch')
-    \ && get(readfile('/proc/sys/kernel/arch', '', 1), 0, '') ==# 'x86_64'
+" Codeium only on amd64, which the updater decides by dpkg's architecture, the
+" userland's; elsewhere a leftover install stays switched off. Vim itself is a
+" program of the userland (the kernel may be 64-bit under a 32-bit one), so its
+" ELF header tells, read without a shell: 64-bit (class 2 at byte 4) x86-64
+" (machine 62 at bytes 18 and 19).
+function! s:IsAmd64Userland() abort
+  let l:vim = exepath(v:progpath)
+  try
+    try
+      let l:header = readblob(l:vim, 0, 20)
+    catch /E118/
+      " an older Vim reads only the whole file
+      let l:header = readblob(l:vim)[:19]
+    endtry
+  catch
+    return v:false
+  endtry
+  return len(l:header) == 20 && l:header[4] == 2 && l:header[18] == 62 && l:header[19] == 0
+endfunction
+let g:codeium_enabled = s:IsAmd64Userland()
 
 let g:codeium_filetypes = {
     \ "gitcommit": v:true,

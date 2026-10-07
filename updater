@@ -15,7 +15,10 @@ software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
 declare -A group_members=()
-# the architectures (dpkg names) a software is built for; one missing here runs everywhere
+# the architectures (dpkg names) a software from a vendor's repository or
+# installer is built for, as nothing tells it beforehand; one missing here runs
+# everywhere. Software from a release is not listed: install-git-release tells
+# when a release has no build for the architecture, and it is skipped then.
 declare -A software_arches=(
     [android-sdk]="amd64"
     [chrome]="amd64"
@@ -36,6 +39,11 @@ declare -A software_arches=(
 declare -A software_needed=()
 # the hosts install-git-release was checked to be logged in to
 declare -A release_host_checked=()
+# the status of a step whose release has no build for the architecture, which
+# install_git_release returns and the step passes on: it is skipped, not failed
+NO_BUILD=4
+# set when install_git_release returned NO_BUILD, so no other status 4 counts
+release_no_build=0
 selected=""
 
 error() {
@@ -265,8 +273,13 @@ needs() {
     local message="${UPDATE_MESSAGE//%PKGNAME%/${software}}"
     echo "${APP_NAME}: ${outer} needs ${check}, ${message,} first" 1>&2
     selected="${software}"
+    release_no_build=0
     "${software_handlers[${software}]}"; status=$?
     selected="${outer}"
+    if [ "${status}" -eq "${NO_BUILD}" ] && [ "${release_no_build}" -eq 1 ]; then
+        error "${outer} needs ${check}, but the release of ${software} has no build for ${PLATFORM}"
+        return 1
+    fi
     if [ "${status}" -ne 0 ]; then
         error "Failed to update ${software}, which ${outer} needs"
         return 1
@@ -306,6 +319,7 @@ group_unavailable_reason() {
 
 run_selected_software() {
     local handler
+    local status
     local item
     local group
     local reason
@@ -340,7 +354,11 @@ run_selected_software() {
         selected="${item}"
         export selected
         handler="${software_handlers[${item}]}"
-        if ! "${handler}"; then
+        release_no_build=0
+        "${handler}"; status=$?
+        if [ "${status}" -eq "${NO_BUILD}" ] && [ "${release_no_build}" -eq 1 ]; then
+            echo "${APP_NAME}: Skipping ${item}: its release has no build for ${PLATFORM}" 1>&2
+        elif [ "${status}" -ne 0 ]; then
             error "Failed to update ${item}"
             update_failed=1
         fi
@@ -1458,6 +1476,14 @@ install_git_release() {
     [ "${dry_run}" -eq 1 ] && install_git_args+=("--dry-run")
     [ "${dry_run}" -eq 0 ] && install_git_args+=("--yes")
     install-git-release "${url}" "${install_git_args[@]}"
+    local status=$?
+    # install-git-release exits with 4 when the release is not built for this
+    # architecture
+    if [ "${status}" -eq 4 ]; then
+        release_no_build=1
+        return "${NO_BUILD}"
+    fi
+    return "${status}"
 }
 
 # Ubuntu lets a program create user namespaces only when its AppArmor profile allows
@@ -1922,7 +1948,7 @@ software-121-mittwald-outlook-bridge@mw() {
     # on them, the tarball does not
     apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
     # the deb of the release, which brings the systemd user unit
-    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*{arch}*webview*" || return 1
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*{arch}*webview*" || return $?
     # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
     if [ ! -f "${env_file}" ]; then
         warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
@@ -1996,7 +2022,7 @@ software-210-himalaya@comms() {
     local account="mail@david-grieser.de"
     # secret-tool talks to the keyring of the user's session
     local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
-    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return 1
+    install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return $?
     # the mail account; its password comes from the GNOME keyring through secret-tool
     needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
     config_update himalaya "${CURRENT_USER_HOME}/.config/himalaya" || return 1
@@ -2116,7 +2142,7 @@ software-316-window-is-ready-filter@gnome@gnome-extensions() {
     gnome_extension_from_git "https://github.com/dgrieser/window-is-ready-filter.git" "window-is-ready-filter@david-grieser.de"
 }
 software-320-opencode@dev@agents() {
-    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-{arch}.tar.gz" || return 1
+    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-{arch}.tar.gz" || return $?
     tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
     config_update opencode "${CURRENT_USER_HOME}/.config/opencode" || return 1
     opencode_auth_update
@@ -2459,7 +2485,7 @@ software-disabled-480-ueberzugpp() {
 }
 
 software-490-yazi@base() {
-    install_git_release "https://github.com/sxyazi/yazi" || return 1
+    install_git_release "https://github.com/sxyazi/yazi" || return $?
     tool_ready ya || return $(( $? == 1 ? 0 : 1 ))
     yazi_plugin_update \
         "yazi-rs/plugins:smart-enter" \
@@ -2473,7 +2499,7 @@ software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rg
 software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb"; }
 software-495-r-quick-share@desktop() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
-    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return 1
+    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return $?
     # its settings: started minimized at login, closing the window keeps it running
     config_update rquickshare "${CURRENT_USER_HOME}/.local/share/dev.mandre.rquickshare" || return 1
     # started at login, so the phone finds it

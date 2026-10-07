@@ -1467,7 +1467,7 @@ Downloads a release artifact from a GitHub or GitLab project (resolving reposito
 | `PROJECT` | Name or URL of the project to install (required). |
 | `-h, --help` | Display help and exit. |
 | `-p, --pattern PATTERN` | Glob pattern for the release artifact; repeatable. `{arch}` stands for each name of the architecture (e.g. `amd64`, `x86_64`, `x64`, or `armhf`, `armv7l`, `armv7`, ... on a 32-bit Raspberry Pi), one pattern per name. Defaults to Linux builds for the architecture. |
-| `-a, --arch ARCH` | Architecture to install for: `amd64`, `arm64`, `armhf`, `armel`, `i386` or a `uname -m` name such as `armv7l` (default: the userland's, from `dpkg --print-architecture`, else `uname -m`, so a 32-bit Raspberry Pi OS on a 64-bit kernel gets `armhf` builds). Builds for other architectures are never chosen; on `armhf`, ARMv7 builds win over ARMv6 ones, which serve as fallback. |
+| `-a, --arch ARCH` | Architecture to install for: a Debian name (`amd64`, `arm64`, `armhf`, `armel`, `i386`, ...) or another name of one from the table in the script, such as `armv7l` or `i686` (default: the userland's, from `dpkg --print-architecture`, else `uname -m`, so a 32-bit Raspberry Pi OS on a 64-bit kernel gets `armhf` builds). Builds for other architectures are never chosen; on `armhf`, ARMv7 builds win over ARMv6 ones, which serve as fallback. |
 | `-b, --binary PATTERN` | Pattern of the binary to install from within the artifact. |
 | `-n, --name NAME` | Name to install the final binary as (default: original binary name). |
 | `-i, --install-path PATH` | Path to install the binary (default: `/usr/local/bin`). |
@@ -1486,6 +1486,8 @@ install-git-release -p '*linux_{arch}.tar.gz' -b 'mytool' -n mt my/project
 install-git-release --arch arm64 --dry-run https://github.com/junegunn/fzf
 install-git-release -c 'sudo setcap cap_net_raw+ep "$BINARY_PATH"' some/network-tool
 ```
+
+Exit status `4` means the release has no build for the architecture: nothing matched, but the patterns pick an asset for another architecture, or only builds for other architectures matched. `updater` skips such a software instead of failing.
 
 ### `npm-pkg-dir`
 Prints the directory of a globally installed npm package, resolved under `npm root -g` (so it follows the active nvm node). Only top-level global packages count, never the dependencies bundled inside npm itself. `updater` uses it to back up a package before a forced reinstall. Needs `node` and `npm` on `PATH`.
@@ -2129,7 +2131,7 @@ Updates a selectable set of system packages, desktop applications, and CLI tools
 
 The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`.
 
-Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed. Software built only for some architectures is skipped on the others (the `software_arches` list in `updater`, by the userland's `dpkg --print-architecture`): Zoom, Slack, Spotify, Chrome, Threema and the Android SDK are amd64 only; AWS CLI v2, Claude Code, Ollama, opencode, Sublime Text, WezTerm and Zed are amd64 and arm64; TeamViewer adds armhf. Codeium (in Vim and Sublime Text) is only set up on amd64. Release downloads through `install-git-release` pick the build for the architecture.
+Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed. Software built only for some architectures is skipped on the others (the `software_arches` list in `updater`, by the userland's `dpkg --print-architecture`): Zoom, Slack, Spotify, Chrome, Threema and the Android SDK are amd64 only; AWS CLI v2, Claude Code, Ollama, opencode, Sublime Text, WezTerm and Zed are amd64 and arm64; TeamViewer adds armhf. Codeium (in Vim and Sublime Text) is only set up on amd64. Release downloads through `install-git-release` pick the build for the architecture, and a software whose release has none is skipped too.
 
 Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya and its jq module, glow, Sublime Text, the Qwen commands, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder).
 
