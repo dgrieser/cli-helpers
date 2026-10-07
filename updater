@@ -47,6 +47,8 @@ declare -A release_host_checked=()
 NO_BUILD=4
 # set when install_git_release returned NO_BUILD, so no other status 4 counts
 release_no_build=0
+# the user units user_service_disable stopped: "ENABLED ACTIVE UNIT", 1 or 0
+user_units_stopped=()
 selected=""
 
 error() {
@@ -871,22 +873,55 @@ git_repo_update() {
 }
 
 # user_service_disable UNIT...: stops and disables the systemd user units that
-# are enabled or running, e.g. the old ones of a renamed software
+# are enabled or running, e.g. the old ones of a renamed software; what each was
+# goes to user_units_stopped, for user_service_restore
 user_service_disable() {
     # systemctl --user talks to the user's session
     local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
     local unit
+    local enabled
+    local active
     for unit in "${@}"; do
-        ${SUDO_USER} "${session_env[@]}" systemctl --user is-enabled --quiet "${unit}" 2>/dev/null \
-            || ${SUDO_USER} "${session_env[@]}" systemctl --user is-active --quiet "${unit}" 2>/dev/null \
-            || continue
+        enabled=0
+        active=0
+        ${SUDO_USER} "${session_env[@]}" systemctl --user is-enabled --quiet "${unit}" 2>/dev/null && enabled=1
+        ${SUDO_USER} "${session_env[@]}" systemctl --user is-active --quiet "${unit}" 2>/dev/null && active=1
+        [ "${enabled}" -eq 0 ] && [ "${active}" -eq 0 ] && continue
         if [ "${dry_run}" -eq 1 ]; then
             echo "Would stop and disable the user service ${unit}" 1>&2
             continue
         fi
         verbose "${SUDO_USER} systemctl --user disable --now ${unit}"
         ${SUDO_USER} "${session_env[@]}" systemctl --user disable --now "${unit}" || return 1
+        user_units_stopped+=("${enabled} ${active} ${unit}")
     done
+}
+
+# user_service_restore: enables and starts again what user_service_disable
+# stopped, the last first, e.g. the old daemon when its successor failed to
+# install
+user_service_restore() {
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local index
+    local enabled
+    local active
+    local unit
+    local failed=0
+    for (( index = ${#user_units_stopped[@]} - 1; index >= 0; index-- )); do
+        read -r enabled active unit <<< "${user_units_stopped[${index}]}"
+        echo "${APP_NAME}: Starting the user service ${unit} again" 1>&2
+        if [ "${enabled}" -eq 1 ]; then
+            verbose "${SUDO_USER} systemctl --user enable ${unit}"
+            ${SUDO_USER} "${session_env[@]}" systemctl --user enable "${unit}" || failed=1
+        fi
+        if [ "${active}" -eq 1 ]; then
+            verbose "${SUDO_USER} systemctl --user start ${unit}"
+            ${SUDO_USER} "${session_env[@]}" systemctl --user start "${unit}" || failed=1
+        fi
+    done
+    user_units_stopped=()
+    [ "${failed}" -eq 0 ] || warning "Failed to start the user services again that were stopped"
+    return "${failed}"
 }
 
 # user_service_enable UNIT [FILE]: installs the systemd user unit FILE (if given,
@@ -1995,12 +2030,24 @@ software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/fir
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
 # formerly gitlab-trackr, whose package forskap-utils replaces; as its upgrade
 # notes say, the old daemon is stopped and disabled, first, while its units are
-# still there, and the new one is started through its socket
+# still there, and the new one is started through its socket. When the install
+# fails, the old daemon runs again as it did.
 software-170-forskap@dev() {
-    user_service_disable gitlab-trackrd.service gitlab-trackrd.socket || return 1
+    local status
+    user_units_stopped=()
+    if ! user_service_disable gitlab-trackrd.service gitlab-trackrd.socket; then
+        user_service_restore
+        return 1
+    fi
     # the package brings the forskapd user units
-    install_git_release "https://github.com/BjarneSeger/forskap" --pattern "forskap-utils_*_linux_{arch}.deb" \
-        && user_service_enable forskapd.socket
+    install_git_release "https://github.com/BjarneSeger/forskap" --pattern "forskap-utils_*_linux_{arch}.deb"
+    status=$?
+    if [ "${status}" -ne 0 ]; then
+        user_service_restore
+        return "${status}"
+    fi
+    user_units_stopped=()
+    user_service_enable forskapd.socket
 }
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
