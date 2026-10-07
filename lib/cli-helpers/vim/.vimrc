@@ -84,9 +84,11 @@ cnoreabbrev <expr> X (getcmdtype() ==# ':' && getcmdline() ==# 'X') ? 'x' : 'X'
 " BufEnter. Each one drops the terminal out of raw mode and back, which
 " swallows any keystroke typed at that moment -- typically the ':' of ':x',
 " leaving the following 'x' to run as a normal-mode delete. Presetting these
-" skips the probe entirely (see autoload/codeium/server.vim).
+" skips the probe entirely (see autoload/codeium/server.vim). The kernel
+" names its architecture (what uname -m prints) in /proc, read without a shell.
 let g:codeium_os = 'Linux'
-let g:codeium_arch = 'x86_64'
+let g:codeium_arch = filereadable('/proc/sys/kernel/arch')
+    \ ? get(readfile('/proc/sys/kernel/arch', '', 1), 0, 'x86_64') : 'x86_64'
 
 let g:codeium_filetypes = {
     \ "gitcommit": v:true,

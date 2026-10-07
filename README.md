@@ -1458,7 +1458,7 @@ bump-version v42 --no-semver
 ```
 
 ### `install-git-release`
-Downloads a release artifact from a GitHub or GitLab project (resolving repository names via `git-search`, with platform/architecture-aware artifact selection), then installs a chosen binary, a `.deb` package, or a bundled application, with dry-run, post-install hooks, and renaming support.
+Downloads a release artifact from a GitHub or GitLab project (resolving repository names via `git-search`, with platform/architecture-aware artifact selection for amd64, arm64, 32-bit ARM and i386), then installs a chosen binary, a `.deb` package, or a bundled application, with dry-run, post-install hooks, and renaming support.
 
 **Usage:** `install-git-release [OPTIONS] PROJECT`
 
@@ -1466,7 +1466,8 @@ Downloads a release artifact from a GitHub or GitLab project (resolving reposito
 |---|---|
 | `PROJECT` | Name or URL of the project to install (required). |
 | `-h, --help` | Display help and exit. |
-| `-p, --pattern PATTERN` | Glob pattern for the release artifact; repeatable. Defaults to a set of Linux/64-bit patterns. |
+| `-p, --pattern PATTERN` | Glob pattern for the release artifact; repeatable. `{arch}` stands for each name of the architecture (e.g. `amd64`, `x86_64`, `x64`, or `armhf`, `armv7l`, `armv7`, ... on a 32-bit Raspberry Pi), one pattern per name. Defaults to Linux builds for the architecture. |
+| `-a, --arch ARCH` | Architecture to install for: `amd64`, `arm64`, `armhf`, `armel`, `i386` or a `uname -m` name such as `armv7l` (default: the userland's, from `dpkg --print-architecture`, else `uname -m`, so a 32-bit Raspberry Pi OS on a 64-bit kernel gets `armhf` builds). Builds for other architectures are never chosen; on `armhf`, ARMv7 builds win over ARMv6 ones, which serve as fallback. |
 | `-b, --binary PATTERN` | Pattern of the binary to install from within the artifact. |
 | `-n, --name NAME` | Name to install the final binary as (default: original binary name). |
 | `-i, --install-path PATH` | Path to install the binary (default: `/usr/local/bin`). |
@@ -1481,7 +1482,8 @@ Downloads a release artifact from a GitHub or GitLab project (resolving reposito
 ```bash
 install-git-release fzf
 install-git-release --dry-run https://github.com/junegunn/fzf
-install-git-release -p '*linux*arm64*' -b 'mytool' -n mt my/project
+install-git-release -p '*linux_{arch}.tar.gz' -b 'mytool' -n mt my/project
+install-git-release --arch arm64 --dry-run https://github.com/junegunn/fzf
 install-git-release -c 'sudo setcap cap_net_raw+ep "$BINARY_PATH"' some/network-tool
 ```
 

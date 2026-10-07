@@ -13,8 +13,14 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
     Options:
         -h, --help          Display this help and exit
 
-        -p, --pattern       Pattern of the artifact to install
-                            Default: *linux*64*
+        -p, --pattern       Pattern of the artifact to install. {arch} stands
+                            for each name of the architecture (amd64, x86_64,
+                            x64, ...), one pattern per name.
+                            Default: Linux builds for the architecture
+
+        -a, --arch          Architecture to install for (amd64, arm64, armhf,
+                            armel, i386 or a uname -m name like armv7l)
+                            Default: the userland's, from dpkg or uname -m
 
         -x, --exclude       Pattern of artifacts to exclude. Neither gh nor
                             glab can exclude, so this is applied after the
@@ -60,7 +66,7 @@ function completion() {
     local skip_next=0
 
     if [ "${previous}" != "-r" ] && [ "${previous}" != "--release" ]; then
-        echo "-h --help -p --pattern -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
+        echo "-h --help -p --pattern -a --arch -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
         return
     fi
     shift
@@ -73,7 +79,7 @@ function completion() {
             continue
         fi
         case "${argument}" in
-            -p|--pattern|-x|--exclude|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
+            -p|--pattern|-a|--arch|-x|--exclude|-r|--release|-i|--install-path|--bundle-path|-b|--binary|-n|--name|-c|--post-install)
                 skip_next=1
                 ;;
             -*)
@@ -358,16 +364,6 @@ function reduce_artifacts() {
     return 0
 }
 
-function reduce_unsupported_artifacts() {
-    local list="${1}"
-    local reduced=""
-    reduced="$(echo "${list}" | grep -vEi 'AppImage$' || true)"
-    if [[ "${ARCH_UNAME}" != "arm"* ]] && [[ "${ARCH_DPKG}" != "arm"* ]]; then
-        reduced="$(echo "${reduced}" | grep -vE 'arm64|aarch64|armhf|armel|armv7|armv6' || true)"
-    fi
-    echo "${reduced}"
-}
-
 function prefer_without() {
     local marker="${1}"; shift
     local list="${1}"; shift
@@ -434,20 +430,163 @@ function prefer_a_over_b() {
     return 0
 }
 
-function arch_pattern() {
-    local parts=()
-    [ -n "${ARCH_UNAME}" ] && parts+=("${ARCH_UNAME}")
-    [ -n "${ARCH_DPKG}" ] && [ "${ARCH_DPKG}" != "${ARCH_UNAME}" ] && parts+=("${ARCH_DPKG}")
-    case "${ARCH_UNAME}|${ARCH_DPKG}" in
-        *x86_64*|*amd64*)
-            parts+=("x64")
-            ;;
-        *aarch64*|*arm64*)
-            parts+=("arm64" "aarch64")
-            ;;
+# normalize_arch NAME: the Debian name of a dpkg or uname -m architecture
+function normalize_arch() {
+    case "${1}" in
+        amd64|x86_64|x86-64|x64) echo "amd64" ;;
+        arm64|aarch64|armv8) echo "arm64" ;;
+        armhf|armv7*|armv8l|arm) echo "armhf" ;;
+        armel|armv6*|armv5*) echo "armel" ;;
+        i386|i486|i586|i686|386|ia32|x86) echo "i386" ;;
+        *) echo "${1}" ;;
     esac
-    local IFS="|"
-    echo "${parts[*]}"
+}
+
+# detect_arch: the architecture of the userland, which is what has to run the
+# binaries. dpkg knows it; uname -m only names the kernel, and a Raspberry Pi OS
+# with a 32-bit (armhf) userland boots a 64-bit (aarch64) kernel on a Pi 3/4/5.
+function detect_arch() {
+    local arch
+    arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    if [ -z "${arch}" ]; then
+        arch="$(normalize_arch "$(uname -m 2>/dev/null)")"
+        if [ "$(getconf LONG_BIT 2>/dev/null)" = "32" ]; then
+            case "${arch}" in
+                arm64) arch="armhf" ;;
+                amd64) arch="i386" ;;
+            esac
+        fi
+    fi
+    echo "${arch}"
+}
+
+# arch_aliases: how release artifacts name ARCH, the preferred names first. A
+# 32-bit ARM userland on an ARMv6 CPU (Pi 1/Zero) cannot run ARMv7 builds.
+function arch_aliases() {
+    case "${ARCH}" in
+        amd64) echo "amd64 x86_64 x86-64 x64" ;;
+        arm64) echo "arm64 aarch64 armv8" ;;
+        armhf)
+            if [[ "$(uname -m 2>/dev/null)" == armv6* ]]; then
+                echo "armhf armv6l armv6 armv6hf arm"
+            else
+                echo "armhf armv7l armv7 armv7hf arm32 armv6l armv6 armv6hf arm"
+            fi
+            ;;
+        armel) echo "armel armv6l armv6 armv5 arm" ;;
+        i386) echo "i386 i686 386 ia32" ;;
+        *) echo "${ARCH}" ;;
+    esac
+}
+
+# arch_fallback_aliases: the aliases of older instruction sets ARCH runs too,
+# taken only when no artifact is built for ARCH itself
+function arch_fallback_aliases() {
+    case "${ARCH}" in
+        armhf)
+            [[ "$(uname -m 2>/dev/null)" == armv6* ]] && echo "arm" && return 0
+            echo "armv6l armv6 armv6hf arm"
+            ;;
+        armel) echo "armv5 arm" ;;
+    esac
+}
+
+# every architecture name an artifact may carry, to spot builds for other ones
+ALL_ARCH_ALIASES="amd64 x86_64 x86-64 x64 arm64 aarch64 armv8 armhf armel armv7l armv7 armv7hf arm32 armv6l armv6 armv6hf armv5 arm i386 i686 386 ia32 ppc64le ppc64 s390x riscv64 mips64le mips64 mipsle mips loong64 loongarch64"
+
+# arch_regex ALIASES...: an ERE that matches any of the aliases as a whole word
+# of a file name, so "arm" matches arm-unknown-linux-gnueabihf but not arm64
+function arch_regex() {
+    local aliases
+    aliases="$(echo "${*}" | tr ' ' '\n' | grep -v '^$' | sed 's/[.]/\\./g' | paste -sd'|')"
+    echo "(^|[^a-z0-9])(${aliases})([^a-z0-9]|$)"
+}
+
+# matches_arch FILE ALIASES...: whether the file name carries one of the aliases
+function matches_arch() {
+    local file="${1}"; shift
+    basename "${file}" | tr '[:upper:]' '[:lower:]' | grep -qE "$(arch_regex "${@}")"
+}
+
+# reduce_unsupported_artifacts LIST: drops AppImages and artifacts built only
+# for other architectures; artifacts naming no architecture stay
+function reduce_unsupported_artifacts() {
+    local list="${1}"
+    local reduced=""
+    local item
+    local native
+    native="$(arch_aliases)"
+    while IFS= read -r item; do
+        [ -z "${item}" ] && continue
+        [[ "${item}" =~ AppImage$ ]] && continue
+        # shellcheck disable=SC2086
+        if matches_arch "${item}" ${ALL_ARCH_ALIASES} && ! matches_arch "${item}" ${native}; then
+            continue
+        fi
+        if [ -z "${reduced}" ]; then
+            reduced="${item}"
+        else
+            reduced="${reduced}"$'\n'"${item}"
+        fi
+    done <<< "${list}"
+    echo "${reduced}"
+}
+
+# filter_native_arch LIST: the artifacts built for this architecture, else the
+# ones for an older instruction set it runs too; empty when none names one
+function filter_native_arch() {
+    local list="${1}"
+    local filtered
+    local preferred
+    local fallback
+    local aliases
+    local item
+    fallback="$(arch_fallback_aliases)"
+    preferred="$(arch_aliases)"
+    if [ -n "${fallback}" ]; then
+        # the aliases without the fallback ones, which end the list
+        preferred="$(echo "${preferred}" | tr ' ' '\n' | grep -vxF -f <(echo "${fallback}" | tr ' ' '\n') | paste -sd' ')"
+    fi
+    for aliases in "${preferred}" "${fallback}"; do
+        [ -z "${aliases}" ] && continue
+        # shellcheck disable=SC2086
+        filtered="$(while IFS= read -r item; do
+            [ -n "${item}" ] && matches_arch "${item}" ${aliases} && echo "${item}"
+        done <<< "${list}")"
+        [ -n "${filtered}" ] && echo "${filtered}" && return 0
+    done
+    return 0
+}
+
+# expand_arch_patterns PATTERNS...: replaces {arch} with each alias of this
+# architecture, one pattern per alias
+function expand_arch_patterns() {
+    local pattern
+    local alias
+    for pattern in "${@}"; do
+        if [[ "${pattern}" == *"{arch}"* ]]; then
+            for alias in $(arch_aliases); do
+                echo "${pattern//\{arch\}/${alias}}"
+            done
+        else
+            echo "${pattern}"
+        fi
+    done
+}
+
+# default_patterns: Linux builds for this architecture; the distinctive names
+# need no "linux" next to them (foo_1.0_amd64.deb)
+function default_patterns() {
+    local alias
+    [ "${ARCH}" = "amd64" ] && echo "*linux*64*"
+    for alias in $(arch_aliases); do
+        echo "*linux*${alias}*"
+        echo "*${alias}*linux*"
+        case "${alias}" in
+            x64|arm|386|ia32|armv8|arm32) ;;
+            *) echo "*${alias}*" ;;
+        esac
+    done
 }
 
 function archive_ls() {
@@ -994,8 +1133,7 @@ BINARY_NAME=""
 POST_INSTALL_CMDS=()
 ARTIFACT_KIND=""
 TMP_DIR=""
-ARCH_UNAME="$(uname -m 2>/dev/null || true)"
-ARCH_DPKG="$(dpkg --print-architecture 2>/dev/null || true)"
+ARCH=""
 
 while [ $# -gt 0 ]; do
     case "${1}" in
@@ -1053,6 +1191,11 @@ while [ $# -gt 0 ]; do
             [ -z "${1}" ] && usage
             POST_INSTALL_CMDS+=("${1}")
             ;;
+        -a|--arch)
+            shift
+            [ -z "${1}" ] && usage
+            ARCH="$(normalize_arch "${1}")"
+            ;;
         -y|--yes)
             YES=1
             ;;
@@ -1068,7 +1211,13 @@ while [ $# -gt 0 ]; do
 done
 
 [ -z "${project}" ] && usage
-[ ${#PATTERNS[@]} -eq 0 ] && PATTERNS=( "*linux*64*" "*amd64*" "*x86_64*linux*" "*x64*linux*" )
+[ -z "${ARCH}" ] && ARCH="$(detect_arch)"
+[ -z "${ARCH}" ] && fail "Failed to detect the architecture, pass it with --arch"
+if [ ${#PATTERNS[@]} -eq 0 ]; then
+    mapfile -t PATTERNS < <(default_patterns)
+else
+    mapfile -t PATTERNS < <(expand_arch_patterns "${PATTERNS[@]}")
+fi
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     echo "Running in dry-run mode..." 1>&2
@@ -1094,7 +1243,7 @@ release_description=""
 [ -n "${RELEASE}" ] && release_description=" (release '${RELEASE}')"
 exclude_description=""
 [ ${#EXCLUDES[@]} -gt 0 ] && exclude_description=", excluding ${EXCLUDES[*]}"
-echo "Retrieving artifact from '${project}'${release_description} with patterns ${PATTERNS[*]}${exclude_description}..." 1>&2
+echo "Retrieving ${ARCH} artifact from '${project}'${release_description} with patterns ${PATTERNS[*]}${exclude_description}..." 1>&2
 
 if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     echo 1>&2
@@ -1170,9 +1319,14 @@ fi
 # sort reverse and make unique
 artifact="$(echo "${artifact}" | sort -ur)"
 
-if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
-    # remove unsupported artifacts early
+# remove unsupported artifacts early, a lone one built for another architecture too
+if [ -n "${artifact}" ]; then
     artifact_list="$(reduce_unsupported_artifacts "${artifact}")"
+    [ -z "${artifact_list}" ] && fail "No artifact for ${ARCH} among: $(echo "${artifact}" | xargs -rd '\n' -n1 basename | paste -sd' ')"
+    artifact="${artifact_list}"
+fi
+
+if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
     # os first: the arch filter alone would happily settle on a darwin build
     artifact_list="$(prefer_linux_over_darwin "${artifact_list}")"
     best=""
@@ -1184,8 +1338,9 @@ if [ "$(echo "${artifact}" | wc -l)" -gt 1 ]; then
 
 
     # try filtering by architecture, original list stays intact
-    filtered="$(echo "${artifact_list}" | grep -E "($(arch_pattern))")"
-    count=$(echo "${filtered}" | wc -l)
+    filtered="$(filter_native_arch "${artifact_list}")"
+    count=0
+    [ -n "${filtered}" ] && count=$(echo "${filtered}" | wc -l)
 
     if [ "${count}" -eq 1 ]; then
         # reduced to one, use it

@@ -1,7 +1,9 @@
 #!/bin/bash
 
 APP_NAME="$(basename "${0}")"
-PLATFORM="$(dpkg --print-architecture)"
+# the userland's architecture (amd64, arm64, armhf, ...), which dpkg installs for;
+# uname -m names the kernel's, which is aarch64 under a 32-bit Raspberry Pi OS
+PLATFORM="$(dpkg --print-architecture 2>/dev/null)"
 UPDATE_MESSAGE="Running %PKGNAME% upgrade"
 FLATHUB_REPO_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
 # shellcheck disable=SC1090
@@ -1745,7 +1747,7 @@ software-057-conda@dev() {
         "https://repo.anaconda.com/pkgs/misc/gpgkeys/anaconda.asc" "34161F5BF5EB1D4BFBBB8F0A8AEB4F8B29D82806"
 }
 software-058-docker-compose@dev() {
-    install_git_release "https://github.com/docker/compose" --pattern "docker-compose-linux-x86_64" --name "docker-compose"
+    install_git_release "https://github.com/docker/compose" --pattern "docker-compose-linux-{arch}" --name "docker-compose"
 }
 software-059-swagger-codegen@dev() {
     needs java || return $(( $? == 3 ? 0 : 1 ))
@@ -1871,7 +1873,7 @@ software-121-mittwald-outlook-bridge@mw() {
     # on them, the tarball does not
     apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
     # the deb of the release, which brings the systemd user unit
-    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*amd64*webview*" || return 1
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*{arch}*webview*" || return 1
     # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
     if [ ! -f "${env_file}" ]; then
         warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
@@ -1890,7 +1892,7 @@ software-130-slack@comms() {
         "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
         "https://packagecloud.io/slacktechnologies/slack/gpgkey"
 }
-software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_amd64.deb"; }
+software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
@@ -1939,7 +1941,7 @@ software-185-bahn-probonio-bot@personal() {
     fi
 }
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
-software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_x86_64*" --name "swctl"; }
+software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya@comms() {
     local account="mail@david-grieser.de"
@@ -2014,7 +2016,7 @@ software-254-inkscape@media() {
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38" "56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38"
 }
 software-255-losslesscut@media() {
-    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-x64.tar.bz2" --bundle --binary "losslesscut" \
+    install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-{arch}.tar.bz2" --bundle --binary "losslesscut" \
         && apparmor_allow_userns losslesscut losslesscut
 }
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
@@ -2041,7 +2043,7 @@ software-280-spotify@media() {
 software-290-trivy@dev@k8s() {
     apt_add_with_repo "trivy" "https://aquasecurity.github.io/trivy-repo/deb/" "generic" "main" "https://aquasecurity.github.io/trivy-repo/deb/public.key"
 }
-software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_amd64.deb"; }
+software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_{arch}.deb"; }
 
 software-300-threema@comms() {
     flatpak_update "ch.threema.threema-desktop" --from "https://releases.threema.ch/flatpak/threema-desktop/ch.threema.threema-desktop.flatpakref" || return 1
@@ -2065,7 +2067,7 @@ software-316-window-is-ready-filter@gnome@gnome-extensions() {
     gnome_extension_from_git "https://github.com/dgrieser/window-is-ready-filter.git" "window-is-ready-filter@david-grieser.de"
 }
 software-320-opencode@dev@agents() {
-    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-x64.tar.gz" || return 1
+    install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-{arch}.tar.gz" || return 1
     tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
     config_update opencode "${CURRENT_USER_HOME}/.config/opencode" || return 1
     opencode_auth_update
@@ -2212,12 +2214,12 @@ REPOS
 }
 software-361-helmfile@dev@k8s() { install_git_release "https://github.com/helmfile/helmfile"; }
 software-362-jsonnet@dev@k8s() {
-    install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnet-go_*_amd64.deb" \
-        && install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnetfmt-go_*_amd64.deb"
+    install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnet-go_*_{arch}.deb" \
+        && install_git_release "https://github.com/google/go-jsonnet" --pattern "jsonnetfmt-go_*_{arch}.deb"
 }
-software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_amd64.deb"; }
+software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_{arch}.deb"; }
 software-364-operator-sdk@dev@k8s() {
-    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_amd64" --name "operator-sdk"
+    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_{arch}" --name "operator-sdk"
 }
 software-366-promql@dev@k8s() { install_git_release "https://github.com/nalbury/promql-cli"; }
 software-367-kubectl-neat@dev@k8s() { install_git_release "https://github.com/itaysk/kubectl-neat"; }
@@ -2260,6 +2262,16 @@ software-370-wezterm@desktop() {
             ;;
     esac
 
+    # the amd64 package has no architecture in its name, the arm64 one does
+    case "${PLATFORM}" in
+        amd64) ;;
+        arm64) wezterm_distribution+=".arm64" ;;
+        *)
+            error "No WezTerm nightly package for ${PLATFORM}"
+            return 1
+            ;;
+    esac
+
     install_git_release "https://github.com/wez/wezterm" \
         --release "nightly" \
         --pattern "wezterm-nightly.${wezterm_distribution}.deb"
@@ -2273,7 +2285,7 @@ software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubec
 # the kubectl-oidc_login symlink makes it available as "kubectl oidc-login", which the kubeconfigs call
 software-391-kubelogin@dev@k8s() {
     install_git_release "https://github.com/int128/kubelogin" \
-        --pattern "kubelogin_linux_amd64.zip" \
+        --pattern "kubelogin_linux_{arch}.zip" \
         --post-install 'ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
 }
 software-420-qwen@dev@agents() {
@@ -2341,7 +2353,16 @@ software-445-ollama@agents() {
 software-450-aws@dev() {
     require_cmd curl unzip || return 1
     local aws_name="aws"
-    local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+    local aws_arch
+    case "${PLATFORM}" in
+        amd64) aws_arch="x86_64" ;;
+        arm64) aws_arch="aarch64" ;;
+        *)
+            error "No AWS CLI v2 build for ${PLATFORM}"
+            return 1
+            ;;
+    esac
+    local aws_url="https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip"
     local aws_file_name
     local aws_file_path
     local aws_folder_path
@@ -2413,11 +2434,11 @@ software-490-yazi@base() {
     needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
     config_update yazi "${CURRENT_USER_HOME}/.config/yazi"
 }
-software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_amd64.deb"; }
-software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_amd64.deb"; }
+software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_{arch}.deb"; }
+software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb"; }
 software-495-r-quick-share@desktop() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
-    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_amd64.deb" || return 1
+    install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return 1
     # its settings: started minimized at login, closing the window keeps it running
     config_update rquickshare "${CURRENT_USER_HOME}/.local/share/dev.mandre.rquickshare" || return 1
     # started at login, so the phone finds it
@@ -2433,7 +2454,7 @@ software-495-r-quick-share@desktop() {
 }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
 software-510-jw-cli@personal() { install_git_release "https://github.com/dgrieser/jw-cli"; }
-software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_amd64*"; }
+software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_{arch}*"; }
 software-530-wscat@dev() { npm_update wscat; }
 software-535-npm-tools@dev() {
     npm_update @electron/asar \
@@ -2443,7 +2464,7 @@ software-535-npm-tools@dev() {
         && npm_update ynab
 }
 software-537-kubelive@dev@k8s() { npm_update kubelive; }
-software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*x86_64*linux*"; }
+software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump" --pattern "*{arch}*linux*"; }
 
 software-550-go@dev() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
@@ -2459,10 +2480,17 @@ software-550-go@dev() {
     local staging_dir
     local bin
 
+    local go_arch="${PLATFORM}"
+    # Go names its 32-bit builds differently from Debian
+    case "${PLATFORM}" in
+        armhf|armel) go_arch="armv6l" ;;
+        i386) go_arch="386" ;;
+    esac
+
     release_json="$(curl -fsSL "${go_dl_url}/?mode=json")" || return 1
     version="$(echo "${release_json}" | jq -r '.[0].version')"
-    file_name="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .filename')"
-    sha256="$(echo "${release_json}" | jq -r --arg arch "${PLATFORM}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .sha256')"
+    file_name="$(echo "${release_json}" | jq -r --arg arch "${go_arch}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .filename')"
+    sha256="$(echo "${release_json}" | jq -r --arg arch "${go_arch}" '.[0].files[] | select(.os == "linux" and .arch == $arch and .kind == "archive") | .sha256')"
     if [[ ! "${version}" =~ ^go[0-9.]+$ ]] || [ -z "${file_name}" ] || [ -z "${sha256}" ]; then
         error "Failed to get latest version of Go from ${go_dl_url}"
         return 1
