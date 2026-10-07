@@ -867,6 +867,23 @@ git_repo_update() {
     ${SUDO_USER} git -C "${dir}" pull --ff-only --quiet
 }
 
+# user_service_disable UNIT...: stops and disables the systemd user units that
+# are enabled, e.g. the old ones of a renamed software
+user_service_disable() {
+    # systemctl --user talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local unit
+    for unit in "${@}"; do
+        ${SUDO_USER} "${session_env[@]}" systemctl --user is-enabled --quiet "${unit}" 2>/dev/null || continue
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would stop and disable the user service ${unit}" 1>&2
+            continue
+        fi
+        verbose "${SUDO_USER} systemctl --user disable --now ${unit}"
+        ${SUDO_USER} "${session_env[@]}" systemctl --user disable --now "${unit}" || return 1
+    done
+}
+
 # user_service_enable UNIT [FILE]: installs the systemd user unit FILE (if given,
 # e.g. from $(LIBDIR)/systemd-user) and enables and starts UNIT for the user
 user_service_enable() {
@@ -1971,9 +1988,13 @@ software-131-slackdump@comms() { install_git_release "https://github.com/rusq/sl
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
 software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
-software-170-gitlab_trackr@dev() {
-    # the package brings the gitlab-trackrd user service
-    install_git_release "https://github.com/BjarneSeger/gitlab_trackr" && user_service_enable gitlab-trackrd.service
+# formerly gitlab-trackr, whose package forskap-utils replaces; the old daemon is
+# stopped and disabled first, while its units are still there
+software-170-forskap@dev() {
+    user_service_disable gitlab-trackrd.service gitlab-trackrd.socket || return 1
+    # the package brings the forskapd user service
+    install_git_release "https://github.com/BjarneSeger/forskap" --pattern "forskap-utils_*_linux_{arch}.deb" \
+        && user_service_enable forskapd.service
 }
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
