@@ -139,18 +139,21 @@ setup_keyring() {
         fi
     fi
 
-    mapfile -t names < <("${keyring_cli}" nm-list 2>/dev/null | tail -n +2 | awk '{ print $1 }')
+    # nm-list is a display table: connection names may themselves contain spaces.
+    mapfile -t names < <(secret-tool search --all --unlock type nm-connection part keyfile 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.name = //p' | sort -u)
     if [ "${#names[@]}" -gt 0 ] && ask "Restore the network connections of the keyring (${names[*]})?"; then
         # the VPN connections are OpenVPN ones, their plugin may be missing
-        if "${keyring_cli}" nm-list 2>/dev/null | awk '$2 == "vpn"' | grep -q . \
-            && ! dpkg -s network-manager-openvpn-gnome > /dev/null 2>&1; then
-            run sudo apt-get install -y network-manager-openvpn-gnome || failed+=("apt-get install network-manager-openvpn-gnome")
-        fi
         for name in "${names[@]}"; do
             type="$(nmcli -g connection.type connection show id "${name}" 2>/dev/null)"
             if [ -n "${type}" ]; then
                 echo "Kept network connection ${name}" 1>&2
                 continue
+            fi
+            type="$(secret-tool lookup type nm-connection name "${name}" part keyfile \
+                | base64 -d | sed -n 's/^type=//p' | head -n 1)"
+            if [ "${type}" = vpn ] && ! dpkg -s network-manager-openvpn-gnome > /dev/null 2>&1; then
+                run sudo apt-get install -y network-manager-openvpn-gnome || failed+=("apt-get install network-manager-openvpn-gnome")
             fi
             run "${keyring_cli}" nm-restore "${name}" || failed+=("keyring-cli nm-restore ${name}")
         done
@@ -173,12 +176,25 @@ setup_dirs() {
 
 install_cli_helpers() {
     local target="install"
+    local desktop_target="install-desktop"
     info "Installing cli-helpers"
     if ask "Install as symlinks back to this repo (for working on it; no installs copies)?"; then
         target="install-links"
+        desktop_target="install-desktop-links"
     fi
-    # shellcheck disable=SC2086
-    run ${MAKE_SUDO} make -C "${REPO_DIR}" "${target}" || fail "Failed to run make ${target}"
+    if [ -n "${MAKE_SUDO}" ]; then
+        # Root installs the system files, but the bridge must point at our HOME.
+        run sudo make -C "${REPO_DIR}" "${target}" "HOME=${HOME}" INSTALL_USER_ASSETS=0 \
+            || fail "Failed to run make ${target}"
+        run make -C "${REPO_DIR}" install-gnome-extension "${desktop_target}" \
+            || fail "Failed to install the per-user assets"
+        if command -v gnome-shell > /dev/null 2>&1 && command -v gnome-extensions > /dev/null 2>&1; then
+            run gnome-extensions enable cli-helpers-window-bridge@dgrieser.de \
+                || warning "Could not enable the GNOME extension; log out and back in, then enable it"
+        fi
+    else
+        run make -C "${REPO_DIR}" "${target}" || fail "Failed to run make ${target}"
+    fi
     # without sudo the .pth file in the system's site-packages is only warned about
     if [ "$(cat /usr/lib/python3/dist-packages/usr-local-python3.pth 2>/dev/null)" != "/usr/local/lib/python3/dist-packages" ]; then
         run sudo make -C "${REPO_DIR}" install-pth || failed+=("sudo make install-pth")

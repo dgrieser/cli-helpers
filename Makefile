@@ -23,6 +23,8 @@ CHROME_POLICY_DIR ?= /etc/opt/chrome/policies/managed
 # present; set ENABLE_GNOME_EXTENSION=1 to force them anyway
 HAVE_GNOME := $(shell command -v gnome-extensions >/dev/null 2>&1 && command -v gnome-shell >/dev/null 2>&1 && echo 1 || echo 0)
 ENABLE_GNOME_EXTENSION ?= $(HAVE_GNOME)
+# setup.sh's sudo fallback installs these separately as the invoking user.
+INSTALL_USER_ASSETS ?= 1
 UPDATE_ARGS ?=
 
 EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
@@ -129,14 +131,14 @@ install: check-dirs
 	done
 	$(MAKE) --no-print-directory install-pth
 	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
-	$(MAKE) install-gnome-extension
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
 	$(MAKE) install-completions
-	$(MAKE) install-desktop
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop)
 	for link in $(LINKS); do \
 		target="$$(readlink "$$link")"; \
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
-	if [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
 		if command -v gnome-extensions >/dev/null 2>&1; then \
 			gnome-extensions enable "$(EXTENSION_UUID)" || \
 				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
@@ -171,13 +173,13 @@ install-links: check-dirs
 		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
 	done
 	$(MAKE) --no-print-directory install-pth
-	$(MAKE) install-gnome-extension
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
 	$(MAKE) install-completions-links
-	$(MAKE) install-desktop-links
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop-links)
 	for link in $(LINKS); do \
 		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
-	if [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
 		if command -v gnome-extensions >/dev/null 2>&1; then \
 			gnome-extensions enable "$(EXTENSION_UUID)" || \
 				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
