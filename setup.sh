@@ -1,7 +1,8 @@
 #!/bin/bash
 # Sets up a new machine from this repo: the keyring from a backup with its SSH
-# keys and network connections, the install folders, cli-helpers itself,
-# the base software, gh and glab with their logins, the categories of updater
+# keys, SSH config and network connections, the install folders, cli-helpers itself,
+# the base software, gh and glab with their logins, the dotfiles of
+# bash_aliases.d (asking for missing SSH keys and history backups), the categories of updater
 # the user picks, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
 
@@ -88,7 +89,7 @@ setup_keyring() {
     local keyring_cli="${REPO_DIR}/keyring-cli"
     local packages=() package path file name type
     local -a files names
-    info "Keyring: import a backup of the old keyring files (~/.local/share/keyrings/*.keyring), then restore the SSH keys and network connections stored in the keyring"
+    info "Keyring: import a backup of the old keyring files (~/.local/share/keyrings/*.keyring), then restore the SSH keys, the SSH config and the network connections stored in the keyring"
     if ! busctl --user status org.freedesktop.secrets > /dev/null 2>&1; then
         warning "No keyring service running, skipping the keyring"
         failed+=("keyring")
@@ -127,6 +128,15 @@ setup_keyring() {
             fi
             run "${keyring_cli}" ssh-restore "${name}" || failed+=("keyring-cli ssh-restore ${name}")
         done
+    fi
+
+    # the SSH config is not in this public repo: it names internal hosts
+    if secret-tool lookup type ssh-config name config > /dev/null 2>&1; then
+        if [ -e "${HOME}/.ssh/config" ]; then
+            echo "Kept ${HOME}/.ssh/config" 1>&2
+        elif ask "Restore the SSH config of the keyring to ~/.ssh/config?"; then
+            run "${keyring_cli}" ssh-config-restore || failed+=("keyring-cli ssh-config-restore")
+        fi
     fi
 
     mapfile -t names < <("${keyring_cli}" nm-list 2>/dev/null | tail -n +2 | awk '{ print $1 }')
@@ -211,6 +221,20 @@ install_gh_glab() {
     command -v glab > /dev/null 2>&1 && login_gitlab "${MITTWALD_GITLAB}"
 }
 
+# the dotfiles of bash_aliases.d once more, now with a terminal: updater installed
+# them without one, so it skipped the questions for a missing SSH key in the
+# documents folder and for the backups of the shell histories
+install_dotfiles() {
+    local dir="${HOME}/workspace/dgrieser/bash_aliases.d"
+    if [ ! -f "${dir}/Makefile" ]; then
+        warning "No ${dir}, skipping its dotfiles"
+        failed+=("bash_aliases.d dotfiles")
+        return
+    fi
+    info "Dotfiles: restore missing SSH keys and shell histories"
+    run make -s -C "${dir}" install || failed+=("make -C ${dir} install")
+}
+
 check_categories() {
     local group
     local known
@@ -280,6 +304,7 @@ install_gh_glab
 info "Installing base"
 # firmware updates are not part of setting up the software
 run_updater base --exclude firmware
+install_dotfiles
 
 check_categories
 select_categories

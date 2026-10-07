@@ -14,10 +14,12 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 
 To set up a new machine, clone the repo and run `./setup.sh` from a terminal as your user. It installs what the
 `Makefile` needs, offers to import a backup of the old keyring files (`keyring-cli import`) and to restore the SSH
-keys and network connections stored in the keyring (`keyring-cli ssh-restore`, `keyring-cli nm-restore`, e.g. the
+keys, the SSH config and the network connections stored in the keyring (`keyring-cli ssh-restore`,
+`keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
 Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
-copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`, and
-then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`,
+runs `make install` of bash_aliases.d once more with a terminal (it asks for missing SSH keys and history backups,
+which `updater` cannot), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
 
@@ -2121,7 +2123,7 @@ The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to p
 
 Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed.
 
-Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder).
+Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya and its jq module, glow, Sublime Text, the Qwen commands, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder).
 
 Secrets stay in the GNOME keyring, never in the repo: `updater opencode` writes the API keys stored with `secret-tool store --label="opencode PROVIDER" service opencode provider PROVIDER` into `~/.local/share/opencode/auth.json` (mode `600`), and keeps the other entries there, e.g. logins.
 
@@ -2296,7 +2298,7 @@ Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, c
 
 `nm-store` stores a NetworkManager connection (e.g. a wifi with 802.1x certificates or an OpenVPN connection) as its profile file, which holds its secrets and is read with `sudo`, plus every certificate and key file the profile names, with the attributes `type=nm-connection`, `name=NAME` and `part=keyfile|file`. `nm-restore` writes these files back (moved into the current `HOME` when the home of the user differs) and loads the profile from `/etc/NetworkManager/system-connections/NAME.nmconnection`. `setup.sh` imports a keyring backup early and then restores the stored SSH keys and network connections.
 
-`ssh-store` stores an SSH private key and its `.pub` file as two items with the attributes `type=ssh-key`, `name=<file name>` and `part=private|public`. `ssh-load` pipes the key into `ssh-add -`, so the key is not written to disk. `ssh-restore` writes the key files back with mode `600` (private) and `644` (public). Keep a passphrase on the key: any process of the session can read the items of an unlocked keyring.
+`ssh-store` stores an SSH private key and its `.pub` file as two items with the attributes `type=ssh-key`, `name=<file name>` and `part=private|public`. `ssh-config-store` stores the SSH client config (`~/.ssh/config`, or what it links to) as one item with `type=ssh-config` and `name=config`, so it stays out of any repo; `ssh-config-restore` writes it back with mode `600` and replaces a symlink instead of writing through it. `ssh-load` pipes the key into `ssh-add -`, so the key is not written to disk. `ssh-restore` writes the key files back with mode `600` (private) and `644` (public). Keep a passphrase on the key: any process of the session can read the items of an unlocked keyring.
 
 **Usage:** `keyring-cli COMMAND [OPTIONS]`
 
@@ -2313,9 +2315,11 @@ Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, c
 | `ssh-list` | List the stored SSH keys with their fingerprint. |
 | `ssh-load NAME` | Add the stored SSH key `NAME` to the ssh-agent. |
 | `ssh-restore NAME [DIR]` | Write the stored SSH key `NAME` to `DIR/NAME` and `DIR/NAME.pub` (default `DIR`: `~/.ssh`). |
+| `ssh-config-store [FILE]` | Store the SSH client config `FILE` (default: `~/.ssh/config`). |
+| `ssh-config-restore [FILE]` | Write the stored SSH client config to `FILE` (default: `~/.ssh/config`). |
 | `-n, --dry-run` | `merge`, `import`: show what would be copied, without writing. |
-| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `nm-store`: replace a stored SSH key or connection with the same name. `ssh-restore`, `nm-restore`: replace existing files and connections. |
-| `-k, --keyring KEYRING` | `ssh-store`: store into `KEYRING` instead of the default keyring. |
+| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `ssh-config-store`, `nm-store`: replace a stored SSH key, SSH config or connection with the same name. `ssh-restore`, `ssh-config-restore`, `nm-restore`: replace existing files and connections. |
+| `-k, --keyring KEYRING` | `ssh-store`, `ssh-config-store`: store into `KEYRING` instead of the default keyring. |
 | `-h, --help` | Show the usage message. |
 
 **Examples:**

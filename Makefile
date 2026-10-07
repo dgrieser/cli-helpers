@@ -37,13 +37,14 @@ APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
 # the configs merged into the user's config dirs (yazi with its local plugins,
 # powerline-shell, claude, codex, opencode, zed, terminator, gradia, gimp, vim,
 # rquickshare, cam-settings, screen-color, git, streamdown, mimeapps, zoom,
-# teamviewer, spotify, himalaya, wireplumber), the dconf
+# teamviewer, spotify, himalaya, wireplumber, glow, sublime-text, jq, qwen), the dconf
 # settings of extensions and apps, the Chrome settings and search engines,
 # systemd user units and a cron file
 CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator gradia gimp vim rquickshare \
 	cam-settings screen-color git streamdown mimeapps zoom teamviewer spotify spotify-user himalaya \
-	wireplumber wireplumber-radeon dconf chrome systemd-user cron
-CONFIGFILES := $(patsubst $(SHAREDDIR)/%,%,$(shell find $(addprefix $(SHAREDDIR)/,$(CONFIGDIRS)) -type f -not -path '*/__pycache__/*' | sort))
+	wireplumber wireplumber-radeon glow sublime-text jq qwen dconf chrome systemd-user cron
+# a shell pipe, not a list: config file names can hold spaces (Sublime Text's)
+CONFIGFILES := (cd $(SHAREDDIR) && find $(CONFIGDIRS) -type f -not -path '*/__pycache__/*' | sort)
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them
@@ -119,7 +120,7 @@ install: check-dirs
 	for app in $(APPSHORTCUTS); do \
 		install -m 0644 "$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
-	for file in $(CONFIGFILES); do \
+	$(CONFIGFILES) | while IFS= read -r file; do \
 		install -D -m 0644 "$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
 	for module in $(MODULES); do \
@@ -161,7 +162,7 @@ install-links: check-dirs
 	for app in $(APPSHORTCUTS); do \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
-	for file in $(CONFIGFILES); do \
+	$(CONFIGFILES) | while IFS= read -r file; do \
 		mkdir -p "$$(dirname "$(DESTDIR)$(LIBDIR)/$$file")"; \
 		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
@@ -298,7 +299,7 @@ uninstall:
 		rm -f "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
 	done
 	rmdir "$(DESTDIR)$(LIBDIR)/app-shortcuts" 2>/dev/null || true
-	for file in $(CONFIGFILES); do \
+	$(CONFIGFILES) | while IFS= read -r file; do \
 		rm -f "$(DESTDIR)$(LIBDIR)/$$file"; \
 	done
 	for dir in $(CONFIGDIRS); do \
