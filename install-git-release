@@ -142,20 +142,49 @@ function success() {
     exit 0
 }
 
-# api_curl PROJECT ARGS...: curl for the REST API of the project's host; public
-# projects need no login, a token from the environment is used if set
-# (GH_TOKEN/GITHUB_TOKEN, GITLAB_TOKEN)
+# api_curl PROJECT ARGS...: curl for the project's host; public projects need
+# no login, a token from the environment (GH_TOKEN/GITHUB_TOKEN, GITLAB_TOKEN)
+# is used if set, else the one gh or glab stored at their login
 function api_curl() {
     local project="${1}"; shift
     local curl_args=( "-fsSL" )
-    local token="${GITLAB_TOKEN}"
+    local token
+    local host
     if [[ "${project}" == "https://github.com/"* ]]; then
         token="${GH_TOKEN:-${GITHUB_TOKEN}}"
+        [ -z "${token}" ] && command -v gh &> /dev/null && token="$(gh auth token 2> /dev/null)"
         [ -n "${token}" ] && curl_args+=( "-H" "Authorization: Bearer ${token}" )
     else
+        token="${GITLAB_TOKEN}"
+        host="$(echo "${project}" | cut -d/ -f3)"
+        [ -z "${token}" ] && command -v glab &> /dev/null && token="$(glab config get token --host "${host}" 2> /dev/null)"
         [ -n "${token}" ] && curl_args+=( "-H" "PRIVATE-TOKEN: ${token}" )
     fi
     curl "${curl_args[@]}" "${@}"
+}
+
+# api_get PROJECT ENDPOINT: the response of the REST API of the project's host
+# to a GET of the endpoint (relative to the API root), through gh or glab where
+# installed, so their login counts also when it is in the keyring, else curl
+function api_get() {
+    local project="${1}"
+    local endpoint="${2}"
+    local host
+    local response
+    if [[ "${project}" == "https://github.com/"* ]]; then
+        if command -v gh &> /dev/null && response="$(gh api "${endpoint}" 2> /dev/null)"; then
+            echo "${response}"
+            return 0
+        fi
+        api_curl "${project}" "https://api.github.com/${endpoint}"
+    else
+        host="$(echo "${project}" | cut -d/ -f1-3)"
+        if command -v glab &> /dev/null && response="$(glab api --hostname "${host#*://}" "${endpoint}" 2> /dev/null)"; then
+            echo "${response}"
+            return 0
+        fi
+        api_curl "${project}" "${host}/api/v4/${endpoint}"
+    fi
 }
 
 # release_assets PROJECT: the name and download URL of each asset of the
@@ -166,16 +195,15 @@ function release_assets() {
     local release_json
     local assets
 
-    command -v curl &> /dev/null || { error "curl is required to download without gh or glab"; return 1; }
-    command -v jq &> /dev/null || { error "jq is required to download without gh or glab"; return 1; }
+    command -v jq &> /dev/null || { error "jq is required to read the release"; return 1; }
 
     if [[ "${project}" == "https://github.com/"* ]]; then
         local repo="${project#https://github.com/}"
         repo="${repo%/}"
         repo="${repo%.git}"
-        api_url="https://api.github.com/repos/${repo}/releases/latest"
-        [ -n "${RELEASE}" ] && api_url="https://api.github.com/repos/${repo}/releases/tags/${RELEASE}"
-        release_json="$(api_curl "${project}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        api_url="repos/${repo}/releases/latest"
+        [ -n "${RELEASE}" ] && api_url="repos/${repo}/releases/tags/${RELEASE}"
+        release_json="$(api_get "${project}" "${api_url}")" || { error "Failed to get the release of ${project} from GitHub"; return 1; }
         assets="$(echo "${release_json}" | jq -r '.assets[] | [.name, .browser_download_url] | @tsv')"
     else
         local host
@@ -184,9 +212,9 @@ function release_assets() {
         path="${project#"${host}"/}"
         path="${path%/}"
         path="${path%.git}"
-        api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/permalink/latest"
-        [ -n "${RELEASE}" ] && api_url="${host}/api/v4/projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/$(jq -rn --arg tag "${RELEASE}" '$tag | @uri')"
-        release_json="$(api_curl "${project}" "${api_url}")" || { error "Failed to get the release from ${api_url}"; return 1; }
+        api_url="projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/permalink/latest"
+        [ -n "${RELEASE}" ] && api_url="projects/$(jq -rn --arg path "${path}" '$path | @uri')/releases/$(jq -rn --arg tag "${RELEASE}" '$tag | @uri')"
+        release_json="$(api_get "${project}" "${api_url}")" || { error "Failed to get the release of ${project} from ${host}"; return 1; }
         assets="$(echo "${release_json}" | jq -r '.assets.links[] | [.name, (.direct_asset_url // .url)] | @tsv')"
     fi
     echo "${assets}"
@@ -202,6 +230,7 @@ function download_with_api() {
     local pattern
     local downloaded=0
 
+    command -v curl &> /dev/null || { error "curl is required to download without gh or glab"; return 1; }
     assets="$(release_assets "${project}")" || return 1
 
     while IFS=$'\t' read -r name url; do
