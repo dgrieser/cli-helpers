@@ -1,5 +1,6 @@
 #!/bin/bash
-# Sets up a new machine from this repo: the install folders, cli-helpers itself,
+# Sets up a new machine from this repo: the keyring from a backup with its SSH
+# keys and network connections, the install folders, cli-helpers itself,
 # the base software, gh and glab with their logins, the categories of updater
 # the user picks, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
@@ -77,6 +78,73 @@ bootstrap() {
     info "Installing what the Makefile needs: ${packages[*]}"
     run sudo apt-get update -q && run sudo apt-get install -y "${packages[@]}" \
         || fail "Failed to install ${packages[*]}"
+}
+
+# the keyring of the old machine: a backup of its keyring files is imported into
+# the login keyring, early, so the logins and tokens in it are there for the
+# later steps; then the SSH keys and network connections (e.g. the Mittwald
+# wifi and VPN) stored in the keyring with keyring-cli are restored
+setup_keyring() {
+    local keyring_cli="${REPO_DIR}/keyring-cli"
+    local packages=() package path file name type
+    local -a files names
+    info "Keyring: import a backup of the old keyring files (~/.local/share/keyrings/*.keyring), then restore the SSH keys and network connections stored in the keyring"
+    if ! busctl --user status org.freedesktop.secrets > /dev/null 2>&1; then
+        warning "No keyring service running, skipping the keyring"
+        failed+=("keyring")
+        return 0
+    fi
+    for package in libsecret-tools jq python3-gi gir1.2-secret-1 python3-cryptography; do
+        dpkg -s "${package}" > /dev/null 2>&1 || packages+=("${package}")
+    done
+    if [ "${#packages[@]}" -gt 0 ]; then
+        if ! { run sudo apt-get update -q && run sudo apt-get install -y "${packages[@]}"; }; then
+            failed+=("apt-get install ${packages[*]}")
+            return 0
+        fi
+    fi
+
+    if ask "Import a keyring backup?"; then
+        path="$("${REPO_DIR}/prompt-file" "Keyring file or folder:")"
+        path="${path/#\~/${HOME}}"
+        if [ -d "${path}" ]; then
+            mapfile -t files < <(find "${path}" -maxdepth 1 -type f -name '*.keyring' | sort)
+            [ "${#files[@]}" -eq 0 ] && warning "No *.keyring files in ${path}"
+        elif [ -n "${path}" ]; then
+            files=("${path}")
+        fi
+        for file in "${files[@]}"; do
+            run "${keyring_cli}" import "${file}" || failed+=("keyring-cli import ${file}")
+        done
+    fi
+
+    mapfile -t names < <("${keyring_cli}" ssh-list 2>/dev/null | tail -n +2 | awk '{ print $1 }')
+    if [ "${#names[@]}" -gt 0 ] && ask "Restore the SSH keys of the keyring (${names[*]}) to ~/.ssh?"; then
+        for name in "${names[@]}"; do
+            if [ -e "${HOME}/.ssh/${name}" ]; then
+                echo "Kept ${HOME}/.ssh/${name}" 1>&2
+                continue
+            fi
+            run "${keyring_cli}" ssh-restore "${name}" || failed+=("keyring-cli ssh-restore ${name}")
+        done
+    fi
+
+    mapfile -t names < <("${keyring_cli}" nm-list 2>/dev/null | tail -n +2 | awk '{ print $1 }')
+    if [ "${#names[@]}" -gt 0 ] && ask "Restore the network connections of the keyring (${names[*]})?"; then
+        # the VPN connections are OpenVPN ones, their plugin may be missing
+        if "${keyring_cli}" nm-list 2>/dev/null | awk '$2 == "vpn"' | grep -q . \
+            && ! dpkg -s network-manager-openvpn-gnome > /dev/null 2>&1; then
+            run sudo apt-get install -y network-manager-openvpn-gnome || failed+=("apt-get install network-manager-openvpn-gnome")
+        fi
+        for name in "${names[@]}"; do
+            type="$(nmcli -g connection.type connection show id "${name}" 2>/dev/null)"
+            if [ -n "${type}" ]; then
+                echo "Kept network connection ${name}" 1>&2
+                continue
+            fi
+            run "${keyring_cli}" nm-restore "${name}" || failed+=("keyring-cli nm-restore ${name}")
+        done
+    fi
 }
 
 setup_dirs() {
@@ -204,6 +272,7 @@ command -v python3 > /dev/null 2>&1 || fail "python3 is required for the prompts
 MAKE_SUDO=""
 info "Setting up this machine from ${REPO_DIR}"
 bootstrap
+setup_keyring
 setup_dirs
 install_cli_helpers
 install_gh_glab

@@ -13,7 +13,9 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 ## Installation
 
 To set up a new machine, clone the repo and run `./setup.sh` from a terminal as your user. It installs what the
-`Makefile` needs, offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
+`Makefile` needs, offers to import a backup of the old keyring files (`keyring-cli import`) and to restore the SSH
+keys and network connections stored in the keyring (`keyring-cli ssh-restore`, `keyring-cli nm-restore`, e.g. the
+Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
 copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`, and
 then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
@@ -2286,9 +2288,15 @@ cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 ```
 
 ### `keyring-cli`
-Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, and merges all items of one keyring into another with `secret-tool`. Needs `secret-tool`, `busctl` and `jq`; `create` also needs PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), since `secret-tool` cannot create a keyring.
+Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, merges all items of one keyring into another with `secret-tool`, imports keyring files from a backup, and stores SSH keys and NetworkManager connections. Needs `secret-tool`, `busctl` and `jq`; `create`, `merge` and `import` also need PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), `import` also `python3-cryptography`: `secret-tool` cannot create a keyring, and it cannot store binary secrets (not UTF-8 or with NUL bytes, e.g. the app secrets of the xdg desktop portal). `updater secret-tool` installs all of them (`libsecret-tools`, `python3-gi`, `gir1.2-secret-1`, `python3-cryptography`; `jq` comes with `updater packages`).
 
 `merge` keeps label and attributes of each item. A target item with the same attributes is the same entry: it is kept, unless `--overwrite` is given and its label or secret differs. The source keyring is not changed. Locked keyrings are unlocked first through the keyring's unlock prompt, also with `--dry-run`. Items without attributes cannot be read by `secret-tool` and are skipped.
+
+`import` reads a gnome-keyring file, e.g. a backup of `~/.local/share/keyrings/login.keyring` from an old machine, and asks for its password in the terminal; a running gnome-keyring does not reliably load a keyring file copied into its folder. Its items go into the target keyring like with `merge`, binary secrets included.
+
+`nm-store` stores a NetworkManager connection (e.g. a wifi with 802.1x certificates or an OpenVPN connection) as its profile file, which holds its secrets and is read with `sudo`, plus every certificate and key file the profile names, with the attributes `type=nm-connection`, `name=NAME` and `part=keyfile|file`. `nm-restore` writes these files back (moved into the current `HOME` when the home of the user differs) and loads the profile from `/etc/NetworkManager/system-connections/NAME.nmconnection`. `setup.sh` imports a keyring backup early and then restores the stored SSH keys and network connections.
+
+`ssh-store` stores an SSH private key and its `.pub` file as two items with the attributes `type=ssh-key`, `name=<file name>` and `part=private|public`. `ssh-load` pipes the key into `ssh-add -`, so the key is not written to disk. `ssh-restore` writes the key files back with mode `600` (private) and `644` (public). Keep a passphrase on the key: any process of the session can read the items of an unlocked keyring.
 
 **Usage:** `keyring-cli COMMAND [OPTIONS]`
 
@@ -2297,8 +2305,17 @@ Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, c
 | `list` | List the keyrings with label, lock state and item count. |
 | `create NAME` | Create the keyring `NAME`; the keyring service asks for its password. |
 | `merge SOURCE TARGET` | Copy all items of `SOURCE` into `TARGET`. Both are a keyring name (e.g. `old-login`), label, alias (e.g. `default`) or D-Bus object path. |
-| `-n, --dry-run` | `merge`: show what would be copied, without writing. |
-| `-o, --overwrite` | `merge`: replace target items with the same attributes whose label or secret differs. |
+| `import FILE [TARGET]` | Copy all items of the gnome-keyring file `FILE` into `TARGET` (default: `default`); asks for the password of `FILE`. |
+| `nm-store NAME` | Store the NetworkManager connection `NAME` with its secrets and its certificate and key files (reads the profile with `sudo`). |
+| `nm-list` | List the stored network connections. |
+| `nm-restore NAME` | Restore the stored network connection `NAME`: its files and its profile (with `sudo`). |
+| `ssh-store FILE` | Store the SSH private key `FILE` and `FILE.pub` under the name of `FILE` (e.g. `id_ed25519`). |
+| `ssh-list` | List the stored SSH keys with their fingerprint. |
+| `ssh-load NAME` | Add the stored SSH key `NAME` to the ssh-agent. |
+| `ssh-restore NAME [DIR]` | Write the stored SSH key `NAME` to `DIR/NAME` and `DIR/NAME.pub` (default `DIR`: `~/.ssh`). |
+| `-n, --dry-run` | `merge`, `import`: show what would be copied, without writing. |
+| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `nm-store`: replace a stored SSH key or connection with the same name. `ssh-restore`, `nm-restore`: replace existing files and connections. |
+| `-k, --keyring KEYRING` | `ssh-store`: store into `KEYRING` instead of the default keyring. |
 | `-h, --help` | Show the usage message. |
 
 **Examples:**
@@ -2307,6 +2324,14 @@ keyring-cli list
 keyring-cli create work
 keyring-cli merge --dry-run old-login login
 keyring-cli merge old-login default
+keyring-cli import --dry-run /media/backup/keyrings/login.keyring
+keyring-cli import /media/backup/keyrings/login.keyring
+keyring-cli nm-store Mittwald
+keyring-cli nm-restore Mittwald
+keyring-cli ssh-store ~/.ssh/id_ed25519
+keyring-cli ssh-list
+keyring-cli ssh-load id_ed25519
+keyring-cli ssh-restore id_ed25519
 ```
 
 ---

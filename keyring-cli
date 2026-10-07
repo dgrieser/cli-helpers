@@ -21,15 +21,45 @@ Commands:
                         and attributes. A TARGET item with the same attributes
                         as a SOURCE item is the same entry: it is kept unless
                         --overwrite is given. SOURCE is not changed.
+  import FILE [TARGET]  Copy all items of the gnome-keyring file FILE (e.g. a
+                        backup of ~/.local/share/keyrings/login.keyring) into
+                        the keyring TARGET (default: default), like merge;
+                        asks for the password of FILE
+  nm-store NAME         Store the NetworkManager connection NAME (e.g. a wifi
+                        or VPN) with its secrets and its certificate and key
+                        files; reads the profile with sudo
+  nm-list               List the stored network connections
+  nm-restore NAME       Restore the stored network connection NAME: its files
+                        and its profile in /etc/NetworkManager (with sudo)
+  ssh-store FILE        Store the SSH private key FILE and its public key
+                        FILE.pub under the name of FILE (e.g. id_ed25519)
+  ssh-list              List the stored SSH keys with their fingerprint
+  ssh-load NAME         Add the stored SSH key NAME to the ssh-agent; the
+                        key is not written to disk
+  ssh-restore NAME [DIR]
+                        Write the stored SSH key NAME to DIR/NAME and
+                        DIR/NAME.pub (default DIR: ~/.ssh)
 
 SOURCE and TARGET are a keyring name (e.g. old-login), its label, an alias
 (e.g. default) or its D-Bus object path. Locked keyrings are unlocked first,
 which shows the unlock prompt of the keyring, also with --dry-run.
 
+SSH keys are stored as items with the attributes type=ssh-key, name=NAME and
+part=private or part=public. Keep a passphrase on the key: any process of the
+session can read the items of an unlocked keyring. Network connections are
+stored as type=nm-connection, name=NAME and part=keyfile or part=file.
+
 Options:
-  -n, --dry-run         merge: Show what would be copied, without writing
-  -o, --overwrite       merge: Replace TARGET items with the same attributes
+  -n, --dry-run         merge, import: Show what would be copied, without
+                        writing
+  -o, --overwrite       merge, import: Replace TARGET items with the same attributes
                         whose label or secret differs
+                        ssh-store, nm-store: Replace a stored SSH key or
+                        connection with the same name
+                        ssh-restore, nm-restore: Replace existing files and
+                        connections
+  -k, --keyring KEYRING ssh-store: Store into KEYRING (default: the default
+                        keyring)
   -h, --help            Show this help message and exit
 EOF
     exit 1
@@ -180,6 +210,92 @@ find_target_item() {
     return 1
 }
 
+# binary_secret MODE ARGS: secret-tool only handles UTF-8 secrets without NUL
+# bytes, so libsecret (PyGObject) handles the raw bytes of binary secrets
+#   is-binary ITEM       exit 0 if the secret is binary
+#   same ITEM1 ITEM2     exit 0 if both secrets are equal
+#   copy ITEM COLLECTION copy ITEM with its label and attributes, replacing an
+#                        item with the same attributes
+binary_secret() {
+    python3 -I -c '
+import sys
+import gi
+gi.require_version("Secret", "1")
+from gi.repository import Secret
+
+def find_collection(service, path):
+    for collection in service.get_collections():
+        if collection.get_object_path() == path:
+            return collection
+    sys.exit(2)
+
+def load(service, path):
+    collection = find_collection(service, path.rsplit("/", 1)[0])
+    collection.load_items_sync(None)
+    for item in collection.get_items():
+        if item.get_object_path() == path:
+            item.load_secret_sync(None)
+            value = item.get_secret()
+            if value is None:
+                sys.exit(2)
+            return item, value
+    sys.exit(2)
+
+try:
+    mode = sys.argv[1]
+    service = Secret.Service.get_sync(Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+    item, value = load(service, sys.argv[2])
+    data = bytes(value.get())
+    if mode == "is-binary":
+        try:
+            data.decode("utf-8")
+            sys.exit(0 if b"\0" in data else 1)
+        except UnicodeDecodeError:
+            sys.exit(0)
+    if mode == "same":
+        sys.exit(0 if data == bytes(load(service, sys.argv[3])[1].get()) else 1)
+    if mode == "copy":
+        collection = find_collection(service, sys.argv[3])
+        attributes = {k: v for k, v in item.get_attributes().items() if not k.startswith("gkr:compat:")}
+        Secret.Item.create_sync(collection, None, attributes, item.get_label(), value, Secret.ItemCreateFlags.REPLACE, None)
+        sys.exit(0)
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(2)
+sys.exit(2)
+' "${@}"
+}
+
+# merge_binary_item: merge_item for a binary secret, uses the variables of merge_item
+merge_binary_item() {
+    action="copy"
+    if target_item="$(find_target_item "${attributes_json}")"; then
+        if binary_secret same "${item}" "${target_item}" \
+            && [ "$(get_property "${target_item}" Item Label | jq -r '.')" = "$(get_property "${item}" Item Label | jq -r '.')" ]; then
+            echo "exists:    ${label}"
+            exists=$(( exists + 1 ))
+            return 0
+        fi
+        if [ "${overwrite}" -eq 0 ]; then
+            echo "differs:   ${label} (use --overwrite to replace)"
+            differs=$(( differs + 1 ))
+            return 0
+        fi
+        action="overwrite"
+    fi
+
+    printf '%-10s %s (binary)\n' "${action}:" "${label}"
+    if [ "${dry_run}" -eq 0 ]; then
+        if ! binary_secret copy "${item}" "${target}"; then
+            error "cannot store ${label}"
+            return 1
+        fi
+    fi
+    copied=$(( copied + 1 ))
+}
+
 merge_item() {
     local item="${1}" label attributes_json target_item secret target_secret action
     local -a attributes
@@ -191,7 +307,21 @@ merge_item() {
         return 1
     fi
     attributes_json="$(attributes_key "${item}")"
+    # items without label show their attributes
+    [ -z "${label}" ] && label="${attributes_json}"
 
+    binary_secret is-binary "${item}"
+    case "${?}" in
+        0)
+            merge_binary_item
+            return
+            ;;
+        1) ;;
+        *)
+            warning "skip ${label}: cannot read secret"
+            return 1
+            ;;
+    esac
     # append and strip a marker to keep trailing newlines of the secret
     secret="$(item_secret "${item}" && echo x)" || {
         warning "skip ${label}: cannot read secret"
@@ -227,6 +357,318 @@ merge_item() {
     copied=$(( copied + 1 ))
 }
 
+# import_keyring FILE TARGET: copy all items of the gnome-keyring file FILE
+# (e.g. a backup of ~/.local/share/keyrings/login.keyring) into the keyring
+# TARGET (object path). A running gnome-keyring does not reliably load a file
+# copied into its folder, so the file is decrypted here with its password: the
+# binary format of gnome-keyring (AES-128-CBC, key and IV from iterated SHA-256
+# of password and salt, MD5 of the plain data to check the password). Items
+# are stored with CreateItem over a plain session, since libsecret (PyGObject)
+# cannot store binary secrets; same-user processes can read the keyring anyway.
+import_keyring() {
+    python3 -I -c '
+import getpass, hashlib, json, struct, sys
+import gi
+gi.require_version("Secret", "1")
+from gi.repository import Gio, GLib, Secret
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    print("ERROR: python3-cryptography is not installed", file=sys.stderr)
+    sys.exit(1)
+
+MAGIC = b"GnomeKeyring\n\r\0\n"
+# the item types of the file format and their schema
+SCHEMAS = {
+    0: "org.freedesktop.Secret.Generic",
+    1: "org.gnome.keyring.NetworkPassword",
+    2: "org.gnome.keyring.Note",
+    3: "org.gnome.keyring.ChainedKeyring",
+    4: "org.gnome.keyring.EncryptionKey",
+    0x100: "org.gnome.keyring.PkStorage",
+}
+SECRETS = "org.freedesktop.secrets"
+
+path, target, dry_run, overwrite = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4] == "1"
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+class Reader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+    def take(self, n):
+        if self.pos + n > len(self.data):
+            fail(f"truncated keyring file: {path}")
+        data = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return data
+    def uint32(self):
+        return struct.unpack(">I", self.take(4))[0]
+    def string(self):
+        n = self.uint32()
+        return None if n == 0xFFFFFFFF else self.take(n)
+    def text(self):
+        return (self.string() or b"").decode("utf-8", "replace")
+    def attributes(self):
+        result = {}
+        for _ in range(self.uint32()):
+            name = self.text()
+            kind = self.uint32()
+            if kind == 0:
+                result[name] = self.text()
+            elif kind == 1:
+                result[name] = str(self.uint32())
+            else:
+                fail(f"unknown attribute type {kind} in {path}")
+        return result
+
+def decrypt(salt, iterations, encrypted, password):
+    digest = hashlib.sha256(password + salt).digest()
+    for _ in range(iterations - 1):
+        digest = hashlib.sha256(digest).digest()
+    decryptor = Cipher(algorithms.AES(digest[:16]), modes.CBC(digest[16:32])).decryptor()
+    data = decryptor.update(encrypted) + decryptor.finalize()
+    return data[16:] if hashlib.md5(data[16:]).digest() == data[:16] else None
+
+def read_keyring():
+    try:
+        with open(path, "rb") as f:
+            reader = Reader(f.read())
+    except OSError as e:
+        fail(f"cannot read {path}: {e.strerror}")
+    if reader.take(16) != MAGIC:
+        fail(f"not a gnome-keyring file: {path}")
+    if reader.take(4) != b"\0\0\0\0":
+        fail(f"unsupported gnome-keyring file version: {path}")
+    name = reader.text()
+    reader.take(16)  # created, modified
+    reader.uint32()  # flags
+    reader.uint32()  # lock timeout
+    iterations = max(reader.uint32(), 1)
+    salt = reader.take(8)
+    reader.take(16)  # reserved
+    types = []
+    for _ in range(reader.uint32()):
+        reader.uint32()  # id
+        types.append(reader.uint32())
+        reader.attributes()  # hashed values
+    encrypted = reader.take(reader.uint32())
+    if len(encrypted) % 16:
+        fail(f"corrupt keyring file: {path}")
+
+    data = decrypt(salt, iterations, encrypted, b"")
+    for _ in range(3):
+        if data is not None:
+            break
+        password = getpass.getpass(f"Password of keyring {name} ({path}): ").encode()
+        data = decrypt(salt, iterations, encrypted, password)
+        if data is None:
+            print("Wrong password", file=sys.stderr)
+    if data is None:
+        fail(f"cannot decrypt {path}")
+
+    reader = Reader(data)
+    items = []
+    for kind in types:
+        label = reader.text()
+        secret = reader.string() or b""
+        reader.take(16)  # created, modified
+        reader.string()  # reserved
+        reader.take(16)  # reserved
+        attributes = reader.attributes()
+        for _ in range(reader.uint32()):  # access control list
+            reader.uint32()
+            reader.string()
+            reader.string()
+            reader.string()
+            reader.uint32()
+        attributes = {k: v for k, v in attributes.items() if not k.startswith("gkr:compat:")}
+        attributes.setdefault("xdg:schema", SCHEMAS.get(kind, SCHEMAS[0]))
+        items.append((label, attributes, secret))
+    return name, items
+
+# the attributes as in merge: without the compatibility attributes, with the
+# generic schema for items without one
+def key(attributes):
+    attributes = {k: v for k, v in attributes.items() if not k.startswith("gkr:compat:")}
+    attributes.setdefault("xdg:schema", SCHEMAS[0])
+    return json.dumps(attributes, sort_keys=True, separators=(",", ":"))
+
+name, items = read_keyring()
+print(f"Importing {len(items)} items of keyring {name} ({path})", file=sys.stderr)
+
+service = Secret.Service.get_sync(Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+collection = next((c for c in service.get_collections() if c.get_object_path() == target), None)
+if collection is None:
+    fail(f"keyring not found: {target}")
+if collection.get_locked():
+    service.unlock_sync([collection], None)
+    if collection.get_locked():
+        fail(f"cannot unlock keyring: {target}")
+collection.load_items_sync(None)
+existing = {}
+for item in collection.get_items():
+    existing.setdefault(key(item.get_attributes()), item)
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+def call(object_path, interface, method, arguments, reply):
+    return bus.call_sync(SECRETS, object_path, f"org.freedesktop.Secret.{interface}", method, arguments,
+                         GLib.VariantType(reply), Gio.DBusCallFlags.NONE, -1, None).unpack()
+session = None
+
+copied = exists = differs = failed = 0
+for label, attributes, secret in items:
+    shown = label or key(attributes)
+    action = "copy"
+    target_item = existing.get(key(attributes))
+    if target_item is not None:
+        target_item.load_secret_sync(None)
+        value = target_item.get_secret()
+        if value is not None and bytes(value.get()) == secret and target_item.get_label() == label:
+            print(f"exists:    {shown}")
+            exists += 1
+            continue
+        if not overwrite:
+            print(f"differs:   {shown} (use --overwrite to replace)")
+            differs += 1
+            continue
+        action = "overwrite"
+    action_text = action + ":"
+    print(f"{action_text:<10} {shown}")
+    if not dry_run:
+        try:
+            if session is None:
+                session = call("/org/freedesktop/secrets", "Service", "OpenSession",
+                               GLib.Variant("(sv)", ("plain", GLib.Variant("s", ""))), "(vo)")[1]
+            try:
+                secret.decode("utf-8")
+                content_type = "application/octet-stream" if b"\0" in secret else "text/plain"
+            except UnicodeDecodeError:
+                content_type = "application/octet-stream"
+            properties = {
+                "org.freedesktop.Secret.Item.Label": GLib.Variant("s", label),
+                "org.freedesktop.Secret.Item.Attributes": GLib.Variant("a{ss}", attributes),
+            }
+            _, prompt = call(target, "Collection", "CreateItem",
+                             GLib.Variant("(a{sv}(oayays)b)", (properties, (session, b"", secret, content_type), True)), "(oo)")
+            if prompt != "/":
+                raise RuntimeError("keyring is locked")
+        except Exception as e:
+            print(f"ERROR: cannot store {shown}: {e}", file=sys.stderr)
+            failed += 1
+            continue
+    copied += 1
+
+copied_text = "to copy" if dry_run else "copied"
+print(f"{copied} {copied_text}, {exists} already present, {differs} differing, {failed} failed", file=sys.stderr)
+sys.exit(1 if failed else 0)
+' "${@}"
+}
+
+# nm_lookup NAME PART [ATTRIBUTES...]: print the stored part of the network
+# connection NAME (base64 decoded)
+nm_lookup() {
+    local name="${1}" part="${2}" encoded
+    shift 2
+    encoded="$(secret-tool lookup type nm-connection name "${name}" part "${part}" "${@}" 2>/dev/null)" || return 1
+    base64 -d <<< "${encoded}"
+}
+
+# nm_store NAME PART LABEL FILE [ATTRIBUTES...]: store FILE base64 encoded, so
+# binary files (e.g. DER certificates) fit into secret-tool
+nm_store() {
+    local name="${1}" part="${2}" label="${3}" file="${4}"
+    shift 4
+    base64 -w 0 < "${file}" | secret-tool store --label="${label}" \
+        type nm-connection name "${name}" part "${part}" "${@}"
+}
+
+# nm_files: print the absolute file paths in the keyfile on stdin (certificates
+# and keys, e.g. client-cert= or vpn ca =), one per line
+nm_files() {
+    sed -n 's#^[^=]*= *\(file://\)\?\(/[^;]*\);\?$#\2#p' | sort -u
+}
+
+nm_store_connection() {
+    local name="${1}" uuid keyfile_path keyfile file
+    uuid="$(nmcli -g connection.uuid connection show id "${name}" 2>/dev/null)"
+    [ -n "${uuid}" ] || fail "network connection not found: ${name}"
+    keyfile_path="$(nmcli -t -f UUID,FILENAME connection show | sed -n "s/^${uuid}://p" | sed 's/\\:/:/g')"
+    [ -n "${keyfile_path}" ] || fail "no profile file for network connection: ${name}"
+    if secret-tool lookup type nm-connection name "${name}" part keyfile > /dev/null 2>&1 && [ "${overwrite}" -eq 0 ]; then
+        fail "network connection exists: ${name} (use --overwrite to replace)"
+    fi
+    # the profile holds its secrets, so only root can read it
+    keyfile="$(sudo cat "${keyfile_path}")" || fail "cannot read ${keyfile_path}"
+    # replacing: remove the files of the stored connection first
+    secret-tool clear type nm-connection name "${name}" part file 2>/dev/null
+    nm_store "${name}" keyfile "NetworkManager connection ${name}" <(printf '%s\n' "${keyfile}") home "${HOME}" \
+        || fail "cannot store network connection: ${name}"
+    echo "Stored network connection ${name} (${keyfile_path})"
+    while read -r file; do
+        [ -n "${file}" ] || continue
+        if [ ! -f "${file}" ]; then
+            warning "file of ${name} not found: ${file}"
+            continue
+        fi
+        nm_store "${name}" file "NetworkManager connection ${name}: ${file}" "${file}" path "${file}" \
+            || fail "cannot store ${file}"
+        echo "Stored ${file}"
+    done < <(nm_files <<< "${keyfile}")
+}
+
+# nm_list: secret-tool search prints the attributes to stderr
+nm_list() {
+    local name type
+    printf '%-24s %s\n' "NAME" "TYPE"
+    while read -r name; do
+        type="$(nm_lookup "${name}" keyfile | sed -n 's/^type=//p' | head -n 1)"
+        printf '%-24s %s\n' "${name}" "${type}"
+    done < <(secret-tool search --all --unlock type nm-connection part keyfile 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.name = //p' | sort -u)
+}
+
+nm_restore_connection() {
+    local name="${1}" keyfile old_home uuid id target path file
+    keyfile="$(nm_lookup "${name}" keyfile)" || fail "network connection not found: ${name}"
+    old_home="$(secret-tool search --all type nm-connection name "${name}" part keyfile 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.home = //p' | head -n 1)"
+    uuid="$(sed -n 's/^uuid=//p' <<< "${keyfile}" | head -n 1)"
+    id="$(sed -n 's/^id=//p' <<< "${keyfile}" | head -n 1)"
+    if [ -n "${uuid}" ] && nmcli -g connection.uuid connection show uuid "${uuid}" > /dev/null 2>&1; then
+        [ "${overwrite}" -eq 0 ] && fail "network connection exists: ${id:-${name}} (use --overwrite to replace)"
+        sudo nmcli connection delete uuid "${uuid}" > /dev/null || fail "cannot delete network connection: ${id:-${name}}"
+    fi
+
+    # the files, moved to this HOME when the user's home differs
+    while read -r path; do
+        [ -n "${path}" ] || continue
+        file="${path}"
+        [ -n "${old_home}" ] && [[ "${path}" == "${old_home}/"* ]] && file="${HOME}/${path#"${old_home}/"}"
+        if [ -e "${file}" ] && [ "${overwrite}" -eq 0 ]; then
+            warning "file exists, kept: ${file}"
+            continue
+        fi
+        (umask 077 && mkdir -p "$(dirname "${file}")") || fail "cannot create directory for ${file}"
+        (umask 077 && nm_lookup "${name}" file path "${path}" > "${file}") || fail "cannot restore ${file}"
+        echo "Restored ${file}"
+    done < <(secret-tool search --all type nm-connection name "${name}" part file 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.path = //p' | sort -u)
+
+    if [ -n "${old_home}" ] && [ "${old_home}" != "${HOME}" ]; then
+        keyfile="${keyfile//"${old_home}/"/"${HOME}/"}"
+    fi
+    # a keyfile of its own in the folder of NetworkManager, also next to netplan
+    target="/etc/NetworkManager/system-connections/${name//\//_}.nmconnection"
+    printf '%s\n' "${keyfile}" | sudo install -m 600 -o root -g root /dev/stdin "${target}" \
+        || fail "cannot write ${target}"
+    sudo nmcli connection load "${target}" || fail "cannot load ${target}"
+    echo "Restored network connection ${id:-${name}} (${target})"
+}
+
 # create_collection NAME: secret-tool cannot create a keyring, and the password
 # prompt of CreateCollection only answers the D-Bus connection that asked for
 # it, so libsecret (PyGObject) creates it in one process
@@ -247,14 +689,92 @@ print(collection.get_object_path())
 ' "${1}"
 }
 
+# ssh_lookup NAME PART: print the private or public part of the stored SSH key
+ssh_lookup() {
+    secret-tool lookup type ssh-key name "${1}" part "${2}" 2>/dev/null
+}
+
+# ssh_store PART FILE: store the private or public key FILE
+ssh_store() {
+    local -a keyring_option=()
+    [ -n "${keyring_path}" ] && keyring_option=( --collection="${keyring_path}" )
+    secret-tool store "${keyring_option[@]}" --label="SSH key ${name} (${1})" \
+        type ssh-key name "${name}" part "${1}" < "${2}"
+}
+
+ssh_store_key() {
+    local file="${1}"
+    [ -f "${file}" ] || fail "file not found: ${file}"
+    head -n 1 "${file}" | grep -q -- '^-----BEGIN .*PRIVATE KEY-----$' || fail "not a private key: ${file}"
+    name="$(basename "${file}")"
+    if [ -n "${keyring}" ]; then
+        keyring_path="$(resolve_collection "${keyring}")" || fail "keyring not found: ${keyring}"
+    fi
+    if ssh_lookup "${name}" private > /dev/null && [ "${overwrite}" -eq 0 ]; then
+        fail "SSH key exists: ${name} (use --overwrite to replace)"
+    fi
+    ssh_store private "${file}" || fail "cannot store private key: ${file}"
+    echo "Stored private key ${name}"
+    if [ -f "${file}.pub" ]; then
+        ssh_store public "${file}.pub" || fail "cannot store public key: ${file}.pub"
+        echo "Stored public key ${name}"
+    else
+        # do not keep the public key of a replaced private key
+        secret-tool clear type ssh-key name "${name}" part public 2>/dev/null
+        warning "no public key ${file}.pub, create it with: ssh-keygen -y -f ${file} > ${file}.pub"
+    fi
+}
+
+# ssh_list: secret-tool search prints the attributes to stderr
+ssh_list() {
+    local name fingerprint
+    printf '%-24s %s\n' "NAME" "FINGERPRINT"
+    while read -r name; do
+        fingerprint="$(ssh_lookup "${name}" public | ssh-keygen -l -f - 2>/dev/null)"
+        printf '%-24s %s\n' "${name}" "${fingerprint:-(no public key)}"
+    done < <(secret-tool search --all --unlock type ssh-key part private 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.name = //p' | sort -u)
+}
+
+ssh_load_key() {
+    ssh_lookup "${1}" private > /dev/null || fail "SSH key not found: ${1}"
+    ssh_lookup "${1}" private | ssh-add - || fail "cannot add SSH key to ssh-agent: ${1}"
+}
+
+ssh_restore_key() {
+    local name="${1}" dir="${2:-${HOME}/.ssh}" private public
+    private="$(ssh_lookup "${name}" private && echo x)" || fail "SSH key not found: ${name}"
+    private="${private%x}"
+    if public="$(ssh_lookup "${name}" public && echo x)"; then
+        public="${public%x}"
+    else
+        public=""
+        warning "no public key stored for ${name}"
+    fi
+    if [ "${overwrite}" -eq 0 ]; then
+        [ -e "${dir}/${name}" ] && fail "file exists: ${dir}/${name} (use --overwrite to replace)"
+        [ -n "${public}" ] && [ -e "${dir}/${name}.pub" ] && fail "file exists: ${dir}/${name}.pub (use --overwrite to replace)"
+    fi
+    [ -d "${dir}" ] || mkdir -m 700 "${dir}" || fail "cannot create directory: ${dir}"
+    (umask 077 && printf '%s' "${private}" > "${dir}/${name}") || fail "cannot write ${dir}/${name}"
+    chmod 600 "${dir}/${name}"
+    echo "Restored ${dir}/${name}"
+    if [ -n "${public}" ]; then
+        printf '%s' "${public}" > "${dir}/${name}.pub" || fail "cannot write ${dir}/${name}.pub"
+        chmod 644 "${dir}/${name}.pub"
+        echo "Restored ${dir}/${name}.pub"
+    fi
+}
+
 dry_run=0
 overwrite=0
+keyring=""
 command=""
 arguments=()
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "list create merge -n --dry-run -o --overwrite -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
+            echo "list create merge import ssh-store ssh-list ssh-load ssh-restore nm-store nm-list nm-restore -n --dry-run -o --overwrite -k --keyring -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
             exit 0
             ;;
         -h|--help)
@@ -265,6 +785,11 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -o|--overwrite)
             overwrite=1
+            ;;
+        -k|--keyring)
+            [ "${#}" -lt 2 ] && fail "${1} needs a KEYRING"
+            keyring="${2}"
+            shift
             ;;
         -*)
             error "Unknown option: ${1}"
@@ -282,7 +807,7 @@ while [ "${#}" -gt 0 ]; do
 done
 
 case "${command}" in
-    list|create|merge)
+    list|create|merge|import|ssh-store|ssh-list|ssh-load|ssh-restore|nm-store|nm-list|nm-restore)
         ;;
     "")
         usage
@@ -292,21 +817,47 @@ case "${command}" in
         usage
         ;;
 esac
-if [ "${command}" != "merge" ] && { [ "${dry_run}" -eq 1 ] || [ "${overwrite}" -eq 1 ]; }; then
-    error "--dry-run and --overwrite only apply to merge"
+if [ "${command}" != "merge" ] && [ "${command}" != "import" ] && [ "${dry_run}" -eq 1 ]; then
+    error "--dry-run only applies to merge and import"
     usage
 fi
 case "${command}" in
-    list) expected=0 ;;
-    create) expected=1 ;;
-    merge) expected=2 ;;
+    merge|import|ssh-store|ssh-restore|nm-store|nm-restore) ;;
+    *)
+        if [ "${overwrite}" -eq 1 ]; then
+            error "--overwrite only applies to merge, import, ssh-store, ssh-restore, nm-store and nm-restore"
+            usage
+        fi
+        ;;
 esac
-if [ "${#arguments[@]}" -ne "${expected}" ]; then
-    error "${command} needs ${expected} argument(s)"
+if [ "${command}" != "ssh-store" ] && [ -n "${keyring}" ]; then
+    error "--keyring only applies to ssh-store"
     usage
 fi
+case "${command}" in
+    list|ssh-list|nm-list) minimum=0; maximum=0 ;;
+    create|ssh-store|ssh-load|nm-store|nm-restore) minimum=1; maximum=1 ;;
+    ssh-restore|import) minimum=1; maximum=2 ;;
+    merge) minimum=2; maximum=2 ;;
+esac
+if [ "${#arguments[@]}" -lt "${minimum}" ] || [ "${#arguments[@]}" -gt "${maximum}" ]; then
+    if [ "${minimum}" -eq "${maximum}" ]; then
+        error "${command} needs ${minimum} argument(s)"
+    else
+        error "${command} needs ${minimum} to ${maximum} arguments"
+    fi
+    usage
+fi
+case "${command}" in
+    ssh-load|ssh-restore)
+        [[ "${arguments[0]}" == */* || -z "${arguments[0]}" ]] && fail "invalid SSH key name: ${arguments[0]}"
+        ;;
+esac
 
-for tool in secret-tool busctl jq; do
+tools=( secret-tool busctl jq )
+[[ "${command}" == ssh-* ]] && tools+=( ssh-keygen ssh-add )
+[[ "${command}" == nm-* ]] && tools+=( nmcli base64 sudo )
+for tool in "${tools[@]}"; do
     command -v "${tool}" > /dev/null 2>&1 || fail "${tool} not found"
 done
 busctl --user status "${SECRETS_SERVICE}" > /dev/null 2>&1 || fail "no Secret Service (${SECRETS_SERVICE}) running"
@@ -314,6 +865,23 @@ busctl --user status "${SECRETS_SERVICE}" > /dev/null 2>&1 || fail "no Secret Se
 if [ "${command}" = "list" ]; then
     list_collections
     exit 0
+fi
+
+case "${command}" in
+    ssh-store) ssh_store_key "${arguments[0]}"; exit 0 ;;
+    ssh-list) ssh_list; exit 0 ;;
+    ssh-load) ssh_load_key "${arguments[0]}"; exit 0 ;;
+    ssh-restore) ssh_restore_key "${arguments[0]}" "${arguments[1]}"; exit 0 ;;
+    nm-store) nm_store_connection "${arguments[0]}"; exit 0 ;;
+    nm-list) nm_list; exit 0 ;;
+    nm-restore) nm_restore_connection "${arguments[0]}"; exit 0 ;;
+esac
+
+if [ "${command}" = "import" ]; then
+    target_name="${arguments[1]:-default}"
+    target="$(resolve_collection "${target_name}")" || fail "keyring not found: ${target_name}"
+    import_keyring "${arguments[0]}" "${target}" "${dry_run}" "${overwrite}"
+    exit
 fi
 
 if [ "${command}" = "create" ]; then
