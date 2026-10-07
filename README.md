@@ -2093,7 +2093,7 @@ wifi --list-available-names
 ```
 
 ### `loggedin`
-Reports the currently logged-in graphical-session user, optionally as a numeric UID, a UID/name pair, or the user's home directory.
+Reports the currently logged-in graphical-session user, optionally as a numeric UID, a UID/name pair, or the user's home directory. Without a graphical session (e.g. a headless Raspberry Pi reached by SSH) it reports the user running it, or, when run as root through `sudo`, the user who ran `sudo`.
 
 **Usage:** `loggedin [-h|--help] [--id] [--id-name] [--home]`
 
