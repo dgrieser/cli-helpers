@@ -6,9 +6,11 @@ import re
 import argparse
 import codecs
 import getpass
+import math
 import select as select_syscall
 import shutil
 import termios
+import time
 import tty
 
 RESET = '\033[0m'
@@ -316,6 +318,9 @@ class Terminal:
     def input_pending(self):
         return self.reader.pending()
 
+    def wait_input(self, timeout):
+        return self.reader.wait(timeout)
+
 
 class KeyReader:
     def __init__(self, fd):
@@ -378,6 +383,10 @@ class KeyReader:
     def pending(self):
         # already decoded input, or bytes waiting to be read right now
         return bool(self.buffer) or self._fill(0)
+
+    def wait(self, timeout):
+        # like pending, but waits up to timeout seconds for the bytes to arrive
+        return bool(self.buffer) or self._fill(timeout)
 
     def read(self):
         char = self._next_char()
@@ -1004,8 +1013,19 @@ def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_la
     return lines, cursor_col
 
 
-def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True):
+class PromptTimeout(Exception):
+    # the --timeout countdown ran out before a key was pressed; carries the
+    # input as it stood, which is accepted like Enter
+    def __init__(self, text):
+        super().__init__(text)
+        self.text = text
+
+
+def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True,
+                 timeout=None, timeout_label='(default in {}s)'):
     renderer = Renderer(term)
+    # the countdown only runs until the first key, the user answers in peace then
+    deadline = time.monotonic() + timeout if timeout else None
     head, head_width = build_head(theme, prompt, prompt_display, prompt_char)
     text = prefill
     cursor = len(text)
@@ -1038,7 +1058,21 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
         if not term.input_pending():
             menu_labels = [label(entry) for entry in menu] if (menu and label) else menu
             lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu_labels, menu_index, view)
+            while deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    renderer.clear()
+                    raise PromptTimeout(text)
+                countdown = (' ' if text else '') + timeout_label.format(math.ceil(remaining))
+                line = lines[0]
+                if visible_length(line) + len(countdown) <= width:
+                    line += theme.paint('hint', countdown)
+                renderer.draw([line] + lines[1:], cursor_line=0, cursor_col=cursor_col)
+                # wake up when the shown seconds change
+                if term.wait_input(remaining - math.floor(remaining) or 1.0):
+                    deadline = None
             renderer.draw(lines, cursor_line=0, cursor_col=cursor_col)
+        deadline = None
         key, char = term.read_key()
 
         if key == 'ctrl-c':
@@ -1217,11 +1251,15 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
     old_settings = raw_mode(term.in_fd)
     line = None
     interrupted = False
+    timed_out = False
     try:
         # no candidates, so Tab and the arrow keys have nothing to offer; Esc is
         # ignored here instead of aborting
         line = run_complete(term, theme, prompt, prompt_display, prompt_char, lambda text: [],
-                            args.prefill, False, False, 0, None, False)
+                            args.prefill, False, False, 0, None, False, args.timeout, args.timeout_label)
+    except PromptTimeout as timeout:
+        line = timeout.text
+        timed_out = True
     except KeyboardInterrupt:
         interrupted = True
         term.write('\r\n')
@@ -1243,7 +1281,8 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
         exit(1)
     if not line:
         line = default
-    term.write(head + line + '\r\n')
+    # the line notes that nobody answered, the answer was the default
+    term.write(head + line + (theme.paint('hint', (' ' if line else '') + '(timed out)') if timed_out else '') + '\r\n')
     term.flush()
     term.close()
     if exit_code_pattern:
@@ -1419,6 +1458,7 @@ def main():
         'prompt-continue-yes',
         'prompt-yes-no',
         'prompt-no-yes',
+        'prompt-continue-timeout',
     }
     if bin_name in exit_code_binaries:
         description = 'Prompt for confirmation and return the result as an exit code'
@@ -1427,8 +1467,10 @@ def main():
         description = 'Read multiple lines from stdin'
         epilog = (
             'Special invocations prompt-continue, prompt-continue-yes, '
-            'prompt-yes-no, and prompt-no-yes return status 0 for "yes" '
-            'and 1 otherwise instead of printing the answer. '
+            'prompt-yes-no, prompt-no-yes and prompt-continue-timeout return '
+            'status 0 for "yes" and 1 otherwise instead of printing the answer; '
+            'prompt-continue-timeout answers "yes" by itself after --timeout '
+            'seconds (default 60). '
             'prompt-select implies --select, prompt-multiselect implies --select '
             '--multi, prompt-complete implies --complete; '
             'in these two modes the positional arguments are the list items or '
@@ -1462,6 +1504,7 @@ def main():
     parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode and multiple line mode (defaults to the current directory in the --files and --dirs modes)')
     parser.add_argument('--height', type=int, help='Maximum number of list rows shown at once (default: fit the terminal)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--timeout', type=int, help='Single-line mode only: accept the input (or the default) after this many seconds without a key press, with a countdown next to the input; the first key stops the countdown')
     parser.add_argument('--no-abort-message', dest='no_abort_message', action='store_true', help='Leave the terminal as it was when the prompt is aborted, instead of noting the abort on a line of its own; for a caller that asks the next question in its place')
     parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1479,6 +1522,7 @@ def main():
     prompt_select = args.select
     prompt_complete = args.complete
     prompt_exit_code_pattern = None
+    args.timeout_label = '(default in {}s)'
 
     # check the name of the binary
     if bin_name == 'prompt-continue':
@@ -1511,6 +1555,17 @@ def main():
         else:
             prompt = 'Do it? [y/N]:'
         prompt_exit_code_pattern = r'^[yY]$'
+    elif bin_name == 'prompt-continue-timeout':
+        # prompt-yes-no that goes on by itself, for a run nobody may be watching
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback) + ' [Y/n]:'
+        else:
+            prompt = 'Continue? [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+        if args.timeout is None:
+            args.timeout = 60
+        args.timeout_label = '(continuing in {}s)'
     elif bin_name == 'prompt-input':
         prompt_single_line = True
         if args.prompt_fallback:
@@ -1569,6 +1624,13 @@ def main():
     if len([option for option in (args.delimiter, args.delimiter_regex, args.key_regex) if option is not None]) > 1:
         print('ERROR: --delimiter, --delimiter-regex and --key-regex are mutually exclusive.', file=sys.stderr)
         exit(1)
+    if args.timeout is not None:
+        if args.timeout < 1:
+            print('ERROR: --timeout must be a positive number.', file=sys.stderr)
+            exit(1)
+        if not prompt_single_line or prompt_protected or prompt_select or prompt_complete:
+            print('ERROR: --timeout can only be used in single-line mode, not with --protected.', file=sys.stderr)
+            exit(1)
     if args.header_lines < 0:
         print('ERROR: --header-lines must not be negative.', file=sys.stderr)
         exit(1)
