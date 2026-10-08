@@ -81,8 +81,10 @@ bootstrap() {
     command -v make > /dev/null 2>&1 || packages+=(make)
     command -v zip > /dev/null 2>&1 || packages+=(zip)
     command -v git > /dev/null 2>&1 || packages+=(git)
+    # updater downloads with curl before base installs it
+    command -v curl > /dev/null 2>&1 || packages+=(curl)
     [ "${#packages[@]}" -eq 0 ] && return 0
-    info "Installing what the Makefile needs: ${packages[*]}"
+    info "Installing what the Makefile and updater need: ${packages[*]}"
     run sudo apt-get update -q && run sudo apt-get install -y "${packages[@]}" \
         || fail "Failed to install ${packages[*]}"
 }

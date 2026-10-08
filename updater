@@ -397,6 +397,7 @@ apt_repo_configured_elsewhere() {
 }
 
 apt_add_with_list_file() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl gpg apt-get || return 1
     local name="${1}"; shift
     local list_url="${1}"; shift
@@ -719,6 +720,7 @@ pip_update() {
 
 gnome_extension_update() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq gnome-shell gnome-extensions gsettings || return 1
     local uuid="${1}"
     local ego_url="https://extensions.gnome.org"
@@ -1508,6 +1510,8 @@ install_git_release() {
     local url="${1}"; shift
     local host
     host="$(echo "${url}" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')"
+    # install-git-release downloads with curl without gh or glab
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     # the archive tools install-git-release unpacks with
     needs packages unzip || return $(( $? == 3 ? 0 : 1 ))
     needs packages file || return $(( $? == 3 ? 0 : 1 ))
@@ -1883,6 +1887,7 @@ software-058-docker-compose@dev() {
 }
 software-059-swagger-codegen@dev() {
     needs java || return $(( $? == 3 ? 0 : 1 ))
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl java || return 1
     local maven_url="https://repo1.maven.org/maven2/io/swagger/codegen/v3/swagger-codegen-cli"
     local lib_dir="/usr/local/lib/swagger-codegen"
@@ -2270,6 +2275,7 @@ opencode_auth_update() {
 
 software-330-zoom@comms() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq dpkg apt-get || return 1
     local zoom_package_name="zoom"
     local zoom_deb_file_name="${zoom_package_name}_${PLATFORM}.deb"
@@ -2374,6 +2380,7 @@ software-366-promql@dev@k8s() { install_git_release "https://github.com/nalbury/
 software-367-kubectl-neat@dev@k8s() { install_git_release "https://github.com/itaysk/kubectl-neat"; }
 # pkgs.k8s.io has one repo per minor version, so follow the latest stable minor
 software-365-kubectl@dev@k8s() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl || return 1
     local stable
     local minor
@@ -2493,6 +2500,7 @@ software-445-ollama@agents() {
 }
 
 software-450-aws@dev() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl unzip || return 1
     local aws_name="aws"
     local aws_arch="x86_64"
@@ -2523,6 +2531,7 @@ software-450-aws@dev() {
 }
 
 software-460-aws-v1@dev() {
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl unzip || return 1
     local aws_name="aws-v1"
     local aws_url="https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
@@ -2603,6 +2612,7 @@ software-540-bump@dev() { install_git_release "https://github.com/watawuwu/bump"
 
 software-550-go@dev() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq tar sha256sum || return 1
     local go_dl_url="https://go.dev/dl"
     local go_root="${CURRENT_USER_HOME}/.local/go"
