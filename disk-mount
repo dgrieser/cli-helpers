@@ -803,7 +803,7 @@ menu_command() {
     [ "${can_mount}" -eq 0 ] && [ "${in_use}" -eq 1 ] && default="unmount"
     items+=("mount=Mount a volume")
     items+=("unmount=Unmount a volume or a drive")
-    items+=("eject=Unmount a drive and power it off")
+    items+=("eject=Eject a drive")
     if has_stale; then
         items+=("cleanup=Remove stale mappings of disconnected drives")
         default="cleanup"
