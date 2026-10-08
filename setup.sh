@@ -5,7 +5,8 @@
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
 # if you like, gitlab.com), the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
-# of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text and the sessions and histories of
+# of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text, the profile of
+# Google Chrome with the key of its passwords and cookies and the sessions and histories of
 # Claude Code, Codex and opencode from a backup, the git repos of the workspace
 # with what only they held (changes, stashes, local branches, worktrees), the categories of updater
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
@@ -145,7 +146,7 @@ choose_backup() {
         return 0
     fi
     found=0
-    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text downloads agents git; do
+    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text chrome downloads agents git; do
         [ -d "${choice}/${dir}" ] && found=1
     done
     if [ "${found}" -eq 0 ]; then
@@ -488,6 +489,45 @@ restore_sublime() {
         done
     fi
     restore_part sublime-text "${dir}"
+}
+
+# the profile of Google Chrome from chrome/ of the backup, with its key from the
+# keyring file there: Chrome encrypts its passwords and cookies with it, so the
+# key of a Chrome that ran here already is replaced (keyring-cli import
+# --overwrite of only that item); a profile that is here is asked about and
+# moved aside to google-chrome.before-restore-DATE, not deleted; before updater
+# installs Chrome
+restore_chrome() {
+    local dir="${HOME}/.config/google-chrome" archive file moved
+    local -a files=()
+    has_part chrome || return 0
+    archive="${BACKUP_DIR}/chrome/google-chrome.tar.gz"
+    [ -f "${archive}" ] || { echo "No google-chrome.tar.gz in chrome/ of the backup" 1>&2; return 0; }
+    info "Chrome: restore its profile (bookmarks, history, passwords, cookies, extensions, settings) and the key of its passwords and cookies from the backup"
+    if [ -e "${dir}" ] && ! ask "Replace the Chrome profile here with the one of the backup (it is moved aside, its passwords and cookies cannot be read any more)?"; then
+        echo "Kept ${dir}" 1>&2
+        return 0
+    fi
+    while pgrep -x chrome > /dev/null 2>&1; do
+        if ! ask "Close Chrome now, then continue (no: skip its profile)?"; then
+            failed+=("chrome, it was running")
+            return 0
+        fi
+    done
+
+    mapfile -t files < <(find "${BACKUP_DIR}/chrome" -maxdepth 1 -type f -name '*.keyring' | sort)
+    [ "${#files[@]}" -eq 0 ] && warning "No keyring file in chrome/ of the backup, Chrome cannot read the passwords and cookies"
+    for file in "${files[@]}"; do
+        # it asks for the password of the old keyring, the old login password
+        run "${REPO_DIR}/keyring-cli" import --match application=chrome --overwrite "${file}" \
+            || failed+=("chrome key: keyring-cli import --match application=chrome --overwrite ${file}, before Chrome starts")
+    done
+
+    if [ -e "${dir}" ]; then
+        moved="${dir}.before-restore-$(date +%Y%m%d-%H%M%S)"
+        run mv "${dir}" "${moved}" || { failed+=("chrome, cannot move ${dir} aside"); return 0; }
+    fi
+    run tar -xzf "${archive}" -C "${HOME}" || failed+=("chrome profile")
 }
 
 # the sessions, histories, memories and settings of Claude Code, Codex and
@@ -904,6 +944,7 @@ restore_bin
 setup_vpn
 install_gh_glab
 restore_sublime
+restore_chrome
 
 info "Installing base"
 # firmware updates are not part of setting up the software

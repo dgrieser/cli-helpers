@@ -4,7 +4,8 @@
 # documents folder with the SSH keys the SSH config names, the private
 # scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
 # the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read, the
-# session of Sublime Text with its open files, the Downloads folder, the sessions, histories,
+# session of Sublime Text with its open files, the profile of Google Chrome
+# with the keyring file of its key, the Downloads folder, the sessions, histories,
 # memories and settings of Claude Code, Codex and opencode, and what only the
 # git repos of the workspace hold: uncommitted changes, stashes, local branches
 # and tags, and the worktrees of ~/workspace.worktree.
@@ -30,6 +31,14 @@ HOME_BIN_FILES=(gen .power .in .out)
 KUBE_MITTWALD_DIR="${HOME}/.kube/mittwald"
 # the session of Sublime Text: its windows, tabs and the unsaved text in them
 SUBLIME_DIR="${HOME}/.config/sublime-text/Local"
+# the profile of Google Chrome: bookmarks, history, passwords, cookies,
+# extensions and settings; left out are the caches, which Chrome builds again,
+# and the lock links of a running Chrome (relative to CHROME_DIR, * stays
+# within one folder, so */ is a profile like Default)
+CHROME_DIR="${HOME}/.config/google-chrome"
+CHROME_EXCLUDES=('*/Cache' '*/Code Cache' '*/GPUCache' '*/DawnGraphiteCache' '*/DawnWebGPUCache'
+    GrShaderCache GraphiteDawnCache ShaderCache component_crx_cache extensions_crx_cache
+    optimization_guide_model_store 'Crash Reports' 'BrowserMetrics*' 'Singleton*')
 # the coding agents, each into agents/NAME.tar.gz of what is under ~: the
 # sessions, histories, memories, settings, skills and plugins; left out are the
 # logins (setup.sh asks to log in again), the installed programs, caches, logs
@@ -74,6 +83,9 @@ and finds every part in it by this layout:
                 the lists of ${KUBE_MITTWALD_DIR}
   sublime-text/ the session of Sublime Text of ${SUBLIME_DIR}: the open
                 windows and tabs, with the unsaved text in them
+  chrome/       google-chrome.tar.gz of ${CHROME_DIR} without its
+                caches, and the keyring file that holds the key Chrome
+                encrypts its passwords and cookies with
   downloads/    the Downloads folder, without unfinished downloads
   agents/       ${AGENTS[*]}: their sessions, histories, memories and
                 settings, one NAME.tar.gz each, without the logins
@@ -84,8 +96,8 @@ and finds every part in it by this layout:
                 stashes, the branches and tags no remote has and the
                 worktrees; the rest comes from the remotes again
 
-The backup holds private keys, the keyring files and the agent sessions: keep it
-somewhere safe.
+The backup holds private keys, the keyring files, the Chrome profile and the
+agent sessions: keep it somewhere safe.
 
 Options:
   -f, --find    List the backups on the attached drives and media, newest
@@ -274,6 +286,54 @@ backup_sublime() {
     fi
     cp -a "${SUBLIME_DIR}" "${target}" || { failed+=("sublime-text"); return 0; }
     echo "sublime-text: $(find "${target}" -type f | wc -l) files of ${SUBLIME_DIR}" 1>&2
+}
+
+# chrome_keyring: the keyring file that holds the key of Chrome ("Chrome Safe
+# Storage"), by the keyring of its item; D-Bus object paths escape other
+# characters than [A-Za-z0-9] as _XX
+chrome_keyring() {
+    local item name
+    item="$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service SearchItems 'a{ss}' 1 application chrome 2>/dev/null \
+        | grep -o '"/org/freedesktop/secrets/collection/[^"]*"' | head -n 1)"
+    [ -n "${item}" ] || return 1
+    item="${item//\"/}"
+    name="${item%/*}"
+    name="$(printf '%b' "$(sed 's/_\([0-9a-fA-F]\{2\}\)/\\x\1/g' <<< "${name##*/}")")"
+    [ -f "${KEYRING_DIR}/${name}.keyring" ] || return 1
+    echo "${KEYRING_DIR}/${name}.keyring"
+}
+
+# the profile of Google Chrome into chrome/google-chrome.tar.gz, with a copy of
+# the keyring file that holds its key: Chrome encrypts the passwords and
+# cookies with it, setup.sh imports only that key from the file
+backup_chrome() {
+    local target="${1}/chrome" path keyring status
+    local -a excludes=()
+    if [ ! -d "${CHROME_DIR}" ]; then
+        echo "chrome: none" 1>&2
+        return 0
+    fi
+    for path in "${CHROME_EXCLUDES[@]}"; do
+        excludes+=("--exclude=${CHROME_DIR#"${HOME}/"}/${path}")
+    done
+    mkdir -p "${target}" || { failed+=("chrome"); return 0; }
+    # a running Chrome keeps writing its files: tar says so with status 1
+    tar -czf "${target}/google-chrome.tar.gz" -C "${HOME}" --anchored --no-wildcards-match-slash \
+        --warning=no-file-changed --warning=no-file-removed "${excludes[@]}" "${CHROME_DIR#"${HOME}/"}"
+    status="${?}"
+    if [ "${status}" -gt 1 ]; then
+        failed+=("chrome")
+        return 0
+    fi
+    echo "chrome: google-chrome.tar.gz ($(du -h "${target}/google-chrome.tar.gz" | cut -f 1)) of ${CHROME_DIR}" 1>&2
+    if ! keyring="$(chrome_keyring)"; then
+        warning "The key of Chrome is in no keyring file, its passwords and cookies cannot be read on the new machine"
+        failed+=("chrome key")
+        return 0
+    fi
+    cp -p "${keyring}" "${target}/" || { failed+=("chrome key"); return 0; }
+    echo "chrome: its key is in $(basename "${keyring}")" 1>&2
 }
 
 # the Downloads folder, whole; a download that is still running or broke off
@@ -553,6 +613,15 @@ if [ -d "${SUBLIME_DIR}" ] && pgrep -x sublime_text > /dev/null 2>&1; then
         done
     fi
 fi
+# a running Chrome writes its databases all the time, a copy of them may be broken
+if [ -d "${CHROME_DIR}" ] && pgrep -x chrome > /dev/null 2>&1; then
+    warning "Chrome is running, the copy of its profile may have broken databases"
+    if [ -t 0 ]; then
+        while pgrep -x chrome > /dev/null 2>&1; do
+            ask "Close Chrome now, then continue (no: back up the profile as it is)?" || break
+        done
+    fi
+fi
 keyring_files=()
 choose_keyrings
 
@@ -567,6 +636,7 @@ backup_keys "${backup}"
 backup_bin "${backup}"
 backup_kube_mittwald "${backup}"
 backup_sublime "${backup}"
+backup_chrome "${backup}"
 backup_downloads "${backup}"
 backup_agents "${backup}"
 backup_git "${backup}"
@@ -576,5 +646,5 @@ if [ "${#failed[@]}" -gt 0 ]; then
     printf '  %s\n' "${failed[@]}" 1>&2
     exit 1
 fi
-info "Done, it holds private keys, the keyring files and the agent sessions: keep it somewhere safe"
+info "Done, it holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe"
 echo "${backup}"

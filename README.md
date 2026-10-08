@@ -24,7 +24,9 @@ copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the Open
 of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
 when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), restores the session of Sublime Text (its open windows
-and tabs with their unsaved text, asking you to close Sublime Text first when it runs), installs the `base` software with `updater`,
+and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome
+with the key of its passwords and cookies (`keyring-cli import --match application=chrome --overwrite`; a profile that is
+already there is only replaced when you say so, and moved aside to `google-chrome.before-restore-<date>`), installs the `base` software with `updater`,
 restores the `Keys` folder of the documents folder and the shell histories, runs `make install` of bash_aliases.d once more with a terminal (it asks for SSH keys and history backups
 the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the lists of `~/.kube/mittwald` that the kubectl-helpers read, the Downloads folder and the sessions, histories, memories and settings of Claude Code, Codex and opencode, offers to restore the git repos of the workspace (cloning the missing ones from their remotes, after dialing the VPN for gitlab.mittwald.it, then bringing back their local branches, stashes, worktrees and uncommitted changes), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
@@ -36,7 +38,8 @@ apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`a
 Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
 `setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents
 folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`, the lists of `~/.kube/mittwald`, the session of Sublime Text (`~/.config/sublime-text/Local`, it offers to wait until you
-closed Sublime Text, so the session has the latest unsaved text), the Downloads folder (without unfinished downloads) and one archive each of
+closed Sublime Text, so the session has the latest unsaved text), the profile of Google Chrome without its caches
+(`~/.config/google-chrome`, it offers to wait until you closed Chrome) with the keyring file that holds its key, the Downloads folder (without unfinished downloads) and one archive each of
 `~/.claude` with `~/.claude.json`, `~/.codex` and opencode's `~/.config/opencode` with `~/.local/share/opencode`, without
 their logins, caches and installed programs, and what only the git repos of `~/workspace` and `~/workspace.worktree` hold: uncommitted changes, stashes, branches no remote has and the worktrees). Without a folder it offers the attached drives and media (mounted under
 `/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
@@ -2482,7 +2485,7 @@ keyring-cli ssh-restore id_ed25519
 ---
 
 ### `setup-backup`
-Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` in the keyring when the stored copy is missing or differs, since `setup.sh` restores the SSH config from there. The backup holds private keys and the keyring files: keep it somewhere safe.
+Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` in the keyring when the stored copy is missing or differs, since `setup.sh` restores the SSH config from there. The backup holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe.
 
 | Folder | What | Where `setup.sh` asks for it |
 |---|---|---|
@@ -2491,8 +2494,9 @@ Backs up on the old machine every file `setup.sh` asks for on a new one, into a 
 | `history/` | `~/.bash_super_history`, `~/.kube_history` | dotfiles: "Path of a backup of ~/..." |
 | `Keys/` | the `Keys` folder of the documents folder (without editor swap files), plus the SSH keys `~/.ssh/config` names that are in neither it nor the keyring | dotfiles: copy it to `Documents/Keys` |
 | `bin/` | the private scripts of `~/bin` that are not in this repo: `gen` (dials the VPN) and `.power` with `.in` and `.out` | "Backup of ~/bin" |
+| `chrome/` | `google-chrome.tar.gz` of `~/.config/google-chrome` without the caches (`Cache`, `Code Cache`, `GPUCache` and the Dawn caches of each profile, the shader, component, extension and model caches, crash reports, metrics and the lock links of a running Chrome), and a copy of the keyring file that holds the key Chrome encrypts its passwords and cookies with (`Chrome Safe Storage`) | "Replace the Chrome profile here?" when there is one: it is moved aside to `google-chrome.before-restore-<date>`; the key is imported with `keyring-cli import --match application=chrome --overwrite`, which asks for the password of the old keyring |
 | `downloads/` | the Downloads folder (`xdg-user-dir DOWNLOAD`), modification times kept, without unfinished downloads (`*.crdownload`, `*.part`) | restored into the Downloads folder, a file that is there already is kept |
-| `git/` | what only the git repos of `~/workspace` and `~/workspace.worktree` hold, one folder per repo at its path under `~`: a `manifest` (remotes, branches, stashes, worktrees), `repo.bundle` with the commits no remote has (branches and detached HEADs no remote has, the stashes, the staged and unstaged changes as `git stash create` makes them; the tags only of a repo without remotes) and `untracked-N.tar` with the untracked files of worktree `N` (not the ignored ones). A repo with nothing of its own, and one in a folder its parent repo ignores (a build), is left out; a worktree its repo does not know any more is warned about (`git worktree repair`) | "Restore these N git repos?": a missing repo is cloned, a branch that went another way on the new machine is kept and the old one comes back as `NAME-setup-backup`, changes that do not fit the worktree become a stash; running it twice changes nothing |
+| `git/` | what only the git repos of `~/workspace` and `~/workspace.worktree` hold, one folder per repo at its path under `~`: a `manifest` (remotes, branches, stashes, worktrees), `repo.bundle` with the commits no remote has (branches and detached HEADs no remote has, the stashes, the staged and unstaged changes as `git stash create` makes them; the tags only of a repo without remotes) and `untracked-N.tar` with the untracked files of worktree `N` (not the ignored ones). A repo with nothing of its own, and one in a folder its parent repo ignores (a build), is left out; a worktree its repo does not know any more is warned about (`git worktree repair`) | "Restore these N git repos?": a missing repo is cloned and its worktrees get the branches of the old machine, at the old commit when the remote deleted the branch (merged) or the uncommitted changes were made on it, so they go back into the worktree; in a repo that was already there a branch that went another way is kept and the old one comes back as `NAME-setup-backup`, and changes that do not fit the worktree become a stash; running it twice changes nothing |
 
 **Usage:** `setup-backup [-h] [FOLDER]`
 
