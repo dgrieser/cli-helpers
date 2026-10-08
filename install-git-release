@@ -49,7 +49,9 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
                             plain binary). May be given multiple times.
                             Env: INSTALL_PATH, BINARY_NAME, BINARY_PATH,
                             ARTIFACT, UNPACK_DIR, SUDO ("sudo" when
-                            INSTALL_PATH is not writable, else empty)
+                            INSTALL_PATH is not writable, else empty);
+                            function: sudo_for_path PATH (prints "sudo"
+                            when PATH cannot be created or written)
 
         -y, --yes           Answer yes to all prompts
 
@@ -1050,15 +1052,12 @@ function prompt_bundle_install() {
     return 0
 }
 
+# sudo_for_path PATH: prints "sudo" when PATH, or the folder a mkdir -p of it
+# would start in (its first existing parent), is not writable
 function sudo_for_path() {
     local path="${1}"
-    local parent
-    if [ -e "${path}" ]; then
-        [ -w "${path}" ] || echo "sudo"
-        return 0
-    fi
-    parent="$(dirname "${path}")"
-    [ -w "${parent}" ] || echo "sudo"
+    while [ ! -e "${path}" ]; do path="$(dirname "${path}")"; done
+    [ -w "${path}" ] || echo "sudo"
 }
 
 function extract_binary_from_archive() {
@@ -1370,8 +1369,9 @@ function run_post_install() {
 
     local binary_path=""
     [ -n "${BINARY}" ] && binary_path="${INSTALL_PATH}/${BINARY}"
-    # commands that write next to the install path (symlinks, man pages) need
-    # the same privileges as the install itself
+    # commands that write next to the install path (symlinks) need the same
+    # privileges as the install itself; for other paths (man pages) they call
+    # sudo_for_path, as setup-dirs may have made only the install path writable
     local sudo
     sudo="$(sudo_for_path "${INSTALL_PATH}")"
 
@@ -1389,6 +1389,7 @@ function run_post_install() {
         echo "  ${cmd}" 1>&2
         if ! (
             cd "${work_dir}" || exit 1
+            export -f sudo_for_path
             INSTALL_PATH="${INSTALL_PATH}" \
             BINARY_NAME="${BINARY}" \
             BINARY_PATH="${binary_path}" \

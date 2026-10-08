@@ -2212,7 +2212,7 @@ software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/fir
 # install-man-page.sh does, but without running the upstream script as root
 software-160-yq@dev() {
     install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --name "yq" \
-        --post-install '${SUDO} install -Dm644 yq.1 "$(dirname "${INSTALL_PATH}")/share/man/man1/yq.1"'
+        --post-install 'man_dir="$(dirname "${INSTALL_PATH}")/share/man/man1"; $(sudo_for_path "${man_dir}") install -Dm644 yq.1 "${man_dir}/yq.1"'
 }
 # formerly gitlab-trackr, whose package forskap-utils replaces; as its upgrade
 # notes say, the old daemon is stopped and disabled, first, while its units are
