@@ -1077,6 +1077,20 @@ tool_ready() {
     return 2
 }
 
+# repo_setup_dirs DIR: a repo with install folders of its own outside of
+# cli-helpers' (e.g. /usr/local/lib/k-ctx of the kubectl-helpers) has them
+# created once as root and group-writable, like cli-helpers' setup-dirs, so the
+# user can install
+repo_setup_dirs() {
+    local dir="${1}"
+    local group
+    grep -q '^check-dirs:' "${dir}/Makefile" && grep -q '^setup-dirs:' "${dir}/Makefile" || return 0
+    ${SUDO_USER} make -s -C "${dir}" check-dirs > /dev/null 2>&1 && return 0
+    group="$(id -gn "${CURRENT_USER_NAME}")" || return 1
+    verbose "${SUDO} make -s -C ${dir} setup-dirs INSTALL_GROUP=${group}"
+    ${SUDO} make -s -C "${dir}" setup-dirs "INSTALL_GROUP=${group}" > /dev/null
+}
+
 # helper_repo_update REPO [TARGET]: one of the own repos, cloned or pulled into
 # ~/workspace/dgrieser and installed by its make TARGET, by default
 # install-links (for the repos of commands, linked into /usr/local/bin)
@@ -1084,22 +1098,13 @@ helper_repo_update() {
     local repo="${1}"
     local target="${2:-install-links}"
     local dir="${CURRENT_USER_HOME}/workspace/dgrieser/${repo##*/}"
-    local group
     needs packages make || return $(( $? == 3 ? 0 : 1 ))
     git_repo_update "${repo}" "${dir}" || return 1
     if [ "${dry_run}" -eq 1 ]; then
         echo "Would install ${dir} (make ${target})" 1>&2
         return 0
     fi
-    # a repo with install folders of its own outside of cli-helpers' (e.g.
-    # /usr/local/lib/k-ctx of the kubectl-helpers) has them created once as root
-    # and group-writable, like cli-helpers' setup-dirs, so the user can install
-    if grep -q '^check-dirs:' "${dir}/Makefile" && grep -q '^setup-dirs:' "${dir}/Makefile" \
-        && ! ${SUDO_USER} make -s -C "${dir}" check-dirs > /dev/null 2>&1; then
-        group="$(id -gn "${CURRENT_USER_NAME}")" || return 1
-        verbose "${SUDO} make -s -C ${dir} setup-dirs INSTALL_GROUP=${group}"
-        ${SUDO} make -s -C "${dir}" setup-dirs "INSTALL_GROUP=${group}" > /dev/null || return 1
-    fi
+    repo_setup_dirs "${dir}" || return 1
     # the session bus lets the install read secrets from the keyring (secret-tool)
     verbose "${SUDO_USER} env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus make -s -C ${dir} ${target}"
     ${SUDO_USER} env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus" make -s -C "${dir}" "${target}" > /dev/null
@@ -1695,14 +1700,14 @@ install_adb() {
 
         verbose "rm -f ${file_args[*]} /etc/udev/rules.d/[0-9][0-9]-android.rules"
     	LC_ALL=C ${SUDO} rm -f "${file_args[@]}" "/etc/udev/rules.d/"[0-9][0-9]"-android.rules"
-        verbose "cp ${file_args[*]} ${rules_file} /etc/udev/rules.d/${rules_file}" || return 1
-        LC_ALL=C ${SUDO} cp "${file_args[@]}" "${rules_file}" "/etc/udev/rules.d/${rules_file}"
-        verbose "chmod ${file_args[*]} a+r /etc/udev/rules.d/${rules_file}" || return 1
-    	LC_ALL=C ${SUDO} chmod "${file_args[@]}" a+r "/etc/udev/rules.d/${rules_file}"
-        verbose "rm -f ${file_args[*]} /usr/lib/sysusers.d/android-udev.conf" || true
+        verbose "cp ${file_args[*]} ${rules_file} /etc/udev/rules.d/${rules_file}"
+        LC_ALL=C ${SUDO} cp "${file_args[@]}" "${rules_file}" "/etc/udev/rules.d/${rules_file}" || return 1
+        verbose "chmod ${file_args[*]} a+r /etc/udev/rules.d/${rules_file}"
+    	LC_ALL=C ${SUDO} chmod "${file_args[@]}" a+r "/etc/udev/rules.d/${rules_file}" || return 1
+        verbose "rm -f ${file_args[*]} /usr/lib/sysusers.d/android-udev.conf"
         LC_ALL=C ${SUDO} rm -f "${file_args[@]}" /usr/lib/sysusers.d/android-udev.conf
-        verbose "cp ${file_args[*]} ${conf_file} /usr/lib/sysusers.d/" || return 1
-    	LC_ALL=C ${SUDO} cp "${file_args[@]}" "${conf_file}" /usr/lib/sysusers.d/
+        verbose "cp ${file_args[*]} ${conf_file} /usr/lib/sysusers.d/"
+    	LC_ALL=C ${SUDO} cp "${file_args[@]}" "${conf_file}" /usr/lib/sysusers.d/ || return 1
     ) || return 1
 
     verbose "systemd-sysusers"
@@ -2113,7 +2118,15 @@ software-121-mittwald-outlook-bridge@mw() {
     fi
     user_service_enable mittwald-outlook-bridge.service
 }
-software-122-git-commit-ai@dev@agents() { curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh"; }
+# the installer takes the API key from MITTWALD_AI_API_KEY; without a terminal it
+# does not ask for it, so a shell without the key leaves cmai without one
+software-122-git-commit-ai@dev@agents() {
+    local key_file="${CURRENT_USER_HOME}/.config/git-commit-ai/config"
+    curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" || return 1
+    if [ "${dry_run}" -eq 0 ] && [ ! -s "${key_file}" ]; then
+        warning "cmai has no API key, set it with: cmai --api-key \"\${MITTWALD_AI_API_KEY}\" (from a shell that has it)"
+    fi
+}
 software-130-slack@comms() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
@@ -2195,7 +2208,12 @@ slack_repo_remove() {
 software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
-software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --name "yq" --post-install "./install-man-page.sh"; }
+# the man page goes to the prefix of the install path, as the bundled
+# install-man-page.sh does, but without running the upstream script as root
+software-160-yq@dev() {
+    install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --name "yq" \
+        --post-install '${SUDO} install -Dm644 yq.1 "$(dirname "${INSTALL_PATH}")/share/man/man1/yq.1"'
+}
 # formerly gitlab-trackr, whose package forskap-utils replaces; as its upgrade
 # notes say, the old daemon is stopped and disabled, first, while its units are
 # still there, and the new one is started through its socket. When the install
@@ -2248,6 +2266,7 @@ software-185-bahn-probonio-bot@personal() {
         echo "Would install ${dir} into ${lib_dir} (make install)" 1>&2
         return 0
     fi
+    repo_setup_dirs "${dir}" || return 1
     # npm is nvm's, so as the user with this PATH
     local make_cmd=("make")
     [ -n "${SUDO_USER}" ] && make_cmd=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}" "make")
@@ -2257,7 +2276,8 @@ software-185-bahn-probonio-bot@personal() {
         echo "${APP_NAME}: no bahn-probonio-bot credentials in the keyring yet, run: probonio-store-credentials; probonio-submit-bill --login" 1>&2
     fi
 }
-software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli"; }
+# each release ships the same build with and without the version in its name
+software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli" --pattern "snaxus-cli-linux-{arch}.tar.gz" --binary "snaxus"; }
 software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl"; }
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya@comms() {
@@ -2598,7 +2618,7 @@ software-390-kubecolor@dev@k8s() { install_git_release "https://github.com/kubec
 software-391-kubelogin@dev@k8s() {
     install_git_release "https://github.com/int128/kubelogin" \
         --pattern "kubelogin_linux_{arch}.zip" \
-        --post-install 'ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
+        --post-install '${SUDO} ln -sfn "${BINARY_NAME}" "${INSTALL_PATH}/kubectl-oidc_login"'
 }
 software-420-qwen@dev@agents() {
     npm_update @qwen-code/qwen-code --force --allow-scripts=@qwen-code/audio-capture || return 1
@@ -2657,9 +2677,23 @@ software-445-ollama@agents() {
         echo -e "NAME\tCURRENT\tUPDATE\nollama\t${installed_version}\t${version}" | column -t -s $'\t'
         return 0
     fi
+    # the install script also resets /usr/local/bin to root:root 755
+    # ("install -o0 -g0 -m755 -d"), which undoes setup-dirs, so its owner and
+    # mode are restored afterwards, also when the script fails
+    local bin_dir="/usr/local/bin"
+    local bin_dir_owner
+    local bin_dir_mode
+    local rc=0
+    bin_dir_owner="$(stat -c '%u:%g' "${bin_dir}")" || return 1
+    bin_dir_mode="$(stat -c '%a' "${bin_dir}")" || return 1
     # the install script sets up /usr/local and the ollama systemd service, so it runs as root
     verbose "curl -fsSL https://ollama.com/install.sh | ${SUDO} sh"
-    curl -fsSL "https://ollama.com/install.sh" | ${SUDO} sh
+    curl -fsSL "https://ollama.com/install.sh" | ${SUDO} sh || rc=1
+    verbose "chown ${bin_dir_owner} ${bin_dir}"
+    ${SUDO} chown "${bin_dir_owner}" "${bin_dir}" || rc=1
+    verbose "chmod ${bin_dir_mode} ${bin_dir}"
+    ${SUDO} chmod "${bin_dir_mode}" "${bin_dir}" || rc=1
+    return ${rc}
 }
 
 software-450-aws@dev() {
@@ -2908,9 +2942,9 @@ software-584-pip-tools@base() {
     config_update streamdown "${CURRENT_USER_HOME}/.config/streamdown"
 }
 software-585-pip-dev-tools@dev() {
-    # mkdocs-drawio-file pins lxml<5, which is built from source
-    apt_upgrade libxml2-dev libxslt1-dev python3-dev || return 1
-    pip_update pip-dev-tools snakeviz mkdocs-drawio-file mkdocs-git-authors-plugin mkdocs-git-revision-date-localized-plugin
+    # mkdocs-drawio replaces the unmaintained mkdocs-drawio-file, whose lxml<5 pin
+    # no longer builds on Python 3.14
+    pip_update pip-dev-tools snakeviz mkdocs-drawio mkdocs-git-authors-plugin mkdocs-git-revision-date-localized-plugin
 }
 software-586-nbcli@mw() { pip_update nbcli nbcli; }
 

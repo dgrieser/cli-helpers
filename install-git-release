@@ -48,7 +48,8 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
                             contents (the downloaded file's directory for a
                             plain binary). May be given multiple times.
                             Env: INSTALL_PATH, BINARY_NAME, BINARY_PATH,
-                            ARTIFACT, UNPACK_DIR
+                            ARTIFACT, UNPACK_DIR, SUDO ("sudo" when
+                            INSTALL_PATH is not writable, else empty)
 
         -y, --yes           Answer yes to all prompts
 
@@ -1369,6 +1370,10 @@ function run_post_install() {
 
     local binary_path=""
     [ -n "${BINARY}" ] && binary_path="${INSTALL_PATH}/${BINARY}"
+    # commands that write next to the install path (symlinks, man pages) need
+    # the same privileges as the install itself
+    local sudo
+    sudo="$(sudo_for_path "${INSTALL_PATH}")"
 
     local rc=0
     local cmd
@@ -1389,6 +1394,7 @@ function run_post_install() {
             BINARY_PATH="${binary_path}" \
             ARTIFACT="${artifact}" \
             UNPACK_DIR="${work_dir}" \
+            SUDO="${sudo}" \
             bash -c "${cmd}" 1>&2
         ); then
             error "Post-install command failed: ${cmd}"

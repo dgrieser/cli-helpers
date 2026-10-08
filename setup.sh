@@ -430,6 +430,21 @@ install_dotfiles() {
     fi
     info "Dotfiles: restore missing SSH keys and shell histories"
     run make -s -C "${dir}" install || failed+=("make -C ${dir} install")
+    export_dotfile_secrets
+}
+
+# this shell started before the dotfiles, so it lacks the keys and tokens their
+# .bashrc exports (e.g. MITTWALD_AI_API_KEY, which the git-commit-ai installer of
+# the updater reads); the ones the keyring holds are exported here for this run
+export_dotfile_secrets() {
+    local block="${HOME}/workspace/dgrieser/bash_aliases.d/home/blocks/.bashrc"
+    local var name value
+    [ -f "${block}" ] || return 0
+    while read -r var name; do
+        [ -n "${!var:-}" ] && continue
+        value="$(secret-tool lookup type dotfile-secret name "${name}" 2>/dev/null)"
+        [ -n "${value}" ] && export "${var}=${value}"
+    done < <(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)="@@SECRET?\{0,1\}:\([A-Za-z0-9_]*\)@@"$/\1 \2/p' "${block}")
 }
 
 # the reminders of the reminder tool from reminder/ of the backup, with the

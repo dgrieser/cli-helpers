@@ -1486,7 +1486,7 @@ Downloads a release artifact from a GitHub or GitLab project (resolving reposito
 | `-i, --install-path PATH` | Path to install the binary (default: `/usr/local/bin`). |
 | `--bundle` | Install the archive as a bundled app rather than a single binary. |
 | `--bundle-path PATH` | Path to install bundled app contents (default: `/usr/local/share`). |
-| `-c, --post-install CMD` | Command to run after a successful install (in the unpacked dir); repeatable. Receives env vars `INSTALL_PATH`, `BINARY_NAME`, `BINARY_PATH`, `ARTIFACT`, `UNPACK_DIR`. |
+| `-c, --post-install CMD` | Command to run after a successful install (in the unpacked dir); repeatable. Receives env vars `INSTALL_PATH`, `BINARY_NAME`, `BINARY_PATH`, `ARTIFACT`, `UNPACK_DIR`, and `SUDO` (`sudo` when `INSTALL_PATH` is not writable, else empty). |
 | `-y, --yes` | Answer yes to all prompts (non-interactive). |
 | `-d, --dry-run` | Trial run: download and inspect but make no changes. |
 | `--bash-completion` | Output shell-completion candidates; release tags are offered when `PROJECT` is an explicit repository. |
