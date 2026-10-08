@@ -2458,6 +2458,7 @@ Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, c
 | `ssh-config-restore [FILE]` | Write the stored SSH client config to `FILE` (default: `~/.ssh/config`). |
 | `-n, --dry-run` | `merge`, `import`: show what would be copied, without writing. |
 | `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `ssh-config-store`, `nm-store`: replace a stored SSH key, SSH config or connection with the same name. `ssh-restore`, `ssh-config-restore`, `nm-restore`: replace existing files and connections. |
+| `-m, --match KEY=VALUE` | `merge`, `import`: copy only the items with the attribute `KEY` set to `VALUE`; repeat to require several attributes. E.g. `application=chrome` for the key of Chrome (`Chrome Safe Storage`), which encrypts its saved passwords and cookies. |
 | `-k, --keyring KEYRING` | `ssh-store`, `ssh-config-store`: store into `KEYRING` instead of the default keyring. |
 | `-h, --help` | Show the usage message. |
 
@@ -2469,6 +2470,7 @@ keyring-cli merge --dry-run old-login login
 keyring-cli merge old-login default
 keyring-cli import --dry-run /media/backup/keyrings/login.keyring
 keyring-cli import /media/backup/keyrings/login.keyring
+keyring-cli import --match application=chrome /media/backup/keyrings/login.keyring
 keyring-cli nm-store Mittwald
 keyring-cli nm-restore Mittwald
 keyring-cli ssh-store ~/.ssh/id_ed25519

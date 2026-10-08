@@ -21,10 +21,13 @@ Commands:
                         and attributes. A TARGET item with the same attributes
                         as a SOURCE item is the same entry: it is kept unless
                         --overwrite is given. SOURCE is not changed.
+                        With --match only the matching items are copied.
   import FILE [TARGET]  Copy all items of the gnome-keyring file FILE (e.g. a
                         backup of ~/.local/share/keyrings/login.keyring) into
                         the keyring TARGET (default: default), like merge;
-                        asks for the password of FILE
+                        asks for the password of FILE. E.g. only the key of
+                        Chrome for its passwords and cookies:
+                        import --match application=chrome login.keyring
   nm-store NAME         Store the NetworkManager connection NAME (e.g. a wifi
                         or VPN) with its secrets and its certificate and key
                         files; reads the profile with sudo
@@ -64,6 +67,8 @@ Options:
                         SSH key, SSH config or connection with the same name
                         ssh-restore, ssh-config-restore, nm-restore: Replace
                         existing files and connections
+  -m, --match KEY=VALUE merge, import: Copy only the items with the attribute
+                        KEY set to VALUE; repeat to require several attributes
   -k, --keyring KEYRING ssh-store: Store into KEYRING (default: the default
                         keyring)
   -h, --help            Show this help message and exit
@@ -313,6 +318,8 @@ merge_item() {
         return 1
     fi
     attributes_json="$(attributes_key "${item}")"
+    jq -e --argjson match "${match_json}" '. as $attributes | $match | to_entries | all(.value == $attributes[.key])' \
+        <<< "${attributes_json}" > /dev/null || return 0
     # items without label show their attributes
     [ -z "${label}" ] && label="${attributes_json}"
 
@@ -363,7 +370,8 @@ merge_item() {
     copied=$(( copied + 1 ))
 }
 
-# import_keyring FILE TARGET: copy all items of the gnome-keyring file FILE
+# import_keyring FILE TARGET DRY_RUN OVERWRITE MATCH: copy the items matching
+# MATCH (JSON object of attributes) of the gnome-keyring file FILE
 # (e.g. a backup of ~/.local/share/keyrings/login.keyring) into the keyring
 # TARGET (object path). A running gnome-keyring does not reliably load a file
 # copied into its folder, so the file is decrypted here with its password: the
@@ -396,6 +404,7 @@ SCHEMAS = {
 SECRETS = "org.freedesktop.secrets"
 
 path, target, dry_run, overwrite = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4] == "1"
+match = json.loads(sys.argv[5])
 
 def fail(message):
     print(f"ERROR: {message}", file=sys.stderr)
@@ -504,6 +513,7 @@ def key(attributes):
     return json.dumps(attributes, sort_keys=True, separators=(",", ":"))
 
 name, items = read_keyring()
+items = [item for item in items if all(item[1].get(k) == v for k, v in match.items())]
 print(f"Importing {len(items)} items of keyring {name} ({path})", file=sys.stderr)
 
 service = Secret.Service.get_sync(Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS, None)
@@ -812,12 +822,13 @@ ssh_restore_key() {
 dry_run=0
 overwrite=0
 keyring=""
+matches=()
 command=""
 arguments=()
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "list create merge import ssh-store ssh-list ssh-load ssh-restore ssh-config-store ssh-config-restore nm-store nm-list nm-restore -n --dry-run -o --overwrite -k --keyring -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
+            echo "list create merge import ssh-store ssh-list ssh-load ssh-restore ssh-config-store ssh-config-restore nm-store nm-list nm-restore -n --dry-run -o --overwrite -m --match -k --keyring -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
             exit 0
             ;;
         -h|--help)
@@ -828,6 +839,11 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -o|--overwrite)
             overwrite=1
+            ;;
+        -m|--match)
+            [[ "${2}" == ?*=* ]] || fail "${1} needs KEY=VALUE"
+            matches+=( "${2}" )
+            shift
             ;;
         -k|--keyring)
             [ "${#}" -lt 2 ] && fail "${1} needs a KEYRING"
@@ -873,6 +889,12 @@ case "${command}" in
         fi
         ;;
 esac
+if [ "${command}" != "merge" ] && [ "${command}" != "import" ] && [ "${#matches[@]}" -gt 0 ]; then
+    error "--match only applies to merge and import"
+    usage
+fi
+# the attributes of --match as JSON object, split at the first =
+match_json="$(jq -cn '[$ARGS.positional[] | {(.[:index("=")]): .[index("=") + 1:]}] | add // {}' --args "${matches[@]}")"
 if [ "${command}" != "ssh-store" ] && [ "${command}" != "ssh-config-store" ] && [ -n "${keyring}" ]; then
     error "--keyring only applies to ssh-store and ssh-config-store"
     usage
@@ -926,7 +948,7 @@ esac
 if [ "${command}" = "import" ]; then
     target_name="${arguments[1]:-default}"
     target="$(resolve_collection "${target_name}")" || fail "keyring not found: ${target_name}"
-    import_keyring "${arguments[0]}" "${target}" "${dry_run}" "${overwrite}"
+    import_keyring "${arguments[0]}" "${target}" "${dry_run}" "${overwrite}" "${match_json}"
     exit
 fi
 
