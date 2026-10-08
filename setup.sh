@@ -1,10 +1,12 @@
 #!/bin/bash
-# Sets up a new machine from this repo: the keyring from a backup with its SSH
+# Sets up a new machine from this repo, restoring from a backup of setup-backup
+# that it asks for once: the keyring with its SSH
 # keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN,
 # the base software, gh and glab with their logins, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
-# of reminder from a backup, the categories of updater
-# the user picks, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
+# of reminder, the lists of ~/.kube/mittwald and the sessions and histories of
+# Claude Code, Codex and opencode from a backup, the categories of updater
+# the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
 # NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
 
@@ -115,15 +117,77 @@ bootstrap() {
         || fail "Failed to install ${packages[*]}"
 }
 
-# the keyring of the old machine: a backup of its keyring files is imported into
+# the backup of setup-backup, asked for once: the ones on the attached drives
+# and media (setup-backup --find), or any other folder; every restore step
+# finds its part in it by the layout of setup-backup and skips a missing one
+choose_backup() {
+    local other="(another folder)" none="(no backup)" dir choice found
+    local -a items=()
+    info "Backup: restore from a backup of the old machine (setup-backup there)"
+    while IFS= read -r dir; do
+        items+=("${dir}"$'\t'"${dir}")
+    done < <("${REPO_DIR}/setup-backup" --find)
+    items+=("${other}"$'\t'"${other}" "${none}"$'\t'"${none}")
+    [ "${#items[@]}" -eq 2 ] && echo "No backups on the attached drives and media" 1>&2
+    choice="$(prompt_run prompt-select --delimiter $'\t' -p "Backup to restore from:" "${items[@]}")"
+    [ -z "${choice}" ] || [ "${choice}" = "${none}" ] && return 0
+    if [ "${choice}" = "${other}" ]; then
+        choice="$(prompt_run prompt-folder "Backup folder (setup-backup-<host>-<date>):")"
+        choice="${choice/#\~/${HOME}}"
+        [ -z "${choice}" ] && return 0
+    fi
+    choice="${choice%/}"
+    if [ ! -d "${choice}" ]; then
+        warning "No such folder: ${choice}, restoring nothing"
+        failed+=("backup ${choice}")
+        return 0
+    fi
+    found=0
+    for dir in keyrings reminder history Keys bin kube-mittwald agents; do
+        [ -d "${choice}/${dir}" ] && found=1
+    done
+    if [ "${found}" -eq 0 ]; then
+        warning "${choice} is no backup of setup-backup, restoring nothing"
+        failed+=("backup ${choice}")
+        return 0
+    fi
+    BACKUP_DIR="${choice}"
+    echo "Restoring from ${BACKUP_DIR}" 1>&2
+}
+
+# restore_part PART TARGET: the files of PART of the backup into the folder
+# TARGET, with their subfolders; a file that is there already is kept
+restore_part() {
+    local src="${BACKUP_DIR}/${1}" dst="${2}" file rel count=0 kept=0
+    while IFS= read -r -d '' file; do
+        rel="${file#"${src}/"}"
+        if [ -e "${dst}/${rel}" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        mkdir -p "$(dirname "${dst}/${rel}")" && cp -P -p "${file}" "${dst}/${rel}" \
+            && count=$((count + 1)) || failed+=("restore ${1}/${rel}")
+    done < <(find "${src}" \( -type f -o -type l \) -print0)
+    echo "${1}: restored ${count} files to ${dst}$([ "${kept}" -gt 0 ] && echo ", kept ${kept} that were there")" 1>&2
+}
+
+# has_part PART: whether the backup has PART; says so when not
+has_part() {
+    [ -z "${BACKUP_DIR}" ] && return 1
+    [ -d "${BACKUP_DIR}/${1}" ] && return 0
+    echo "No ${1}/ in the backup" 1>&2
+    return 1
+}
+
+# the keyring of the old machine: the keyring files of the backup are imported into
 # the login keyring, early, so the logins and tokens in it are there for the
 # later steps; then the SSH keys and network connections (e.g. the Mittwald
 # wifi and VPN) stored in the keyring with keyring-cli are restored
 setup_keyring() {
     local keyring_cli="${REPO_DIR}/keyring-cli"
-    local packages=() package path file name type
-    local -a files names
-    info "Keyring: import a backup of the old keyring files (~/.local/share/keyrings/*.keyring), then restore the SSH keys, the SSH config and the network connections stored in the keyring"
+    local packages=() package file name type
+    local -a files=() names
+    info "Keyring: import the old keyring files of the backup (keyrings/), then restore the SSH keys, the SSH config and the network connections stored in the keyring"
     if ! busctl --user status org.freedesktop.secrets > /dev/null 2>&1; then
         warning "No keyring service running, skipping the keyring"
         failed+=("keyring")
@@ -139,17 +203,9 @@ setup_keyring() {
         fi
     fi
 
-    if ask "Import a keyring backup?"; then
-        path="$(prompt_run prompt-file "Keyring file or folder:")"
-        path="${path/#\~/${HOME}}"
-        if [ -d "${path}" ]; then
-            mapfile -t files < <(find "${path}" -maxdepth 1 -type f -name '*.keyring' | sort)
-            [ "${#files[@]}" -eq 0 ] && warning "No *.keyring files in ${path}"
-        elif [ -n "${path}" ]; then
-            files=("${path}")
-        fi
-        # the folder of setup-backup around keyrings/, offered for its other parts
-        [ -n "${path}" ] && BACKUP_DIR="$(dirname "$([ -d "${path}" ] && echo "${path%/}" || dirname "${path}")")"
+    if [ -n "${BACKUP_DIR}" ]; then
+        mapfile -t files < <(find "${BACKUP_DIR}/keyrings" -maxdepth 1 -type f -name '*.keyring' 2>/dev/null | sort)
+        [ "${#files[@]}" -eq 0 ] && echo "No keyring files in the backup" 1>&2
         for file in "${files[@]}"; do
             run "${keyring_cli}" import "${file}" || failed+=("keyring-cli import ${file}")
         done
@@ -251,31 +307,11 @@ login_github() {
     echo "Logged in to github.com" 1>&2
 }
 
-# the own scripts of ~/bin from the bin folder of setup-backup, before the VPN:
-# gen dials it; a file in ~/bin already is kept
+# the own scripts of ~/bin from bin/ of the backup, before the VPN: gen dials it
 restore_bin() {
-    local dir="${HOME}/bin"
-    local path file name count=0
-    info "~/bin: restore your own scripts from a backup (bin/ of setup-backup), gen among them dials the VPN"
-    ask "Import a backup of ~/bin?" || return 0
-    path="$(prompt_run prompt-folder --prefill "${BACKUP_DIR:+${BACKUP_DIR}/bin/}" "Backup of ~/bin:")"
-    path="${path/#\~/${HOME}}"
-    [ -z "${path}" ] && return 0
-    if [ ! -d "${path}" ]; then
-        warning "No such folder: ${path}"
-        failed+=("~/bin ${path}")
-        return 0
-    fi
-    mkdir -p "${dir}" || { failed+=("~/bin ${path}"); return 0; }
-    while IFS= read -r -d '' file; do
-        name="$(basename "${file}")"
-        if [ -e "${dir}/${name}" ]; then
-            echo "Kept ${dir}/${name}" 1>&2
-            continue
-        fi
-        cp -p "${file}" "${dir}/${name}" && count=$((count + 1)) || failed+=("~/bin ${name}")
-    done < <(find "${path}" -mindepth 1 -maxdepth 1 -type f -print0)
-    echo "Restored ${count} files to ${dir}" 1>&2
+    has_part bin || return 0
+    info "~/bin: restore your own scripts from the backup, gen among them dials the VPN"
+    restore_part bin "${HOME}/bin"
 }
 
 # the VPN of Mittwald, fully set up before the glab login to gitlab.mittwald.it:
@@ -354,9 +390,26 @@ install_gh_glab() {
     command -v glab > /dev/null 2>&1 && login_gitlab "${MITTWALD_GITLAB}"
 }
 
+# the Keys folder of the documents folder and the shell histories from Keys/
+# and history/ of the backup, before the dotfiles: install-home of
+# bash_aliases.d then links the SSH keys from there and asks for nothing
+restore_keys_history() {
+    local keys_dir
+    if has_part Keys; then
+        keys_dir="$(xdg-user-dir DOCUMENTS 2>/dev/null || echo "${HOME}/Documents")/Keys"
+        info "Keys: restore the Keys folder of the documents folder from the backup"
+        restore_part Keys "${keys_dir}"
+    fi
+    if has_part history; then
+        info "Shell histories: restore them from the backup"
+        restore_part history "${HOME}"
+    fi
+}
+
 # the dotfiles of bash_aliases.d once more, now with a terminal: updater installed
 # them without one, so it skipped the questions for a missing SSH key in the
-# documents folder and for the backups of the shell histories
+# documents folder and for the backups of the shell histories (the ones the
+# backup did not have)
 install_dotfiles() {
     local dir="${HOME}/workspace/dgrieser/bash_aliases.d"
     if [ ! -f "${dir}/Makefile" ]; then
@@ -368,56 +421,78 @@ install_dotfiles() {
     run make -s -C "${dir}" install || failed+=("make -C ${dir} install")
 }
 
-# the reminders of the reminder tool from a backup: a copy of ~/.cache/reminder
-# as a folder, or that folder in a .tar.gz, .tgz or .zip; a reminder that is
-# here already is kept, and so is the display order
+# the reminders of the reminder tool from reminder/ of the backup, with the
+# done ones and their display order
 restore_reminders() {
-    local dir="${HOME}/.cache/reminder"
-    local path src tmp file name
-    info "Reminders: restore a backup of ${dir} (the *.md reminders, the done ones and their order)"
-    ask "Import a backup of the reminders?" || return 0
-    path="$(prompt_run prompt-file "Reminder folder or archive:")"
-    path="${path/#\~/${HOME}}"
-    [ -z "${path}" ] && return 0
+    has_part reminder || return 0
+    info "Reminders: restore them from the backup"
+    restore_part reminder "${HOME}/.cache/reminder"
+}
 
-    if [ -d "${path}" ]; then
-        src="${path}"
-    elif [ -f "${path}" ]; then
-        tmp="$(mktemp -d)" || { failed+=("reminders ${path}"); return 0; }
-        case "${path}" in
-            *.tar.gz|*.tgz) tar -xzf "${path}" -C "${tmp}" ;;
-            *.zip)          command -v unzip > /dev/null 2>&1 || run sudo apt-get install -y unzip
-                            unzip -q "${path}" -d "${tmp}" ;;
-            *)              warning "Not a folder, .tar.gz, .tgz or .zip: ${path}"; false ;;
-        esac || { rm -rf "${tmp}"; failed+=("reminders ${path}"); return 0; }
-        # the archive may hold the folder itself or only what is in it
-        src="$(find "${tmp}" \( -name '*.md' -o -name '*.md_*' -o -name .order \) -type f \
-            -printf '%h\n' | sort | head -n 1)"
-    else
-        warning "No such file or folder: ${path}"
-        failed+=("reminders ${path}")
-        return 0
-    fi
+# the lists of ~/.kube/mittwald that the kubectl-helpers read (the evil-eye
+# namespaces of k-ctx among them) from kube-mittwald/ of the backup
+restore_kube_mittwald() {
+    has_part kube-mittwald || return 0
+    info "~/.kube/mittwald: restore the lists the kubectl-helpers read from the backup"
+    restore_part kube-mittwald "${HOME}/.kube/mittwald"
+}
 
-    if [ -z "${src}" ] || ! compgen -G "${src}/*.md*" > /dev/null; then
-        warning "No reminders in ${path}"
-        failed+=("reminders ${path}")
-    else
-        mkdir -p "${dir}"
-        for file in "${src}"/*.md "${src}"/*.md_* "${src}/.order"; do
-            [ -f "${file}" ] || continue
-            name="$(basename "${file}")"
-            if [ -e "${dir}/${name}" ]; then
-                echo "Kept ${dir}/${name}" 1>&2
-                continue
+# the sessions, histories, memories and settings of Claude Code, Codex and
+# opencode from agents/ of the backup, one NAME.tar.gz each; before updater
+# installs them, so it merges the shipped settings into the restored ones; a
+# file that is here already is kept; the logins are not in the backup,
+# login_agents asks for them
+restore_agents() {
+    local archive count=0
+    has_part agents || return 0
+    info "Agents: restore the sessions, histories, memories and settings of Claude Code, Codex and opencode from the backup"
+    for archive in "${BACKUP_DIR}/agents"/*.tar.gz; do
+        [ -f "${archive}" ] || continue
+        echo "Restoring $(basename "${archive}" .tar.gz)" 1>&2
+        if tar -xzf "${archive}" -C "${HOME}" --skip-old-files; then
+            count=$((count + 1))
+        else
+            failed+=("agents $(basename "${archive}")")
+        fi
+    done
+    echo "agents: restored ${count} to ${HOME}" 1>&2
+}
+
+# agent_cmd NAME: the installed command, also when the PATH of this shell does
+# not have it yet: claude lives in ~/.local/bin, codex in the bin of nvm's node
+agent_cmd() {
+    local cmd
+    cmd="$(command -v "${1}" 2>/dev/null)" && { echo "${cmd}"; return 0; }
+    for cmd in "${HOME}/.local/bin/${1}" "${HOME}"/.nvm/versions/node/*/bin/"${1}"; do
+        [ -x "${cmd}" ] && { echo "${cmd}"; return 0; }
+    done
+    return 1
+}
+
+# the logins of Claude Code and Codex, which setup-backup leaves out of the
+# backup; one that is logged in already is not asked for
+login_agents() {
+    local claude codex
+    if claude="$(agent_cmd claude)"; then
+        if "${claude}" auth status --json 2>/dev/null | grep -q '"loggedIn": *true'; then
+            echo "Claude Code is logged in" 1>&2
+        else
+            info "Claude Code: log in to your Anthropic account"
+            if ask "Log in to Claude Code (claude auth login)?"; then
+                run "${claude}" auth login || failed+=("claude auth login")
             fi
-            # the reminders without an order are listed by their modification time
-            cp -p "${file}" "${dir}/${name}" || failed+=("reminders ${name}")
-        done
-        echo "Restored the reminders to ${dir}" 1>&2
+        fi
     fi
-    [ -n "${tmp}" ] && rm -rf "${tmp}"
-    return 0
+    if codex="$(agent_cmd codex)"; then
+        if "${codex}" login status > /dev/null 2>&1; then
+            echo "Codex is logged in" 1>&2
+        else
+            info "Codex: log in with ChatGPT or an API key"
+            if ask "Log in to Codex (codex login)?"; then
+                run "${codex}" login || failed+=("codex login")
+            fi
+        fi
+    fi
 }
 
 check_categories() {
@@ -566,6 +641,7 @@ MAKE_SUDO=""
 BACKUP_DIR=""
 info "Setting up this machine from ${REPO_DIR}"
 bootstrap
+choose_backup
 setup_keyring
 setup_dirs
 install_cli_helpers
@@ -577,8 +653,11 @@ install_gh_glab
 info "Installing base"
 # firmware updates are not part of setting up the software
 run_updater base --exclude firmware
+restore_keys_history
 install_dotfiles
 restore_reminders
+restore_kube_mittwald
+restore_agents
 
 check_categories
 select_categories
@@ -586,6 +665,7 @@ if [ "${#selected[@]}" -gt 0 ]; then
     info "Installing ${selected[*]}"
     run_updater "${selected[@]}"
 fi
+login_agents
 
 hash -r
 setup_k_ctx_shell

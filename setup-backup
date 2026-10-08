@@ -1,8 +1,10 @@
 #!/bin/bash
-# Backs up on the old machine every file setup.sh asks for on the new one: the
+# Backs up on the old machine every file setup.sh restores on the new one: the
 # keyring files, the reminders, the shell histories, the Keys folder of the
-# documents folder with the SSH keys the SSH config names and the private
-# scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out).
+# documents folder with the SSH keys the SSH config names, the private
+# scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
+# the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read and the
+# sessions, histories, memories and settings of Claude Code, Codex and opencode.
 # Before the keyring files are copied it offers to store the current SSH config in the keyring, so setup.sh
 # restores that one and not an older copy.
 
@@ -21,30 +23,56 @@ HOME_BIN="${HOME}/bin"
 # the VPN with gen before the glab login, and .power runs ssh with the password
 # that .in reads and .out closes
 HOME_BIN_FILES=(gen .power .in .out)
+# the lists the kubectl-helpers read, e.g. the evil-eye namespaces of k-ctx
+KUBE_MITTWALD_DIR="${HOME}/.kube/mittwald"
+# the coding agents, each into agents/NAME.tar.gz of what is under ~: the
+# sessions, histories, memories, settings, skills and plugins; left out are the
+# logins (setup.sh asks to log in again), the installed programs, caches, logs
+# and what only lives as long as a running session (locks, shell snapshots)
+AGENTS=(claude codex opencode)
+AGENT_PATHS_claude=(.claude .claude.json)
+AGENT_EXCLUDES_claude=(.claude/.credentials.json .claude/cache .claude/telemetry
+    .claude/shell-snapshots .claude/session-env .claude/sessions
+    .claude/.last-cleanup .claude/.last-update-result.json
+    '.claude/policy-limits.json*' .claude/remote-settings.json)
+AGENT_PATHS_codex=(.codex)
+AGENT_EXCLUDES_codex=(.codex/auth.json .codex/installation_id .codex/packages
+    .codex/.tmp .codex/tmp .codex/cache .codex/models_cache.json .codex/version.json
+    '.codex/logs_*.sqlite*' .codex/app-server-control .codex/app-server-daemon
+    .codex/thread-writer-locks .codex/shell_snapshots .codex/.sqlite-maintenance.lock)
+AGENT_PATHS_opencode=(.config/opencode .local/share/opencode)
+AGENT_EXCLUDES_opencode=(.config/opencode/node_modules .local/share/opencode/auth.json
+    .local/share/opencode/log)
 
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} [-h] [FOLDER]
+usage: ${APP_NAME} [-h] [--find] [FOLDER]
 
-Back up every file setup.sh asks for on a new machine into a new folder
-setup-backup-<host>-<date> in FOLDER (asked for when not given):
+Back up every file setup.sh restores on a new machine into a new folder
+setup-backup-<host>-<date> in FOLDER. Without FOLDER it offers the attached
+drives and media (mounted under /media/\$USER, /run/media/\$USER or /mnt),
+or asks for a folder when there are none. setup.sh asks once for that folder
+and finds every part in it by this layout:
 
-  keyrings/     the keyring files of ${KEYRING_DIR}, with the SSH keys,
-                the SSH config and the network connections stored in them
-                (setup.sh: "Keyring file or folder")
+  keyrings/     the keyring files of ${KEYRING_DIR} (with several, the
+                ones checked in a list), with the SSH keys, the SSH config and
+                the network connections stored in them
   reminder/     the reminders of ${REMINDER_DIR}
-                (setup.sh: "Reminder folder or archive")
   history/      ${HISTORY_FILES[*]}
-                (setup.sh, dotfiles: "Path of a backup of ~/...")
   Keys/         the Keys folder of the documents folder, plus the SSH keys
                 ~/.ssh/config names that are in neither it nor the keyring
-                (setup.sh, dotfiles: copy them to Documents/Keys)
   bin/          ${HOME_BIN_FILES[*]} of ${HOME_BIN}
-                (setup.sh: "Backup of ~/bin")
+  kube-mittwald/
+                the lists of ${KUBE_MITTWALD_DIR}
+  agents/       ${AGENTS[*]}: their sessions, histories, memories and
+                settings, one NAME.tar.gz each, without the logins
 
-The backup holds private keys and the keyring files: keep it somewhere safe.
+The backup holds private keys, the keyring files and the agent sessions: keep it
+somewhere safe.
 
 Options:
+  -f, --find    List the backups on the attached drives and media, newest
+                first, and exit (setup.sh offers them)
   -h, --help    Show this help message and exit
 EOF
     exit 1
@@ -91,19 +119,43 @@ store_ssh_config() {
     "${BIN_DIR}/keyring-cli" ssh-config-store --overwrite "${SSH_CONFIG}" || failed+=("keyring-cli ssh-config-store")
 }
 
-backup_keyrings() {
-    local target="${1}/keyrings" files=()
+# the keyring files to back up into keyring_files: with several and a
+# terminal, the ones checked in a list, which starts with the default keyring
+# (login unless the default file names another) checked; without a terminal
+# all of them
+choose_keyrings() {
+    local default file chosen status
+    local -a files items=() checked=()
     mapfile -t files < <(find "${KEYRING_DIR}" -maxdepth 1 -type f -name '*.keyring' 2>/dev/null | sort)
-    if [ "${#files[@]}" -eq 0 ]; then
-        warning "No keyring files in ${KEYRING_DIR}"
+    keyring_files=("${files[@]}")
+    [ "${#files[@]}" -le 1 ] || [ ! -t 0 ] && return 0
+    default="$(cat "${KEYRING_DIR}/default" 2>/dev/null)"
+    default="${KEYRING_DIR}/${default:-login}.keyring"
+    [ -f "${default}" ] && checked=(--checked "${default}")
+    for file in "${files[@]}"; do
+        items+=("${file}"$'\t'"$(basename "${file}") ($(du -h "${file}" | cut -f 1), changed $(date -r "${file}" +%Y-%m-%d))")
+    done
+    chosen="$("${BIN_DIR}/prompt-multiselect" --delimiter $'\t' -p "Keyrings to back up:" \
+        "${checked[@]}" "${items[@]}")"
+    status="${?}"
+    [ "${status}" -eq 130 ] && { echo 1>&2; fail "Aborted"; }
+    keyring_files=()
+    [ "${status}" -eq 0 ] && [ -n "${chosen}" ] && mapfile -t keyring_files <<< "${chosen%$'\n'}"
+    return 0
+}
+
+backup_keyrings() {
+    local target="${1}/keyrings"
+    if [ "${#keyring_files[@]}" -eq 0 ]; then
+        warning "No keyring files backed up"
         failed+=("keyrings")
         return 0
     fi
-    if ! { mkdir -p "${target}" && cp -p "${files[@]}" "${target}/"; }; then
+    if ! { mkdir -p "${target}" && cp -p "${keyring_files[@]}" "${target}/"; }; then
         failed+=("keyrings")
         return 0
     fi
-    echo "keyrings: ${#files[@]} files" 1>&2
+    echo "keyrings: $(basename -a "${keyring_files[@]}" | paste -sd ' ')" 1>&2
 }
 
 backup_reminders() {
@@ -186,9 +238,89 @@ backup_bin() {
     echo "bin: ${#files[@]} files of ${HOME_BIN}" 1>&2
 }
 
+backup_kube_mittwald() {
+    local target="${1}/kube-mittwald" count
+    if ! compgen -G "${KUBE_MITTWALD_DIR}/*" > /dev/null; then
+        echo "kube-mittwald: none" 1>&2
+        return 0
+    fi
+    cp -a "${KUBE_MITTWALD_DIR}" "${target}" || { failed+=("kube-mittwald"); return 0; }
+    count="$(find "${target}" -type f | wc -l)"
+    echo "kube-mittwald: ${count} files of ${KUBE_MITTWALD_DIR}" 1>&2
+}
+
+backup_agents() {
+    local target="${1}/agents" name path status ref
+    local -a paths excludes
+    for name in "${AGENTS[@]}"; do
+        paths=()
+        ref="AGENT_PATHS_${name}[@]"
+        for path in "${!ref}"; do
+            [ -e "${HOME}/${path}" ] && paths+=("${path}")
+        done
+        if [ "${#paths[@]}" -eq 0 ]; then
+            echo "agents: no ${name}" 1>&2
+            continue
+        fi
+        excludes=()
+        ref="AGENT_EXCLUDES_${name}[@]"
+        for path in "${!ref}"; do
+            excludes+=("--exclude=${path}")
+        done
+        mkdir -p "${target}" || { failed+=("agents ${name}"); continue; }
+        # a running session keeps writing its files: tar says so with status 1,
+        # what it read is still a whole archive
+        tar -czf "${target}/${name}.tar.gz" -C "${HOME}" --anchored \
+            --warning=no-file-changed --warning=no-file-removed "${excludes[@]}" "${paths[@]}"
+        status="${?}"
+        if [ "${status}" -gt 1 ]; then
+            failed+=("agents ${name}")
+            continue
+        fi
+        echo "agents: ${name}.tar.gz ($(du -h "${target}/${name}.tar.gz" | cut -f 1)) of ${paths[*]}" 1>&2
+    done
+}
+
+# the mount points of the attached drives and media: where udisks mounts them
+# for the user (/media/USER on Debian and Ubuntu, /run/media/USER elsewhere)
+# and what is mounted under /mnt
+media_dirs() {
+    local user
+    user="$(id -un)"
+    findmnt -n -l -o TARGET | grep -E "^(/media/${user}|/run/media/${user}|/mnt)/" | sort -u
+}
+
+# the backups on the attached drives and media, at their top or one folder
+# down, newest first by the date in their name
+find_backups() {
+    local dir
+    while IFS= read -r dir; do
+        find "${dir}" -mindepth 1 -maxdepth 2 -type d -name 'setup-backup-*' 2>/dev/null
+    done < <(media_dirs) | awk '{ print substr($0, length($0) - 14) "\t" $0 }' | sort -r | cut -f 2-
+}
+
+# the folder to store the backup in: one of the attached drives and media, or
+# any other folder
+choose_folder() {
+    local other="(another folder)" dir choice status
+    local -a items=()
+    while IFS= read -r dir; do
+        items+=("${dir}"$'\t'"${dir} ($(df -h --output=avail "${dir}" | tail -n 1 | tr -d ' ') free)")
+    done < <(media_dirs)
+    if [ "${#items[@]}" -gt 0 ]; then
+        choice="$("${BIN_DIR}/prompt-select" --delimiter $'\t' -p "Folder to store the backup in:" \
+            "${items[@]}" "${other}"$'\t'"${other}")"
+        status="${?}"
+        [ "${status}" -ne 0 ] && return "${status}"
+        [ "${choice}" != "${other}" ] && { echo "${choice}"; return 0; }
+    fi
+    "${BIN_DIR}/prompt-folder" "Folder to store the backup in:"
+}
+
 folder=""
 while [ $# -gt 0 ]; do
     case "${1}" in
+        -f|--find) find_backups; exit 0 ;;
         -h|--help) usage ;;
         -*)        echo "ERROR: Unknown option ${1}" 1>&2; usage ;;
         *)         [ -n "${folder}" ] && usage; folder="${1}" ;;
@@ -198,13 +330,16 @@ done
 
 if [ -z "${folder}" ]; then
     [ -t 0 ] || fail "No FOLDER given and no terminal to ask for one"
-    folder="$("${BIN_DIR}/prompt-folder" "Folder to store the backup in:")"
+    folder="$(choose_folder)"
+    [ "${?}" -eq 130 ] && { echo 1>&2; fail "Aborted"; }
     [ -z "${folder}" ] && fail "No folder given"
 fi
 folder="${folder/#\~/${HOME}}"
 [ -d "${folder}" ] || fail "No such folder: ${folder}"
 
 [ -t 0 ] && store_ssh_config
+keyring_files=()
+choose_keyrings
 
 backup="${folder%/}/setup-backup-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
 umask 077
@@ -215,11 +350,13 @@ backup_reminders "${backup}"
 backup_histories "${backup}"
 backup_keys "${backup}"
 backup_bin "${backup}"
+backup_kube_mittwald "${backup}"
+backup_agents "${backup}"
 
 if [ "${#failed[@]}" -gt 0 ]; then
     info "Done, but these failed:"
     printf '  %s\n' "${failed[@]}" 1>&2
     exit 1
 fi
-info "Done, it holds private keys and the keyring files: keep it somewhere safe"
+info "Done, it holds private keys, the keyring files and the agent sessions: keep it somewhere safe"
 echo "${backup}"

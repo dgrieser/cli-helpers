@@ -13,24 +13,31 @@ Built for Linux, running on GNOME with either X11 or Wayland.
 ## Installation
 
 To set up a new machine, clone the repo and run `./setup.sh` from a terminal as your user. It installs what the
-`Makefile` needs, offers to import a backup of the old keyring files (`keyring-cli import`) and to restore the SSH
+`Makefile` needs and asks once for the backup to restore from: it lists the backups of `setup-backup` it finds on the
+attached drives and media (`setup-backup --find`), and you can also enter another folder or go without one. Every
+restore step then finds its part in that folder by the layout of `setup-backup` and skips a missing one; a file
+that is already on the machine is kept. It imports the old keyring files of the backup (`keyring-cli import`) and offers to restore the SSH
 keys, the SSH config and the network connections stored in the keyring (`keyring-cli ssh-restore`,
 `keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
 Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
-copies, offers to restore your own scripts of `~/bin` from the backup, sets up the Mittwald VPN (the OpenVPN plugin
+copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the OpenVPN plugin
 of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
 when the host is not reachable, with `~/bin/gen` if you like), installs the `base` software with `updater`,
-runs `make install` of bash_aliases.d once more with a terminal (it asks for missing SSH keys and history backups,
-which `updater` cannot), offers to import a backup of the reminders of `reminder`, and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+restores the `Keys` folder of the documents folder and the shell histories, runs `make install` of bash_aliases.d once more with a terminal (it asks for SSH keys and history backups
+the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the lists of `~/.kube/mittwald` that the kubectl-helpers read and the sessions, histories, memories and settings of Claude Code, Codex and opencode, and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
 With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx` (`k-ctx shell-init`, sourced by bash_aliases.d) and offers to set up `netbox-cli` (`NETBOX_URL`, and `NETBOX_TOKEN` stored in the keyring for the
 dotfiles) and to fetch a kubeconfig for every NetBox cluster that has none in `~/.kube` (`k-ctx add --yes`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
 
-Run `setup-backup` on the old machine first: it copies every file `setup.sh` asks for into a new folder
-`setup-backup-<host>-<date>` (the keyring files, the reminders, the shell histories and the `Keys` folder of the documents
-folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`), after offering to store the current SSH
+Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
+`setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents
+folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`, the lists of `~/.kube/mittwald` and one archive each of
+`~/.claude` with `~/.claude.json`, `~/.codex` and opencode's `~/.config/opencode` with `~/.local/share/opencode`, without
+their logins, caches and installed programs). Without a folder it offers the attached drives and media (mounted under
+`/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
 config in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
 
 The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
@@ -1796,9 +1803,11 @@ Pasting works as expected: a pasted `\r\n` counts as one line break rather than 
 | Home / `g`, End / `G` | Jump to the first / last entry. |
 | `1`…`9`, `0` | Jump to that entry (`0` is the tenth). |
 | Tab / Shift-Tab | On a `--cycle` row, show its next / previous item; elsewhere ignored. |
+| Space (with `--multi`) | Check / uncheck the highlighted entry. |
+| `a` (with `--multi`) | Check all entries, or uncheck all when all are checked. |
 | any character (with `--filter`) | Add it to the filter; the cursor stays on its row while that still matches. |
 | Backspace / Ctrl-W / Ctrl-U (with `--filter`) | Delete a character / a word / the whole filter. |
-| Enter | Select the highlighted entry and print it. |
+| Enter | Select the highlighted entry and print it; with `--multi`, print the checked entries, one per line (nothing when none is checked). |
 | Esc, `q` | Abort (exit 1). With `--filter`, Esc first clears the filter and `q` is filter text. |
 | Ctrl-C | Abort (exit 130). |
 
@@ -1837,6 +1846,7 @@ The script branches on its invoked name (`argv[0]`):
 | `prompt-multiline` | Multi-line input (until Ctrl-D), printing all lines; trailing args become the prompt text. |
 | `prompt-password` | Single-line masked secret entry (prompt `Password:`), printing the entered value. |
 | `prompt-select` | Implies `--select`; trailing args are the list items (not the prompt text, use `-p` for that). |
+| `prompt-multiselect` | Implies `--select --multi`; trailing args are the list items, the checked ones are printed one per line. |
 | `prompt-complete` | Implies `--complete`; trailing args are the completion candidates (not the prompt text, use `-p` for that). |
 | `prompt-file` | Implies `--complete --files` with prompt `Enter file:`, pre-filled with the current directory; trailing args become the prompt text. |
 | `prompt-folder` | Implies `--complete --dirs` with prompt `Enter directory:`, pre-filled with the current directory; trailing args become the prompt text. |
@@ -1854,6 +1864,7 @@ kubectl get pods | prompt-select -p "Pod:" --delimiter '' --header-lines 1
 id="$(docker ps | prompt-select -p "Container:" --key-regex '^\S+' --header-lines 1)"
 sha="$(git log --oneline -20 | prompt-select -p "Commit:" --delimiter-regex '\s+')"
 action="$(prompt-select --cycle 'review|approve|merge' "review=Approve + Merge" "approve=Approve" "merge=Merge" "diff=Diff")"
+mapfile -t hosts < <(prompt-multiselect --checked web-01 -p "Hosts:" web-01 web-02 db-01)
 branch="$(git branch --format '%(refname:short)' | prompt-complete -p "Branch:")"
 host="$(prompt-complete --ignore-case -p "Host:" web-01 web-02 db-01)"
 config="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
