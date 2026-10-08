@@ -2328,6 +2328,34 @@ disk-mount cleanup
 disk-mount list
 ```
 
+### `disk-backup`
+Backs up a mounted filesystem (an old system disk, a home partition, ...) into a read-only squashfs image that can be mounted later (`mount -o loop IMAGE DIR`), uncompressed by default. It skips data that can be regenerated: on a root filesystem swap, virtual filesystems, temp dirs, package caches and snap/flatpak data; in every home it finds (`home/*`, `root`, or SOURCE itself) `~/.cache`, the trash, package caches of go, npm, yarn, gradle, maven, cargo and conda, browser/electron app caches and `node_modules`, `__pycache__`, `.terraform`, `.pytest_cache` and `.mypy_cache`. The list of excluded paths and the `mksquashfs` log are written next to the image. Runs itself again with `sudo` when not root.
+
+Without SOURCE it is interactive, using [prompt](#prompt): it offers the mounted filesystems in a select menu (or any folder), asks for the folder and name of the image, the compression (none or one of the compressors `mksquashfs` supports), whether to use the default exclusions and for more paths to skip, skipping what the options already give; before building it shows a summary (source size, free space, number of excluded paths, the list on request) and asks to go on.
+
+**Usage:** `disk-backup [OPTIONS] [SOURCE]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SOURCE` | Mount point of the filesystem to back up; without it the tool asks. |
+| `-o, --output FILE` | Image to write (default: `OUTPUT_DIR/NAME-YYYY-MM-DD.sqfs`). |
+| `-d, --output-dir DIR` | Directory of the image (default: current directory). |
+| `-n, --name NAME` | Name of the image (default: last part of SOURCE, `root` for `/`). |
+| `-e, --exclude PATH` | Also skip PATH, relative to SOURCE, globs allowed (repeatable). |
+| `-E, --exclude-from FILE` | Also skip the paths listed in FILE, one per line. |
+| `-c, --compress ALGO` | Compress with ALGO, one of those of `mksquashfs` (`zstd`, `xz`, `gzip`, `lz4`, `lzo`, `lzma`) or `none` (default). |
+| `--no-default-excludes` | Skip only the paths given by `--exclude` and `--exclude-from`. |
+| `--dry-run` | Print the excluded paths and stop. |
+
+**Examples:**
+```bash
+disk-backup
+sudo disk-backup /mnt/old-disk -d ~/backups -n old-system
+sudo disk-backup /mnt/old-disk -e 'home/*/Downloads/*.iso' -e home/me/venv
+sudo disk-backup /mnt/data -c zstd -o /media/usb/data.sqfs
+disk-backup --dry-run /mnt/old-disk
+```
+
 ### `set-slack-profile`
 Sets your Slack status via a webhook, either automatically based on the current network connection (Wi-Fi SSID or Ethernet domain) or by a manual override, with optional time-limited persistence.
 

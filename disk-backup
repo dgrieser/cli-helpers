@@ -1,0 +1,416 @@
+#!/bin/bash
+# Backs up a mounted filesystem (an old system disk, a home partition, ...) into a
+# read-only, mountable squashfs image, skipping caches, trash and other data that
+# can be regenerated. Asks for what is not given when run without SOURCE. Runs
+# itself again with sudo, so every file can be read.
+
+APP_NAME="$(basename "${0}")"
+BIN_DIR="$(cd "$(dirname "$(realpath "${0}")")" && pwd)"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [SOURCE]
+
+Back up the filesystem mounted at SOURCE into a squashfs image, uncompressed by
+default, which can be mounted read-only later (mount -o loop IMAGE DIR). Runs itself
+again with sudo when not root.
+
+Without SOURCE it asks for the source (a menu of the mounted filesystems), the
+folder and name of the image, the compression, whether to use the default
+exclusions and for more paths to skip, as far as the options do not give them;
+before building it shows a summary and asks to go on.
+
+By default it skips:
+  - on a root filesystem: swap.img, virtual filesystems, temp dirs, package caches,
+    snap/flatpak data, global node_modules, pip packages in /usr/local
+  - in every home (home/*, root, a top-level dir or SOURCE itself with .config or
+    .cache): ~/.cache, the trash, package caches of go, npm, yarn, gradle, maven,
+    cargo and conda, editor caches, browser/electron app caches in ~/.config, ~/.var
+    and ~/snap, and node_modules, __pycache__, .terraform, .pytest_cache and
+    .mypy_cache anywhere below
+The list of excluded paths and the mksquashfs log are written next to the image.
+
+Options:
+  -o, --output FILE         Image to write (default: OUTPUT_DIR/NAME-YYYY-MM-DD.sqfs)
+  -d, --output-dir DIR      Directory of the image (default: current directory)
+  -n, --name NAME           Name of the image (default: last part of SOURCE, root for /)
+  -e, --exclude PATH        Also skip PATH, relative to SOURCE, globs allowed (repeatable)
+  -E, --exclude-from FILE   Also skip the paths listed in FILE, one per line
+  -c, --compress ALGO       Compress with ALGO, one of those of mksquashfs (zstd, xz,
+                            gzip, lz4, lzo, lzma) or none (default)
+  --no-default-excludes     Skip only the paths given by --exclude and --exclude-from
+  --dry-run                 Print the excluded paths and stop
+  -h, --help                Show this help message and exit
+
+Examples:
+  ${APP_NAME}
+  sudo ${APP_NAME} /mnt/old-disk -d ~/backups -n old-system
+  sudo ${APP_NAME} /mnt/old-disk -e 'home/*/Downloads/*.iso' -e home/me/venv
+  sudo ${APP_NAME} /mnt/data -c zstd -o /media/usb/data.sqfs
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+# exits after a cancelled prompt, keeping Ctrl-C's status
+cancelled() {
+    [ "${1}" -eq 130 ] && exit 130
+    abort
+}
+
+# ask_source: pick SOURCE from the mounted filesystems (without snaps, /boot and
+# pseudo filesystems), or any folder
+ask_source() {
+    local other="Other folder..." target fstype size used choice
+    local -a items=()
+    while read -r target fstype size used; do
+        target="$(printf '%b' "${target}")"
+        case "${fstype}" in squashfs|overlay|iso9660|tmpfs|fuse.*) continue ;; esac
+        case "${target}" in /boot|/boot/*|/snap/*|/var/snap/*) continue ;; esac
+        items+=("${target}"$'\t'"${target}  (${fstype}, ${used} of ${size} used)")
+    done < <(findmnt -rn --real -o TARGET,FSTYPE,SIZE,USED)
+    choice="$("${BIN_DIR}/prompt-select" --delimiter $'\t' -p "Filesystem to back up:" \
+        "${items[@]}" "${other}"$'\t'"${other}")" || cancelled "${?}"
+    if [ "${choice}" = "${other}" ]; then
+        choice="$("${BIN_DIR}/prompt-folder" "Folder to back up:")" || cancelled "${?}"
+    fi
+    echo "${choice}"
+}
+
+# compressors: print the compressors this mksquashfs supports, one per line
+compressors() {
+    mksquashfs -help-all 2>&1 | sed -n '/Compressors available:$/,/^-/{/Compressors available\|^-/d;p}' \
+        | awk '{print $1}'
+}
+
+# ask_compression: pick none or one of the compressors, with a hint on each
+ask_compression() {
+    local c
+    local -A hints=([zstd]="fast, good ratio" [xz]="slow, smallest" [lzma]="slow, small, legacy"
+        [gzip]="medium, most compatible" [lz4]="fastest, biggest" [lzo]="fast, big")
+    local -a items=("none=none (fastest to write, no CPU, biggest)")
+    while read -r c; do
+        items+=("${c}=${c}${hints[${c}]:+ (${hints[${c}]})}")
+    done < <(compressors)
+    "${BIN_DIR}/prompt-select" -p "Compression:" --default none "${items[@]}"
+}
+
+# ask_excludes: read more paths to skip, absolute or relative to SOURCE, until
+# an empty answer
+ask_excludes() {
+    local p
+    while true; do
+        p="$("${BIN_DIR}/prompt-file" --prefill "${src%/}/" \
+            "Also skip (globs allowed, empty to finish):")" || cancelled "${?}"
+        [ -z "${p}" ] || [ "${p%/}" = "${src%/}" ] && break
+        if [[ "${p}" == /* ]]; then
+            if [[ "${p}" != "${src%/}/"* ]]; then
+                warning "${p} is not below ${src}, ignored"
+                continue
+            fi
+            p="${p#"${src%/}/"}"
+        fi
+        if ! compgen -G "${src%/}/${p}" >/dev/null; then
+            warning "${p} matches nothing in ${src}, ignored"
+            continue
+        fi
+        excludes+=("${p%/}")
+    done
+}
+
+step() {
+    printf '\n\033[1m[%s] [%d/%d] %s\033[0m\n' "$(date +%T)" "${1}" "${steps}" "${2}"
+}
+
+# add_existing PATH...: append the paths (globs already expanded) that exist to the
+# exclude list
+add_existing() {
+    local p
+    for p in "${@}"; do
+        [ -e "${p}" ] && printf '%s\n' "${p}"
+    done >> "${excl_tmp}"
+}
+
+# find_progress LABEL DIR...: prune the dirs matching the tests of array EXPR in
+# each DIR into the exclude list, printing "[i/n] dir  (excluded so far)" meanwhile
+find_progress() {
+    local label="${1}"; shift
+    local n="${#}" i=0 d
+    for d in "${@}"; do
+        i=$((i + 1))
+        printf '\r\033[K  %s [%d/%d] %s  (%d excluded so far)' "${label}" "${i}" "${n}" "${d}" "$(wc -l < "${excl_tmp}")" 1>&2
+        [ -e "${d}" ] || continue
+        find "${d}" -xdev -type d \( "${EXPR[@]}" \) -prune -print 2>/dev/null >> "${excl_tmp}" || true
+    done
+    printf '\r\033[K  %s done (%d excluded so far)\n' "${label}" "$(wc -l < "${excl_tmp}")" 1>&2
+}
+
+src=""
+out=""
+out_dir="."
+name=""
+excludes=()
+exclude_files=()
+compress=""
+compress_set=""
+default_excludes=1
+default_excludes_set=0
+dry_run=0
+interactive=0
+args=("${@}")
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -o|--output)
+            [ -n "${2}" ] || fail "${1} requires a file"
+            out="${2}"
+            shift
+            ;;
+        -d|--output-dir)
+            [ -n "${2}" ] || fail "${1} requires a directory"
+            out_dir="${2}"
+            shift
+            ;;
+        -n|--name)
+            [ -n "${2}" ] || fail "${1} requires a name"
+            name="${2}"
+            shift
+            ;;
+        -e|--exclude)
+            [ -n "${2}" ] || fail "${1} requires a path"
+            excludes+=("${2#/}")
+            shift
+            ;;
+        -E|--exclude-from)
+            [ -f "${2}" ] || fail "${1} requires an existing file"
+            exclude_files+=("$(realpath "${2}")")
+            shift
+            ;;
+        -c|--compress)
+            [ -n "${2}" ] || fail "${1} requires an algorithm"
+            compress="${2}"
+            compress_set=1
+            shift
+            ;;
+        --no-default-excludes)
+            default_excludes=0
+            default_excludes_set=1
+            ;;
+        --dry-run)
+            dry_run=1
+            ;;
+        -*)
+            error "unknown option ${1}"
+            usage
+            ;;
+        *)
+            [ -z "${src}" ] || usage
+            src="${1}"
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${src}" ]; then
+    [ -t 0 ] && [ -t 2 ] || usage
+    interactive=1
+fi
+command -v mksquashfs >/dev/null || fail "mksquashfs not found (apt install squashfs-tools)"
+if [ "${dry_run}" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "+ sudo ${APP_NAME} ${args[*]}" 1>&2
+    exec sudo -- "${BIN_DIR}/${APP_NAME}" "${args[@]}"
+fi
+if [ "${interactive}" -eq 1 ]; then
+    for tool in prompt-select prompt-folder prompt-file prompt-input prompt-yes-no prompt-no-yes; do
+        [ -x "${BIN_DIR}/${tool}" ] || fail "${tool} not found next to ${APP_NAME}"
+    done
+    [ -n "${src}" ] || src="$(ask_source)" || exit "${?}"
+fi
+[ -d "${src}" ] || fail "'${src}' is not a directory"
+src="$(realpath "${src}")"
+[ "${compress}" = "none" ] && compress=""
+if [ -n "${compress}" ] && ! compressors | grep -qx -- "${compress}"; then
+    fail "unknown compression ${compress}, use none or one of: $(compressors | paste -sd ' ')"
+fi
+
+if [ -z "${out}" ]; then
+    if [ -z "${name}" ]; then
+        name="$(basename "${src}")"
+        [ "${name}" = "/" ] && name="root"
+        if [ "${interactive}" -eq 1 ]; then
+            name="$("${BIN_DIR}/prompt-input" --default "${name}" "Image name:")" || cancelled "${?}"
+            [ -n "${name}" ] || fail "the image needs a name"
+        fi
+    fi
+    if [ "${interactive}" -eq 1 ] && [ "${out_dir}" = "." ]; then
+        out_dir="$("${BIN_DIR}/prompt-folder" "Folder to store the image in:")" || cancelled "${?}"
+        [ -n "${out_dir}" ] || out_dir="."
+    fi
+    out="${out_dir}/${name}-$(date +%F).sqfs"
+fi
+if [ "${interactive}" -eq 1 ]; then
+    if [ -z "${compress_set}" ]; then
+        compress="$(ask_compression)" || cancelled "${?}"
+    fi
+    if [ "${default_excludes_set}" -eq 0 ]; then
+        "${BIN_DIR}/prompt-yes-no" "Skip caches, trash and build dirs (see --help)" || default_excludes=0
+    fi
+    ask_excludes
+fi
+out="$(realpath -m "${out}")"
+[ -e "${out}" ] && fail "${out} exists, refusing to overwrite"
+excl="${out%.sqfs}.excludes.txt"
+log="${out%.sqfs}.log"
+steps=5
+[ "${dry_run}" -eq 1 ] && steps=3
+start="${SECONDS}"
+
+excl_tmp="$(mktemp)"
+trap 'rm -f "${excl_tmp}"' EXIT
+cd "${src}" || fail "cannot enter ${src}"
+shopt -s nullglob dotglob
+
+# homes: home/*, root, top-level dirs and SOURCE itself (a home partition or a
+# single home) that hold .config or .cache; "." is kept as an empty prefix
+homes=()
+for d in . root home/* *; do
+    [ -d "${d}/.config" ] || [ -d "${d}/.cache" ] || continue
+    [ "${d}" = "." ] && d="" || d="${d}/"
+    [[ " ${homes[*]} " == *" ${d:-.} "* ]] || homes+=("${d:-.}")
+done
+
+step 1 "Adding fixed exclusions"
+for p in "${excludes[@]}"; do
+    # unquoted on purpose: expand the globs relative to SOURCE
+    # shellcheck disable=SC2086
+    add_existing ${p}
+done
+for f in "${exclude_files[@]}"; do
+    while IFS= read -r p; do
+        p="${p#/}"
+        [ -n "${p}" ] || continue
+        # shellcheck disable=SC2086
+        add_existing ${p}
+    done < "${f}"
+done
+# the image and its side files when written below SOURCE
+for f in "${out}" "${excl}" "${log}"; do
+    [[ "${f}" == "${src%/}/"* ]] && printf '%s\n' "${f#"${src%/}/"}" >> "${excl_tmp}"
+done
+if [ "${default_excludes}" -eq 1 ]; then
+    if [ -d etc ] && [ -d usr ]; then
+        # root filesystem: swap, virtual fs, temp, package caches, pip-installed
+        # system packages (apt-managed usr/lib/python3/dist-packages kept)
+        add_existing swap.img swapfile proc sys dev run tmp lost+found var/tmp var/cache \
+            var/lib/snapd/cache var/lib/apt/lists var/crash \
+            usr/local/lib/node_modules usr/lib/node_modules \
+            usr/local/lib/ollama var/lib/flatpak var/lib/snapd \
+            usr/local/lib/python3*/dist-packages usr/local/lib/python3*/site-packages
+    fi
+    for h in "${homes[@]}"; do
+        [ "${h}" = "." ] && h=""
+        add_existing \
+            "${h}".cache "${h}".local/share/Trash \
+            "${h}"go/pkg \
+            "${h}".npm/_cacache "${h}".npm/_npx "${h}".npm/_logs \
+            "${h}".yarn/berry/cache "${h}".yarn/cache \
+            "${h}".gradle/caches "${h}".gradle/wrapper/dists \
+            "${h}".m2/repository \
+            "${h}".cargo/registry "${h}".cargo/git \
+            "${h}".conda/pkgs \
+            "${h}".codex/cache \
+            "${h}".config/Code/CachedExtensionVSIXs "${h}".config/Code/CachedData \
+            "${h}".local/share/JetBrains/*/caches
+    done
+fi
+echo "  homes: ${homes[*]:-none}"
+echo "  $(wc -l < "${excl_tmp}") fixed paths"
+
+if [ "${default_excludes}" -eq 1 ] && [ "${#homes[@]}" -gt 0 ]; then
+    step 2 "Finding browser/electron app caches in ~/.config, ~/.var, ~/snap"
+    EXPR=(-name Cache -o -name "Code Cache" -o -name GPUCache -o -name CacheStorage
+        -o -name ShaderCache -o -name GrShaderCache -o -name DawnCache -o -name DawnGraphiteCache
+        -o -name DawnWebGPUCache -o -name "Service Worker" -o -name cache)
+    app_dirs=()
+    build_dirs=()
+    for h in "${homes[@]}"; do
+        [ "${h}" = "." ] && h=""
+        mapfile -t -O "${#app_dirs[@]}" app_dirs < <(find "${h}".config "${h}".var "${h}"snap \
+            -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+        mapfile -t -O "${#build_dirs[@]}" build_dirs < <(find "${h:-.}" -mindepth 1 -maxdepth 1 \
+            -type d 2>/dev/null | sed 's|^\./||' | sort)
+    done
+    find_progress "app caches" "${app_dirs[@]}"
+
+    step 3 "Finding node_modules, __pycache__, .terraform, ... in homes"
+    EXPR=(-name node_modules -o -name __pycache__ -o -name .terraform
+        -o -name .pytest_cache -o -name .mypy_cache)
+    find_progress "build dirs" "${build_dirs[@]}"
+else
+    step 2 "Skipping app caches (default exclusions off or no homes found)"
+    step 3 "Skipping build dirs (default exclusions off or no homes found)"
+fi
+
+if [ "${dry_run}" -eq 1 ]; then
+    echo
+    sort -u "${excl_tmp}"
+    echo "  total: $(sort -u "${excl_tmp}" | wc -l) excluded paths" 1>&2
+    exit 0
+fi
+
+mkdir -p "$(dirname "${out}")" || fail "cannot create $(dirname "${out}")"
+sort -u "${excl_tmp}" > "${excl}"
+echo "  total: $(wc -l < "${excl}") excluded paths (list: ${excl})"
+
+if [ "${interactive}" -eq 1 ]; then
+    echo
+    echo "  source:      ${src} ($(df -h --output=used "${src}" | tail -1 | tr -d ' ') used on its filesystem)"
+    echo "  image:       ${out}"
+    echo "  free space:  $(df -h --output=avail "$(dirname "${out}")" | tail -1 | tr -d ' ')"
+    echo "  compression: ${compress:-none}"
+    echo "  excluded:    $(wc -l < "${excl}") paths"
+    if "${BIN_DIR}/prompt-no-yes" "Show the excluded paths"; then
+        sed 's/^/    /' "${excl}"
+    fi
+    "${BIN_DIR}/prompt-yes-no" "Build the image" || { rm -f "${excl}"; abort; }
+fi
+
+step 4 "Building squashfs image ${out}"
+echo "  free space: $(df -h --output=avail "$(dirname "${out}")" | tail -1 | tr -d ' ')"
+echo "  mksquashfs first scans the whole source tree (may take minutes without output),"
+echo "  then shows a progress bar. Log: ${log}"
+if [ -n "${compress}" ] && [ "${compress}" != "none" ]; then
+    comp_args=(-comp "${compress}")
+else
+    comp_args=(-no-compression)
+fi
+set -o pipefail
+# mksquashfs drops excludes that do not exist yet, so the log has to exist before
+: > "${log}"
+mksquashfs "${src}" "${out}" "${comp_args[@]}" -b 1M \
+    -one-file-system -ef "${excl}" \
+    -progress 2>&1 | tee "${log}" || fail "mksquashfs failed, see ${log}"
+
+step 5 "Done"
+ls -lh "${out}"
+el=$((SECONDS - start))
+printf '  elapsed: %dh %02dm %02ds\n' $((el / 3600)) $((el % 3600 / 60)) $((el % 60))
