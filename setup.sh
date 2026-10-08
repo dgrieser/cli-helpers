@@ -2,9 +2,10 @@
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
 # keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN,
-# the base software, gh and glab with their logins, the dotfiles of
+# the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
+# if you like, gitlab.com), the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
-# of reminder, the lists of ~/.kube/mittwald and the sessions and histories of
+# of reminder, the lists of ~/.kube/mittwald, the session of Sublime Text and the sessions and histories of
 # Claude Code, Codex and opencode from a backup, the categories of updater
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
 # NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
@@ -143,7 +144,7 @@ choose_backup() {
         return 0
     fi
     found=0
-    for dir in keyrings reminder history Keys bin kube-mittwald agents; do
+    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text agents; do
         [ -d "${choice}/${dir}" ] && found=1
     done
     if [ "${found}" -eq 0 ]; then
@@ -363,14 +364,22 @@ dial_vpn() {
     done
 }
 
+# login_gitlab HOST [optional]: glab logged in to HOST; the login to
+# gitlab.mittwald.it is needed for the mittwald tools, an optional one (gitlab.com)
+# is only offered, and declining it is no failure
 login_gitlab() {
-    local host="${1}"
+    local host="${1}" optional="${2:-}"
     while ! glab auth status --hostname "${host}" > /dev/null 2>&1; do
-        info "glab is not logged in to ${host}, it is needed for the mittwald tools"
-        if ! ask "Log in now (glab auth login --hostname ${host})?"; then
-            warning "Not logged in to ${host}, the mittwald tools will fail"
-            failed+=("glab auth login --hostname ${host}")
-            return 0
+        if [ -n "${optional}" ]; then
+            info "glab is not logged in to ${host}"
+            ask "Log in to ${host} (glab auth login --hostname ${host})?" || return 0
+        else
+            info "glab is not logged in to ${host}, it is needed for the mittwald tools"
+            if ! ask "Log in now (glab auth login --hostname ${host})?"; then
+                warning "Not logged in to ${host}, the mittwald tools will fail"
+                failed+=("glab auth login --hostname ${host}")
+                return 0
+            fi
         fi
         if [ "${host}" = "${MITTWALD_GITLAB}" ] && ! dial_vpn "${host}"; then
             warning "No VPN, not logged in to ${host}, the mittwald tools will fail"
@@ -388,6 +397,7 @@ install_gh_glab() {
     hash -r
     command -v gh > /dev/null 2>&1 && login_github
     command -v glab > /dev/null 2>&1 && login_gitlab "${MITTWALD_GITLAB}"
+    command -v glab > /dev/null 2>&1 && login_gitlab gitlab.com optional
 }
 
 # the Keys folder of the documents folder and the shell histories from Keys/
@@ -435,6 +445,25 @@ restore_kube_mittwald() {
     has_part kube-mittwald || return 0
     info "~/.kube/mittwald: restore the lists the kubectl-helpers read from the backup"
     restore_part kube-mittwald "${HOME}/.kube/mittwald"
+}
+
+# the session of Sublime Text from sublime-text/ of the backup: the windows and
+# tabs it had open, with their unsaved text; before updater installs it, so
+# its first start opens them; a running one would write its own session over it
+restore_sublime() {
+    local dir="${HOME}/.config/sublime-text/Local"
+    has_part sublime-text || return 0
+    info "Sublime Text: restore its session (the open files and their unsaved text) from the backup"
+    if pgrep -x sublime_text > /dev/null 2>&1; then
+        warning "Sublime Text is running and would write its session over the restored one"
+        while pgrep -x sublime_text > /dev/null 2>&1; do
+            if ! ask "Close Sublime Text now, then continue (no: skip its session)?"; then
+                failed+=("sublime-text, it was running")
+                return 0
+            fi
+        done
+    fi
+    restore_part sublime-text "${dir}"
 }
 
 # the sessions, histories, memories and settings of Claude Code, Codex and
@@ -649,6 +678,7 @@ install_cli_helpers
 restore_bin
 setup_vpn
 install_gh_glab
+restore_sublime
 
 info "Installing base"
 # firmware updates are not part of setting up the software

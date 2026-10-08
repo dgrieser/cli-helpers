@@ -3,8 +3,9 @@
 # keyring files, the reminders, the shell histories, the Keys folder of the
 # documents folder with the SSH keys the SSH config names, the private
 # scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
-# the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read and the
-# sessions, histories, memories and settings of Claude Code, Codex and opencode.
+# the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read, the
+# session of Sublime Text with its open files and the sessions, histories,
+# memories and settings of Claude Code, Codex and opencode.
 # Before the keyring files are copied it offers to store the current SSH config in the keyring, so setup.sh
 # restores that one and not an older copy.
 
@@ -25,6 +26,8 @@ HOME_BIN="${HOME}/bin"
 HOME_BIN_FILES=(gen .power .in .out)
 # the lists the kubectl-helpers read, e.g. the evil-eye namespaces of k-ctx
 KUBE_MITTWALD_DIR="${HOME}/.kube/mittwald"
+# the session of Sublime Text: its windows, tabs and the unsaved text in them
+SUBLIME_DIR="${HOME}/.config/sublime-text/Local"
 # the coding agents, each into agents/NAME.tar.gz of what is under ~: the
 # sessions, histories, memories, settings, skills and plugins; left out are the
 # logins (setup.sh asks to log in again), the installed programs, caches, logs
@@ -64,6 +67,8 @@ and finds every part in it by this layout:
   bin/          ${HOME_BIN_FILES[*]} of ${HOME_BIN}
   kube-mittwald/
                 the lists of ${KUBE_MITTWALD_DIR}
+  sublime-text/ the session of Sublime Text of ${SUBLIME_DIR}: the open
+                windows and tabs, with the unsaved text in them
   agents/       ${AGENTS[*]}: their sessions, histories, memories and
                 settings, one NAME.tar.gz each, without the logins
 
@@ -249,6 +254,16 @@ backup_kube_mittwald() {
     echo "kube-mittwald: ${count} files of ${KUBE_MITTWALD_DIR}" 1>&2
 }
 
+backup_sublime() {
+    local target="${1}/sublime-text"
+    if [ ! -d "${SUBLIME_DIR}" ]; then
+        echo "sublime-text: none" 1>&2
+        return 0
+    fi
+    cp -a "${SUBLIME_DIR}" "${target}" || { failed+=("sublime-text"); return 0; }
+    echo "sublime-text: $(find "${target}" -type f | wc -l) files of ${SUBLIME_DIR}" 1>&2
+}
+
 backup_agents() {
     local target="${1}/agents" name path status ref
     local -a paths excludes
@@ -338,6 +353,16 @@ folder="${folder/#\~/${HOME}}"
 [ -d "${folder}" ] || fail "No such folder: ${folder}"
 
 [ -t 0 ] && store_ssh_config
+# Sublime Text writes its session (and the unsaved text) only now and then and
+# when it closes, so a running one may have newer text than the session file
+if [ -d "${SUBLIME_DIR}" ] && pgrep -x sublime_text > /dev/null 2>&1; then
+    warning "Sublime Text is running, its session file may miss the latest unsaved text"
+    if [ -t 0 ]; then
+        while pgrep -x sublime_text > /dev/null 2>&1; do
+            ask "Close Sublime Text now, then continue (no: back up the session as it is)?" || break
+        done
+    fi
+fi
 keyring_files=()
 choose_keyrings
 
@@ -351,6 +376,7 @@ backup_histories "${backup}"
 backup_keys "${backup}"
 backup_bin "${backup}"
 backup_kube_mittwald "${backup}"
+backup_sublime "${backup}"
 backup_agents "${backup}"
 
 if [ "${#failed[@]}" -gt 0 ]; then

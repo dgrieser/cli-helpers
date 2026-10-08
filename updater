@@ -396,6 +396,23 @@ apt_repo_configured_elsewhere() {
     return 1
 }
 
+# apt_remove_own_repo LIST KEY: the list and key apt_add_with_repo wrote, once
+# the repo is configured elsewhere too: a package that sets up its own repo on
+# install (Chrome's google-chrome.sources) names another key for the same URL,
+# and apt refuses every update over the two ("Conflicting values set for option
+# Signed-By"), so the package's own one is kept
+apt_remove_own_repo() {
+    local list="${1}" key="${2}"
+    [ -e "${list}" ] || [ -e "${key}" ] || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would remove ${list} and ${key}" 1>&2
+        return 0
+    fi
+    echo "${APP_NAME}: removing ${list}, the repo is configured elsewhere" 1>&2
+    verbose "${SUDO} rm -f ${list} ${key}"
+    ${SUDO} rm -f "${list}" "${key}"
+}
+
 apt_add_with_list_file() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl gpg apt-get || return 1
@@ -498,6 +515,7 @@ apt_add_with_repo() {
     local other_list_path
     if other_list_path="$(apt_repo_configured_elsewhere "${repo_url}" "${repo_list_path}")"; then
         echo "${APP_NAME}: ${repo_url} is configured in ${other_list_path} already, using that" 1>&2
+        apt_remove_own_repo "${repo_list_path}" "${repo_gpg_path}" || return 1
         apt_upgrade "${name}"
         return
     fi
@@ -560,7 +578,13 @@ apt_add_with_repo() {
             echo "Would update to ${repo_line} from ${current_repo_line}" 1>&2
         fi
     fi
-    apt_upgrade "${name}"
+    local status=0
+    apt_upgrade "${name}" || status=$?
+    # the package may have set up its own repo while it was installed
+    if [ "${dry_run}" -eq 0 ] && apt_repo_configured_elsewhere "${repo_url}" "${repo_list_path}" > /dev/null; then
+        apt_remove_own_repo "${repo_list_path}" "${repo_gpg_path}" || return 1
+    fi
+    return "${status}"
 }
 
 # apt-get that never stops to ask: DEBIAN_FRONTEND only quiets debconf, dpkg still
@@ -1027,11 +1051,21 @@ helper_repo_update() {
     local repo="${1}"
     local target="${2:-install-links}"
     local dir="${CURRENT_USER_HOME}/workspace/dgrieser/${repo##*/}"
+    local group
     needs packages make || return $(( $? == 3 ? 0 : 1 ))
     git_repo_update "${repo}" "${dir}" || return 1
     if [ "${dry_run}" -eq 1 ]; then
         echo "Would install ${dir} (make ${target})" 1>&2
         return 0
+    fi
+    # a repo with install folders of its own outside of cli-helpers' (e.g.
+    # /usr/local/lib/k-ctx of the kubectl-helpers) has them created once as root
+    # and group-writable, like cli-helpers' setup-dirs, so the user can install
+    if grep -q '^check-dirs:' "${dir}/Makefile" && grep -q '^setup-dirs:' "${dir}/Makefile" \
+        && ! ${SUDO_USER} make -s -C "${dir}" check-dirs > /dev/null 2>&1; then
+        group="$(id -gn "${CURRENT_USER_NAME}")" || return 1
+        verbose "${SUDO} make -s -C ${dir} setup-dirs INSTALL_GROUP=${group}"
+        ${SUDO} make -s -C "${dir}" setup-dirs "INSTALL_GROUP=${group}" > /dev/null || return 1
     fi
     # the session bus lets the install read secrets from the keyring (secret-tool)
     verbose "${SUDO_USER} env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus make -s -C ${dir} ${target}"
@@ -1923,6 +1957,27 @@ software-059-swagger-codegen@dev() {
     echo "${version}" | ${SUDO} tee "${lib_dir}/version" > /dev/null
 }
 
+# chrome_first_start: Chrome started once for the user and waited for until it
+# is closed again, so it creates its profile (chrome-profile only changes an
+# existing one); only with a terminal to say so and a graphical session to
+# show it in, otherwise the user is told to do it
+chrome_first_start() {
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    [ -n "${DISPLAY}" ] && session_env+=("DISPLAY=${DISPLAY}")
+    [ -n "${WAYLAND_DISPLAY}" ] && session_env+=("WAYLAND_DISPLAY=${WAYLAND_DISPLAY}")
+    if [ ! -t 0 ] || { [ -z "${DISPLAY}" ] && [ -z "${WAYLAND_DISPLAY}" ]; }; then
+        echo "${APP_NAME}: Chrome has no profile yet: start it once, close it and run: ${APP_NAME} chrome" 1>&2
+        return 1
+    fi
+    echo "${APP_NAME}: Starting Chrome once, so it creates its profile: set it up and close it to continue..." 1>&2
+    verbose "${SUDO_USER} ${session_env[*]} google-chrome"
+    ${SUDO_USER} "${session_env[@]}" google-chrome > /dev/null 2>&1
+    # the launcher returns with the browser, which may still be writing its profile
+    while pgrep -u "${CURRENT_USER_ID}" -x chrome > /dev/null 2>&1; do
+        sleep 1
+    done
+}
+
 software-060-chrome@dev() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
@@ -1930,6 +1985,10 @@ software-060-chrome@dev() {
     local status=0
     apt_add_with_repo "google-chrome-stable" "https://dl.google.com/linux/chrome-stable/deb/" "stable" "main" "https://dl.google.com/linux/linux_signing_key.pub" || return 1
     tool_ready google-chrome || return $(( $? == 1 ? 0 : 1 ))
+    # a Chrome that never ran has no profile yet: started once, it creates one
+    if [ "${dry_run}" -eq 0 ] && ! ${SUDO_USER} test -d "${CURRENT_USER_HOME}/.config/google-chrome"; then
+        chrome_first_start || return 0
+    fi
     # the settings and custom search engines of the profile; Chrome writes them
     # back when it exits, so only while it is closed
     [ "${dry_run}" -eq 1 ] && profile_args+=("--dry-run")

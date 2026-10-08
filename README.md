@@ -23,7 +23,8 @@ Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-d
 copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the OpenVPN plugin
 of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
-when the host is not reachable, with `~/bin/gen` if you like), installs the `base` software with `updater`,
+when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), restores the session of Sublime Text (its open windows
+and tabs with their unsaved text, asking you to close Sublime Text first when it runs), installs the `base` software with `updater`,
 restores the `Keys` folder of the documents folder and the shell histories, runs `make install` of bash_aliases.d once more with a terminal (it asks for SSH keys and history backups
 the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the lists of `~/.kube/mittwald` that the kubectl-helpers read and the sessions, histories, memories and settings of Claude Code, Codex and opencode, and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
@@ -34,7 +35,8 @@ apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`a
 
 Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
 `setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents
-folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`, the lists of `~/.kube/mittwald` and one archive each of
+folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`, the lists of `~/.kube/mittwald`, the session of Sublime Text (`~/.config/sublime-text/Local`, it offers to wait until you
+closed Sublime Text, so the session has the latest unsaved text) and one archive each of
 `~/.claude` with `~/.claude.json`, `~/.codex` and opencode's `~/.config/opencode` with `~/.local/share/opencode`, without
 their logins, caches and installed programs). Without a folder it offers the attached drives and media (mounted under
 `/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
