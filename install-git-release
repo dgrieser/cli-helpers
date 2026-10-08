@@ -54,7 +54,15 @@ usage: ${APP_NAME} [OPTIONS] PROJECT
 
         -d, --dry-run       Perform a trial run with no changes made
 
+        --no-cache          Ignore the cached artifact pattern of the project
+
         --bash-completion   Print completion candidates and exit
+
+    After an install, the name of the installed artifact is cached as a
+    pattern without its version, per project, architecture and patterns.
+    Later runs download only what that pattern matches, and fall back to
+    the regular patterns when it matches nothing.
+    Cache: \${XDG_CACHE_HOME:-~/.cache}/install-git-release/patterns
 
     Exit status 4: the release has no build for the architecture.
 EOF
@@ -68,7 +76,7 @@ function completion() {
     local skip_next=0
 
     if [ "${previous}" != "-r" ] && [ "${previous}" != "--release" ]; then
-        echo "-h --help -p --pattern -a --arch -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run"
+        echo "-h --help -p --pattern -a --arch -x --exclude -r --release -b --binary -n --name -i --install-path --bundle --bundle-path -c --post-install -y --yes -d --dry-run --no-cache"
         return
     fi
     shift
@@ -245,18 +253,165 @@ function download_with_api() {
         done
     done <<< "${assets}"
     if [ "${downloaded}" -eq 0 ]; then
-        built_for_other_arch "$(cut -f1 <<< "${assets}")" && fail_no_build "The release of ${project} has no build for ${ARCH}"
+        # a cached pattern that matches nothing says nothing about the build
+        [ "${CACHED_ATTEMPT}" -eq 0 ] && built_for_other_arch "$(cut -f1 <<< "${assets}")" \
+            && fail_no_build "The release of ${project} has no build for ${ARCH}"
         error "No release asset of ${project} matches ${PATTERNS[*]}"
         return 1
     fi
 }
 
+# download_artifacts: downloads the release assets matching PATTERNS into
+# tmpfolder with gh or glab, else through the REST API
+function download_artifacts() {
+    local pattern
+    local -a args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
+    [ -n "${RELEASE}" ] && args+=( "${RELEASE}" )
+    if [[ "${project}" == "https://github.com"* ]]; then
+        for pattern in "${PATTERNS[@]}"; do
+            args+=( "-p" "${pattern}" )
+        done
+        if ! command -v gh &> /dev/null; then
+            echo "gh not found, using the GitHub API..." 1>&2
+        elif gh "${args[@]}" 1>&2; then
+            return 0
+        else
+            echo "gh failed, trying the GitHub API..." 1>&2
+        fi
+    else
+        for pattern in "${PATTERNS[@]}"; do
+            args+=( "-n" "${pattern}" )
+        done
+        if ! command -v glab &> /dev/null; then
+            echo "glab not found, using the GitLab API..." 1>&2
+        elif glab "${args[@]}" 1>&2; then
+            return 0
+        else
+            echo "glab failed, trying the GitLab API..." 1>&2
+        fi
+    fi
+    download_with_api "${project}"
+}
+
+# collect_artifacts: the downloaded files matching PATTERNS, without the
+# excluded ones
+function collect_artifacts() {
+    local found=""
+    local pattern
+    for pattern in "${PATTERNS[@]}"; do
+        [ -n "${found}" ] && found+=$'\n'
+        # shellcheck disable=SC2086
+        found="${found}$(ls -1 "${tmpfolder}/"${pattern} 2> /dev/null)"
+    done
+    [ ${#EXCLUDES[@]} -gt 0 ] && found="$(filter_excluded_patterns "${found}")"
+    # the cached pattern never yields what the regular ones would not
+    [ "${CACHED_ATTEMPT}" -eq 1 ] && found="$(matching_regular_patterns "${found}")"
+    echo "${found}"
+}
+
+# matching_regular_patterns LIST: the files whose names match REGULAR_PATTERNS
+function matching_regular_patterns() {
+    local file
+    local pattern
+    while IFS= read -r file; do
+        [ -z "${file}" ] && continue
+        for pattern in "${REGULAR_PATTERNS[@]}"; do
+            # shellcheck disable=SC2053
+            [[ "$(basename "${file}")" == ${pattern} ]] && echo "${file}" && break
+        done
+    done <<< "${1}"
+}
+
+# pattern_cache_key: what a cached pattern is valid for, the project, the
+# architecture and the patterns as given
+function pattern_cache_key() {
+    local key="${project%/}"
+    key="${key%.git}"
+    key="${key} ${ARCH} ${PATTERN_TEMPLATES[*]}"
+    echo "${key//$'\t'/ }"
+}
+
+# read_cached_pattern KEY: the pattern cached for the key, if any
+function read_cached_pattern() {
+    [ -r "${PATTERN_CACHE}" ] || return 0
+    K="${1}" awk -F'\t' '$1 == ENVIRON["K"] { pattern = $2 } END { print pattern }' "${PATTERN_CACHE}"
+}
+
+# generalize_artifact_name NAME: a pattern for the artifact in every release,
+# the version, dates, build numbers and commit hashes in its name replaced
+# with *; fails when the name keeps something that looks like a version
+function generalize_artifact_name() {
+    local name="${1}"
+    local pattern="${name}"
+    local tag
+    [[ "${name}" == *[\*\?\[\]]* ]] && return 1
+    if [[ "${RELEASE}" =~ [0-9] ]]; then
+        for tag in "${RELEASE}" "${RELEASE#[vV]}"; do
+            pattern="${pattern//"${tag}"/*}"
+        done
+    fi
+    # dates, versions with a pre-release suffix, Debian revisions, build
+    # numbers, v-prefixed major versions, commit hashes
+    pattern="$(sed -E \
+        -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}/*/g' \
+        -e 's/[vV]?[0-9]+(\.[0-9]+)+([-.~+]?(alpha|beta|rc|pre|dev|preview|nightly|snapshot)[.-]?[0-9]*)?/*/gI' \
+        -e 's/\*-[0-9]+([_.])/*\1/g' \
+        -e 's/[0-9]{6,}/*/g' \
+        -e 's/(^|[-_.])[vV][0-9]+([-_.]|$)/\1*\2/g' \
+        -e 's/(^|[-_.])[0-9a-f]{7,40}([-_.]|$)/\1*\2/g' \
+        -e 's/\*+/*/g' <<< "${pattern}")"
+    # anything left that may change between releases: no pattern
+    [[ "${pattern}" =~ [0-9]\.[0-9] ]] && return 1
+    [[ "${pattern}" =~ [0-9]{4,} ]] && return 1
+    [[ "${pattern//\*/}" =~ [a-zA-Z] ]] || return 1
+    # shellcheck disable=SC2053
+    [[ "${name}" == ${pattern} ]] || return 1
+    echo "${pattern}"
+}
+
+# store_cached_pattern KEY NAME: caches the pattern of the installed artifact
+function store_cached_pattern() {
+    local key="${1}"
+    local name="${2}"
+    local pattern
+    local tmp
+    # a name given literally (wezterm-nightly.Ubuntu24.04.deb) stays as it is:
+    # its numbers were chosen, not released
+    for pattern in "${REGULAR_PATTERNS[@]}"; do
+        [ "${pattern}" = "${name}" ] && break
+        pattern=""
+    done
+    if [ -z "${pattern}" ] && ! pattern="$(generalize_artifact_name "${name}")"; then
+        echo "No version-free pattern for '${name}', not caching it" 1>&2
+        return 0
+    fi
+    [ "$(read_cached_pattern "${key}")" = "${pattern}" ] && return 0
+    mkdir -p "$(dirname "${PATTERN_CACHE}")" 2> /dev/null || return 0
+    tmp="$(mktemp "${PATTERN_CACHE}.XXXXXX" 2> /dev/null)" || return 0
+    if {
+        [ -f "${PATTERN_CACHE}" ] && K="${key}" awk -F'\t' '$1 != ENVIRON["K"]' "${PATTERN_CACHE}"
+        printf '%s\t%s\n' "${key}" "${pattern}"
+    } > "${tmp}" && mv -f "${tmp}" "${PATTERN_CACHE}"; then
+        echo "Cached artifact pattern '${pattern}'" 1>&2
+    else
+        rm -f "${tmp}"
+    fi
+}
+
+# manual_download: downloads the URL the user gives into a folder of its own,
+# its file in MANUAL_ARTIFACT, since its name need not match the patterns
 function manual_download() {
+    local manual_dir="${tmpfolder}/manual"
+    MANUAL_DOWNLOAD=1
     echo 1>&2
     download_url="$(prompt-input "Please provide download URL:")"
     [ -z "${download_url}" ] && abort
-    (cd "${tmpfolder}" && curl -L -O "${download_url}")
-    return $?
+    rm -rf "${manual_dir}"
+    mkdir -p "${manual_dir}" || fail "Failed to create '${manual_dir}'"
+    (cd "${manual_dir}" && curl -fL -O "${download_url}") || fail "Failed to download ${download_url}"
+    MANUAL_ARTIFACT="$(find "${manual_dir}" -mindepth 1 -maxdepth 1 -type f | head -n 1)"
+    [ -z "${MANUAL_ARTIFACT}" ] && fail "Nothing downloaded from ${download_url}"
+    return 0
 }
 
 function cleanup() {
@@ -1264,6 +1419,11 @@ POST_INSTALL_CMDS=()
 ARTIFACT_KIND=""
 TMP_DIR=""
 ARCH=""
+NO_CACHE=0
+CACHED_ATTEMPT=0
+MANUAL_DOWNLOAD=0
+MANUAL_ARTIFACT=""
+PATTERN_CACHE="${XDG_CACHE_HOME:-${HOME}/.cache}/install-git-release/patterns"
 
 while [ $# -gt 0 ]; do
     case "${1}" in
@@ -1277,6 +1437,9 @@ while [ $# -gt 0 ]; do
             ;;
         -d|--dry-run)
             DRY_RUN=1
+            ;;
+        --no-cache)
+            NO_CACHE=1
             ;;
         -p|--pattern)
             shift
@@ -1346,6 +1509,8 @@ done
 # the patterns as given, {arch} still in them
 PATTERN_TEMPLATES=( "${PATTERNS[@]}" )
 mapfile -t PATTERNS < <(arch_patterns "${ARCH}" "${PATTERN_TEMPLATES[@]}")
+# the patterns without the cached one, which they must still match
+REGULAR_PATTERNS=( "${PATTERNS[@]}" )
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     echo "Running in dry-run mode..." 1>&2
@@ -1397,52 +1562,41 @@ if [[ ! "${project}" =~ ^(https?)://.* ]]; then
     fi
 fi
 
-if [[ "${project}" == "https://github.com"* ]]; then
-    gh_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
-    [ -n "${RELEASE}" ] && gh_args+=( "${RELEASE}" )
-    for pattern in "${PATTERNS[@]}"; do
-        gh_args+=( "-p" "${pattern}" )
-    done
-    if ! command -v gh &> /dev/null; then
-        echo "gh not found, using the GitHub API..." 1>&2
-        download_with_api "${project}" || manual_download
-    elif ! gh "${gh_args[@]}" 1>&2; then
-        echo "gh failed, trying the GitHub API..." 1>&2
-        download_with_api "${project}" || { error "Failed to retrieve artifact from '${project}'"; manual_download; }
-    fi
-else
-    if [[ "${project}" == "https://"* ]]; then
-        if [ -n "${GITLAB_HOST}" ] && [[ "${project}" != "${GITLAB_HOST}"* ]]; then
-            GITLAB_HOST="$(echo "${project}" | cut -d/ -f1-3)"
-            unset GITLAB_TOKEN
-        fi
-    fi
-
-    glab_args=( "-R" "${project}" "release" "download" "-D" "${tmpfolder}" )
-    [ -n "${RELEASE}" ] && glab_args+=( "${RELEASE}" )
-    for pattern in "${PATTERNS[@]}"; do
-        glab_args+=( "-n" "${pattern}" )
-    done
-    if ! command -v glab &> /dev/null; then
-        echo "glab not found, using the GitLab API..." 1>&2
-        download_with_api "${project}" || manual_download
-    elif ! glab "${glab_args[@]}" 1>&2; then
-        echo "glab failed, trying the GitLab API..." 1>&2
-        download_with_api "${project}" || { error "Failed to retrieve artifact from '${project}'"; manual_download; }
+if [[ "${project}" != "https://github.com"* ]] && [[ "${project}" == "https://"* ]]; then
+    if [ -n "${GITLAB_HOST}" ] && [[ "${project}" != "${GITLAB_HOST}"* ]]; then
+        GITLAB_HOST="$(echo "${project}" | cut -d/ -f1-3)"
+        unset GITLAB_TOKEN
     fi
 fi
 
+CACHE_KEY="$(pattern_cache_key)"
 artifact=""
-for pattern in "${PATTERNS[@]}"; do
-    [ -n "${artifact}" ] && artifact+=$'\n'
-    # shellcheck disable=SC2086
-    artifact="${artifact}$(ls -1 "${tmpfolder}/"${pattern} 2> /dev/null)"
-done
-if [ ${#EXCLUDES[@]} -gt 0 ]; then
-    artifact="$(filter_excluded_patterns "${artifact}")"
-    [ -z "${artifact}" ] && error "All downloaded artifacts excluded by ${EXCLUDES[*]}"
+cached_pattern=""
+[ ${NO_CACHE} -eq 0 ] && cached_pattern="$(read_cached_pattern "${CACHE_KEY}")"
+if [ -n "${cached_pattern}" ]; then
+    echo "Trying cached pattern ${cached_pattern}..." 1>&2
+    PATTERNS=( "${cached_pattern}" )
+    CACHED_ATTEMPT=1
+    download_artifacts && artifact="$(collect_artifacts)"
+    CACHED_ATTEMPT=0
+    if [ -z "${artifact}" ]; then
+        echo "Nothing retrieved with the cached pattern, retrying with ${REGULAR_PATTERNS[*]}..." 1>&2
+        find "${tmpfolder}" -mindepth 1 -delete
+        PATTERNS=( "${REGULAR_PATTERNS[@]}" )
+    fi
 fi
+
 if [ -z "${artifact}" ]; then
+    if download_artifacts; then
+        artifact="$(collect_artifacts)"
+        [ -z "${artifact}" ] && [ ${#EXCLUDES[@]} -gt 0 ] && [ -n "$(ls -A "${tmpfolder}")" ] \
+            && error "All downloaded artifacts excluded by ${EXCLUDES[*]}"
+    else
+        error "Failed to retrieve artifact from '${project}'"
+        manual_download
+    fi
+fi
+if [ -z "${artifact}" ] && [ "${MANUAL_DOWNLOAD}" -eq 0 ]; then
     # gh and glab say only that nothing matched
     assets="$(release_assets "${project}" 2> /dev/null)" \
         && built_for_other_arch "$(cut -f1 <<< "${assets}")" \
@@ -1450,6 +1604,7 @@ if [ -z "${artifact}" ]; then
     error "Artifact not found"
     manual_download
 fi
+[ "${MANUAL_DOWNLOAD}" -eq 1 ] && artifact="${MANUAL_ARTIFACT}"
 
 # sort reverse and make unique
 artifact="$(echo "${artifact}" | sort -ur)"
@@ -1549,5 +1704,9 @@ if [ "${DRY_RUN}" -eq 0 ] && [ -n "${BINARY}" ]; then
 fi
 
 run_post_install "${artifact}" "${ARTIFACT_KIND}" || abort
+
+if [ "${DRY_RUN}" -eq 0 ] && [ "${MANUAL_DOWNLOAD}" -eq 0 ]; then
+    store_cached_pattern "${CACHE_KEY}" "$(basename "${artifact}")"
+fi
 
 success

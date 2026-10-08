@@ -1,6 +1,8 @@
 #!/bin/bash
 
 APP_NAME="$(basename "${0}")"
+# set by is_interactive on its first call
+INTERACTIVE=""
 # the userland's architecture (amd64, arm64, armhf, ...), which dpkg installs for;
 # uname -m names the kernel's, which is aarch64 under a 32-bit Raspberry Pi OS
 PLATFORM="$(dpkg --print-architecture 2>/dev/null)"
@@ -106,11 +108,14 @@ EOF
     exit 1
 }
 
+# is_interactive: whether stdin and stdout are a terminal; checked once, since
+# stdout goes through tee into the log file from then on
 is_interactive() {
-    if [ -t 0 ] && [ -t 1 ]; then
-        return 0
+    if [ -z "${INTERACTIVE}" ]; then
+        INTERACTIVE=0
+        [ -t 0 ] && [ -t 1 ] && INTERACTIVE=1
     fi
-    return 1
+    [ "${INTERACTIVE}" -eq 1 ]
 }
 
 is_install_type() {
@@ -2190,7 +2195,7 @@ slack_repo_remove() {
 software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
 software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
-software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --post-install "./install-man-page.sh"; }
+software-160-yq@dev() { install_git_release "https://github.com/mikefarah/yq" --binary "yq_*" --name "yq" --post-install "./install-man-page.sh"; }
 # formerly gitlab-trackr, whose package forskap-utils replaces; as its upgrade
 # notes say, the old daemon is stopped and disabled, first, while its units are
 # still there, and the new one is started through its socket. When the install
@@ -2710,7 +2715,8 @@ software-460-aws-v1@dev() {
     fi
     curl -sS -L "${aws_url}" -o "${aws_file_path}" || return 1
     unzip "${aws_file_path}" -d "${aws_folder_path}" || return 1
-    ${SUDO} "${aws_folder_path}/awscli-bundle/install" \
+    # its shebang wants "python", which recent Ubuntu does not ship
+    ${SUDO} python3 "${aws_folder_path}/awscli-bundle/install" \
         -i "${aws_target_parent_folder}/${aws_name}" \
         -b "${aws_target_parent_folder}/bin/${aws_name}" \
         || return 1
