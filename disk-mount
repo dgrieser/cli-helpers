@@ -630,15 +630,38 @@ release_record() {
     fi
 }
 
+# Flushes the pending writes of the filesystems mounted at the given mount
+# points, showing how much is left; a slow USB stick can take minutes. The
+# flush runs in the background, so Ctrl-C still stops the script.
+flush_mounts() {
+    local pid left waited=0
+    [ "${#}" -eq 0 ] && return 0
+    sync -f "${@}" &
+    pid="${!}"
+    while kill -0 "${pid}" 2>/dev/null; do
+        if [ "${waited}" -ge 2 ] && [ -t 2 ]; then
+            left="$(awk '/^(Dirty|Writeback):/ { kb += $2 } END { printf "%d", kb / 1024 }' /proc/meminfo)"
+            printf '\r\033[KFlushing pending writes, %s MiB left ...' "${left}" 1>&2
+        fi
+        waited=$(( waited + 1 ))
+        sleep 0.5
+    done
+    [ "${waited}" -gt 2 ] && [ -t 2 ] && printf '\r\033[K' 1>&2
+    wait "${pid}"
+}
+
 # releases the given records from the deepest level up
 release_records() {
-    local i depth max=0
+    local i depth max=0 mountpoints=() record_mounts=()
     for i in "${@}"; do
         [ "${rec_depth[i]}" -gt "${max}" ] && max="${rec_depth[i]}"
+        [ -n "${rec_mounts[i]}" ] && [ "${rec_mounts[i]}" != "[SWAP]" ] || continue
+        IFS=',' read -r -a record_mounts <<< "${rec_mounts[i]}"
+        mountpoints+=("${record_mounts[@]}")
     done
     # a working directory on the volume would keep it busy
     cd / || return 1
-    sync
+    flush_mounts "${mountpoints[@]}"
     for (( depth = max; depth >= 0; depth-- )); do
         for i in "${@}"; do
             [ "${rec_depth[i]}" -eq "${depth}" ] || continue
