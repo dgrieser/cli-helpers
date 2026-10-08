@@ -413,80 +413,6 @@ apt_remove_own_repo() {
     ${SUDO} rm -f "${list}" "${key}"
 }
 
-apt_add_with_list_file() {
-    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
-    require_cmd curl gpg apt-get || return 1
-    local name="${1}"; shift
-    local list_url="${1}"; shift
-    local repo_key_url="${1}"; shift
-    local repo_list_path="/etc/apt/sources.list.d/${name}.list"
-    local repo_gpg_path="/etc/apt/keyrings/${name}-repo-key.gpg"
-
-    local repo_key_ext
-    repo_key_ext="$(echo "${repo_key_url}" | grep -oE "\.[a-z]{3}$")"
-    [ -z "${repo_key_ext}" ] && repo_key_ext=".gpg"
-
-    local file_args=()
-    [ "${verbose}" -eq 1 ] && file_args+=("-v")
-
-    [ "${verbose}" -eq 1 ] && echo "+ mktemp --suffix \".list\"" 1>&2
-    local tmp_list_file
-    local tmp_key_file=""
-    tmp_list_file="$(mktemp --suffix ".list")"
-    trap 'rm -f "${tmp_list_file}" "${tmp_key_file}"; trap - RETURN' RETURN
-    [ "${verbose}" -eq 1 ] && echo "+ tmp_list_file=${tmp_list_file}" 1>&2
-
-
-    [ "${verbose}" -eq 1 ] && echo "+ curl -fsSL ${list_url} > ${tmp_list_file}" 1>&2
-    curl -fsSL "${list_url}" > "${tmp_list_file}" || return 1
-
-    if [ "${dry_run}" -eq 0 ]; then
-        [ "${verbose}" -eq 1 ] && echo "+ mktemp --suffix \".${repo_key_ext}\"" 1>&2
-        tmp_key_file="$(mktemp --suffix "${repo_key_ext}")"
-        [ "${verbose}" -eq 1 ] && echo "+ tmp_key_file=${tmp_key_file}" 1>&2
-
-        [ "${verbose}" -eq 1 ] && echo "+ curl -fsSL ${repo_key_url} > ${tmp_key_file}" 1>&2
-        curl -fsSL "${repo_key_url}" > "${tmp_key_file}" || return 1
-
-        [ "${verbose}" -eq 1 ] && echo "+ gpg --with-colons --import-options show-only --import ${tmp_key_file} | awk -F: '\$1 == \"pub\" { print \$7; exit }" 1>&2
-        expiry_timestamp="$(repo_key_expiry "${tmp_key_file}")"
-        [ -z "${expiry_timestamp}" ] && expiry_timestamp="0" && echo "WARNING: Failed to get expiry timestamp of ${repo_key_url}" 1>&2
-        expiry_date="$([ "${expiry_timestamp}" -gt "0" ] && date --date=@"${expiry_timestamp}" +%Y-%m-%d || echo "No expiry date" )"
-        now_timestamp="$(date +%s)"
-        if (( expiry_timestamp > 0 )) && (( expiry_timestamp < now_timestamp )); then
-            echo "ERROR: ${repo_key_url} has expired at ${expiry_date}" 1>&2
-            return 1
-        elif [ "${verbose}" -eq 1 ]; then
-            echo "+ expiry_date=${expiry_date}" 1>&2
-        fi
-
-        # parse keypath from list file
-        [ "${verbose}" -eq 1 ] && echo "+ grep -Eo -m 1 'signed-by=[^] ,]+' | ${tmp_list_file} | cut -d= -f2" 1>&2
-        key_path="$(grep -Eo -m 1 'signed-by=[^] ,]+' "${tmp_list_file}" | cut -d= -f2)"
-        [ "${verbose}" -eq 1 ] && echo "+ key_path='${key_path}'"
-        [ -n "${key_path}" ] && repo_gpg_path="${key_path}"
-
-        [ "${verbose}" -eq 1 ] && echo "+ mv ${file_args[*]} ${tmp_list_file} ${repo_list_path}" 1>&2
-        LC_ALL=C ${SUDO} mv "${file_args[@]}" "${tmp_list_file}" "${repo_list_path}" 2>&1 | sed 's/^/+ /' 1>&2
-
-        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} mkdir -p ${file_args[*]} $(dirname "${repo_gpg_path}")" 1>&2
-        LC_ALL=C ${SUDO} mkdir -p "${file_args[@]}" "$(dirname "${repo_gpg_path}")" 2>&1 | sed 's/^/+ /' 1>&2
-
-        [ "${verbose}" -eq 1 ] && echo "+ ${SUDO} gpg --dearmor --yes -o ${repo_gpg_path} < ${tmp_key_file}" 1>&2
-        LC_ALL=C ${SUDO} gpg --dearmor --yes -o "${repo_gpg_path}" < "${tmp_key_file}" || return 1
-
-        if [ "${verbose}" -eq 1 ]; then
-            echo "+ gpg --no-options --show-keys --with-fingerprint ${repo_gpg_path}"
-            LC_ALL=C ${SUDO_USER} gpg --no-options --show-keys --with-fingerprint "${repo_gpg_path}" 2>&1 | sed 's/^/+ /' 1>&2
-        fi
-    else
-        echo "Changes from ${list_url}:"
-        diff --color=always -u "${repo_list_path}" "${tmp_list_file}" 1>&2
-    fi
-
-    apt_upgrade "${name}"
-}
-
 apt_add_with_repo() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl gpg apt-get || return 1
@@ -596,22 +522,104 @@ apt_get_noninteractive() {
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${@}"
 }
 
+# apt_source_files URL: the enabled source files in sources.list.d that configure
+# the repo at URL; the Ubuntu archive in ubuntu.sources is never one of them
+apt_source_files() {
+    local url="${1%/}"
+    local file
+    for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "${file}" ] && [ "${file##*/}" != "ubuntu.sources" ] || continue
+        grep -qiE '^[[:space:]]*Enabled:[[:space:]]*no' "${file}" && continue
+        # the URL as a whole, so .../debian does not match .../debian-security
+        awk -v url="${url}" '
+            /^[[:space:]]*#/ { next }
+            (i = index($0, url)) {
+                c = substr($0, i + length(url), 1)
+                if (c == "" || c == "/" || c == " " || c == "\t") { found = 1; exit }
+            }
+            END { exit !found }' "${file}" && echo "${file}"
+    done
+}
+
+# apt_own_source FILE: whether FILE is a list apt_add_with_repo wrote
+apt_own_source() {
+    local name="${1##*/}"
+    grep -qF "signed-by=/etc/apt/keyrings/${name%.list}-repo-key.gpg" "${1}" 2>/dev/null
+}
+
+# apt_broken_sources OUTPUT: the source files behind the errors in the OUTPUT of
+# apt-get update, e.g. a repo whose key apt rejects (NO_PUBKEY), that has no
+# Release file, that two files name with different keys (Signed-By conflict) or a
+# malformed file; network errors are left alone, they pass
+apt_broken_sources() {
+    local line url path files own_files file
+    while IFS= read -r line; do
+        grep -qiE 'could not resolve|temporary failure|could not connect|connection (failed|timed out|refused)|unable to connect|network is unreachable' \
+            <<< "${line}" && continue
+        while IFS= read -r path; do
+            [ -f "${path}" ] && [ "${path##*/}" != "ubuntu.sources" ] && echo "${path}"
+        done < <(grep -oE "/etc/apt/sources\.list\.d/[^ :']+" <<< "${line}")
+        while IFS= read -r url; do
+            url="${url%%/dists/*}"
+            files="$(apt_source_files "${url}")"
+            [ -z "${files}" ] && continue
+            if grep -qF 'Conflicting values set for option Signed-By' <<< "${line}"; then
+                # keep the repo the package set up itself, drop the list next to it
+                own_files=""
+                for file in ${files}; do
+                    apt_own_source "${file}" && own_files+="${file}"$'\n'
+                done
+                [ -n "${own_files}" ] && [ "$(grep -c . <<< "${own_files}")" -lt "$(grep -c . <<< "${files}")" ] \
+                    && files="${own_files}"
+            fi
+            echo "${files}"
+        done < <(grep -oE "https?://[^ ']+" <<< "${line}")
+    done < <(grep -E '^E: ' <<< "${1}") | grep . | sort -u
+}
+
+# apt_update: apt-get update, and when a repo breaks it, whichever software or
+# package added it, that repo's source file is disabled (renamed to .disabled,
+# which apt skips) and the update runs again, so one broken repo does not fail
+# every apt install after it
+apt_update() {
+    local output status files file
+    while true; do
+        if [ "${verbose}" -eq 1 ]; then
+            output="$(LC_ALL=C ${SUDO} apt-get update 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}")"
+            status=$?
+        else
+            output="$(LC_ALL=C ${SUDO} apt-get update 2>&1)"
+            status=$?
+            [ "${status}" -ne 0 ] && echo "${output}" 1>&2
+        fi
+        [ "${status}" -eq 0 ] && return 0
+
+        files="$(apt_broken_sources "${output}")"
+        if [ -z "${files}" ]; then
+            error "apt-get update failed, no broken source file found to disable"
+            return 1
+        fi
+        if [ "${dry_run}" -eq 1 ]; then
+            for file in ${files}; do
+                echo "Would disable ${file}, it breaks apt-get update" 1>&2
+            done
+            return 1
+        fi
+        for file in ${files}; do
+            warning "Disabling ${file}, it breaks apt-get update (re-enable: ${SUDO:+sudo }mv ${file}.disabled ${file})"
+            verbose "${SUDO} mv -f ${file} ${file}.disabled"
+            ${SUDO} mv -f "${file}" "${file}.disabled" || return 1
+        done
+        echo "${APP_NAME}: Updating sources again..." 1>&2
+    done
+}
+
 apt_upgrade() {
     require_cmd apt-get || return 1
     # no packages: upgrade everything installed; otherwise install/upgrade just these
     local -a pkgs=("${@}")
     echo "${APP_NAME}: Updating sources..." 1>&2
-    local apt_exit_code=-1
-    if [ "${verbose}" -eq 1 ]; then
-        LC_ALL=C ${SUDO} apt-get update
-        apt_exit_code=$?
-    else
-        local apt_update_output
-        apt_update_output="$(LC_ALL=C ${SUDO} apt-get update 2>&1)"
-        apt_exit_code=$?
-        [ ${apt_exit_code} -ne 0 ] && echo "${apt_update_output}" 1>&2
-    fi
-    [ ${apt_exit_code} -ne 0 ] && return 1
+    apt_update || return 1
 
     if [ "${dry_run}" -eq 0 ]; then
         if [ "${#pkgs[@]}" -gt 0 ]; then
@@ -2012,7 +2020,6 @@ software-080-claude@dev@agents() {
     config_update claude "${CURRENT_USER_HOME}/.claude" || return 1
     claude_plugins_update "${lib_dir}/claude/settings.json"
 }
-software-090-code@dev() { apt_upgrade "code"; }
 software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
 software-110-nerd-fonts@base() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
@@ -2083,10 +2090,82 @@ software-121-mittwald-outlook-bridge@mw() {
 }
 software-122-git-commit-ai@dev@agents() { curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh"; }
 software-130-slack@comms() {
-    # jessie is the only supported version
-    apt_add_with_list_file "slack-desktop" \
-        "https://packagecloud.io/install/repositories/slacktechnologies/slack/config_file.list?os=debian&dist=jessie&source=script" \
-        "https://packagecloud.io/slacktechnologies/slack/gpgkey"
+    needs packages jq || return $(( $? == 3 ? 0 : 1 ))
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd curl jq dpkg apt-get || return 1
+    local slack_package_name="slack-desktop"
+    local slack_release_url="https://slack.com/api/desktop.latestRelease?arch=x64&variant=deb&redirect=false"
+    local slack_release_response
+    local slack_deb_url
+    local slack_deb_file_path
+    local version
+    local installed_version
+
+    # no apt repo: Slack's packagecloud key binds its signing subkey with SHA1,
+    # which apt 3 rejects (NO_PUBKEY C6ABDCF64DB9A0B2), and the failing repo
+    # breaks every apt-get update; the cron job of the package adds the repo
+    # again unless /etc/default/slack turns that off
+    slack_repo_remove || return 1
+
+    slack_release_response="$(curl -sS "${slack_release_url}")" || return 1
+    version="$(echo "${slack_release_response}" | jq -r '.version // empty')"
+    slack_deb_url="$(echo "${slack_release_response}" | jq -r '.download_url // empty')"
+    if [[ ! "${version}" =~ ^[0-9\.]+$ ]] || [[ "${slack_deb_url}" != https://* ]]; then
+        error "Failed to get latest version of Slack"
+        echo "${slack_release_url} returned:" 1>&2
+        echo "${slack_release_response}" 1>&2
+        return 1
+    fi
+
+    installed_version="$(dpkg -s "${slack_package_name}" 2>/dev/null | grep -m 1 '^Version:' | awk '{print $2}')"
+    [ -z "${installed_version}" ] && installed_version="<unknown>"
+    if [ "${version}" = "${installed_version}" ]; then
+        echo "${APP_NAME}: Slack ${installed_version} is up to date" 1>&2
+    elif [ "${dry_run}" -eq 1 ]; then
+        echo "${APP_NAME}: Update available for Slack ${installed_version} -> ${version}" 1>&2
+        echo -e "NAME\tCURRENT\tUPDATE\nSlack\t${installed_version}\t${version}" | column -t -s $'\t'
+    else
+        echo "${APP_NAME}: Update available for Slack ${installed_version} -> ${version}" 1>&2
+        slack_deb_file_path="$(mktemp --suffix ".deb")" || return 1
+        trap 'rm -f "${slack_deb_file_path}"; trap - RETURN' RETURN
+        if ! curl -fL "${slack_deb_url}" -o "${slack_deb_file_path}"; then
+            error "Failed to download latest version of Slack from ${slack_deb_url}"
+            return 1
+        fi
+        # readable by _apt, which apt-get install drops to for a local file
+        chmod 644 "${slack_deb_file_path}"
+        apt_get_noninteractive install "${slack_deb_file_path}" || return 1
+    fi
+}
+
+# slack_repo_remove: the packagecloud repo of Slack, both the list updater wrote
+# before and the one the cron job of the package writes, and keep the cron job
+# from adding it again
+slack_repo_remove() {
+    local -a files=()
+    local file
+    for file in /etc/apt/sources.list.d/slack-desktop.list /etc/apt/keyrings/slack-desktop-repo-key.gpg \
+        /etc/apt/sources.list.d/slack.list; do
+        [ -e "${file}" ] && files+=("${file}")
+    done
+    local defaults_file="/etc/default/slack"
+    local defaults=$'repo_add_once="false"\nrepo_reenable_on_distupgrade="false"'
+    local defaults_current=""
+    [ -r "${defaults_file}" ] && defaults_current="$(cat "${defaults_file}")"
+    if [ "${dry_run}" -eq 1 ]; then
+        [ "${#files[@]}" -gt 0 ] && echo "Would remove ${files[*]}" 1>&2
+        [ "${defaults_current}" != "${defaults}" ] && echo "Would write ${defaults_file} to keep Slack from adding its repo" 1>&2
+        return 0
+    fi
+    if [ "${#files[@]}" -gt 0 ]; then
+        echo "${APP_NAME}: removing the Slack apt repo, its key fails with apt 3" 1>&2
+        verbose "${SUDO} rm -f ${files[*]}"
+        ${SUDO} rm -f "${files[@]}" || return 1
+    fi
+    if [ "${defaults_current}" != "${defaults}" ]; then
+        verbose "echo ... | ${SUDO} tee ${defaults_file}"
+        echo "${defaults}" | ${SUDO} tee "${defaults_file}" > /dev/null || return 1
+    fi
 }
 software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
