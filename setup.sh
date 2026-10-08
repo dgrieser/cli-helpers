@@ -513,12 +513,13 @@ restore_agents() {
 
 # restore_git_repo DIR: the repo of DIR of git/ of the backup to its path under
 # ~: cloned from its remotes when it is not there, then what only it held on the
-# old machine from repo.bundle: the branches (one that went another way here is
-# kept and the old one restored as NAME-setup-backup), the tags, the stashes and
-# the worktrees with their uncommitted and untracked files; changes that do not
-# fit the worktree as it is here become a stash instead
+# old machine from repo.bundle: the branches (one that went another way in a repo
+# that was here is kept and the old one restored as NAME-setup-backup), the tags,
+# the stashes and the worktrees at their old commits with their uncommitted and
+# untracked files; changes that do not fit the worktree as it is here become a
+# stash instead
 restore_git_repo() {
-    local src="${1}" rel dst line kind a b c d e f sha cur wt path fresh=0 checked_out
+    local src="${1}" rel dst line kind a b c d e f sha cur wt path fresh=0 checked_out at_old
     local -a remotes=() branches=() tags=() stashes=() worktrees=()
     rel="${src#"${BACKUP_DIR}/git/"}"
     dst="${HOME}/${rel}"
@@ -569,7 +570,10 @@ restore_git_repo() {
     for line in "${branches[@]}"; do
         IFS=$'\x1f' read -r a b <<< "${line}"
         sha="$(git -C "${dst}" rev-parse "refs/setup-backup/heads/${a}")"
-        if ! cur="$(git -C "${dst}" rev-parse -q --verify "refs/heads/${a}")"; then
+        # a fresh clone holds nothing of its own, its branch is the one of the
+        # old machine; the checkout of the main worktree below makes its files
+        # fit when it is the one checked out
+        if [ "${fresh}" -eq 1 ] || ! cur="$(git -C "${dst}" rev-parse -q --verify "refs/heads/${a}")"; then
             git -C "${dst}" update-ref "refs/heads/${a}" "${sha}"
         elif [ "${cur}" = "${sha}" ]; then
             :
@@ -605,31 +609,65 @@ restore_git_repo() {
     for wt in "${worktrees[@]}"; do
         IFS=$'\x1f' read -r a path b c d e <<< "${wt}"
         path="${HOME}/${path}"
+        # older backups wrote heads/NAME for a branch that shares its name with a tag
+        [[ "${b}" == heads/* ]] && git -C "${dst}" rev-parse -q --verify "refs/tags/${b#heads/}" > /dev/null \
+            && b="${b#heads/}"
+        # the branch to check out is put at the commit of the old machine when it
+        # is not here (its remote deleted it, e.g. merged) or, in a fresh clone,
+        # the uncommitted changes were made on that commit; else it stays where
+        # its remote moved on to, as it held no commits of its own then
+        at_old=0
+        if [ -n "${b}" ] && git -C "${dst}" cat-file -e "${c}^{commit}" 2> /dev/null \
+            && { ! git -C "${dst}" rev-parse -q --verify "refs/heads/${b}" > /dev/null \
+                || { [ "${fresh}" -eq 1 ] && [ -n "${d}" ]; }; }; then
+            at_old=1
+        fi
         if [ "${a}" -eq 0 ]; then
             path="${dst}"
+            # forced, as a fresh clone has nothing to lose and the branches above
+            # may have moved the branch it has checked out
             if [ "${fresh}" -eq 1 ]; then
-                if [ -n "${b}" ]; then
-                    git -C "${dst}" checkout -q "${b}"
+                if [ -z "${b}" ]; then
+                    git -C "${dst}" checkout -q -f --detach "${c}"
+                elif [ "${at_old}" -eq 1 ]; then
+                    git -C "${dst}" checkout -q -f -B "${b}" "${c}"
                 else
-                    git -C "${dst}" checkout -q --detach "${c}"
+                    git -C "${dst}" checkout -q -f "${b}"
                 fi || failed+=("git ${rel}: checkout ${b:-${c}}")
+            else
+                at_old=0
             fi
         elif [ ! -e "${path}" ]; then
-            if [ -n "${b}" ]; then
-                run git -C "${dst}" worktree add -q "${path}" "${b}"
-            else
+            if [ -z "${b}" ]; then
                 run git -C "${dst}" worktree add -q --detach "${path}" "${c}"
+            elif [ "${at_old}" -eq 1 ]; then
+                run git -C "${dst}" worktree add -q -B "${b}" "${path}" "${c}"
+            else
+                run git -C "${dst}" worktree add -q "${path}" "${b}"
             fi || { failed+=("git ${rel}: worktree ${path}"); continue; }
         elif [ "$(git -C "${path}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
             != "$(git -C "${dst}" rev-parse --path-format=absolute --git-common-dir)" ]; then
             warning "${path} is there but no worktree of ${dst}, its changes are not restored"
             failed+=("git worktree ${path}")
             continue
+        else
+            at_old=0
         fi
-        # changes that are there already (a second run) are left alone
+        # a branch put at a commit tracks the branch of its name of a remote,
+        # origin first, as a checkout of a remote branch does
+        if [ "${at_old}" -eq 1 ] && ! git -C "${dst}" rev-parse -q --verify "${b}@{upstream}" > /dev/null 2>&1; then
+            for line in origin $(git -C "${dst}" remote); do
+                git -C "${dst}" rev-parse -q --verify "refs/remotes/${line}/${b}" > /dev/null || continue
+                git -C "${dst}" branch -q --set-upstream-to="${line}/${b}" "${b}"
+                break
+            done
+        fi
+        # changes that are there already or a stash already (a second run) are
+        # left alone
         sha="$(git -C "${path}" stash create 2>/dev/null)"
-        if [ -n "${d}" ] && [ -n "${sha}" ] \
-            && [ "$(git -C "${path}" rev-parse "${sha}^{tree}")" = "$(git -C "${path}" rev-parse "${d}^{tree}")" ]; then
+        if [ -n "${d}" ] && { git -C "${dst}" stash list --format='%H' | grep -qx "${d}" \
+            || { [ -n "${sha}" ] \
+                && [ "$(git -C "${path}" rev-parse "${sha}^{tree}")" = "$(git -C "${path}" rev-parse "${d}^{tree}")" ]; }; }; then
             d=""
         fi
         if [ -n "${d}" ]; then

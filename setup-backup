@@ -397,7 +397,8 @@ backup_git_repo() {
             changed=1
         fi
         head="$(git -C "${wt}" rev-parse HEAD)"
-        branch="$(git -C "${wt}" symbolic-ref -q --short HEAD)"
+        # not symbolic-ref --short, it gives heads/NAME when a tag is named NAME too
+        branch="$(git -C "${wt}" branch --show-current)"
         if [ -z "${branch}" ] && [ -n "${local_only[${head}]:-}" ]; then
             refs+=("refs/backup/head/${n} ${head}")
         fi
