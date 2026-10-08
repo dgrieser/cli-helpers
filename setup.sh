@@ -5,8 +5,9 @@
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
 # if you like, gitlab.com), the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
-# of reminder, the lists of ~/.kube/mittwald, the session of Sublime Text and the sessions and histories of
-# Claude Code, Codex and opencode from a backup, the categories of updater
+# of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text and the sessions and histories of
+# Claude Code, Codex and opencode from a backup, the git repos of the workspace
+# with what only they held (changes, stashes, local branches, worktrees), the categories of updater
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
 # NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
@@ -144,7 +145,7 @@ choose_backup() {
         return 0
     fi
     found=0
-    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text agents; do
+    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text downloads agents git; do
         [ -d "${choice}/${dir}" ] && found=1
     done
     if [ "${found}" -eq 0 ]; then
@@ -447,6 +448,14 @@ restore_kube_mittwald() {
     restore_part kube-mittwald "${HOME}/.kube/mittwald"
 }
 
+# the Downloads folder from downloads/ of the backup; a file that is there
+# already is kept
+restore_downloads() {
+    has_part downloads || return 0
+    info "Downloads: restore the Downloads folder from the backup"
+    restore_part downloads "$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "${HOME}/Downloads")"
+}
+
 # the session of Sublime Text from sublime-text/ of the backup: the windows and
 # tabs it had open, with their unsaved text; before updater installs it, so
 # its first start opens them; a running one would write its own session over it
@@ -485,6 +494,169 @@ restore_agents() {
         fi
     done
     echo "agents: restored ${count} to ${HOME}" 1>&2
+}
+
+# restore_git_repo DIR: the repo of DIR of git/ of the backup to its path under
+# ~: cloned from its remotes when it is not there, then what only it held on the
+# old machine from repo.bundle: the branches (one that went another way here is
+# kept and the old one restored as NAME-setup-backup), the tags, the stashes and
+# the worktrees with their uncommitted and untracked files; changes that do not
+# fit the worktree as it is here become a stash instead
+restore_git_repo() {
+    local src="${1}" rel dst line kind a b c d e f sha cur wt path fresh=0 checked_out
+    local -a remotes=() branches=() tags=() stashes=() worktrees=()
+    rel="${src#"${BACKUP_DIR}/git/"}"
+    dst="${HOME}/${rel}"
+    # the fields are kept apart by \x1f, as read joins tabs in a row and loses
+    # an empty field
+    while IFS= read -r line; do
+        IFS=$'\x1f' read -r kind line <<< "${line//$'\t'/$'\x1f'}"
+        case "${kind}" in
+            remote)   remotes+=("${line}") ;;
+            branch)   branches+=("${line}") ;;
+            tag)      tags+=("${line}") ;;
+            stash)    stashes+=("${line}") ;;
+            worktree) worktrees+=("${line}") ;;
+        esac
+    done < "${src}/manifest"
+
+    echo "${rel}" 1>&2
+    if [ ! -e "${dst}/.git" ]; then
+        if [ "${#remotes[@]}" -gt 0 ]; then
+            # from origin, or the first remote; the others are added after the clone
+            IFS=$'\x1f' read -r a b <<< "${remotes[0]}"
+            for line in "${remotes[@]}"; do
+                [ "${line%%$'\x1f'*}" = origin ] && IFS=$'\x1f' read -r a b <<< "${line}"
+            done
+            run git clone -q -o "${a}" "${b}" "${dst}" || { failed+=("git clone ${b} ${dst}"); return 0; }
+        else
+            run git init -q "${dst}" || { failed+=("git init ${dst}"); return 0; }
+        fi
+        fresh=1
+    fi
+    for line in "${remotes[@]}"; do
+        IFS=$'\x1f' read -r a b <<< "${line}"
+        git -C "${dst}" remote get-url "${a}" > /dev/null 2>&1 && continue
+        git -C "${dst}" remote add "${a}" "${b}" && git -C "${dst}" fetch -q "${a}" \
+            || failed+=("git remote add ${a} ${b} in ${dst}")
+    done
+
+    if [ -f "${src}/repo.bundle" ]; then
+        # the bundle builds on the commits of the remotes, which an old clone may lack
+        git -C "${dst}" bundle verify -q "${src}/repo.bundle" > /dev/null 2>&1 \
+            || git -C "${dst}" fetch -q --all
+        if ! git -C "${dst}" fetch -q --no-tags "${src}/repo.bundle" '+refs/*:refs/setup-backup/*'; then
+            failed+=("git ${rel}, the commits of the remotes it builds on are gone")
+            return 0
+        fi
+    fi
+
+    for line in "${branches[@]}"; do
+        IFS=$'\x1f' read -r a b <<< "${line}"
+        sha="$(git -C "${dst}" rev-parse "refs/setup-backup/heads/${a}")"
+        if ! cur="$(git -C "${dst}" rev-parse -q --verify "refs/heads/${a}")"; then
+            git -C "${dst}" update-ref "refs/heads/${a}" "${sha}"
+        elif [ "${cur}" = "${sha}" ]; then
+            :
+        elif git -C "${dst}" merge-base --is-ancestor "${cur}" "${sha}"; then
+            checked_out="$(git -C "${dst}" worktree list --porcelain \
+                | awk -v ref="branch refs/heads/${a}" '/^worktree / { wt = substr($0, 10) } $0 == ref { print wt }')"
+            if [ -n "${checked_out}" ]; then
+                git -C "${checked_out}" merge -q --ff-only "${sha}" \
+                    || failed+=("git ${rel}: fast-forward of ${a} in ${checked_out}")
+            else
+                git -C "${dst}" update-ref "refs/heads/${a}" "${sha}" "${cur}"
+            fi
+        else
+            warning "${rel}: ${a} went another way here, the old one is ${a}-setup-backup"
+            git -C "${dst}" update-ref "refs/heads/${a}-setup-backup" "${sha}"
+        fi
+        if [ -n "${b}" ] && git -C "${dst}" rev-parse -q --verify "refs/remotes/${b}" > /dev/null; then
+            git -C "${dst}" branch -q --set-upstream-to="${b}" "${a}"
+        fi
+    done
+    for a in "${tags[@]}"; do
+        git -C "${dst}" rev-parse -q --verify "refs/tags/${a}" > /dev/null && continue
+        git -C "${dst}" update-ref "refs/tags/${a}" "$(git -C "${dst}" rev-parse "refs/setup-backup/tags/${a}")"
+    done
+    # the oldest first, so they keep their order
+    for (( c = ${#stashes[@]} - 1; c >= 0; c-- )); do
+        IFS=$'\x1f' read -r a b <<< "${stashes[${c}]}"
+        sha="$(git -C "${dst}" rev-parse "refs/setup-backup/backup/stash/${a}")"
+        git -C "${dst}" stash list --format='%H' | grep -qx "${sha}" && continue
+        git -C "${dst}" stash store -m "${b}" "${sha}" || failed+=("git ${rel}: stash ${b}")
+    done
+
+    for wt in "${worktrees[@]}"; do
+        IFS=$'\x1f' read -r a path b c d e <<< "${wt}"
+        path="${HOME}/${path}"
+        if [ "${a}" -eq 0 ]; then
+            path="${dst}"
+            if [ "${fresh}" -eq 1 ]; then
+                if [ -n "${b}" ]; then
+                    git -C "${dst}" checkout -q "${b}"
+                else
+                    git -C "${dst}" checkout -q --detach "${c}"
+                fi || failed+=("git ${rel}: checkout ${b:-${c}}")
+            fi
+        elif [ ! -e "${path}" ]; then
+            if [ -n "${b}" ]; then
+                run git -C "${dst}" worktree add -q "${path}" "${b}"
+            else
+                run git -C "${dst}" worktree add -q --detach "${path}" "${c}"
+            fi || { failed+=("git ${rel}: worktree ${path}"); continue; }
+        elif [ "$(git -C "${path}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+            != "$(git -C "${dst}" rev-parse --path-format=absolute --git-common-dir)" ]; then
+            warning "${path} is there but no worktree of ${dst}, its changes are not restored"
+            failed+=("git worktree ${path}")
+            continue
+        fi
+        # changes that are there already (a second run) are left alone
+        sha="$(git -C "${path}" stash create 2>/dev/null)"
+        if [ -n "${d}" ] && [ -n "${sha}" ] \
+            && [ "$(git -C "${path}" rev-parse "${sha}^{tree}")" = "$(git -C "${path}" rev-parse "${d}^{tree}")" ]; then
+            d=""
+        fi
+        if [ -n "${d}" ]; then
+            # onto the commit they were made on, into a clean worktree, else a stash
+            if [ "$(git -C "${path}" rev-parse HEAD)" = "${c}" ] \
+                && [ -z "$(git -C "${path}" status --porcelain --untracked-files=no)" ] \
+                && git -C "${path}" stash apply -q --index "${d}" > /dev/null 2>&1; then
+                :
+            else
+                warning "${path}: the uncommitted changes of the old machine are a stash now"
+                git -C "${dst}" stash store -m "setup-backup changes of ${path#"${HOME}/"}" "${d}" \
+                    || failed+=("git ${rel}: changes of ${path}")
+            fi
+        fi
+        if [ "${e}" = 1 ]; then
+            tar -xf "${src}/untracked-${a}.tar" -C "${path}" --skip-old-files \
+                || failed+=("git ${rel}: untracked files of ${path}")
+        fi
+    done
+
+    git -C "${dst}" for-each-ref --format='delete %(refname)' refs/setup-backup \
+        | git -C "${dst}" update-ref --stdin
+}
+
+# the git repos of the workspace from git/ of the backup (see restore_git_repo);
+# after the logins and SSH keys, as the missing ones are cloned
+restore_git() {
+    local manifest
+    local -a dirs=()
+    has_part git || return 0
+    while IFS= read -r manifest; do
+        dirs+=("$(dirname "${manifest}")")
+    done < <(find "${BACKUP_DIR}/git" -name manifest | sort)
+    [ "${#dirs[@]}" -eq 0 ] && return 0
+    info "Git repos: restore what only they held (uncommitted changes, stashes, local branches, worktrees), the missing ones are cloned"
+    printf '  %s\n' "${dirs[@]#"${BACKUP_DIR}/git/"}" 1>&2
+    ask "Restore these ${#dirs[@]} git repos?" || return 0
+    grep -qsF "${MITTWALD_GITLAB}" "${dirs[@]/%//manifest}" && ! dial_vpn "${MITTWALD_GITLAB}" \
+        && warning "No VPN, the repos of ${MITTWALD_GITLAB} cannot be cloned"
+    for manifest in "${dirs[@]}"; do
+        restore_git_repo "${manifest}"
+    done
 }
 
 # agent_cmd NAME: the installed command, also when the PATH of this shell does
@@ -687,7 +859,9 @@ restore_keys_history
 install_dotfiles
 restore_reminders
 restore_kube_mittwald
+restore_downloads
 restore_agents
+restore_git
 
 check_categories
 select_categories

@@ -4,8 +4,10 @@
 # documents folder with the SSH keys the SSH config names, the private
 # scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
 # the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read, the
-# session of Sublime Text with its open files and the sessions, histories,
-# memories and settings of Claude Code, Codex and opencode.
+# session of Sublime Text with its open files, the Downloads folder, the sessions, histories,
+# memories and settings of Claude Code, Codex and opencode, and what only the
+# git repos of the workspace hold: uncommitted changes, stashes, local branches
+# and tags, and the worktrees of ~/workspace.worktree.
 # Before the keyring files are copied it offers to store the current SSH config in the keyring, so setup.sh
 # restores that one and not an older copy.
 
@@ -46,6 +48,9 @@ AGENT_EXCLUDES_codex=(.codex/auth.json .codex/installation_id .codex/packages
 AGENT_PATHS_opencode=(.config/opencode .local/share/opencode)
 AGENT_EXCLUDES_opencode=(.config/opencode/node_modules .local/share/opencode/auth.json
     .local/share/opencode/log)
+# the git repos: every one under these folders (the worktrees folder also holds
+# clones of its own); a worktree is only backed up when it is in one of them
+GIT_DIRS=("${HOME}/workspace" "${HOME}/workspace.worktree")
 
 usage() {
     cat <<EOF 1>&2
@@ -69,8 +74,15 @@ and finds every part in it by this layout:
                 the lists of ${KUBE_MITTWALD_DIR}
   sublime-text/ the session of Sublime Text of ${SUBLIME_DIR}: the open
                 windows and tabs, with the unsaved text in them
+  downloads/    the Downloads folder, without unfinished downloads
   agents/       ${AGENTS[*]}: their sessions, histories, memories and
                 settings, one NAME.tar.gz each, without the logins
+  git/          what only the git repos of ~/workspace and
+                ~/workspace.worktree hold, one folder per repo at its path
+                under ~: the uncommitted changes
+                (staged, unstaged and untracked, not the ignored files), the
+                stashes, the branches and tags no remote has and the
+                worktrees; the rest comes from the remotes again
 
 The backup holds private keys, the keyring files and the agent sessions: keep it
 somewhere safe.
@@ -264,6 +276,24 @@ backup_sublime() {
     echo "sublime-text: $(find "${target}" -type f | wc -l) files of ${SUBLIME_DIR}" 1>&2
 }
 
+# the Downloads folder, whole; a download that is still running or broke off
+# (.crdownload of Chrome, .part of Firefox) is left out
+backup_downloads() {
+    local target="${1}/downloads" dir
+    dir="$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "${HOME}/Downloads")"
+    if [ ! -d "${dir}" ] || [ "${dir}" = "${HOME}" ] || [ -z "$(ls -A "${dir}")" ]; then
+        echo "downloads: none" 1>&2
+        return 0
+    fi
+    if ! { mkdir -p "${target}" \
+        && find "${dir}" -mindepth 1 -maxdepth 1 ! -name '*.crdownload' ! -name '*.part' \
+            -exec cp -a -t "${target}" {} +; }; then
+        failed+=("downloads ${dir}")
+        return 0
+    fi
+    echo "downloads: $(find "${target}" -type f | wc -l) files ($(du -sh "${target}" | cut -f 1)) of ${dir}" 1>&2
+}
+
 backup_agents() {
     local target="${1}/agents" name path status ref
     local -a paths excludes
@@ -294,6 +324,165 @@ backup_agents() {
         fi
         echo "agents: ${name}.tar.gz ($(du -h "${target}/${name}.tar.gz" | cut -f 1)) of ${paths[*]}" 1>&2
     done
+}
+
+# in_git_dirs PATH: whether PATH is in one of GIT_DIRS
+in_git_dirs() {
+    local dir
+    for dir in "${GIT_DIRS[@]}"; do
+        [[ "${1}/" == "${dir}/"* ]] && return 0
+    done
+    return 1
+}
+
+# backup_git_repo REPO TARGET: what only REPO holds into TARGET, which is left
+# out when there is nothing: a manifest of the remotes, branches, tags, stashes
+# and worktrees, repo.bundle with the commits no remote has (the stashes and
+# uncommitted changes as commits, as git stash create makes them) and
+# untracked-N.tar with the untracked files of worktree N; returns 1 for a repo
+# that holds nothing of its own
+backup_git_repo() {
+    local repo="${1}" target="${2}"
+    local name url upstream sha message index line wt head branch wip untracked tmp status
+    local changed=0 n=-1
+    local -a manifest=() refs=() files=() worktrees=()
+    local -A local_only=()
+    cd "${repo}" || return 1
+    git rev-parse --verify -q HEAD > /dev/null || return 1
+
+    # the commits no remote-tracking branch has, of all branches and HEADs at
+    # once; a tag only counts without remotes, as the tags of a remote are not
+    # all on its branches
+    while IFS= read -r sha; do
+        local_only["${sha}"]=1
+    done < <({ git for-each-ref --format='%(objectname)' refs/heads
+               git worktree list --porcelain | sed -n 's/^HEAD //p'; } \
+        | git rev-list --stdin --not --remotes 2>/dev/null)
+
+    while IFS= read -r name; do
+        url="$(git remote get-url "${name}")"
+        manifest+=("remote"$'\t'"${name}"$'\t'"${url}")
+    done < <(git remote)
+    # \x1f between the fields, as read joins tabs in a row and loses an empty one
+    while IFS=$'\x1f' read -r name upstream sha; do
+        [ -n "${local_only[${sha}]:-}" ] || continue
+        manifest+=("branch"$'\t'"${name}"$'\t'"${upstream}")
+        refs+=("refs/heads/${name} ${sha}")
+    done < <(git for-each-ref --format='%(refname:lstrip=2)%1f%(upstream:short)%1f%(objectname)' refs/heads)
+    if [ -z "$(git remote)" ]; then
+        while IFS=$'\x1f' read -r name sha; do
+            manifest+=("tag"$'\t'"${name}")
+            refs+=("refs/tags/${name} ${sha}")
+        done < <(git for-each-ref --format='%(refname:lstrip=2)%1f%(objectname)' refs/tags)
+    fi
+    index=0
+    while IFS=$'\x1f' read -r sha message; do
+        manifest+=("stash"$'\t'"${index}"$'\t'"${message}")
+        refs+=("refs/backup/stash/${index} ${sha}")
+        index=$((index + 1))
+    done < <(git stash list --format='%H%x1f%gs')
+
+    # the main worktree first, then the linked ones; one that is gone (prunable)
+    # or outside the workspace is left out
+    while IFS= read -r line; do
+        case "${line}" in
+            "worktree "*) worktrees+=("${line#worktree }") ;;
+            prunable*|bare) unset 'worktrees[-1]' ;;
+        esac
+    done < <(git worktree list --porcelain)
+    for wt in "${worktrees[@]}"; do
+        n=$((n + 1))
+        if [ "${n}" -gt 0 ]; then
+            in_git_dirs "${wt}" || continue
+            changed=1
+        fi
+        head="$(git -C "${wt}" rev-parse HEAD)"
+        branch="$(git -C "${wt}" symbolic-ref -q --short HEAD)"
+        if [ -z "${branch}" ] && [ -n "${local_only[${head}]:-}" ]; then
+            refs+=("refs/backup/head/${n} ${head}")
+        fi
+        wip=""
+        if [ -n "$(git -C "${wt}" status --porcelain --untracked-files=no --ignore-submodules)" ]; then
+            if ! wip="$(git -C "${wt}" stash create "setup-backup of ${wt#"${HOME}/"}")" || [ -z "${wip}" ]; then
+                warning "Cannot save the uncommitted changes of ${wt}"
+                return 2
+            fi
+            refs+=("refs/backup/wip/${n} ${wip}")
+        fi
+        # a nested repo shows up as its folder, it is backed up on its own
+        files=()
+        while IFS= read -r -d '' line; do
+            [[ "${line}" == */ ]] || files+=("${line}")
+        done < <(git -C "${wt}" ls-files -o --exclude-standard -z)
+        untracked=0
+        if [ "${#files[@]}" -gt 0 ]; then
+            mkdir -p "${target}" && printf '%s\0' "${files[@]}" \
+                | tar -cf "${target}/untracked-${n}.tar" -C "${wt}" --null -T - || return 2
+            untracked=1
+            changed=1
+        fi
+        manifest+=("worktree"$'\t'"${n}"$'\t'"${wt#"${HOME}/"}"$'\t'"${branch}"$'\t'"${head}"$'\t'"${wip}"$'\t'"${untracked}")
+    done
+
+    [ "${#refs[@]}" -gt 0 ] && changed=1
+    [ "${changed}" -eq 0 ] && return 1
+    mkdir -p "${target}" || return 2
+    printf '%s\n' "${manifest[@]}" > "${target}/manifest" || return 2
+    [ "${#refs[@]}" -eq 0 ] && return 0
+
+    # the refs go into a bundle of a scratch repo that borrows the objects of
+    # this one, so the repo itself gets no refs; the commits the remotes have
+    # are left out, a clone has them
+    tmp="$(mktemp -d)"
+    git init -q --bare "${tmp}" \
+        && git rev-parse --path-format=absolute --git-common-dir | sed 's#$#/objects#' > "${tmp}/objects/info/alternates" \
+        && { printf 'create %s\n' "${refs[@]}"
+             git for-each-ref --format='create %(refname) %(objectname)' refs/remotes; } \
+            | git -C "${tmp}" update-ref --stdin \
+        && git -C "${tmp}" bundle create -q "${target}/repo.bundle" "${refs[@]%% *}" --not --remotes
+    status="${?}"
+    rm -rf "${tmp}"
+    [ "${status}" -eq 0 ] || return 2
+}
+
+# the git repos of the workspace, each that holds something of its own (see
+# backup_git_repo); a worktree whose repo does not know it any more (e.g. one
+# copied from another machine) is only warned about
+backup_git() {
+    local target="${1}/git" dir repo gitdir count=0 status
+    local -a repos=()
+    command -v git > /dev/null 2>&1 || return 0
+    for dir in "${GIT_DIRS[@]}"; do
+        [ -d "${dir}" ] || continue
+        while IFS= read -r repo; do
+            repos+=("${repo%/.git}")
+        done < <(find "${dir}" \( -name node_modules -o -name .venv \) -prune \
+            -o -name .git -type d -print -prune 2>/dev/null)
+        while IFS= read -r repo; do
+            gitdir="$(sed -n 's/^gitdir: //p' "${repo}")"
+            # a submodule points into the .git/modules of its parent
+            [[ "${gitdir}" == */worktrees/* ]] || continue
+            [ -d "${gitdir}" ] && [ "$(cat "${gitdir}/gitdir" 2>/dev/null)" = "${repo}" ] && continue
+            warning "${repo%/.git} is a worktree its repo does not know (${gitdir}), not backed up: git -C REPO worktree repair ${repo%/.git}"
+            failed+=("git ${repo%/.git}")
+        done < <(find "${dir}" \( -name node_modules -o -name .venv \) -prune -o -name .git -type f -print 2>/dev/null)
+    done
+    mapfile -t repos < <(printf '%s\n' "${repos[@]}" | sort -u)
+    for repo in "${repos[@]}"; do
+        # a repo in a folder its parent ignores is a build artifact, e.g. a
+        # checkout of gitlab-ci-local or a build
+        dir="$(git -C "$(dirname "${repo}")" rev-parse --show-toplevel 2>/dev/null)" \
+            && git -C "${dir}" check-ignore -q "${repo}" && continue
+        ( backup_git_repo "${repo}" "${target}/${repo#"${HOME}/"}" )
+        status="${?}"
+        case "${status}" in
+            0) count=$((count + 1))
+               echo "git: ${repo#"${HOME}/"} ($(du -sh "${target}/${repo#"${HOME}/"}" | cut -f 1))" 1>&2 ;;
+            1) ;;
+            *) failed+=("git ${repo}") ;;
+        esac
+    done
+    echo "git: ${count} of ${#repos[@]} repos hold something of their own" 1>&2
 }
 
 # the mount points of the attached drives and media: where udisks mounts them
@@ -377,7 +566,9 @@ backup_keys "${backup}"
 backup_bin "${backup}"
 backup_kube_mittwald "${backup}"
 backup_sublime "${backup}"
+backup_downloads "${backup}"
 backup_agents "${backup}"
+backup_git "${backup}"
 
 if [ "${#failed[@]}" -gt 0 ]; then
     info "Done, but these failed:"
