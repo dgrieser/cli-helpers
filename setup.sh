@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sets up a new machine from this repo: the keyring from a backup with its SSH
-# keys, SSH config and network connections, the install folders, cli-helpers itself,
+# keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN,
 # the base software, gh and glab with their logins, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
 # of reminder from a backup, the categories of updater
@@ -26,6 +26,9 @@ declare -A CATEGORY_DESCRIPTIONS=(
 )
 SPECIAL_GROUPS=(base gnome gnome-extensions)
 MITTWALD_GITLAB="gitlab.mittwald.it"
+# the VPN connection to it, which gen of ~/bin dials
+VPN_NAME="mittwald"
+GEN="${HOME}/bin/gen"
 # the shorthands of k-ctx: c switches the cluster, s goes to an identifier, n
 # switches the namespace, "for" loops over clusters and bm is the baremetal parent
 K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-prefix for
@@ -47,14 +50,37 @@ fail() {
     exit 1
 }
 
+# Ctrl-C aborts the whole setup, also in a prompt: the prompts read it as a key
+# in raw mode and exit with 130, so the shell itself gets no SIGINT
+abort() {
+    trap - INT
+    echo 1>&2
+    warning "Aborted"
+    exit 130
+}
+
+# interrupted STATUS: a status of 130 aborts the setup, also from a command
+# substitution, which signals this shell; any other status is returned
+interrupted() {
+    [ "${1}" -eq 130 ] || return "${1}"
+    kill -INT "$$"
+    exit 130
+}
+
 # the prompts of the repo, as cli-helpers is not installed yet at the start
+prompt_run() {
+    "${REPO_DIR}/${1}" "${@:2}"
+    interrupted "${?}"
+}
+
 ask() {
-    "${REPO_DIR}/prompt-yes-no" "${1}"
+    prompt_run prompt-yes-no "${1}"
 }
 
 run() {
     echo "+ ${*}" 1>&2
     "${@}"
+    interrupted "${?}"
 }
 
 run_updater() {
@@ -114,7 +140,7 @@ setup_keyring() {
     fi
 
     if ask "Import a keyring backup?"; then
-        path="$("${REPO_DIR}/prompt-file" "Keyring file or folder:")"
+        path="$(prompt_run prompt-file "Keyring file or folder:")"
         path="${path/#\~/${HOME}}"
         if [ -d "${path}" ]; then
             mapfile -t files < <(find "${path}" -maxdepth 1 -type f -name '*.keyring' | sort)
@@ -122,6 +148,8 @@ setup_keyring() {
         elif [ -n "${path}" ]; then
             files=("${path}")
         fi
+        # the folder of setup-backup around keyrings/, offered for its other parts
+        [ -n "${path}" ] && BACKUP_DIR="$(dirname "$([ -d "${path}" ] && echo "${path%/}" || dirname "${path}")")"
         for file in "${files[@]}"; do
             run "${keyring_cli}" import "${file}" || failed+=("keyring-cli import ${file}")
         done
@@ -223,6 +251,82 @@ login_github() {
     echo "Logged in to github.com" 1>&2
 }
 
+# the own scripts of ~/bin from the bin folder of setup-backup, before the VPN:
+# gen dials it; a file in ~/bin already is kept
+restore_bin() {
+    local dir="${HOME}/bin"
+    local path file name count=0
+    info "~/bin: restore your own scripts from a backup (bin/ of setup-backup), gen among them dials the VPN"
+    ask "Import a backup of ~/bin?" || return 0
+    path="$(prompt_run prompt-folder --prefill "${BACKUP_DIR:+${BACKUP_DIR}/bin/}" "Backup of ~/bin:")"
+    path="${path/#\~/${HOME}}"
+    [ -z "${path}" ] && return 0
+    if [ ! -d "${path}" ]; then
+        warning "No such folder: ${path}"
+        failed+=("~/bin ${path}")
+        return 0
+    fi
+    mkdir -p "${dir}" || { failed+=("~/bin ${path}"); return 0; }
+    while IFS= read -r -d '' file; do
+        name="$(basename "${file}")"
+        if [ -e "${dir}/${name}" ]; then
+            echo "Kept ${dir}/${name}" 1>&2
+            continue
+        fi
+        cp -p "${file}" "${dir}/${name}" && count=$((count + 1)) || failed+=("~/bin ${name}")
+    done < <(find "${path}" -mindepth 1 -maxdepth 1 -type f -print0)
+    echo "Restored ${count} files to ${dir}" 1>&2
+}
+
+# the VPN of Mittwald, fully set up before the glab login to gitlab.mittwald.it:
+# the OpenVPN plugin of NetworkManager with its GNOME part, the connection loaded
+# (from the keyring when the keyring step did not restore it) and gen to dial it
+setup_vpn() {
+    local packages=() package
+    info "VPN: the OpenVPN plugin of NetworkManager, the ${VPN_NAME} connection and ${GEN} to dial it"
+    # gen switches the wifi with iw
+    for package in network-manager-openvpn network-manager-openvpn-gnome iw; do
+        dpkg -s "${package}" > /dev/null 2>&1 || packages+=("${package}")
+    done
+    if [ "${#packages[@]}" -gt 0 ]; then
+        if run sudo apt-get install -y "${packages[@]}"; then
+            # the connections of a plugin that was missing are read again
+            run sudo nmcli connection reload || failed+=("nmcli connection reload")
+        else
+            failed+=("apt-get install ${packages[*]}")
+        fi
+    fi
+
+    if [ "$(nmcli -g connection.type connection show id "${VPN_NAME}" 2>/dev/null)" = vpn ]; then
+        echo "VPN connection ${VPN_NAME} is loaded" 1>&2
+    elif secret-tool lookup type nm-connection name "${VPN_NAME}" part keyfile > /dev/null 2>&1; then
+        run "${REPO_DIR}/keyring-cli" nm-restore "${VPN_NAME}" || failed+=("keyring-cli nm-restore ${VPN_NAME}")
+    else
+        warning "No VPN connection ${VPN_NAME}, neither in NetworkManager nor in the keyring"
+        failed+=("VPN connection ${VPN_NAME}")
+    fi
+
+    if [ ! -x "${GEN}" ]; then
+        warning "No ${GEN} to dial the VPN, restore it with the backup of ~/bin"
+        failed+=("${GEN}")
+    fi
+}
+
+# gitlab.mittwald.it is only reachable through the VPN (or from the office)
+dial_vpn() {
+    local host="${1}"
+    # any HTTP answer will do, only no connection at all means no VPN
+    while ! curl -sS -o /dev/null --connect-timeout 5 "https://${host}" 2> /dev/null; do
+        info "${host} is not reachable: dial the ${VPN_NAME} VPN now"
+        if [ -x "${GEN}" ] && ask "Dial it with ${GEN}?"; then
+            run "${GEN}"
+            continue
+        fi
+        echo "Dial it in another terminal (${GEN} or nmcli connection up id ${VPN_NAME})" 1>&2
+        ask "Try ${host} again?" || return 1
+    done
+}
+
 login_gitlab() {
     local host="${1}"
     while ! glab auth status --hostname "${host}" > /dev/null 2>&1; do
@@ -230,6 +334,11 @@ login_gitlab() {
         if ! ask "Log in now (glab auth login --hostname ${host})?"; then
             warning "Not logged in to ${host}, the mittwald tools will fail"
             failed+=("glab auth login --hostname ${host}")
+            return 0
+        fi
+        if [ "${host}" = "${MITTWALD_GITLAB}" ] && ! dial_vpn "${host}"; then
+            warning "No VPN, not logged in to ${host}, the mittwald tools will fail"
+            failed+=("VPN for glab auth login --hostname ${host}")
             return 0
         fi
         glab auth login --hostname "${host}"
@@ -267,7 +376,7 @@ restore_reminders() {
     local path src tmp file name
     info "Reminders: restore a backup of ${dir} (the *.md reminders, the done ones and their order)"
     ask "Import a backup of the reminders?" || return 0
-    path="$("${REPO_DIR}/prompt-file" "Reminder folder or archive:")"
+    path="$(prompt_run prompt-file "Reminder folder or archive:")"
     path="${path/#\~/${HOME}}"
     [ -z "${path}" ] && return 0
 
@@ -364,12 +473,12 @@ setup_netbox() {
     url="${NETBOX_URL}"
     [ -z "${url}" ] && [ -f "${block}" ] \
         && url="$(sed -n 's/^export NETBOX_URL="\(.*\)"$/\1/p' "${block}" | head -n 1)"
-    url="$("${REPO_DIR}/prompt-input" --prompt "NetBox URL:" --default "${url}")"
+    url="$(prompt_run prompt-input --prompt "NetBox URL:" --default "${url}")"
     [ -z "${url}" ] && return 1
 
     token="$(secret-tool lookup type dotfile-secret name NETBOX_TOKEN 2>/dev/null)"
     if [ -z "${token}" ]; then
-        token="$("${REPO_DIR}/prompt-input" --protected --prompt "NetBox API token:")"
+        token="$(prompt_run prompt-input --protected --prompt "NetBox API token:")"
         [ -z "${token}" ] && return 1
         # stored where the dotfiles look for it, so the next shell has it too
         if printf '%s' "${token}" | secret-tool store --label="dotfile NETBOX_TOKEN" \
@@ -448,16 +557,21 @@ gnome_settings() {
     fi
 }
 
+trap abort INT
 [ "$(id -u)" -eq 0 ] && fail "Run ${APP_NAME} as your user, it asks for sudo itself"
 [ -t 0 ] || fail "Run ${APP_NAME} in a terminal, it asks questions"
 command -v python3 > /dev/null 2>&1 || fail "python3 is required for the prompts"
 
 MAKE_SUDO=""
+BACKUP_DIR=""
 info "Setting up this machine from ${REPO_DIR}"
 bootstrap
 setup_keyring
 setup_dirs
 install_cli_helpers
+# gen needs the prompts, vpn-up and wifi of cli-helpers
+restore_bin
+setup_vpn
 install_gh_glab
 
 info "Installing base"

@@ -1,0 +1,303 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [OPTIONS]
+
+Read, write, inspect and repair a bash history file. With HISTTIMEFORMAT set,
+bash writes a "#<epoch>" line before each entry; entries without one (e.g. from
+before it was set, or appended by other tools) show no time and confuse tools
+that read the timestamps.
+
+Commands:
+  read                  Print the entries, each with its time
+                        (2024-01-31T12:00:00+0100) unless --no-timestamp
+  append                Append what comes on stdin as one entry, with a
+                        timestamp when HISTTIMEFORMAT is set or with
+                        --with-timestamp; does nothing without --file or
+                        \$HISTFILE, e.g. in a shell without a history
+  stats                 Count the entries with and without a timestamp and
+                        show the time of the first and the last one
+  fix-timestamps        Give every entry without a timestamp one: the one of
+                        the entry before it, so the order stays the same (the
+                        first timestamp of the file for the entries before
+                        it), or the one of --timestamp. Prints the result,
+                        unless --in-place is given
+
+Options:
+  -f, --file FILE       History file (default: \$HISTFILE, else ~/.bash_history)
+  -l, --lines N         read: only the last N entries
+  -e, --exclude REGEX   read: leave out entries matching the extended regular
+                        expression REGEX; repeatable
+  --no-timestamp        read: print only the entries
+  --with-timestamp      append: always write a timestamp
+  -t, --timestamp WHEN  fix-timestamps: give all entries without a timestamp
+                        this one: epoch seconds or a date that date -d
+                        understands, e.g. "2024-01-31 12:00"
+  -i, --in-place        fix-timestamps: rewrite FILE, keeping the old one as
+                        FILE.bak
+  -h, --help            Show this help message and exit
+
+Called as history_read or history_append it runs read or append, with the
+options of those (history_append -t is --with-timestamp).
+
+A line is one entry: with lithist, bash writes a multi-line command as several
+lines after one timestamp, and fix-timestamps would split it into entries.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# bash_completion PREV WORDS...: the words to complete after PREV
+bash_completion() {
+    local prev="${1}" word command=""
+    shift
+    case "${prev}" in
+        -f|--file|-l|--lines|-e|--exclude|-t|--timestamp)
+            return 0
+            ;;
+    esac
+    case "${APP_NAME}" in
+        history_read)
+            command=read
+            ;;
+        history_append)
+            echo "-f --file -t --with-timestamp -h --help"
+            return 0
+            ;;
+    esac
+    for word in "${@}"; do
+        case "${word}" in
+            read|append|stats|fix-timestamps) command="${word}" ;;
+        esac
+    done
+    case "${command}" in
+        "")             echo "read append stats fix-timestamps -f --file -h --help" ;;
+        read)           echo "-f --file -l --lines -e --exclude --no-timestamp -h --help" ;;
+        append)         echo "-f --file --with-timestamp -h --help" ;;
+        stats)          echo "-f --file -h --help" ;;
+        fix-timestamps) echo "-f --file -t --timestamp -i --in-place -h --help" ;;
+    esac
+}
+
+format_time() {
+    date -d "@${1}" '+%Y-%m-%d %H:%M:%S'
+}
+
+# read_history FILE: the entries, trimmed and without the empty ones, each with
+# the time of the timestamp before it; the regexes of excludes come through
+# the environment, as awk -v would interpret their backslashes
+read_history() {
+    HISTORY_CLI_EXCLUDES="$(printf '%s\n' "${excludes[@]}")" awk -v no_timestamp="${no_timestamp}" '
+        BEGIN { count = split(ENVIRON["HISTORY_CLI_EXCLUDES"], patterns, "\n") }
+        # also the no-break spaces of pasted text
+        { sub(/^([ \t\r\v\f]|\302\240)+/, ""); sub(/([ \t\r\v\f]|\302\240)+$/, "") }
+        /^#[0-9]+$/ { stamp = strftime("%Y-%m-%dT%H:%M:%S%z", substr($0, 2)); next }
+        $0 == "" { next }
+        {
+            for (i = 1; i <= count; i++) {
+                if (patterns[i] != "" && $0 ~ patterns[i]) next
+            }
+            if (no_timestamp || stamp == "") print; else print stamp " " $0
+        }
+    ' "${1}"
+}
+
+# append_history FILE: stdin as one entry
+append_history() {
+    local entry
+    entry="$(cat -)"
+    if [ "${with_timestamp}" -eq 1 ] || [ -n "${HISTTIMEFORMAT}" ]; then
+        entry="#$(date +%s)"$'\n'"${entry}"
+    fi
+    printf '%s\n' "${entry}" >> "${1}"
+}
+
+stats() {
+    local file="${1}" entries stamped first last
+    read -r entries stamped first last < <(awk '
+        /^#[0-9]+$/ { stamp = substr($0, 2); if (first == "") first = stamp; last = stamp; pending = 1; next }
+        { entries++; if (pending) stamped++; pending = 0 }
+        END { printf "%d %d %s %s\n", entries, stamped, (first == "" ? "-" : first), (last == "" ? "-" : last) }
+    ' "${file}")
+    echo "File:              ${file}"
+    echo "Entries:           ${entries}"
+    echo "With timestamp:    ${stamped}"
+    echo "Without timestamp: $((entries - stamped))"
+    if [ "${first}" != "-" ]; then
+        echo "First timestamp:   $(format_time "${first}")"
+        echo "Last timestamp:    $(format_time "${last}")"
+    fi
+}
+
+# fix_timestamps FILE FIXED FIRST: the file with a timestamp before every entry,
+# FIXED for all of them, else the one before it and FIRST before the first one
+fix_timestamps() {
+    local file="${1}" fixed="${2}" first="${3}"
+    awk -v fixed="${fixed}" -v first="${first}" '
+        BEGIN { stamp = (fixed != "" ? fixed : first) }
+        /^#[0-9]+$/ { if (fixed == "") stamp = substr($0, 2); print; pending = 1; next }
+        { if (!pending) print "#" stamp; print; pending = 0 }
+    ' "${file}"
+}
+
+# fix_in_place FILE FIXED FIRST
+fix_in_place() {
+    local file="${1}" tmp
+    tmp="$(mktemp "${file}.XXXXXX")" || fail "Cannot create a file next to ${file}"
+    if ! fix_timestamps "${@}" > "${tmp}"; then
+        rm -f "${tmp}"
+        exit 1
+    fi
+    if cmp -s "${file}" "${tmp}"; then
+        rm -f "${tmp}"
+        echo "Every entry of ${file} has a timestamp" 1>&2
+        return 0
+    fi
+    cp -p "${file}" "${file}.bak" || { rm -f "${tmp}"; fail "Cannot back up ${file}"; }
+    # the new file keeps the mode of the old one
+    chmod --reference="${file}" "${tmp}" && mv "${tmp}" "${file}" || { rm -f "${tmp}"; fail "Cannot write ${file}"; }
+    echo "Fixed ${file}, the old one is ${file}.bak" 1>&2
+}
+
+# the old commands, now symlinks to this one
+case "${APP_NAME}" in
+    history_read)
+        set -- read "${@}"
+        ;;
+    history_append)
+        arguments=()
+        for argument in "${@}"; do
+            [ "${argument}" = -t ] && argument="--with-timestamp"
+            arguments+=("${argument}")
+        done
+        set -- append "${arguments[@]}"
+        ;;
+esac
+
+command=""
+file=""
+lines=""
+excludes=()
+no_timestamp=0
+with_timestamp=0
+timestamp=""
+in_place=0
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            shift
+            bash_completion "${@}"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -f|--file)
+            shift
+            [ -z "${1}" ] && usage
+            file="${1}"
+            ;;
+        -l|--lines)
+            shift
+            [ -z "${1}" ] && usage
+            lines="${1}"
+            ;;
+        -e|--exclude)
+            shift
+            [ -z "${1}" ] && usage
+            excludes+=("${1}")
+            ;;
+        --no-timestamp)
+            no_timestamp=1
+            ;;
+        --with-timestamp)
+            with_timestamp=1
+            ;;
+        -t|--timestamp)
+            shift
+            [ -z "${1}" ] && usage
+            timestamp="${1}"
+            ;;
+        -i|--in-place)
+            in_place=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            [ -n "${command}" ] && error "Unexpected argument: ${1}" && usage
+            command="${1}"
+            ;;
+    esac
+    shift
+done
+
+case "${command}" in
+    read|append|stats|fix-timestamps)
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        error "Unknown command: ${command}"
+        usage
+        ;;
+esac
+[ "${command}" != read ] && { [ -n "${lines}" ] || [ "${#excludes[@]}" -gt 0 ] || [ "${no_timestamp}" -eq 1 ]; } \
+    && error "--lines, --exclude and --no-timestamp only apply to read" && usage
+[ "${command}" != append ] && [ "${with_timestamp}" -eq 1 ] \
+    && error "--with-timestamp only applies to append" && usage
+[ "${command}" != fix-timestamps ] && { [ -n "${timestamp}" ] || [ "${in_place}" -eq 1 ]; } \
+    && error "--timestamp and --in-place only apply to fix-timestamps" && usage
+[ -n "${lines}" ] && [[ ! "${lines}" =~ ^[1-9][0-9]*$ ]] && fail "Not a number of lines: ${lines}"
+if [ -n "${timestamp}" ] && [[ ! "${timestamp}" =~ ^[0-9]+$ ]]; then
+    timestamp="$(date -d "${timestamp}" +%s 2>/dev/null)" || fail "Not a date: ${timestamp}"
+fi
+
+if [ "${command}" = append ]; then
+    file="${file:-${HISTFILE}}"
+    [ -z "${file}" ] && exit 0
+    append_history "${file}"
+    exit
+fi
+
+file="${file:-${HISTFILE:-${HOME}/.bash_history}}"
+[ -f "${file}" ] || fail "No history file ${file}"
+
+case "${command}" in
+    read)
+        if [ -n "${lines}" ]; then
+            read_history "${file}" | tail -n "${lines}"
+        else
+            read_history "${file}"
+        fi
+        ;;
+    stats)
+        stats "${file}"
+        ;;
+    fix-timestamps)
+        first=""
+        if [ -z "${timestamp}" ]; then
+            first="$(grep -m 1 -E '^#[0-9]+$' "${file}")"
+            [ -z "${first}" ] && fail "${file} has no timestamp to take over, give one with --timestamp"
+            first="${first#\#}"
+        fi
+        if [ "${in_place}" -eq 1 ]; then
+            fix_in_place "${file}" "${timestamp}" "${first}"
+        else
+            fix_timestamps "${file}" "${timestamp}" "${first}"
+        fi
+        ;;
+esac

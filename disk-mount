@@ -505,19 +505,122 @@ open_volume() {
     open_volume "${device}"
 }
 
+# Prints the PIDs of the processes using the filesystems mounted at the given
+# mount points. Without root only the own processes are visible, so it asks
+# sudo when it finds none.
+users_of_mounts() {
+    local pids
+    command -v fuser &>/dev/null || return 0
+    pids="$(fuser -m "${@}" 2>/dev/null)"
+    if [ -z "${pids// /}" ] && [ "${EUID}" -ne 0 ]; then
+        pids="$(run sudo fuser -m "${@}" 2>/dev/null)"
+    fi
+    [ -z "${pids// /}" ] && return 0
+    printf '%s\n' ${pids} | grep -vx "${$}" | sort -nu
+}
+
+print_processes() {
+    local width
+    width="$(tput cols 2>/dev/null)"
+    ps -o pid,user,args -p "$(IFS=','; echo "${*}")" | sed 's/^/  /' | cut -c "1-${width:-${COLUMNS:-200}}" 1>&2
+}
+
+# signal_processes SIGNAL PID...: signals the own processes directly and the
+# ones of other users through sudo
+signal_processes() {
+    local signal="${1}" pid uid own=() other=()
+    shift
+    for pid in "${@}"; do
+        uid="$(ps -o uid= -p "${pid}" | tr -d '[:space:]')"
+        [ -z "${uid}" ] && continue
+        if [ "${uid}" = "${UID}" ]; then
+            own+=("${pid}")
+        else
+            other+=("${pid}")
+        fi
+    done
+    [ "${#own[@]}" -gt 0 ] && run kill "-${signal}" "${own[@]}"
+    [ "${#other[@]}" -gt 0 ] && run sudo kill "-${signal}" "${other[@]}"
+    return 0
+}
+
+# terminates the given processes, killing the ones still alive after 5 seconds
+kill_processes() {
+    local pid alive=("${@}") _
+    signal_processes TERM "${alive[@]}"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        for pid in "${!alive[@]}"; do
+            [ -e "/proc/${alive[pid]}" ] || unset 'alive[pid]'
+        done
+        [ "${#alive[@]}" -eq 0 ] && return 0
+        sleep 0.5
+    done
+    signal_processes KILL "${alive[@]}"
+    sleep 0.5
+}
+
+# tries to unmount a filesystem, returns 2 when it is busy
+try_unmount() {
+    local output
+    if output="$(udisksctl unmount -b "${1}" 2>&1)"; then
+        echo "${output}"
+        return 0
+    fi
+    [[ "${output}" == *DeviceBusy* || "${output}" == *"target is busy"* ]] && return 2
+    echo "${output}" 1>&2
+    return 1
+}
+
+# unmount_filesystem DEVICE MOUNTS: unmounts a filesystem; while it is busy it
+# shows the processes using it, offers to kill them once and then asks to
+# check again until they are closed
+unmount_filesystem() {
+    local path="${1}" mountpoints=() pids=() still="" status
+    IFS=',' read -r -a mountpoints <<< "${2}"
+    try_unmount "${path}"
+    status="${?}"
+    [ "${status}" -eq 2 ] || return "${status}"
+    mapfile -t pids < <(users_of_mounts "${mountpoints[@]}")
+    if [ "${#pids[@]}" -gt 0 ]; then
+        warning "${path} is busy, used by:"
+        print_processes "${pids[@]}"
+        prompt-no-yes "Kill these processes"
+        status="${?}"
+        [ "${status}" -eq 130 ] && exit 130
+        if [ "${status}" -eq 0 ]; then
+            kill_processes "${pids[@]}"
+            try_unmount "${path}"
+            status="${?}"
+            [ "${status}" -eq 2 ] || return "${status}"
+        fi
+        still="still "
+    fi
+    while true; do
+        mapfile -t pids < <(users_of_mounts "${mountpoints[@]}")
+        if [ "${#pids[@]}" -gt 0 ]; then
+            warning "${path} is ${still}busy, close these processes:"
+            print_processes "${pids[@]}"
+        else
+            warning "${path} is ${still}busy, but no process uses it; look for mounts on top of ${2}, loop devices or swap files on it"
+        fi
+        still="still "
+        prompt-yes-no "Check again"
+        status="${?}"
+        [ "${status}" -eq 130 ] && exit 130
+        [ "${status}" -eq 0 ] || return 1
+        try_unmount "${path}"
+        status="${?}"
+        [ "${status}" -eq 2 ] || return "${status}"
+    done
+}
+
 # unmounts a record, or locks or deactivates it when it is an open container
 release_record() {
-    local i="${1}" path="${rec_path[${1}]}" mountpoint
+    local i="${1}" path="${rec_path[${1}]}"
     if [ "${rec_mounts[i]}" = "[SWAP]" ]; then
         run sudo swapoff "${path}" || return 1
     elif [ -n "${rec_mounts[i]}" ]; then
-        if ! udisksctl unmount -b "${path}"; then
-            error "${path} is busy, close what still uses it:"
-            while read -r -d ',' mountpoint; do
-                fuser -vm "${mountpoint}"
-            done <<< "${rec_mounts[i]},"
-            return 1
-        fi
+        unmount_filesystem "${path}" "${rec_mounts[i]}" || return 1
     fi
     is_open "${i}" || return 0
     if is_lvm "${i}"; then
@@ -533,6 +636,8 @@ release_records() {
     for i in "${@}"; do
         [ "${rec_depth[i]}" -gt "${max}" ] && max="${rec_depth[i]}"
     done
+    # a working directory on the volume would keep it busy
+    cd / || return 1
     sync
     for (( depth = max; depth >= 0; depth-- )); do
         for i in "${@}"; do

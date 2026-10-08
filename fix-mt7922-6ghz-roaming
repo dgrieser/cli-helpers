@@ -1,0 +1,264 @@
+#!/bin/bash
+#
+# Make 6 GHz usable on MT7921/MT7922, fixing two independent blockers.
+#
+# Symptom: wpa_supplicant logs "SME: Association request to the driver failed"
+# for 6 GHz BSSIDs, drops the link and reassociates on 5 GHz every ~5 min (the
+# bgscan simple long_interval). Each teardown also drops any firewall/RADIUS
+# session bound to the association.
+#
+# Blocker 1 - firmware CLC (Country Location Control) exposes no usable 6 GHz
+# channels. Bypassed with mt7921_common disable_clc=1.
+#
+# Blocker 2 - the regulatory domain only exists as a country-IE hint from the AP.
+# Roaming disconnects before associating, so cfg80211 sees no connected device,
+# logs "All devices are disconnected, going to restore regulatory settings" and
+# reverts to the WORLD domain, where every 6 GHz channel is no-IR. The in-flight
+# association then targets a disabled channel and the kernel rejects it locally:
+#   nl80211: MLME command failed (assoc): ret=-22 (Invalid argument)
+# Pinning the domain as a user hint (iw reg set) stops that fallback entirely.
+#
+# Pass the country you are actually in with --country (default DE). A user-set domain no longer
+# follows the country IEs broadcast by local APs, so it must be corrected when
+# taking the machine abroad; `iw reg set 00` returns to the world domain.
+#
+# Aborts unless MT7921-family hardware bound to mt7921e is actually present.
+# Reloading the driver briefly drops the Wi-Fi link.
+#
+# Runs with set -euo pipefail: on_exit logs any failure die() did not catch.
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Make 6 GHz wifi work on MediaTek MT7921/MT7922 (mt7921e): turn off the firmware
+CLC with the mt7921_common disable_clc=1 option and pin the regulatory domain
+with a udev rule, so a roam no longer falls back to the WORLD domain. Reloads
+the driver (the wifi drops for a few seconds) and asks for sudo. Logs to
+~/.local/state/${APP_NAME}.log.
+
+Options:
+  -c, --country CC      Regulatory domain to pin, the country you are in
+                        (default: DE); 00 is the world domain
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+REGDOM=DE
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -c|--country)
+            shift
+            [ -z "${1:-}" ] && usage
+            REGDOM="${1}"
+            ;;
+        -*)
+            echo "ERROR: Unknown option: ${1}" 1>&2
+            usage
+            ;;
+        *)
+            echo "ERROR: Unexpected argument: ${1}" 1>&2
+            usage
+            ;;
+    esac
+    shift
+done
+[[ "${REGDOM}" =~ ^([A-Z]{2}|00)$ ]] || { echo "ERROR: Not a country code: ${REGDOM}" 1>&2; exit 1; }
+
+set -euo pipefail
+
+CONF=/etc/modprobe.d/mt7921.conf
+CONF_LINE='options mt7921_common disable_clc=1'
+PARAM=/sys/module/mt7921_common/parameters/disable_clc
+UDEV_RULE=/etc/udev/rules.d/99-wireless-regdom.rules
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+LOG="$LOG_DIR/${APP_NAME}.log"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "${1}" "${2}" | tee -a "$LOG"
+}
+
+info() { log INFO "$*"; }
+warn() { log WARN "$*"; }
+HANDLED=0
+die() {
+    log ERROR "$*"
+    log ERROR "aborted"
+    HANDLED=1
+    exit 1
+}
+
+# Catch failures that slipped past die() (set -e on an unchecked command).
+on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ "$HANDLED" -eq 0 ]; then
+        log ERROR "unexpected failure, exit status $rc"
+    fi
+}
+trap on_exit EXIT
+
+info "=== start: $(basename "$0") on $(uname -srm), user $(id -un) ==="
+info "log file: $LOG"
+
+# --- hardware / driver checks -------------------------------------------------
+
+command -v lspci >/dev/null 2>&1 || die "lspci not found (install pciutils)"
+command -v modprobe >/dev/null 2>&1 || die "modprobe not found"
+
+# MT7921 family PCI IDs: MT7921 14c3:7961, MT7921K 14c3:0608, MT7922 14c3:0616.
+PCI_MATCH=$(lspci -nn 2>/dev/null | grep -iE '14c3:(7961|0608|0616)' || true)
+if [ -z "$PCI_MATCH" ]; then
+    # Fall back to driver binding in case of an unknown/new device ID.
+    if ! lspci -nnk 2>/dev/null | grep -q 'driver in use: mt7921e'; then
+        die "no MT7921/MT7922 device found and nothing bound to mt7921e — wrong machine for this fix"
+    fi
+    warn "no known MT7921-family PCI ID, but a device is bound to mt7921e — continuing"
+else
+    info "hardware: $PCI_MATCH"
+fi
+
+DRV=$(lspci -nnk 2>/dev/null | grep -A3 -iE '14c3:(7961|0608|0616)' | grep -oP 'driver in use: \K\S+' | head -1 || true)
+if [ -n "$DRV" ] && [ "$DRV" != "mt7921e" ]; then
+    die "device is bound to '$DRV', not mt7921e — this fix does not apply"
+fi
+info "driver in use: ${DRV:-mt7921e (assumed)}"
+
+if ! modinfo mt7921_common 2>/dev/null | grep -q '^parm:.*disable_clc'; then
+    die "mt7921_common has no disable_clc parameter — kernel too old, fix unavailable"
+fi
+info "mt7921_common supports disable_clc"
+
+if [ -r "$PARAM" ] && [ "$(cat "$PARAM")" = "Y" ]; then
+    info "disable_clc already active in the running driver"
+    ALREADY_ACTIVE=1
+else
+    ALREADY_ACTIVE=0
+fi
+
+WIFI_IF=$(ls /sys/class/net 2>/dev/null | while read -r i; do
+    [ -e "/sys/class/net/$i/wireless" ] && readlink -f "/sys/class/net/$i/device/driver" 2>/dev/null | grep -q mt7921e && echo "$i"
+done | head -1)
+info "wireless interface: ${WIFI_IF:-none found}"
+
+# --- privileges ---------------------------------------------------------------
+
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+else
+    command -v sudo >/dev/null 2>&1 || die "not root and sudo not found"
+    SUDO="sudo"
+    info "requesting sudo privileges"
+    $SUDO -v || die "sudo authentication failed"
+fi
+
+# --- write modprobe.d config --------------------------------------------------
+
+if [ -f "$CONF" ] && grep -qxF "$CONF_LINE" "$CONF"; then
+    info "$CONF already contains the option, leaving it untouched"
+else
+    if [ -f "$CONF" ]; then
+        BACKUP="$CONF.bak.$(date '+%Y%m%d%H%M%S')"
+        info "backing up existing $CONF to $BACKUP"
+        $SUDO cp -a "$CONF" "$BACKUP"
+    fi
+    info "writing '$CONF_LINE' to $CONF"
+    echo "$CONF_LINE" | $SUDO tee "$CONF" >/dev/null
+fi
+
+# --- reload driver ------------------------------------------------------------
+
+if [ "$ALREADY_ACTIVE" -eq 1 ]; then
+    info "driver already running with disable_clc=1, skipping reload"
+else
+    warn "reloading mt7921e — Wi-Fi link will drop for a few seconds"
+    info "unloading mt7921e mt7921_common"
+    $SUDO modprobe -r mt7921e mt7921_common || die "module unload failed (device busy? try again or reboot)"
+    info "loading mt7921e"
+    $SUDO modprobe mt7921e || die "module load failed — Wi-Fi is down, reboot to recover"
+fi
+
+# --- verify -------------------------------------------------------------------
+
+for _ in $(seq 1 10); do
+    [ -r "$PARAM" ] && break
+    sleep 1
+done
+
+if [ -r "$PARAM" ]; then
+    VAL=$(cat "$PARAM")
+    if [ "$VAL" = "Y" ]; then
+        info "verified: disable_clc=$VAL"
+    else
+        die "disable_clc is '$VAL', expected 'Y' — modprobe.d option not picked up"
+    fi
+else
+    die "$PARAM not readable after reload — driver did not come back"
+fi
+
+if command -v iw >/dev/null 2>&1; then
+    # The module registers before the phy finishes firmware load; without this
+    # wait the channel list is still empty and the check reports a false 0.
+    for _ in $(seq 1 15); do
+        [ -n "$(iw list 2>/dev/null | grep -m1 'MHz')" ] && break
+        sleep 1
+    done
+    SIXG=$(iw list 2>/dev/null | grep -cE '(59[4-9][0-9]|6[0-3][0-9][0-9]|64[0-2][0-9])(\.[0-9])? MHz' || true)
+    info "$SIXG channel entries in the 5945-6425 MHz range visible to the driver"
+    [ "$SIXG" -eq 0 ] && warn "no 6 GHz channels exposed — CLC bypass may not have helped, check dmesg"
+else
+    warn "iw not installed, skipping 6 GHz channel check"
+fi
+
+# --- blocker 2: pin the regulatory domain -------------------------------------
+# Without a user hint, cfg80211 falls back to the WORLD domain the moment the
+# roam's disconnect leaves no device connected, disabling all 6 GHz mid-roam.
+
+if ! command -v iw >/dev/null 2>&1; then
+    warn "iw not installed — cannot pin the regulatory domain, 6 GHz roams will keep failing"
+else
+    IW_BIN=$(command -v iw)
+    RULE_LINE="SUBSYSTEM==\"ieee80211\", ACTION==\"add\", RUN+=\"$IW_BIN reg set $REGDOM\""
+
+    # udev fires per phy, so this re-applies on boot and after a module reload.
+    if [ -f "$UDEV_RULE" ] && grep -qxF "$RULE_LINE" "$UDEV_RULE"; then
+        info "$UDEV_RULE already pins regdom $REGDOM"
+    else
+        if [ -f "$UDEV_RULE" ]; then
+            RULE_BACKUP="$UDEV_RULE.bak.$(date '+%Y%m%d%H%M%S')"
+            info "backing up existing $UDEV_RULE to $RULE_BACKUP"
+            $SUDO cp -a "$UDEV_RULE" "$RULE_BACKUP"
+        fi
+        info "installing udev rule pinning regdom $REGDOM"
+        printf '# Pin the wireless regulatory domain as a user hint so cfg80211 does not\n# fall back to the WORLD domain (all 6 GHz no-IR) during a roam disconnect.\n%s\n' \
+            "$RULE_LINE" | $SUDO tee "$UDEV_RULE" >/dev/null
+        $SUDO udevadm control --reload 2>/dev/null || warn "udevadm control --reload failed"
+    fi
+
+    info "applying regdom $REGDOM now"
+    $SUDO iw reg set "$REGDOM" || die "iw reg set $REGDOM failed"
+    sleep 2
+
+    CUR_REG=$(iw reg get 2>/dev/null | awk '/^country/ {print $2; exit}' | tr -d ':')
+    if [ "$CUR_REG" = "$REGDOM" ]; then
+        info "verified: regulatory domain is $CUR_REG"
+    else
+        die "regulatory domain is '${CUR_REG:-unknown}', expected $REGDOM"
+    fi
+
+    SIXG_OK=$(iw list 2>/dev/null | grep -cE '\* (59[4-9][0-9]|6[0-3][0-9][0-9]|64[0-2][0-9])\.[0-9] MHz \[[0-9]+\] \([0-9]' || true)
+    info "$SIXG_OK 6 GHz channels enabled with a transmit power (not no-IR)"
+    [ "$SIXG_OK" -eq 0 ] && warn "6 GHz channels present but none enabled — check 'iw list' and regdb"
+fi
+
+info "=== done ==="
+info "persistent across reboots via $CONF and $UDEV_RULE"
+info "revert CLC:    sudo rm $CONF && sudo modprobe -r mt7921e mt7921_common && sudo modprobe mt7921e"
+info "revert regdom: sudo rm $UDEV_RULE && sudo udevadm control --reload && sudo iw reg set 00"

@@ -1,0 +1,357 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+DEBIAN_HOST="deb.debian.org"
+ARCHIVE_HOST="archive.debian.org"
+SECURITY_HOST="security.debian.org"
+SOURCES_LIST="/etc/apt/sources.list"
+SOURCES_DIR="/etc/apt/sources.list.d"
+TIMEOUT=10
+# the releases in their order, for the table; a new codename comes after them
+KNOWN_CODENAMES=(buzz rex bo hamm slink potato woody sarge etch lenny squeeze wheezy jessie stretch buster bullseye
+    bookworm trixie forky duke)
+# folders under dists/ that are no release of their own
+ALIASES=(stable testing unstable oldstable oldoldstable experimental rc-buggy)
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [CODENAME]
+
+Show which Debian releases are still on ${DEBIAN_HOST} and which have moved to
+${ARCHIVE_HOST}, with the apt line to use for each. Needs only bash: it talks
+HTTP over /dev/tcp, so it also runs in a minimal chroot or container.
+
+Without options it prints a table of every release (or of CODENAME only).
+
+Arguments:
+  CODENAME              Debian codename, e.g. buster (default with --print and
+                        --fix: the one of this system, from /etc/os-release)
+
+Options:
+  -c, --codename NAME   Same as CODENAME
+  -p, --print           Print the sources.list content for CODENAME: the
+                        release, its -updates and its security suite, from the
+                        archive once the release is archived
+  -f, --fix             Write that content to ${SOURCES_LIST} (as root); the
+                        old file is kept as .bak and the Debian lists in
+                        ${SOURCES_DIR} are moved to .bak, which apt ignores
+  -C, --components LIST Components for --print and --fix, e.g. "main contrib"
+                        (default: the ones of the current Debian line in
+                        ${SOURCES_LIST}, else main)
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# http_get HOST PATH [STOP]: print the body of http://HOST/PATH, up to the
+# first line matching the regex STOP; fails unless the answer is 200 OK
+http_get() {
+    local host="${1}" path="${2}" stop="${3}"
+    local fd status line
+    { exec {fd}<>"/dev/tcp/${host}/80"; } 2> /dev/null || return 2
+    printf 'GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n' \
+        "${path}" "${host}" "${APP_NAME}" >&"${fd}"
+    IFS= read -r -t "${TIMEOUT}" status <&"${fd}"
+    while IFS= read -r -t "${TIMEOUT}" line <&"${fd}"; do
+        [ -z "${line%$'\r'}" ] && break
+    done
+    case "${status}" in
+        "HTTP/1."?" 200 "*)
+            ;;
+        *)
+            exec {fd}>&-
+            return 1
+            ;;
+    esac
+    while IFS= read -r -t "${TIMEOUT}" line <&"${fd}" || [ -n "${line}" ]; do
+        line="${line%$'\r'}"
+        printf '%s\n' "${line}"
+        [ -n "${stop}" ] && [[ "${line}" =~ ${stop} ]] && break
+    done
+    exec {fd}>&-
+    return 0
+}
+
+# list_dists HOST PATH: the folder names of a directory listing
+list_dists() {
+    local line rest
+    http_get "${1}" "${2}" | while IFS= read -r line; do
+        rest="${line}"
+        while [[ "${rest}" =~ href=\"([a-z0-9][a-z0-9.-]*)/\" ]]; do
+            echo "${BASH_REMATCH[1]}"
+            rest="${rest#*"${BASH_REMATCH[0]}"}"
+        done
+    done
+}
+
+# load_dists: the suites of the main mirror, the archive and both security
+# repos, as " name name ... " for a quick lookup
+load_dists() {
+    local -a names
+    mapfile -t names < <(list_dists "${DEBIAN_HOST}" /debian/dists/)
+    [ "${#names[@]}" -eq 0 ] && fail "cannot read http://${DEBIAN_HOST}/debian/dists/"
+    debian_dists=" ${names[*]} "
+    mapfile -t names < <(list_dists "${ARCHIVE_HOST}" /debian/dists/)
+    [ "${#names[@]}" -eq 0 ] && fail "cannot read http://${ARCHIVE_HOST}/debian/dists/"
+    archive_dists=" ${names[*]} "
+    mapfile -t names < <(list_dists "${SECURITY_HOST}" /debian-security/dists/)
+    security_dists=" ${names[*]} "
+    mapfile -t names < <(list_dists "${ARCHIVE_HOST}" /debian-security/dists/)
+    archive_security_dists=" ${names[*]} "
+}
+
+in_list() {
+    [[ "${1}" == *" ${2} "* ]]
+}
+
+# is_archived CODENAME: once on the archive, the main mirror may still serve a
+# stale index whose packages are gone, so the archive wins
+is_archived() {
+    in_list "${archive_dists}" "${1}"
+}
+
+exists() {
+    in_list "${debian_dists}" "${1}" || in_list "${archive_dists}" "${1}"
+}
+
+# release_info CODENAME: the Version and Suite of its Release file, tab
+# separated, "-" for a missing one (sid has no version, the oldest releases no
+# Release file)
+release_info() {
+    local host="${DEBIAN_HOST}" line version="-" suite="-"
+    is_archived "${1}" && host="${ARCHIVE_HOST}"
+    while IFS= read -r line; do
+        case "${line}" in
+            "Version: "*) version="${line#*: }" ;;
+            "Suite: "*)   suite="${line#*: }" ;;
+        esac
+    done < <(http_get "${host}" "/debian/dists/${1}/Release" '^(MD5Sum|SHA1|SHA256):')
+    printf '%s\t%s\n' "${version}" "${suite}"
+}
+
+mirror_url() {
+    if is_archived "${1}"; then
+        echo "http://${ARCHIVE_HOST}/debian"
+    else
+        echo "http://${DEBIAN_HOST}/debian"
+    fi
+}
+
+# sources_list CODENAME COMPONENTS: the release, its -updates and its security
+# suite, which is CODENAME-security since bullseye and CODENAME/updates before
+sources_list() {
+    local codename="${1}" components="${2}" url security security_url
+    url="$(mirror_url "${codename}")"
+    echo "deb ${url} ${codename} ${components}"
+    if is_archived "${codename}"; then
+        in_list "${archive_dists}" "${codename}-updates" && echo "deb ${url} ${codename}-updates ${components}"
+        security="${archive_security_dists}"
+        security_url="http://${ARCHIVE_HOST}/debian-security"
+    else
+        in_list "${debian_dists}" "${codename}-updates" && echo "deb ${url} ${codename}-updates ${components}"
+        security="${security_dists}"
+        security_url="http://${SECURITY_HOST}/debian-security"
+    fi
+    if in_list "${security}" "${codename}-security"; then
+        echo "deb ${security_url} ${codename}-security ${components}"
+    elif in_list "${security}" "${codename}"; then
+        echo "deb ${security_url} ${codename}/updates ${components}"
+    fi
+}
+
+# system_codename: VERSION_CODENAME, or the name in VERSION="8 (jessie)" of
+# releases before it
+system_codename() {
+    [ -r /etc/os-release ] || return 1
+    (
+        . /etc/os-release
+        # Ubuntu and other derivatives have codenames of their own
+        [ "${ID}" = debian ] || exit 1
+        if [ -n "${VERSION_CODENAME}" ]; then
+            echo "${VERSION_CODENAME}"
+        elif [[ "${VERSION}" =~ \(([a-z]+)\) ]]; then
+            echo "${BASH_REMATCH[1]}"
+        else
+            exit 1
+        fi
+    )
+}
+
+# current_components CODENAME: the components of the Debian line for CODENAME
+# in sources.list
+current_components() {
+    local type url suite rest
+    [ -r "${SOURCES_LIST}" ] || return 1
+    while read -r type url suite rest; do
+        [ "${type}" = deb ] || continue
+        [[ "${url}" == "["* ]] && continue
+        [ "${suite}" = "${1}" ] || continue
+        [[ "${url}" == *debian.org/* ]] || continue
+        [ -n "${rest}" ] && echo "${rest}" && return 0
+    done < "${SOURCES_LIST}"
+    return 1
+}
+
+# sorted_codenames: the releases on both hosts in release order, then new ones,
+# then sid
+sorted_codenames() {
+    local name known
+    local -A seen=()
+    for name in "${KNOWN_CODENAMES[@]}"; do
+        exists "${name}" && echo "${name}" && seen["${name}"]=1
+    done
+    for name in ${debian_dists} ${archive_dists}; do
+        [[ "${name}" == *[-.]* ]] && continue
+        [[ "${name}" =~ [0-9] ]] && continue
+        [ "${name}" = sid ] && continue
+        [ -n "${seen[${name}]}" ] && continue
+        for known in "${ALIASES[@]}"; do
+            [ "${known}" = "${name}" ] && continue 2
+        done
+        echo "${name}"
+        seen["${name}"]=1
+    done
+    exists sid && echo sid
+}
+
+print_table() {
+    local -a rows=() codenames
+    local name version suite status line row system
+    local -a widths=(8 7 5 6)
+    local bold="" reset=""
+    if [ -t 1 ]; then
+        bold=$'\033[1m'
+        reset=$'\033[0m'
+    fi
+    system="$(system_codename)"
+    if [ -n "${1}" ]; then
+        codenames=("${1}")
+    else
+        mapfile -t codenames < <(sorted_codenames)
+    fi
+    for name in "${codenames[@]}"; do
+        IFS=$'\t' read -r version suite < <(release_info "${name}")
+        if is_archived "${name}"; then
+            status="archived"
+        else
+            status="current"
+        fi
+        [ "${name}" = "${system}" ] && name="${name}*"
+        line="deb $(mirror_url "${name%\*}") ${name%\*} main"
+        rows+=("${name}"$'\t'"${version}"$'\t'"${suite}"$'\t'"${status}"$'\t'"${line}")
+        [ "${#name}" -gt "${widths[0]}" ] && widths[0]="${#name}"
+        [ "${#version}" -gt "${widths[1]}" ] && widths[1]="${#version}"
+        [ "${#suite}" -gt "${widths[2]}" ] && widths[2]="${#suite}"
+        [ "${#status}" -gt "${widths[3]}" ] && widths[3]="${#status}"
+    done
+    printf "${bold}%-${widths[0]}s  %-${widths[1]}s  %-${widths[2]}s  %-${widths[3]}s  %s${reset}\n" \
+        CODENAME VERSION SUITE STATUS "APT LINE"
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r name version suite status line <<< "${row}"
+        printf "%-${widths[0]}s  %-${widths[1]}s  %-${widths[2]}s  %-${widths[3]}s  %s\n" \
+            "${name}" "${version}" "${suite}" "${status}" "${line}"
+    done
+    [ -n "${system}" ] && echo "* this system"
+}
+
+# fix_sources CONTENT: write CONTENT to sources.list and move the other Debian
+# lists aside, so no line points at a host without the release
+fix_sources() {
+    local content="${1}" file
+    if [ -r "${SOURCES_LIST}" ] && [ "$(cat "${SOURCES_LIST}")" = "${content}" ]; then
+        echo "${SOURCES_LIST} is up to date"
+    else
+        if [ -e "${SOURCES_LIST}" ]; then
+            cp -p "${SOURCES_LIST}" "${SOURCES_LIST}.bak" || fail "cannot back up ${SOURCES_LIST}"
+            echo "Kept the old ${SOURCES_LIST} as ${SOURCES_LIST}.bak"
+        fi
+        printf '%s\n' "${content}" > "${SOURCES_LIST}" || fail "cannot write ${SOURCES_LIST}"
+        echo "Wrote ${SOURCES_LIST}:"
+        printf '%s\n' "${content}" | sed 's/^/  /'
+    fi
+    for file in "${SOURCES_DIR}"/*.list "${SOURCES_DIR}"/*.sources; do
+        [ -f "${file}" ] || continue
+        grep -qE '(deb|security|archive)\.debian\.org' "${file}" || continue
+        mv "${file}" "${file}.bak" || fail "cannot move ${file} aside"
+        echo "Moved ${file} to ${file}.bak"
+    done
+}
+
+codename=""
+components=""
+print=0
+fix=0
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -c|--codename)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${codename}" ] && usage
+            codename="${1}"
+            ;;
+        -p|--print)
+            print=1
+            ;;
+        -f|--fix)
+            fix=1
+            ;;
+        -C|--components)
+            shift
+            [ -z "${1}" ] && usage
+            components="${1}"
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            [ -n "${codename}" ] && error "Unexpected argument: ${1}" && usage
+            codename="${1}"
+            ;;
+    esac
+    shift
+done
+
+[ "${print}" -eq 1 ] && [ "${fix}" -eq 1 ] && error "--print and --fix exclude each other" && usage
+[ -n "${components}" ] && [ "${print}" -eq 0 ] && [ "${fix}" -eq 0 ] \
+    && error "--components only applies to --print and --fix" && usage
+[[ -n "${codename}" && ! "${codename}" =~ ^[a-z]+$ ]] && fail "Not a codename: ${codename}"
+[ "${fix}" -eq 1 ] && [ "$(id -u)" -ne 0 ] && fail "--fix has to run as root"
+if [ -z "${codename}" ] && { [ "${print}" -eq 1 ] || [ "${fix}" -eq 1 ]; }; then
+    codename="$(system_codename)" || fail "No Debian codename in /etc/os-release, give one"
+fi
+
+load_dists
+[ -n "${codename}" ] && ! exists "${codename}" \
+    && fail "Debian ${codename} is neither on ${DEBIAN_HOST} nor on ${ARCHIVE_HOST}"
+
+if [ "${print}" -eq 0 ] && [ "${fix}" -eq 0 ]; then
+    print_table "${codename}"
+    exit 0
+fi
+
+[ -z "${components}" ] && components="$(current_components "${codename}")"
+[ -z "${components}" ] && components="main"
+content="$(sources_list "${codename}" "${components}")"
+if [ "${print}" -eq 1 ]; then
+    printf '%s\n' "${content}"
+else
+    fix_sources "${content}"
+fi

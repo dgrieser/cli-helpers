@@ -1,0 +1,68 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+DRIVER_DIR="/sys/bus/i2c/drivers/i2c_hid_acpi"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Bring back an I2C-HID touchpad (e.g. of a Framework laptop) that stopped
+working, without a reboot: unbind it from its driver and bind it again. Asks
+for sudo.
+
+Options:
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# find_touchpad: the I2C device whose input device is named like a touchpad,
+# or a PIXA one (the touchpad of the Framework laptops)
+find_touchpad() {
+    local path name
+    for path in "${DRIVER_DIR}"/i2c-*; do
+        [ -e "${path}" ] || continue
+        name="$(basename "${path}")"
+        if grep -qi touchpad /sys/bus/i2c/devices/"${name}"/*/input/input*/name 2>/dev/null \
+            || [[ "${name}" == *PIXA* ]]; then
+            echo "${name}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+
+device="$(find_touchpad)" || fail "No touchpad found under ${DRIVER_DIR}"
+echo "Rebinding ${device}"
+echo "${device}" | sudo tee "${DRIVER_DIR}/unbind" > /dev/null || fail "Cannot unbind ${device}"
+sleep 1
+echo "${device}" | sudo tee "${DRIVER_DIR}/bind" > /dev/null || fail "Cannot bind ${device} again"
+echo "Done"

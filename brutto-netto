@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Compute the German net salary for a gross salary with the calculator of
+brutto-netto-rechner.info: taxes (Lohnsteuer, Solidaritätszuschlag,
+Kirchensteuer) and social security contributions per month and per year.
+
+Your own tax details (tax class, state, children, ...) are best kept as defaults
+in ~/.config/cli-helpers/brutto-netto.yaml, whose keys are the long option names
+(e.g. "tax-class: 3"); --save writes the options given into it.
+
+Without BRUTTO it asks for the salary with the prompts of cli-helpers, and for
+the tax details too as long as none are saved; --interactive always asks for
+them, starting from the defaults. It offers to save the details that changed.
+"""
+
+import argparse
+import datetime
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import yaml
+
+URL = "https://www.brutto-netto-rechner.info/index.php"
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                           "cli-helpers", "brutto-netto.yaml")
+TIMEOUT = 30
+STATES = [
+    "baden-wuerttemberg", "bayern", "berlin", "brandenburg", "bremen", "hamburg", "hessen",
+    "mecklenburg-vorpommern", "niedersachsen", "nordrhein-westfalen", "rheinland-pfalz", "saarland",
+    "sachsen", "sachsen-anhalt", "schleswig-holstein", "thueringen",
+]
+# the rows of the result, as the site labels them
+ROWS = ["Brutto", "Geldwerter Vorteil", "Solidaritätszuschlag", "Kirchensteuer", "Lohnsteuer", "Steuern",
+        "Rentenversicherung", "Arbeitslosenversicherung", "Krankenversicherung", "Pflegeversicherung",
+        "Sozialabgaben", "Netto"]
+TAX_CLASSES = {
+    1: "single",
+    2: "single parent",
+    3: "married, the higher income (the partner has 5)",
+    4: "married, both earn about the same",
+    5: "married, the lower income (the partner has 3)",
+    6: "second job",
+}
+# the tax details --interactive asks for; the rarer ones stay options
+ASKED = ["tax-class", "state", "church", "age", "children"]
+# the prompts of cli-helpers, next to this script (installed or in the repo)
+PROMPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# the options a config file may set, with their defaults
+DEFAULTS = {
+    "year": None,
+    "tax-class": 1,
+    "state": "nordrhein-westfalen",
+    "church": False,
+    "age": 30,
+    "children": 0,
+    "child-allowance": None,
+    "health-surcharge": None,
+    "private-health": None,
+    "no-employer-health": False,
+    "no-pension": False,
+    "no-unemployment": False,
+    "tax-allowance": None,
+    "benefit": None,
+}
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    if not os.path.isfile(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE) as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        fail(f"cannot read {CONFIG_FILE}: {e}")
+    if not isinstance(config, dict):
+        fail(f"{CONFIG_FILE} must be a mapping")
+    unknown = sorted(set(config) - set(DEFAULTS))
+    if unknown:
+        fail(f"unknown keys in {CONFIG_FILE}: {', '.join(unknown)}")
+    return config
+
+
+def save_config(args, given):
+    config = load_config()
+    for key in given:
+        config[key] = getattr(args, key.replace("-", "_"))
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=True)
+    print(f"Saved {', '.join(sorted(given))} to {CONFIG_FILE}", file=sys.stderr)
+
+
+def prompt(tool, *arguments):
+    """Run a prompt of cli-helpers: its answer, None for "no" or an empty
+    answer; Esc aborts, Ctrl-C (exit 130) too, with its status."""
+    path = os.path.join(PROMPT_DIR, tool)
+    if not os.access(path, os.X_OK):
+        path = shutil.which(tool)
+        if not path:
+            fail(f"{tool} of cli-helpers not found")
+    result = subprocess.run([path, *arguments], stdout=subprocess.PIPE, text=True)
+    if result.returncode == 130:
+        sys.exit(130)
+    if result.returncode != 0:
+        return None
+    return result.stdout.rstrip("\n")
+
+
+def ask_yes(question, default):
+    return prompt("prompt-yes-no" if default else "prompt-no-yes", question) is not None
+
+
+def ask_value(question, default, convert):
+    """Ask until the answer converts; Ctrl-D aborts (the prompt says so)."""
+    while True:
+        answer = prompt("prompt-input", "--prompt", question, "--default", default)
+        if answer is None:
+            sys.exit(1)
+        if answer == "":
+            continue
+        try:
+            return convert(answer)
+        except (argparse.ArgumentTypeError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+
+
+def ask_select(question, items, default):
+    """items: (key, title) pairs; Esc aborts (the prompt says so)."""
+    answer = prompt("prompt-select", "--prompt", question, "--default", str(default), "--filter",
+                    *[f"{key}={title}" for key, title in items])
+    if answer is None:
+        sys.exit(1)
+    return answer
+
+
+def age(value):
+    result = int(value)
+    if not 14 <= result <= 99:
+        raise ValueError(f"not an age: {value}")
+    return result
+
+
+def interactive(args, ask_details):
+    """Ask for BRUTTO when missing and, with ask_details, for the tax details,
+    then offer to save the details that differ from the config file."""
+    if args.brutto is None:
+        period = "year" if args.yearly else "month"
+        args.brutto = ask_value(f"Gross salary per {period}:", "", number)
+    if not ask_details:
+        return
+    args.tax_class = int(ask_select("Tax class (Steuerklasse):",
+                                    [(k, f"{k}: {v}") for k, v in TAX_CLASSES.items()], args.tax_class))
+    args.state = ask_select("Federal state:", [(state, state) for state in STATES], args.state)
+    args.church = ask_yes("Pay church tax (Kirchensteuer)?", args.church)
+    args.age = ask_value("Age:", str(args.age), age)
+    args.children = int(ask_select("Children:", [(n, str(n)) for n in range(6)], args.children))
+
+    config = load_config()
+    changed = [key for key in ASKED
+               if getattr(args, key.replace("-", "_")) != config.get(key, DEFAULTS[key])]
+    if changed and ask_yes(f"Save {', '.join(changed)} as defaults to {CONFIG_FILE}?", not config):
+        save_config(args, changed)
+
+
+def fetch(data=None):
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    request = urllib.request.Request(URL, data=body, headers={"User-Agent": "brutto-netto (cli-helpers)"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            # the site is in ISO-8859-1
+            return response.read().decode("iso-8859-1")
+    except (urllib.error.URLError, OSError) as e:
+        fail(f"cannot reach {URL}: {e}")
+
+
+def form_defaults(page):
+    """The years the calculator offers (newest first) and its default health
+    insurance surcharge (the average Zusatzbeitrag of the year)."""
+    years = []
+    match = re.search(r'<select[^>]*name="f_abrechnungsjahr"[^>]*>(.*?)</select>', page, re.S)
+    if match:
+        years = [int(y) for y in re.findall(r'value="(\d{4})"', match.group(1))]
+    surcharge = None
+    match = re.search(r'<input[^>]*name="f_KVZ"[^>]*value="([\d.]+)"', page)
+    if match:
+        surcharge = float(match.group(1))
+    return sorted(years, reverse=True), surcharge
+
+
+def text_of(page):
+    text = re.sub(r"<!--.*?-->", " ", page, flags=re.S)
+    text = re.sub(r"<[^>]+>", "|", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    # long labels are split with a hyphen ("Renten-|versicherung", "Kranken|-|versicherung")
+    text = re.sub(r"\s*\|?\s*-\s*(\|\s*)+", "", text)
+    return re.sub(r"(\|\s*)+", "|", text)
+
+
+def amount(cell):
+    """12.345,67 € as a number, any other cell (e.g. "in PKV enthalten") as is."""
+    match = re.fullmatch(r"([\d.]+,\d{2}) €", cell)
+    return float(match.group(1).replace(".", "").replace(",", ".")) if match else cell
+
+
+def parse_result(page):
+    """The month and year values of each row; a row is a "Label:" cell followed
+    by them, and a label may be split over two cells ("Geldwerter|Vorteil:")."""
+    text = text_of(page)
+    start = text.find("Ergebnis")
+    if start < 0:
+        fail("no result in the answer of the calculator (did the site change?)")
+    cells = [cell.strip() for cell in text[start:].split("|")]
+    result = {}
+    for index, cell in enumerate(cells[:-2]):
+        if not cell.endswith(":"):
+            continue
+        label = cell[:-1]
+        if label not in ROWS and index > 0:
+            label = f"{cells[index - 1]} {label}"
+        if label in ROWS and label not in result:
+            result[label] = (amount(cells[index + 1]), amount(cells[index + 2]))
+    if not all(isinstance(value, float) for value in result.get("Netto", ("",))):
+        fail("no net salary in the answer of the calculator (did the site change?)")
+    return result
+
+
+def euro(value):
+    if not isinstance(value, float):
+        return value
+    text = f"{value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"{text} €"
+
+
+def print_table(result, args):
+    width = max(len(label) for label in ROWS)
+    church = "mit" if args.church else "ohne"
+    print(f"{args.year}, Steuerklasse {args.tax_class}, {args.state}, {church} Kirchensteuer, "
+          f"{args.children} Kinder, {args.age} Jahre\n")
+    print(f"{'':{width}}  {'Monat':>16}  {'Jahr':>16}")
+    for label in ROWS:
+        if label not in result:
+            continue
+        month, year = result[label]
+        if label in ("Geldwerter Vorteil", "Solidaritätszuschlag", "Kirchensteuer") and month == 0:
+            continue
+        if label in ("Steuern", "Sozialabgaben", "Netto"):
+            print(f"{'':{width}}  {'-' * 16}  {'-' * 16}")
+        print(f"{label:{width}}  {euro(month):>16}  {euro(year):>16}")
+
+
+def number(value):
+    """A German or English amount: 4500, 4.500,50 or 4500.50."""
+    text = value.strip()
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+(,\d+)?|\d+,\d+", text):
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        result = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an amount: {value}")
+    if result < 0:
+        raise argparse.ArgumentTypeError(f"not an amount: {value}")
+    return result
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  brutto-netto 4500\n"
+               "  brutto-netto 60000 --yearly --tax-class 3 --children 2\n"
+               "  brutto-netto 4500 --hours 40 --new-hours 32   # the same job part-time\n"
+               "  brutto-netto --tax-class 3 --children 2 --state bayern --save\n"
+               "  brutto-netto -q 4500                         # only the monthly net")
+    parser.add_argument("brutto", nargs="?", type=number, help="gross salary per month (per year with --yearly)")
+    parser.add_argument("-y", "--yearly", action="store_true", help="BRUTTO is per year, not per month")
+    parser.add_argument("--hours", type=number, help="weekly hours BRUTTO is paid for, with --new-hours")
+    parser.add_argument("--new-hours", type=number,
+                        help="weekly hours to compute for: BRUTTO is scaled by NEW_HOURS / HOURS")
+    parser.add_argument("--year", type=int, help="tax year (default: the newest the calculator offers)")
+    parser.add_argument("-k", "--tax-class", type=int, choices=range(1, 7), metavar="1-6",
+                        help="tax class, Steuerklasse (default: 1)")
+    parser.add_argument("-s", "--state", choices=STATES, metavar="STATE",
+                        help="federal state, e.g. bayern (default: nordrhein-westfalen): " + ", ".join(STATES))
+    parser.add_argument("--church", action="store_true", default=None, help="pay church tax, Kirchensteuer")
+    parser.add_argument("--no-church", dest="church", action="store_false", help="pay no church tax (default)")
+    parser.add_argument("-a", "--age", type=int, help="age in years (default: 30)")
+    parser.add_argument("-c", "--children", type=int, choices=range(0, 6), metavar="0-5",
+                        help="number of children, for the care insurance (default: 0)")
+    parser.add_argument("--child-allowance", type=float, choices=[x / 2 for x in range(0, 11)], metavar="0-5",
+                        help="child allowances, Kinderfreibeträge, in steps of 0.5 (default: --children)")
+    parser.add_argument("--health-surcharge", type=float, metavar="PERCENT",
+                        help="additional contribution of the health insurance, Zusatzbeitrag "
+                             "(default: the average the calculator uses)")
+    parser.add_argument("--private-health", type=number, metavar="AMOUNT",
+                        help="privately insured with this monthly premium")
+    parser.add_argument("--no-employer-health", action="store_true", default=None,
+                        help="with --private-health: no employer contribution to it")
+    parser.add_argument("--no-pension", action="store_true", default=None,
+                        help="not in the statutory pension insurance")
+    parser.add_argument("--no-unemployment", action="store_true", default=None,
+                        help="not in the unemployment insurance")
+    parser.add_argument("--tax-allowance", type=number, metavar="AMOUNT",
+                        help="monthly tax allowance, Steuerfreibetrag")
+    parser.add_argument("--benefit", type=number, metavar="AMOUNT",
+                        help="monthly non-cash benefit, geldwerter Vorteil (e.g. a company car)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print only the net amount (per month, "
+                        "per year with --yearly), e.g. for scripts")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="ask for the tax details (and BRUTTO when missing), starting from the defaults")
+    parser.add_argument("--save", action="store_true",
+                        help=f"save the tax options given as defaults to {CONFIG_FILE}")
+    args = parser.parse_args()
+
+    given = [key for key in DEFAULTS if getattr(args, key.replace("-", "_")) is not None]
+    config = load_config()
+    for key, default in DEFAULTS.items():
+        attr = key.replace("-", "_")
+        if getattr(args, attr) is None:
+            setattr(args, attr, config.get(key, default))
+
+    if (args.hours is None) != (args.new_hours is None):
+        parser.error("--hours and --new-hours go together")
+    if args.hours == 0:
+        parser.error("--hours must not be 0")
+    if args.no_employer_health and args.private_health is None:
+        parser.error("--no-employer-health only applies to --private-health")
+    if args.save:
+        if not given:
+            parser.error("--save needs the options to save, e.g. --tax-class 3")
+        save_config(args, given)
+        if args.brutto is None:
+            sys.exit(0)
+    terminal = sys.stdin.isatty() and sys.stderr.isatty()
+    if (args.brutto is None or args.interactive) and not terminal:
+        parser.error("BRUTTO is required" if args.brutto is None else "--interactive needs a terminal")
+    if args.brutto is None or args.interactive:
+        # without BRUTTO the details are asked too the first time, before they
+        # are saved, unless options gave some of them
+        interactive(args, args.interactive or not (given or os.path.isfile(CONFIG_FILE)))
+    return args
+
+
+def main():
+    args = parse_args()
+    years, surcharge = form_defaults(fetch())
+    if args.year is None:
+        args.year = years[0] if years else datetime.date.today().year
+    elif years and args.year not in years:
+        fail(f"the calculator offers the years {', '.join(map(str, years))}, not {args.year}")
+    if args.health_surcharge is None:
+        args.health_surcharge = surcharge if surcharge is not None else 2.9
+
+    brutto = args.brutto
+    if args.hours is not None:
+        brutto = brutto / args.hours * args.new_hours
+    if args.child_allowance is None:
+        args.child_allowance = float(args.children)
+
+    data = {
+        "f_start": 1,
+        "ok": 1,
+        "f_bruttolohn": f"{brutto:.2f}",
+        "f_abrechnungszeitraum": "jahr" if args.yearly else "monat",
+        "f_geld_werter_vorteil": f"{args.benefit:.2f}" if args.benefit else "",
+        "f_abrechnungsjahr": args.year,
+        "f_steuerfreibetrag": f"{args.tax_allowance:.2f}" if args.tax_allowance else "",
+        "f_steuerklasse": args.tax_class,
+        "f_kirche": "ja" if args.church else "nein",
+        "f_bundesland": args.state,
+        "f_alter": args.age,
+        "f_kinder": "ja" if args.children > 0 else "nein",
+        "f_kinderfreibetrag": f"{args.child_allowance:g}",
+        "f_kinder_anz": args.children,
+        "f_krankenversicherung": "privat_versichert" if args.private_health is not None else "pflichtversichert",
+        "f_private_kv": f"{args.private_health:.2f}" if args.private_health is not None else "",
+        "f_arbeitgeberzuschuss_pkv": "nein" if args.no_employer_health else "ja",
+        "f_KVZ": f"{args.health_surcharge:g}",
+        "f_rentenversicherung": "nicht_pflichtversichert" if args.no_pension else "pflichtversichert",
+        "f_arbeitslosenversicherung": "nicht_pflichtversichert" if args.no_unemployment else "pflichtversichert",
+    }
+    result = parse_result(fetch(data))
+    if args.quiet:
+        month, year = result["Netto"]
+        print(f"{year if args.yearly else month:.2f}")
+    else:
+        print_table(result, args)
+
+
+if __name__ == "__main__":
+    main()

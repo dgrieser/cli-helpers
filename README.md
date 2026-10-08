@@ -17,7 +17,10 @@ To set up a new machine, clone the repo and run `./setup.sh` from a terminal as 
 keys, the SSH config and the network connections stored in the keyring (`keyring-cli ssh-restore`,
 `keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
 Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
-copies, installs `gh` and `glab` and asks you to log in with them, installs the `base` software with `updater`,
+copies, offers to restore your own scripts of `~/bin` from the backup, sets up the Mittwald VPN (the OpenVPN plugin
+of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs `gh` and
+`glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
+when the host is not reachable, with `~/bin/gen` if you like), installs the `base` software with `updater`,
 runs `make install` of bash_aliases.d once more with a terminal (it asks for missing SSH keys and history backups,
 which `updater` cannot), offers to import a backup of the reminders of `reminder`, and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx` (`k-ctx shell-init`, sourced by bash_aliases.d) and offers to set up `netbox-cli` (`NETBOX_URL`, and `NETBOX_TOKEN` stored in the keyring for the
@@ -27,7 +30,8 @@ apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`a
 
 Run `setup-backup` on the old machine first: it copies every file `setup.sh` asks for into a new folder
 `setup-backup-<host>-<date>` (the keyring files, the reminders, the shell histories and the `Keys` folder of the documents
-folder with the SSH keys of the SSH config), after offering to store the current SSH config in the keyring.
+folder with the SSH keys of the SSH config, and the private scripts `gen`, `.power`, `.in` and `.out` of `~/bin`), after offering to store the current SSH
+config in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
 
 The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
@@ -1578,39 +1582,42 @@ Takes no arguments.
 lastcmd
 ```
 
-### `history_append`
-Reads data from stdin and appends it to the shell history file, optionally prefixing a Unix epoch timestamp line.
+### `history-cli`
+Reads, writes, inspects and repairs a bash history file. With `HISTTIMEFORMAT` set, bash writes a `#<epoch>` line before each entry; entries without one (from before it was set, or appended by other tools) show no time and confuse tools that read the timestamps.
 
-**Usage:** `history_append [-h|--help] [-f|--file <file>] [-t|--with-timestamp]`
+**Usage:** `history-cli COMMAND [OPTIONS]`
 
-| Argument / Flag | Description |
+| Command / Flag | Description |
 |---|---|
-| `-h, --help` | Print the help message and exit. |
-| `-f, --file <file>` | History file to write to; defaults to `$HISTFILE` or `~/.bash_history`. |
-| `-t, --with-timestamp` | Include a timestamp line; defaults to whether `$HISTTIMEFORMAT` is set. |
+| `read` | Print the entries (trimmed, without empty ones), each with the ISO time of its timestamp (`2024-01-31T12:00:00+0100`) unless `--no-timestamp`. |
+| `append` | Append stdin as one entry, with a timestamp line when `$HISTTIMEFORMAT` is set or with `--with-timestamp`. Does nothing without `--file` or `$HISTFILE`, e.g. in a shell without a history. |
+| `stats` | Count the entries with and without a timestamp and show the time of the first and the last one. |
+| `fix-timestamps` | Give every entry without a timestamp one: the one of the entry before it, so the order stays the same (the first timestamp of the file for the entries before it). Prints the result unless `--in-place` is given. |
+| `-f, --file FILE` | History file (default: `$HISTFILE`, else `~/.bash_history`). |
+| `-l, --lines N` | `read`: only the last `N` entries. |
+| `-e, --exclude REGEX` | `read`: leave out entries matching the extended regular expression; repeatable. |
+| `--no-timestamp` | `read`: print only the entries. |
+| `--with-timestamp` | `append`: always write a timestamp. |
+| `-t, --timestamp WHEN` | `fix-timestamps`: give all entries without a timestamp this one, as epoch seconds or a date `date -d` understands. |
+| `-i, --in-place` | `fix-timestamps`: rewrite the file, keeping the old one as `FILE.bak`. |
+
+A line counts as one entry: with `lithist`, a multi-line command written as several lines after one timestamp would be split into entries.
 
 **Examples:**
 ```bash
-echo "make deploy" | history_append
-echo "make deploy" | history_append -t -f ~/project.history
+history-cli read -l 50 --no-timestamp -e '^ls' -e '^cd'
+echo "make deploy" | history-cli append
+history-cli stats
+history-cli fix-timestamps -i
+history-cli fix-timestamps -f ~/.kube_history -t "2024-01-31 12:00" -i
 ```
 
-### `history_read`
-Reads the shell history file referenced by `$HISTFILE`, pairing each command with a formatted ISO timestamp, with options to tail a number of lines, omit timestamps, or exclude commands by regex.
+### `history_append`, `history_read`
+Symlinks to [history-cli](#history-cli) that keep the old commands working: `history_read [OPTIONS]` is `history-cli read [OPTIONS]`, and `history_append [OPTIONS]` is `history-cli append [OPTIONS]`, where `-t` still means `--with-timestamp`.
 
-**Usage:** `history_read [-l LINES] [--no-timestamp] [-e PATTERN ...]`
-
-| Argument / Flag | Description |
-|---|---|
-| `-l, --lines LINES` | Return only the last LINES history entries. |
-| `--no-timestamp` | Print only the command lines, without timestamps. |
-| `-e, --exclude PATTERN` | Exclude commands matching the given regex; repeatable. |
-
-**Examples:**
 ```bash
-history_read
 history_read --lines 50 --no-timestamp
-history_read -e '^ls' -e '^cd'
+echo "make deploy" | history_append -t -f ~/project.history
 ```
 
 ### `patch-apply`
@@ -1653,6 +1660,44 @@ reminder --add     # or -a
 ```
 
 ---
+
+### `brutto-netto`
+Computes the German net salary for a gross salary with the calculator of brutto-netto-rechner.info and prints the taxes (Lohnsteuer, Solidaritätszuschlag, Kirchensteuer) and social security contributions per month and per year. The tax year defaults to the newest the calculator offers, the health insurance surcharge (Zusatzbeitrag) to its average of that year. Your own tax details are best kept as defaults in `~/.config/cli-helpers/brutto-netto.yaml`, whose keys are the long option names (`tax-class: 3`); `--save` writes the options given into it.
+
+Without `BRUTTO` it asks for the salary with [prompt-input](#prompt), and as long as no tax details are saved also for the tax class, federal state, church tax, age and children ([prompt-select](#prompt) lists, filtered by typing), starting from the defaults; `--interactive` always asks for them. Afterwards it offers to save the details that changed. Esc or Ctrl-D in a prompt aborts, Ctrl-C exits with 130.
+
+**Usage:** `brutto-netto [OPTIONS] [BRUTTO]`
+
+| Argument / Flag | Description |
+|---|---|
+| `BRUTTO` | Gross salary per month (per year with `--yearly`), e.g. `4500` or `4.500,50`; asked for when missing. |
+| `-y, --yearly` | `BRUTTO` is per year. |
+| `--hours H --new-hours N` | Scale `BRUTTO` from `H` to `N` weekly hours, e.g. for the same job part-time. |
+| `--year YEAR` | Tax year (default: the newest the calculator offers). |
+| `-k, --tax-class 1-6` | Tax class, Steuerklasse (default: 1). |
+| `-s, --state STATE` | Federal state, e.g. `bayern` (default: `nordrhein-westfalen`). |
+| `--church`, `--no-church` | Pay church tax or not (default: not). |
+| `-a, --age AGE` | Age in years (default: 30). |
+| `-c, --children 0-5` | Number of children, for the care insurance (default: 0). |
+| `--child-allowance 0-5` | Child allowances (Kinderfreibeträge) in steps of 0.5 (default: `--children`). |
+| `--health-surcharge PERCENT` | Additional contribution of the health insurance. |
+| `--private-health AMOUNT` | Privately insured with this monthly premium; `--no-employer-health` without employer contribution. |
+| `--no-pension`, `--no-unemployment` | Not in the statutory pension or unemployment insurance. |
+| `--tax-allowance AMOUNT` | Monthly tax allowance (Steuerfreibetrag). |
+| `--benefit AMOUNT` | Monthly non-cash benefit (geldwerter Vorteil), e.g. a company car. |
+| `-q, --quiet` | Print only the net amount (per month, per year with `--yearly`). |
+| `-i, --interactive` | Ask for the tax details (and `BRUTTO` when missing), starting from the defaults. |
+| `--save` | Save the tax options given as defaults. |
+
+**Examples:**
+```bash
+brutto-netto                     # asks for everything
+brutto-netto -i 4500             # asks for the tax details
+brutto-netto 4500
+brutto-netto 60000 --yearly --tax-class 3 --children 2
+brutto-netto 4500 --hours 40 --new-hours 32
+brutto-netto --tax-class 3 --children 2 --state bayern --save
+```
 
 ## Interactive Input Prompts
 
@@ -2151,6 +2196,47 @@ updater --verbose all
 make update UPDATE_ARGS='--dry-run apt'
 ```
 
+### `debian-dist-check`
+Shows which Debian releases are still on deb.debian.org and which have moved to archive.debian.org, with their version, suite and the apt line to use, and fixes the apt sources of a system whose release was archived. It needs only bash (HTTP over `/dev/tcp`), so it also runs in a minimal chroot or container without curl or wget. A release on the archive counts as archived even when deb.debian.org still serves its stale index.
+
+**Usage:** `debian-dist-check [OPTIONS] [CODENAME]`
+
+| Argument / Flag | Description |
+|---|---|
+| `CODENAME` | Debian codename, e.g. `buster`. Without options: the table row of only this release. With `--print`/`--fix` it defaults to the codename of the system (`/etc/os-release`). |
+| `-c, --codename NAME` | Same as `CODENAME`. |
+| `-p, --print` | Print the `sources.list` content for the release: the release, its `-updates` and its security suite (`CODENAME-security`, or `CODENAME/updates` before bullseye), from the archive once it is archived. |
+| `-f, --fix` | Write that content to `/etc/apt/sources.list` (as root). The old file is kept as `sources.list.bak`, and the Debian lists in `/etc/apt/sources.list.d` (also `debian.sources`) are moved to `.bak`, which apt ignores. |
+| `-C, --components LIST` | Components for `--print`/`--fix`, e.g. `"main contrib"` (default: the ones of the current Debian line in `sources.list`, else `main`). |
+
+**Examples:**
+```bash
+debian-dist-check                 # table of every release
+debian-dist-check buster          # only buster
+debian-dist-check -p -c stretch   # the sources.list for stretch
+sudo debian-dist-check --fix      # fix this system's sources.list
+```
+
+### `fix-mt7922-6ghz-roaming`
+Makes 6 GHz wifi work on MediaTek MT7921/MT7922 cards (driver `mt7921e`), which otherwise drop 6 GHz links and fall back to 5 GHz every few minutes. It turns off the firmware CLC with `options mt7921_common disable_clc=1` in `/etc/modprobe.d/mt7921.conf` and pins the regulatory domain with a udev rule (`/etc/udev/rules.d/99-wireless-regdom.rules`), so a roam no longer falls back to the WORLD domain, where 6 GHz is no-IR. It aborts on other hardware, reloads the driver (the wifi drops for a few seconds), checks the 6 GHz channels and logs to `~/.local/state/fix-mt7922-6ghz-roaming.log`. A pinned domain does not follow the country of the APs any more, so set it again abroad (`iw reg set 00` is the world domain).
+
+**Usage:** `fix-mt7922-6ghz-roaming [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-c, --country CC` | Regulatory domain to pin, the country you are in (default: `DE`). |
+
+**Examples:**
+```bash
+fix-mt7922-6ghz-roaming
+fix-mt7922-6ghz-roaming --country AT
+```
+
+### `fix-touchpad`
+Brings back an I2C-HID touchpad (e.g. of a Framework laptop) that stopped working, without a reboot: it unbinds the device from `i2c_hid_acpi` and binds it again. Asks for sudo.
+
+**Usage:** `fix-touchpad`
+
 ### `bluetooth-trigger`
 Listens on the system D-Bus for BlueZ Bluetooth device add/remove events and prints the device object path as each device appears or disappears (with commented-out scaffolding for triggering actions on a specific MAC address).
 
@@ -2359,6 +2445,7 @@ Backs up on the old machine every file `setup.sh` asks for on a new one, into a 
 | `reminder/` | `~/.cache/reminder`, modification times kept | "Reminder folder or archive" |
 | `history/` | `~/.bash_super_history`, `~/.kube_history` | dotfiles: "Path of a backup of ~/..." |
 | `Keys/` | the `Keys` folder of the documents folder (without editor swap files), plus the SSH keys `~/.ssh/config` names that are in neither it nor the keyring | dotfiles: copy it to `Documents/Keys` |
+| `bin/` | the private scripts of `~/bin` that are not in this repo: `gen` (dials the VPN) and `.power` with `.in` and `.out` | "Backup of ~/bin" |
 
 **Usage:** `setup-backup [-h] [FOLDER]`
 
