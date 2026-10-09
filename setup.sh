@@ -380,7 +380,7 @@ render_secrets() {
 # you say so
 install_etc_files() {
     local src_dir="${REPO_DIR}/lib/cli-helpers/etc" src dst mode tmp
-    local -a files=() changed=()
+    local -a files=() changed=() restart=()
     info "/etc: the dispatcher scripts of NetworkManager (all DNS through the ${VPN_NAME} VPN while it is up), the stub of systemd-resolved on docker0 and the DNS of docker"
     # an array, not a read loop: ask reads the terminal
     mapfile -d '' -t files < <(find "${src_dir}" -type f -print0 | sort -z)
@@ -408,12 +408,13 @@ install_etc_files() {
 
     # the dispatcher scripts run on the next connection, the services read their
     # files when they start; docker reads it on its first start when not running
-    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/resolved\.conf\.d/'; then
-        run sudo systemctl restart systemd-resolved || failed+=("systemctl restart systemd-resolved")
-    fi
-    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/docker/' && systemctl is-active --quiet docker; then
-        run sudo systemctl restart docker || failed+=("systemctl restart docker")
-    fi
+    printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/resolved\.conf\.d/' && restart+=(systemd-resolved)
+    printf '%s\n' "${changed[@]}" | grep -q '^/etc/docker/' && systemctl is-active --quiet docker && restart+=(docker)
+    [ "${#restart[@]}" -eq 0 ] && return 0
+    # these are no unit files, but the units installed before (apt, snaps) make
+    # every restart warn about a missing daemon-reload
+    run sudo systemctl daemon-reload || failed+=("systemctl daemon-reload")
+    run sudo systemctl restart "${restart[@]}" || failed+=("systemctl restart ${restart[*]}")
 }
 
 # gitlab.mittwald.it is only reachable through the VPN (or from the office)
