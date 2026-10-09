@@ -1771,7 +1771,7 @@ software-017-dev-helpers@dev() { helper_repo_update "dgrieser/dev-helpers"; }
 software-018-kubectl-helpers@k8s() { helper_repo_update "dgrieser/kubectl-helpers"; }
 software-019-mw-helpers@mw() { helper_repo_update "gitlab.mittwald.it/dgrieser/mw-helpers"; }
 software-020-apt@base() { apt_upgrade; }
-software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging jq unzip file 7zip; }
+software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging python3-networkmanager jq unzip file 7zip; }
 software-022-glow@base() {
     apt_upgrade glow || return 1
     config_update glow "${CURRENT_USER_HOME}/.config/glow"

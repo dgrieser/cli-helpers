@@ -21,7 +21,12 @@ keys, the SSH config and the network connections stored in the keyring (`keyring
 `keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
 Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
 copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the OpenVPN plugin
-of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs `gh` and
+of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs the files of
+`lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
+is up, with the Mittwald domains to search, and sets the Slack status, as the Mittwald wifi does, which also gets calmer
+roaming scans; a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
+internal names too; the internal names are `@@SECRET:NAME@@` in the repo, filled in from the keyring item
+`type=dotfile-secret name=NAME`, and a file that differs is only replaced when you say so), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
 when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), restores the session of Sublime Text (its open windows
 and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome

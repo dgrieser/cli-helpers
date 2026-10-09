@@ -1,7 +1,8 @@
 #!/bin/bash
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
-# keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN,
+# keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
+# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker),
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
 # if you like, gitlab.com), the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
@@ -348,6 +349,70 @@ setup_vpn() {
     if [ ! -x "${GEN}" ]; then
         warning "No ${GEN} to dial the VPN, restore it with the backup of ~/bin"
         failed+=("${GEN}")
+    fi
+}
+
+# render_secrets FILE: FILE with every @@SECRET:NAME@@ filled in from the keyring
+# item type=dotfile-secret name=NAME, as the dotfiles of bash_aliases.d do; fails
+# on a missing one
+render_secrets() {
+    local file="${1}" content name value
+    content="$(cat "${file}"; echo x)"
+    content="${content%x}"
+    while read -r name; do
+        value="$(secret-tool lookup type dotfile-secret name "${name}" 2>/dev/null)"
+        if [ -z "${value}" ]; then
+            warning "No secret ${name} in the keyring for ${file#"${REPO_DIR}/"} (store it: secret-tool store --label=\"dotfile ${name}\" type dotfile-secret name ${name})"
+            return 1
+        fi
+        content="${content//"@@SECRET:${name}@@"/"${value}"}"
+    done < <(grep -oE '@@SECRET:[A-Za-z0-9_]+@@' "${file}" | sed -E 's/^@@SECRET:(.*)@@$/\1/' | sort -u)
+    printf '%s' "${content}"
+}
+
+# the files of lib/cli-helpers/etc into /etc, before the VPN is dialed: the
+# dispatcher scripts of NetworkManager (tun-up sends all DNS through the VPN while
+# it is up, with the Mittwald domains to search, and sets the Slack status, as the
+# Mittwald wifi does, which also gets calmer roaming scans), the stub of
+# systemd-resolved on docker0 and the DNS of docker pointing at it, so containers
+# resolve the internal names too; the internal names are @@SECRET:NAME@@ in this
+# public repo (render_secrets); a file that differs here is only replaced when
+# you say so
+install_etc_files() {
+    local src_dir="${REPO_DIR}/lib/cli-helpers/etc" src dst mode tmp
+    local -a files=() changed=()
+    info "/etc: the dispatcher scripts of NetworkManager (all DNS through the ${VPN_NAME} VPN while it is up), the stub of systemd-resolved on docker0 and the DNS of docker"
+    # an array, not a read loop: ask reads the terminal
+    mapfile -d '' -t files < <(find "${src_dir}" -type f -print0 | sort -z)
+    tmp="$(mktemp)"
+    for src in "${files[@]}"; do
+        dst="/etc/${src#"${src_dir}/"}"
+        render_secrets "${src}" > "${tmp}" || { failed+=("${dst}, a secret is missing"); continue; }
+        if sudo cmp -s "${tmp}" "${dst}"; then
+            echo "${dst} is up to date" 1>&2
+            continue
+        fi
+        if sudo test -e "${dst}"; then
+            sudo diff -u "${dst}" "${tmp}" 1>&2
+            if ! ask "Replace ${dst} with the one of the repo?"; then
+                echo "Kept ${dst}" 1>&2
+                continue
+            fi
+        fi
+        mode=644
+        [ -x "${src}" ] && mode=755
+        run sudo install -D -m "${mode}" -o root -g root "${tmp}" "${dst}" && changed+=("${dst}") \
+            || failed+=("install ${dst}")
+    done
+    rm -f "${tmp}"
+
+    # the dispatcher scripts run on the next connection, the services read their
+    # files when they start; docker reads it on its first start when not running
+    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/resolved\.conf\.d/'; then
+        run sudo systemctl restart systemd-resolved || failed+=("systemctl restart systemd-resolved")
+    fi
+    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/docker/' && systemctl is-active --quiet docker; then
+        run sudo systemctl restart docker || failed+=("systemctl restart docker")
     fi
 }
 
@@ -942,6 +1007,8 @@ install_cli_helpers
 # gen needs the prompts, vpn-up and wifi of cli-helpers
 restore_bin
 setup_vpn
+# before the VPN is dialed for the glab login: tun-up gives it the internal names
+install_etc_files
 install_gh_glab
 restore_sublime
 restore_chrome

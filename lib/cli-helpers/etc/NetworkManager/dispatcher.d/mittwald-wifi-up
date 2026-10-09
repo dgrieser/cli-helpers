@@ -1,0 +1,9 @@
+#!/bin/bash
+
+interface="${1}"
+action="${2}"
+
+if [ "${action}" = "up" ] && [[ "${interface}" = wlp* ]] && [[ "${CONNECTION_ID}" = Mittwald* ]]; then
+    #systemctl --machine $(loggedin)@.host --user restart caa.service
+    set-slack-profile
+fi

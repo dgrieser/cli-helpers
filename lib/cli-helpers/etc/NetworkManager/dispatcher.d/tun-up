@@ -1,0 +1,9 @@
+#!/bin/bash
+
+interface="${1}"
+action="${2}"
+
+if [ "${action}" = "vpn-up" ] && [[ ${interface} = tun* ]] && [ "${CONNECTION_ID}" = "mittwald" ]; then
+    resolvectl domain "${interface}" ~. "${VPN_IP4_DOMAINS}" @@SECRET:MITTWALD_VPN_DNS_DOMAINS@@
+    set-slack-profile
+fi
