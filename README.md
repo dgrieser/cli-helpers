@@ -31,7 +31,11 @@ internal names too; the internal names are `@@SECRET:NAME@@` in the repo, filled
 when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), restores the session of Sublime Text (its open windows
 and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome
 with the key of its passwords and cookies (`keyring-cli import --match application=chrome --overwrite`; a profile that is
-already there is only replaced when you say so, and moved aside to `google-chrome.before-restore-<date>`), installs the `base` software with `updater`,
+already there is only replaced when you say so, and moved aside to `google-chrome.before-restore-<date>`), writes the desktop
+entries of the apps installed in Chrome again, which Chrome keeps outside its profile (`lib/cli-helpers/chrome-web-apps`: for every
+app Chrome made a shortcut for, from its web app database in `Sync Data/LevelDB` of each profile, with the icons, the jump list and
+the links the app opens, such as `mailto` or `web+msteams`; these become the default in `~/.config/mimeapps.list` unless a default
+of your own is set there, of several apps the one launched last), installs the `base` software with `updater`,
 restores the `Keys` folder of the documents folder and the shell histories, runs `make install` of bash_aliases.d once more with a terminal (it asks for SSH keys and history backups
 the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the lists of `~/.kube/mittwald` that the kubectl-helpers read, the Downloads folder and the sessions, histories, memories and settings of Claude Code, Codex and opencode, offers to restore the git repos of the workspace (cloning the missing ones from their remotes, after dialing the VPN for gitlab.mittwald.it, then bringing back their local branches, stashes, worktrees and uncommitted changes), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
@@ -2583,6 +2587,8 @@ A URL counts as an authentication URL when it is a loopback URL on one of the au
 
 The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
 
+Meeting, chat and other links of Microsoft Teams open in the Teams app, the web app installed in Chrome, instead of a browser tab: a link on one of the Teams hosts (`teams.microsoft.com`, `teams.cloud.microsoft`) to `/l/...` (e.g. `/l/meetup-join/...`, `/l/chat/...`) or `/meet/...`, also through the Teams launcher (`/dl/launcher/launcher.html?url=...`) or the old client (`/_#/l/...`), becomes the `web+msteams:` link that the launcher hands the app (`web+msteams:/l/meetup-join/...`) and is opened with `xdg-open`. That needs an app registered for `web+msteams` links, which `lib/cli-helpers/chrome-web-apps` (`setup.sh chrome-apps`) does for the Teams app; without one, or when it cannot be started, the link opens in the browser as before. Chrome asks once whether the app may open these links. Any other Teams URL, and Teams for home (`teams.live.com`), go to the browser.
+
 Register it as the default browser with `browser-router --set-default` or `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
 
 **Usage:** `browser-router [OPTIONS] [URL ...]` or `browser-router --set-default [--dry-run]`
@@ -2604,11 +2610,13 @@ Register it as the default browser with `browser-router --set-default` or `make 
 - `BROWSER_ROUTER_AUTH_HOSTS` — hosts counting as authentication
 - `BROWSER_ROUTER_AUTH_PATH_REGEX` — path pattern for authentication hosts
 - `BROWSER_ROUTER_AUTH_REDIRECT_REGEX` — redirect pattern accepted by the probe
+- `BROWSER_ROUTER_TEAMS_HOSTS` — hosts whose Teams links open in the Teams app (default `teams.microsoft.com teams.cloud.microsoft`, empty for none)
 - `BROWSER_ROUTER_LOG` — log file for routing decisions
 
 **Examples:**
 ```bash
 browser-router --dry-run http://localhost:8000 https://example.com
+browser-router --dry-run https://teams.microsoft.com/l/meetup-join/...
 browser-router https://example.com
 kubectl oidc-login get-token --browser-command=browser-router ...
 ```

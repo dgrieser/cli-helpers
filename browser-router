@@ -28,6 +28,12 @@ A URL counts as an authentication URL when it is
     (${DEFAULT_AUTH_HOSTS})
     whose path matches the authentication path pattern.
 
+Meeting, chat and other links of Microsoft Teams on one of the Teams hosts
+(${DEFAULT_TEAMS_HOSTS}), such as
+https://teams.microsoft.com/l/meetup-join/..., open in the Teams app (the
+web app installed in Chrome) as the web+msteams: link its launcher hands the
+app, when an app is registered for web+msteams links (chrome-web-apps).
+
 Options:
   -a, --auth            Treat every URL as an authentication URL
   -r, --regular         Treat every URL as a regular URL
@@ -51,6 +57,8 @@ Configuration variables (environment overrides the file):
   BROWSER_ROUTER_AUTH_HOSTS        Hosts counting as authentication
   BROWSER_ROUTER_AUTH_PATH_REGEX   Path pattern for authentication hosts
   BROWSER_ROUTER_AUTH_REDIRECT_REGEX  Redirect pattern accepted by the probe
+  BROWSER_ROUTER_TEAMS_HOSTS       Hosts whose Teams links open in the Teams app
+                                   (empty: none)
   BROWSER_ROUTER_LOG               Log file for routing decisions
 EOF
     exit 1
@@ -200,6 +208,68 @@ is_auth_url() {
     return 1
 }
 
+url_decode() {
+    local value="${1//+/ }"
+
+    value="${value//\\/\\\\}"
+    printf '%b' "${value//%/\\x}"
+}
+
+# the web+msteams: link of a meeting, chat or other link on a Teams host: the
+# path the Teams launcher hands its app, e.g. /l/meetup-join/... of
+# https://teams.microsoft.com/l/meetup-join/..., also of a link to the launcher
+# itself (/dl/launcher/launcher.html?url=/_#/l/...) or to the old client
+# (/_#/l/...); none for any other URL
+teams_link() {
+    local url="${1}" host candidate rest hostport target param found=0
+    local -a params=()
+
+    case "${url}" in
+        http://*|https://*)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    host="$(url_host "${url}")"
+    for candidate in ${BROWSER_ROUTER_TEAMS_HOSTS}; do
+        [ "${host}" = "${candidate}" ] && found=1
+    done
+    [ "${found}" -eq 1 ] || return 1
+
+    rest="${url#*://}"
+    hostport="${rest%%[/?#]*}"
+    target="${rest#"${hostport}"}"
+    case "${target}" in
+        /dl/launcher/launcher.html\?*)
+            rest="${target#*\?}"
+            IFS='&' read -r -a params <<< "${rest%%#*}"
+            target=""
+            for param in "${params[@]}"; do
+                [ "${param%%=*}" = "url" ] && target="$(url_decode "${param#url=}")"
+            done
+            ;;
+    esac
+    target="${target#/_#}"
+    case "${target}" in
+        /l/*|/meet/*)
+            echo "web+msteams:${target}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# whether an app other than this one opens links of the scheme SCHEME
+scheme_handler() {
+    local handler
+
+    command -v xdg-mime >/dev/null 2>&1 || return 1
+    handler="$(xdg-mime query default "x-scheme-handler/${1}" 2>/dev/null)"
+    [ -n "${handler}" ] && [ "${handler}" != "${DESKTOP_FILE}" ]
+}
+
 # makes `xdg-settings set default-web-browser` refer to this command
 DESKTOP_FILE="browser-router.desktop"
 CHROME_DIR="/opt/google/chrome"
@@ -242,6 +312,8 @@ DEFAULT_PROBE_PORTS="8000 18000"
 DEFAULT_AUTH_HOSTS="auth.mittwald.it auth.mittwald.m3-dev.services"
 DEFAULT_AUTH_PATH_REGEX="(/protocol/openid-connect/auth|/realms/[^/]+/login-actions/)"
 DEFAULT_AUTH_REDIRECT_REGEX="(/protocol/openid-connect/auth|[?&]response_type=code)"
+# the hosts of Teams for work; teams.live.com is Teams for home, which the app does not open
+DEFAULT_TEAMS_HOSTS="teams.microsoft.com teams.cloud.microsoft"
 DEFAULT_CONF_FILE="${CLI_HELPERS_BROWSER_ROUTER_CONF:-${XDG_CONFIG_HOME:-${HOME}/.config}/cli-helpers/browser-router.conf}"
 
 if [ -f "${DEFAULT_CONF_FILE}" ]; then
@@ -256,6 +328,8 @@ BROWSER_ROUTER_PROBE_TIMEOUT="${BROWSER_ROUTER_PROBE_TIMEOUT:-1}"
 BROWSER_ROUTER_AUTH_HOSTS="${BROWSER_ROUTER_AUTH_HOSTS:-${DEFAULT_AUTH_HOSTS}}"
 BROWSER_ROUTER_AUTH_PATH_REGEX="${BROWSER_ROUTER_AUTH_PATH_REGEX:-${DEFAULT_AUTH_PATH_REGEX}}"
 BROWSER_ROUTER_AUTH_REDIRECT_REGEX="${BROWSER_ROUTER_AUTH_REDIRECT_REGEX:-${DEFAULT_AUTH_REDIRECT_REGEX}}"
+# set but empty: no Teams links for the app
+BROWSER_ROUTER_TEAMS_HOSTS="${BROWSER_ROUTER_TEAMS_HOSTS-${DEFAULT_TEAMS_HOSTS}}"
 BROWSER_ROUTER_LOG="${BROWSER_ROUTER_LOG:-}"
 
 force_auth=0
@@ -333,12 +407,17 @@ if [ "${#urls[@]}" -eq 0 ]; then
 fi
 
 auth_urls=()
+teams_urls=()
+teams_links=()
 regular_urls=()
 for url in "${urls[@]}"; do
     if [ "${force_regular}" -eq 1 ]; then
         regular_urls+=("${url}")
     elif [ "${force_auth}" -eq 1 ] || is_auth_url "${url}"; then
         auth_urls+=("${url}")
+    elif link="$(teams_link "${url}")" && scheme_handler web+msteams; then
+        teams_urls+=("${url}")
+        teams_links+=("${link}")
     else
         regular_urls+=("${url}")
     fi
@@ -353,6 +432,17 @@ for url in "${auth_urls[@]}"; do
         continue
     fi
     "${auth_command}" "${auth_options[@]}" "${url}" || status=1
+done
+
+# the Teams app, or the browser when it cannot be started
+for index in "${!teams_links[@]}"; do
+    log "teams ${teams_links[${index}]}"
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "teams ${teams_links[${index}]}"
+        continue
+    fi
+    # Chrome says on stdout that it handed the link to its running instance
+    xdg-open "${teams_links[${index}]}" > /dev/null || regular_urls+=("${teams_urls[${index}]}")
 done
 
 if [ "${#regular_urls[@]}" -gt 0 ]; then

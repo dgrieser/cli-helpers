@@ -7,7 +7,8 @@
 # if you like, gitlab.com), the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
 # of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text, the profile of
-# Google Chrome with the key of its passwords and cookies and the sessions and histories of
+# Google Chrome with the key of its passwords and cookies, the desktop entries of the apps
+# installed in Chrome with the links they open, the sessions and histories of
 # Claude Code, Codex and opencode from a backup, the git repos of the workspace
 # with what only they held (changes, stashes, local branches, worktrees), the categories of updater
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
@@ -56,6 +57,7 @@ STEPS=(
     "gh-glab       install_gh_glab       -      gh and glab with their logins"
     "sublime       restore_sublime       backup the session of Sublime Text"
     "chrome        restore_chrome        backup the profile of Google Chrome with the key of its passwords and cookies"
+    "chrome-apps   setup_chrome_apps     -      the desktop entries of the apps installed in Chrome, with their icons and the links they open"
     "base          install_base          -      the base software (updater base)"
     "keys-history  restore_keys_history  backup the Keys folder of the documents folder and the shell histories"
     "dotfiles      install_dotfiles      -      the dotfiles of bash_aliases.d, asking for missing SSH keys and history backups"
@@ -626,6 +628,17 @@ restore_chrome() {
         run mv "${dir}" "${moved}" || { failed+=("chrome, cannot move ${dir} aside"); return 0; }
     fi
     run tar -xzf "${archive}" -C "${HOME}" || failed+=("chrome profile")
+}
+
+# the desktop entries of the apps installed in Chrome (chrome-<id>-<profile>.desktop),
+# which Chrome keeps outside its profile, so a restored profile has its apps
+# without them: written again from its web app database, with their icons, jump
+# lists and the links they open (e.g. mailto, web+msteams), which become the
+# default where no default of your own is set; for any profile here, restored
+# or not, also before Chrome is installed
+setup_chrome_apps() {
+    info "Chrome apps: write the desktop entries of the apps installed in Chrome, with their icons and the links they open"
+    run "${REPO_DIR}/lib/cli-helpers/chrome-web-apps" || failed+=("chrome-apps: lib/cli-helpers/chrome-web-apps")
 }
 
 # the sessions, histories, memories and settings of Claude Code, Codex and

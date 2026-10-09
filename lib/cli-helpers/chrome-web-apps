@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Write the desktop entries of the web apps installed in Google Chrome.
+
+Chrome creates a desktop entry (chrome-<app id>-<profile>.desktop) for every web
+app it installs, but keeps it outside its profile, so a profile restored from a
+backup has its apps without them. This writes them again from Chrome's own
+record of what it set up on the system (its web app database, a LevelDB in
+Sync Data/LevelDB of each profile), for every app it made a shortcut for:
+
+- the desktop entry in ~/.local/share/applications, as Chrome writes it: with
+  the jump list of the app (Actions) and the URL schemes it opens (MimeType,
+  e.g. mailto or web+msteams)
+- its icons in ~/.local/share/icons/hicolor, from the profile
+- the default app of each of these URL schemes in ~/.config/mimeapps.list,
+  unless one of your own is set there already; of several apps for a scheme
+  the one launched last
+
+An entry that differs is written again. Chrome may run meanwhile, the database
+is only read.
+"""
+import argparse
+import filecmp
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+
+
+CHROME = "/opt/google/chrome/google-chrome"
+APP_KEY_PREFIX = b"web_apps-dt-"
+APP_ID = re.compile(r"[a-p]{32}")
+# the fields of a web app in the database (WebAppProto of Chrome)
+APP_NAME = 2
+APP_LAST_LAUNCH = 15
+APP_INSTALL_TIME = 16
+APP_OS_STATES = 59
+# the fields of APP_OS_STATES: what Chrome set up on the system for the app
+OS_SHORTCUT = 1       # the desktop entry, its name in field 1
+OS_PROTOCOLS = 3      # the URL schemes, each in field 1: scheme 1, URL 2
+OS_SHORTCUT_MENU = 6  # the jump list, each item in field 1: name 1, URL 2
+# the sizes of the hicolor icon theme
+ICON_SIZES = {16, 22, 24, 32, 36, 48, 64, 72, 96, 128, 192, 256, 384, 512}
+DEFAULTS_SECTION = "[Default Applications]"
+
+# LevelDB: the write-ahead log is 32 KiB blocks of records, a table ends with
+# a footer holding the handle of its index block
+LOG_BLOCK = 32768
+LOG_HEADER = 7
+LOG_FULL, LOG_FIRST, LOG_MIDDLE, LOG_LAST = 1, 2, 3, 4
+TABLE_FOOTER = 48
+TABLE_MAGIC = 0xdb4775248b80fb57
+VALUE, DELETION = 1, 0
+
+
+def log(message):
+    print(message, file=sys.stderr)
+
+
+def fail(message):
+    log(f"ERROR: {message}")
+    sys.exit(1)
+
+
+def varint(buf, pos):
+    result = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def varbytes(buf, pos):
+    length, pos = varint(buf, pos)
+    return buf[pos:pos + length], pos + length
+
+
+def unsnappy(buf):
+    """A block compressed with Snappy, which Chrome's LevelDB uses."""
+    length, pos = varint(buf, 0)
+    out = bytearray()
+    while pos < len(buf):
+        tag = buf[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:
+            count = tag >> 2
+            if count >= 60:
+                width = count - 59
+                count = int.from_bytes(buf[pos:pos + width], "little")
+                pos += width
+            out += buf[pos:pos + count + 1]
+            pos += count + 1
+            continue
+        if kind == 1:
+            count = ((tag >> 2) & 7) + 4
+            offset = ((tag >> 5) << 8) | buf[pos]
+            pos += 1
+        else:
+            count = (tag >> 2) + 1
+            width = 2 if kind == 2 else 4
+            offset = int.from_bytes(buf[pos:pos + width], "little")
+            pos += width
+        # a copy may overlap what it produces, so byte by byte
+        for _ in range(count):
+            out.append(out[-offset])
+    if len(out) != length:
+        raise ValueError("corrupt Snappy block")
+    return bytes(out)
+
+
+def table_block(data, handle):
+    offset, pos = varint(handle, 0)
+    size, _ = varint(handle, pos)
+    block = data[offset:offset + size]
+    compression = data[offset + size]
+    if compression == 1:
+        return unsnappy(block)
+    if compression != 0:
+        raise ValueError(f"unknown compression {compression}")
+    return block
+
+
+def block_entries(block):
+    restarts = struct.unpack_from("<I", block, len(block) - 4)[0]
+    end = len(block) - 4 - 4 * restarts
+    pos, key = 0, b""
+    while pos < end:
+        shared, pos = varint(block, pos)
+        unshared, pos = varint(block, pos)
+        length, pos = varint(block, pos)
+        key = key[:shared] + block[pos:pos + unshared]
+        pos += unshared
+        yield key, block[pos:pos + length]
+        pos += length
+
+
+def table_entries(data):
+    """(key, sequence, kind, value) of a table file (.ldb)."""
+    footer = data[-TABLE_FOOTER:]
+    if int.from_bytes(footer[-8:], "little") != TABLE_MAGIC:
+        raise ValueError("no LevelDB table")
+    _, pos = varint(footer, 0)
+    _, pos = varint(footer, pos)
+    for _, handle in block_entries(table_block(data, footer[pos:])):
+        for key, value in block_entries(table_block(data, handle)):
+            tag = int.from_bytes(key[-8:], "little")
+            yield key[:-8], tag >> 8, tag & 0xff, value
+
+
+def log_entries(data):
+    """(key, sequence, kind, value) of a log file; a record Chrome is still
+    writing ends it"""
+    pos, record = 0, None
+    while pos + LOG_HEADER <= len(data):
+        left = LOG_BLOCK - pos % LOG_BLOCK
+        if left < LOG_HEADER:
+            pos += left
+            continue
+        length, kind = struct.unpack_from("<HB", data, pos + 4)
+        payload = data[pos + LOG_HEADER:pos + LOG_HEADER + length]
+        pos += LOG_HEADER + length
+        if len(payload) < length:
+            return
+        if kind == LOG_FULL:
+            batch = payload
+        elif kind == LOG_FIRST:
+            record = payload
+            continue
+        elif kind == LOG_MIDDLE and record is not None:
+            record += payload
+            continue
+        elif kind == LOG_LAST and record is not None:
+            batch, record = record + payload, None
+        else:
+            # zeros of a preallocated block
+            pos += LOG_BLOCK - pos % LOG_BLOCK if pos % LOG_BLOCK else 0
+            continue
+        sequence, count = struct.unpack_from("<QI", batch)
+        at = 12
+        for index in range(count):
+            kind = batch[at]
+            key, at = varbytes(batch, at + 1)
+            value = None
+            if kind == VALUE:
+                value, at = varbytes(batch, at)
+            yield key, sequence + index, kind, value
+
+
+def read_leveldb(path):
+    """The keys of a LevelDB with their latest values, from all its files."""
+    latest = {}
+    for name in sorted(os.listdir(path)):
+        if name.endswith((".ldb", ".sst")):
+            entries = table_entries
+        elif name.endswith(".log"):
+            entries = log_entries
+        else:
+            continue
+        with open(os.path.join(path, name), "rb") as handle:
+            data = handle.read()
+        for key, sequence, kind, value in entries(data):
+            if key not in latest or latest[key][0] < sequence:
+                latest[key] = (sequence, kind, value)
+    return {key: value for key, (_, kind, value) in latest.items() if kind == VALUE}
+
+
+def fields(buf):
+    """The fields of a protobuf message by number, each a list of its values."""
+    result = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = varint(buf, pos)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, pos = varint(buf, pos)
+        elif wire == 1:
+            value, pos = buf[pos:pos + 8], pos + 8
+        elif wire == 2:
+            value, pos = varbytes(buf, pos)
+        elif wire == 5:
+            value, pos = buf[pos:pos + 4], pos + 4
+        else:
+            raise ValueError(f"unknown wire type {wire}")
+        result.setdefault(number, []).append(value)
+    return result
+
+
+def first(message, number, default=None):
+    return message.get(number, [default])[0]
+
+
+def text(value):
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else ""
+
+
+def web_apps(profile_dir):
+    """The apps of a profile Chrome made a shortcut for."""
+    path = os.path.join(profile_dir, "Sync Data", "LevelDB")
+    if not os.path.isdir(path):
+        return []
+    # Chrome may replace a file while it runs: read them all again
+    for attempt in range(3):
+        try:
+            database = read_leveldb(path)
+            break
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+    apps = []
+    for key, value in database.items():
+        app_id = key[len(APP_KEY_PREFIX):].decode("ascii", "replace")
+        if not key.startswith(APP_KEY_PREFIX) or not APP_ID.fullmatch(app_id):
+            continue
+        app = fields(value)
+        states = fields(first(app, APP_OS_STATES, b""))
+        shortcut = first(states, OS_SHORTCUT)
+        if shortcut is None:
+            continue
+        menu = fields(first(states, OS_SHORTCUT_MENU, b""))
+        protocols = fields(first(states, OS_PROTOCOLS, b""))
+        apps.append({
+            "id": app_id,
+            "name": text(first(fields(shortcut), 1)) or text(first(app, APP_NAME)) or app_id,
+            "last_used": first(app, APP_LAST_LAUNCH) or first(app, APP_INSTALL_TIME) or 0,
+            "actions": [(text(first(item, 1)), text(first(item, 2)))
+                        for item in map(fields, menu.get(1, []))],
+            "schemes": [text(first(fields(item), 1)) for item in protocols.get(1, [])],
+        })
+    return sorted(apps, key=lambda app: app["id"])
+
+
+def desktop_escape(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+
+
+def exec_arg(arg):
+    """An argument of Exec=, quoted when it holds a reserved character."""
+    if re.search(r"[\s\"'\\><~|&;$*?#()`]", arg):
+        arg = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+    return desktop_escape(arg.replace("%", "%%"))
+
+
+def install_icons(app_dir, icon_name, dry_run):
+    """The icons of an app into the hicolor theme; the path of the largest."""
+    src_dir = os.path.join(app_dir, "Trusted Icons", "Icons")
+    if not os.path.isdir(src_dir):
+        src_dir = os.path.join(app_dir, "Icons")
+    try:
+        sizes = sorted(int(name[:-4]) for name in os.listdir(src_dir)
+                       if name.endswith(".png") and name[:-4].isdigit() and int(name[:-4]) in ICON_SIZES)
+    except FileNotFoundError:
+        return None
+    icons_dir = os.path.join(data_home(), "icons", "hicolor")
+    dst = None
+    for size in sizes:
+        src = os.path.join(src_dir, f"{size}.png")
+        dst = os.path.join(icons_dir, f"{size}x{size}", "apps", f"{icon_name}.png")
+        if os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False):
+            continue
+        if not dry_run:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+    return dst
+
+
+def desktop_entry(app, profile, icon):
+    command = [CHROME, f"--profile-directory={profile}", f"--app-id={app['id']}"]
+    actions = []
+    for name, url in app["actions"]:
+        action = re.sub(r"[^A-Za-z0-9]", "-", name) or "Action"
+        while action in [a for a, _, _ in actions]:
+            action += "-"
+        actions.append((action, name, url))
+    lines = [
+        "[Desktop Entry]",
+        "Version=1.0",
+        "Terminal=false",
+        "Type=Application",
+        f"Name={desktop_escape(app['name'])}",
+    ]
+    if app["schemes"]:
+        lines.append("MimeType=" + "".join(f"x-scheme-handler/{scheme};" for scheme in app["schemes"]))
+    lines.append("Exec=" + " ".join(map(exec_arg, command)) + " %U")
+    if icon:
+        lines.append(f"Icon={desktop_escape(icon)}")
+    lines.append(f"StartupWMClass=crx_{app['id']}")
+    if actions:
+        lines.append("Actions=" + ";".join(action for action, _, _ in actions))
+    for action, name, url in actions:
+        lines += [
+            "",
+            f"[Desktop Action {action}]",
+            f"Name={desktop_escape(name)}",
+            "Exec=" + " ".join(map(exec_arg, command + [f"--app-launch-url-for-shortcuts-menu-item={url}"])),
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def write_file(path, content, dry_run):
+    """Whether the file was new, changed or the same: created, updated or None."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            if handle.read() == content:
+                return None
+        change = "updated"
+    except FileNotFoundError:
+        change = "created"
+    if not dry_run:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".cli-helpers"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp, path)
+    return change
+
+
+def data_home():
+    return os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+
+
+def desktop_entry_exists(name):
+    dirs = [data_home()] + (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    return any(os.path.isfile(os.path.join(d, "applications", name)) for d in dirs if d)
+
+
+def set_default_handlers(handlers, dry_run):
+    """HANDLERS (scheme to desktop entry) as the defaults of mimeapps.list,
+    where it names none of its own that exists"""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    path = os.path.join(config_home, "mimeapps.list")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    if DEFAULTS_SECTION not in lines:
+        lines += ([""] if lines and lines[-1] else []) + [DEFAULTS_SECTION]
+    start = lines.index(DEFAULTS_SECTION) + 1
+    end = start
+    while end < len(lines) and not lines[end].startswith("["):
+        end += 1
+    changed = False
+    for scheme, entry in sorted(handlers.items()):
+        key = f"x-scheme-handler/{scheme}"
+        index = next((i for i in range(start, end) if lines[i].split("=", 1)[0].strip() == key), None)
+        current = lines[index].split("=", 1)[1].split(";")[0].strip() if index is not None else ""
+        if current == entry:
+            continue
+        if current and desktop_entry_exists(current):
+            log(f"Kept {current} as the default for {scheme} links, not {entry}")
+            continue
+        log(f"{'Would set' if dry_run else 'Set'} {entry} as the default for {scheme} links")
+        if index is None:
+            # after the last key of the section, before its blank lines
+            at = end
+            while at > start and not lines[at - 1].strip():
+                at -= 1
+            lines.insert(at, f"{key}={entry};")
+            end += 1
+        else:
+            lines[index] = f"{key}={entry};"
+        changed = True
+    if changed and not dry_run:
+        write_file(path, "\n".join(lines) + "\n", dry_run)
+
+
+def refresh_caches(icons_dir, applications_dir):
+    """The caches of desktop entries and icons, where the tools are there."""
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", "-q", applications_dir], check=False)
+    if os.path.isfile(os.path.join(icons_dir, "icon-theme.cache")) and shutil.which("gtk-update-icon-cache"):
+        subprocess.run(["gtk-update-icon-cache", "-q", "-f", "-t", icons_dir], check=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Write the desktop entries of the web apps installed in Chrome.")
+    parser.add_argument("--user-data-dir", default=os.path.expanduser("~/.config/google-chrome"),
+                        help="the data folder of Chrome with its profiles (default: ~/.config/google-chrome)")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
+    args = parser.parse_args()
+
+    user_data_dir = os.path.abspath(args.user_data_dir)
+    if not os.path.isdir(user_data_dir):
+        log(f"{user_data_dir} does not exist, Chrome has no profile yet")
+        return
+    applications_dir = os.path.join(data_home(), "applications")
+    handlers = {}
+    changed = False
+    for profile in sorted(os.listdir(user_data_dir)):
+        profile_dir = os.path.join(user_data_dir, profile)
+        if not os.path.isfile(os.path.join(profile_dir, "Preferences")):
+            continue
+        try:
+            apps = web_apps(profile_dir)
+        except (OSError, ValueError, IndexError, struct.error) as error:
+            fail(f"cannot read the web apps of {profile_dir}: {error}")
+        changes = 0
+        for app in apps:
+            # Chrome's own names, also of a profile with a space in its name
+            name = f"chrome-{app['id']}-{profile.replace(' ', '_')}"
+            icon = install_icons(os.path.join(profile_dir, "Web Applications", "Manifest Resources", app["id"]),
+                                 name, args.dry_run)
+            entry = desktop_entry(app, profile, icon)
+            change = write_file(os.path.join(applications_dir, f"{name}.desktop"), entry, args.dry_run)
+            if change:
+                changes += 1
+                verb = f"Would {change[:-1]}" if args.dry_run else change.capitalize()
+                log(f"{verb} {name}.desktop: {app['name']}")
+            for scheme in app["schemes"]:
+                if scheme not in handlers or handlers[scheme][0] < app["last_used"]:
+                    handlers[scheme] = (app["last_used"], f"{name}.desktop")
+        if apps and not changes:
+            log(f"The desktop entries of the {len(apps)} web apps of the Chrome profile {profile} are up to date")
+        changed = changed or changes > 0
+    set_default_handlers({scheme: entry for scheme, (_, entry) in handlers.items()}, args.dry_run)
+    if changed and not args.dry_run:
+        refresh_caches(os.path.join(data_home(), "icons", "hicolor"), applications_dir)
+
+
+if __name__ == "__main__":
+    main()
