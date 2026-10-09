@@ -40,8 +40,8 @@ APP_OS_STATES = 59
 OS_SHORTCUT = 1       # the desktop entry, its name in field 1
 OS_PROTOCOLS = 3      # the URL schemes, each in field 1: scheme 1, URL 2
 OS_SHORTCUT_MENU = 6  # the jump list, each item in field 1: name 1, URL 2
-# the sizes of the hicolor icon theme
-ICON_SIZES = {16, 22, 24, 32, 36, 48, 64, 72, 96, 128, 192, 256, 384, 512}
+# the icon sizes Chrome installs, so uninstalling an app in Chrome removes them all
+ICON_SIZES = {16, 32, 48, 128, 256, 512}
 DEFAULTS_SECTION = "[Default Applications]"
 
 # LevelDB: the write-ahead log is 32 KiB blocks of records, a table ends with
