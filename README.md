@@ -36,7 +36,8 @@ restores the `Keys` folder of the documents folder and the shell histories, runs
 the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the lists of `~/.kube/mittwald` that the kubectl-helpers read, the Downloads folder and the sessions, histories, memories and settings of Claude Code, Codex and opencode, offers to restore the git repos of the workspace (cloning the missing ones from their remotes, after dialing the VPN for gitlab.mittwald.it, then bringing back their local branches, stashes, worktrees and uncommitted changes), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
 It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
 With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx` (`k-ctx shell-init`, sourced by bash_aliases.d) and offers to set up `netbox-cli` (`NETBOX_URL`, and `NETBOX_TOKEN` stored in the keyring for the
-dotfiles) and to fetch a kubeconfig for every NetBox cluster that has none in `~/.kube` (`k-ctx add --yes`).
+dotfiles) and to fetch a kubeconfig for every cluster `k-ctx list --remote` can fetch one for that has none in `~/.kube`
+(`k-ctx add --yes`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
 `./setup.sh --list` lists these steps in this order, and `./setup.sh STEP...` runs only those, still in this order (a step

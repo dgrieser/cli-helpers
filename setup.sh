@@ -963,8 +963,10 @@ setup_netbox() {
     return 1
 }
 
-# a kubeconfig for every cluster NetBox knows, through k-ctx add of
-# kubectl-helpers; a cluster with a kubeconfig in ~/.kube already is kept
+# a kubeconfig for every cluster k-ctx of kubectl-helpers can fetch one for
+# (k-ctx list --remote: the NetBox clusters with what a kubeconfig needs, not an
+# F5 pair or a planned one), through k-ctx add; a cluster with a kubeconfig in
+# ~/.kube already is kept
 setup_kubeconfigs() {
     local tool cluster
     local -a existing
@@ -978,7 +980,7 @@ setup_kubeconfigs() {
             && warning "Skipping the kubeconfigs, missing: ${missing[*]} (the k8s and mw categories)"
         return 0
     fi
-    info "Kubeconfigs: fetch one for every cluster NetBox knows (k-ctx add)"
+    info "Kubeconfigs: fetch one for every cluster that has one in NetBox (k-ctx add)"
     if ! setup_netbox; then
         failed+=("netbox-cli setup, no kubeconfigs")
         return 0
@@ -989,7 +991,7 @@ setup_kubeconfigs() {
         existing=("${HOME}/.kube/${cluster,,}-m3-"*.config)
         [ -e "${existing[0]}" ] && continue
         clusters+=("${cluster}")
-    done < <(netbox-cli get clusters -oname 2>/dev/null | sort -u)
+    done < <(k-ctx list --remote 2>/dev/null | tail -n +2 | awk '{ print $1 }' | sort -u)
     if [ "${#clusters[@]}" -eq 0 ]; then
         echo "Every cluster has a kubeconfig in ${HOME}/.kube" 1>&2
         return 0
