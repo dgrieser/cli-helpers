@@ -1373,8 +1373,10 @@ flatpak_update() {
     fi
 }
 
+# curl_update PKG URL [ARG...]: pipe the install script at URL into bash, with ARGs
+# for the script
 curl_update() {
-    local pkg="${1}"; shift   
+    local pkg="${1}"; shift
     local url="${1}"; shift
     [ -z "${url}" ] && echo "ERROR: curl_update requires a URL" 1>&2 && return 1
     [ -z "${pkg}" ] && echo "ERROR: curl_update requires a package name" 1>&2 && return 1
@@ -1384,10 +1386,10 @@ curl_update() {
     [ "${verbose}" -eq 0 ] && curl_args+=( "--silent" "--show-error" )
     curl_args+=( "${url}" )
     if [ "${dry_run}" -eq 0 ]; then
-        [ "${verbose}" -eq 1 ] && echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash" 1>&2
-        curl "${curl_args[@]}" | ${SUDO_USER} bash
+        [ "${verbose}" -eq 1 ] && echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash -s -- ${*}" 1>&2
+        curl "${curl_args[@]}" | ${SUDO_USER} bash -s -- "${@}"
     else
-        echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash"
+        echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash -s -- ${*}"
     fi
 }
 
@@ -2118,11 +2120,12 @@ software-121-mittwald-outlook-bridge@mw() {
     fi
     user_service_enable mittwald-outlook-bridge.service
 }
-# the installer takes the API key from MITTWALD_AI_API_KEY; without a terminal it
-# does not ask for it, so a shell without the key leaves cmai without one
+# --non-interactive: every step of the installer takes its default answer; the
+# installer takes the API key from MITTWALD_AI_API_KEY and does not ask for it, so
+# a shell without the key leaves cmai without one
 software-122-git-commit-ai@dev@agents() {
     local key_file="${CURRENT_USER_HOME}/.config/git-commit-ai/config"
-    curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" || return 1
+    curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" --non-interactive || return 1
     if [ "${dry_run}" -eq 0 ] && [ ! -s "${key_file}" ]; then
         warning "cmai has no API key, set it with: cmai --api-key \"\${MITTWALD_AI_API_KEY}\" (from a shell that has it)"
     fi
@@ -2655,7 +2658,7 @@ codex_caveman_update() {
     (cd /tmp && "${npx_cmd[@]}" skills add JuliusBrussee/caveman -a codex -g -y)
 }
 software-440-kilocode@dev@agents() { npm_update @kilocode/cli --allow-scripts=@kilocode/cli; }
-software-445-ollama@agents() {
+software-445-ollama@dev() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl || return 1
     local latest_url
