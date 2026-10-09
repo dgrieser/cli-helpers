@@ -39,6 +39,8 @@ With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx
 dotfiles) and to fetch a kubeconfig for every NetBox cluster that has none in `~/.kube` (`k-ctx add --yes`).
 Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
+`./setup.sh --list` lists these steps in this order, and `./setup.sh STEP...` runs only those, still in this order (a step
+that restores from the backup asks for the backup first), e.g. `./setup.sh etc` for the files of `/etc` alone.
 
 Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
 `setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents

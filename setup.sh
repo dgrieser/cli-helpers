@@ -13,7 +13,10 @@
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
 # NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
+# setup.sh --list lists its steps, setup.sh STEP... runs only those.
 
+# the step functions are called by their name in STEPS
+# shellcheck disable=SC2329
 APP_NAME="$(basename "${0}")"
 REPO_DIR="$(cd "$(dirname "${0}")" && pwd)"
 
@@ -39,6 +42,35 @@ GEN="${HOME}/bin/gen"
 # switches the namespace, "for" loops over clusters and bm is the baremetal parent
 K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-prefix for
     --alias-evileye-loop-prefix for --alias-netbox-env-parent bm)
+# the steps in the order of a full run, as NAME FUNCTION BACKUP DESCRIPTION; BACKUP
+# is "backup" for a step that restores from the backup; setup.sh STEP... runs
+# only these, still in this order
+STEPS=(
+    "keyring       setup_keyring         backup the keyring files of the backup, then the SSH keys, SSH config and network connections in the keyring"
+    "cli-helpers   setup_cli_helpers     -      the install folders and cli-helpers itself"
+    # gen needs the prompts, vpn-up and wifi of cli-helpers
+    "bin           restore_bin           backup your own scripts of ~/bin, gen among them dials the VPN"
+    "vpn           setup_vpn             -      the OpenVPN plugin of NetworkManager, the ${VPN_NAME} connection and gen to dial it"
+    # before the VPN is dialed for the glab login: tun-up gives it the internal names
+    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker"
+    "gh-glab       install_gh_glab       -      gh and glab with their logins"
+    "sublime       restore_sublime       backup the session of Sublime Text"
+    "chrome        restore_chrome        backup the profile of Google Chrome with the key of its passwords and cookies"
+    "base          install_base          -      the base software (updater base)"
+    "keys-history  restore_keys_history  backup the Keys folder of the documents folder and the shell histories"
+    "dotfiles      install_dotfiles      -      the dotfiles of bash_aliases.d, asking for missing SSH keys and history backups"
+    "reminders     restore_reminders     backup the reminders of reminder"
+    "kube-mittwald restore_kube_mittwald backup the lists of ~/.kube/mittwald"
+    "downloads     restore_downloads     backup the Downloads folder"
+    "agents        restore_agents        backup the sessions, histories, memories and settings of Claude Code, Codex and opencode"
+    "git           restore_git           backup the git repos of the workspace with what only they held"
+    "categories    install_categories    -      the categories of updater you pick"
+    "agent-logins  login_agents          -      the logins of Claude Code and Codex"
+    "k-ctx         setup_k_ctx_shell     -      the shell shorthands of k-ctx"
+    "kubeconfigs   setup_kubeconfigs     -      netbox-cli and a kubeconfig per NetBox cluster"
+    "browser       set_default_browser   -      browser-router as the default browser"
+    "gnome         gnome_settings        -      the GNOME settings and app shortcuts"
+)
 
 failed=()
 
@@ -992,53 +1024,96 @@ gnome_settings() {
     fi
 }
 
+# the install folders, then cli-helpers into them, with sudo when they are not
+# writable
+setup_cli_helpers() {
+    setup_dirs
+    install_cli_helpers
+}
+
+install_base() {
+    info "Installing base"
+    # firmware updates are not part of setting up the software
+    run_updater base --exclude firmware
+}
+
+install_categories() {
+    check_categories
+    select_categories
+    [ "${#selected[@]}" -eq 0 ] && return 0
+    info "Installing ${selected[*]}"
+    run_updater "${selected[@]}"
+}
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [-h] [-l] [STEP...]
+
+Set up this machine from this repo, restoring from a backup of setup-backup.
+Without STEP it runs every step, with STEP... only those, in the order of
+--list. A step that restores from the backup asks for the backup first. Run it
+as your user from a terminal, it asks for sudo.
+
+Options:
+  -l, --list    List the steps in the order of a full run and exit
+  -h, --help    Show this help message and exit
+EOF
+    exit 1
+}
+
+list_steps() {
+    local step name func backup description
+    for step in "${STEPS[@]}"; do
+        read -r name func backup description <<< "${step}"
+        printf '%-14s %s%s\n' "${name}" "${description}" "$([ "${backup}" = backup ] && echo " (from the backup)")"
+    done
+}
+
 trap abort INT
+wanted=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -l|--list) list_steps; exit 0 ;;
+        -h|--help) usage ;;
+        -*)        echo "ERROR: Unknown option ${1}" 1>&2; usage ;;
+        *)
+            list_steps | awk '{ print $1 }' | grep -qxF -- "${1}" || fail "Unknown step ${1}, see ${APP_NAME} --list"
+            wanted+=("${1}")
+            ;;
+    esac
+    shift
+done
 [ "$(id -u)" -eq 0 ] && fail "Run ${APP_NAME} as your user, it asks for sudo itself"
 [ -t 0 ] || fail "Run ${APP_NAME} in a terminal, it asks questions"
 command -v python3 > /dev/null 2>&1 || fail "python3 is required for the prompts"
 
+# the steps to run, all of them without STEP
+steps=() functions=()
+needs_backup=0
+for step in "${STEPS[@]}"; do
+    read -r name func backup _ <<< "${step}"
+    [ "${#wanted[@]}" -gt 0 ] && ! printf '%s\n' "${wanted[@]}" | grep -qxF -- "${name}" && continue
+    steps+=("${name}")
+    functions+=("${func}")
+    [ "${backup}" = backup ] && needs_backup=1
+done
+
 MAKE_SUDO=""
 BACKUP_DIR=""
-info "Setting up this machine from ${REPO_DIR}"
-bootstrap
-choose_backup
-setup_keyring
-setup_dirs
-install_cli_helpers
-# gen needs the prompts, vpn-up and wifi of cli-helpers
-restore_bin
-setup_vpn
-# before the VPN is dialed for the glab login: tun-up gives it the internal names
-install_etc_files
-install_gh_glab
-restore_sublime
-restore_chrome
-
-info "Installing base"
-# firmware updates are not part of setting up the software
-run_updater base --exclude firmware
-restore_keys_history
-install_dotfiles
-restore_reminders
-restore_kube_mittwald
-restore_downloads
-restore_agents
-restore_git
-
-check_categories
-select_categories
-if [ "${#selected[@]}" -gt 0 ]; then
-    info "Installing ${selected[*]}"
-    run_updater "${selected[@]}"
+if [ "${#wanted[@]}" -gt 0 ]; then
+    info "Setting up this machine from ${REPO_DIR}, only: ${steps[*]}"
+else
+    info "Setting up this machine from ${REPO_DIR}"
 fi
-login_agents
-
-hash -r
-setup_k_ctx_shell
-setup_kubeconfigs
-set_default_browser
-gnome_settings
+bootstrap
+[ "${needs_backup}" -eq 1 ] && choose_backup
+for func in "${functions[@]}"; do
+    hash -r
+    "${func}"
+done
 
 # new GNOME extensions and group memberships (docker) only apply to a new session
-info "Log out and back in, so new GNOME extensions and groups take effect"
+if printf '%s\n' "${steps[@]}" | grep -qxE 'base|categories'; then
+    info "Log out and back in, so new GNOME extensions and groups take effect"
+fi
 finish
