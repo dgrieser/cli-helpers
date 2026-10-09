@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Link router (cli-helpers)",
+  "version": "1.0",
+  "description": "Opens the links of some sites in their apps instead of a tab, e.g. Teams meeting links in the Teams app. The routes are in rules.json.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoanE84baXNLAbl54gp6JltQ8TIKBNdibbtXjC2J+dPMWeYtm7ZBmRJsM0y0fGlyZ1yJpAIfgY6tWfKEKE6HWhjUL2KfpUW1aTz1ZcrqY74uTN6lxMBEiD9xsoyS/C7KXOHyNK6zZUndHIMe8JDVi5oO93Fs7xniZaizkRODrVkD8HySbqT5Xfi7vDX3YWJvX1SeOJNYm03+UxWAEi25WusQR2Wjkw5ygE5w65ll3jfONXnpEkD4rkLC1b5JNSc1KqFKhjO13deQ+i+xwQ1KLC38Oe4YOh5qnONbrlFNOGnruGApaRYGwlXWFCbAGIPd4fIuYt+uppcBR+VlhYEiLsQIDAQAB",
+  "permissions": ["declarativeNetRequestWithHostAccess"],
+  "host_permissions": [
+    "https://teams.microsoft.com/*",
+    "https://teams.cloud.microsoft/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {"id": "routes", "enabled": true, "path": "rules.json"}
+    ]
+  }
+}

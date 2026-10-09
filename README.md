@@ -2587,7 +2587,7 @@ A URL counts as an authentication URL when it is a loopback URL on one of the au
 
 The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
 
-Meeting, chat and other links of Microsoft Teams open in the Teams app, the web app installed in Chrome, instead of a browser tab: a link on one of the Teams hosts (`teams.microsoft.com`, `teams.cloud.microsoft`) to `/l/...` (e.g. `/l/meetup-join/...`, `/l/chat/...`) or `/meet/...`, also through the Teams launcher (`/dl/launcher/launcher.html?url=...`) or the old client (`/_#/l/...`), becomes the `web+msteams:` link that the launcher hands the app (`web+msteams:/l/meetup-join/...`) and is opened with `xdg-open`. That needs an app registered for `web+msteams` links, which `lib/cli-helpers/chrome-web-apps` (`setup.sh chrome-apps`) does for the Teams app; without one, or when it cannot be started, the link opens in the browser as before. Chrome asks once whether the app may open these links. Any other Teams URL, and Teams for home (`teams.live.com`), go to the browser.
+Meeting, chat and other links of Microsoft Teams open in the Teams app, the web app installed in Chrome, instead of a browser tab: a link on one of the Teams hosts (`teams.microsoft.com`, `teams.cloud.microsoft`) to `/l/...` (e.g. `/l/meetup-join/...`, `/l/chat/...`) or `/meet/...`, also through the Teams launcher (`/dl/launcher/launcher.html?url=...`) or the old client (`/_#/l/...`), becomes the `web+msteams:` link that the launcher hands the app (`web+msteams:/l/meetup-join/...`) and is opened with `xdg-open`. That needs an app registered for `web+msteams` links, which `lib/cli-helpers/chrome-web-apps` (`setup.sh chrome-apps`) does for the Teams app; without one, or when it cannot be started, the link opens in the browser as before. Chrome asks once whether the app may open these links. Any other Teams URL, and Teams for home (`teams.live.com`), go to the browser. Links clicked in Chrome itself, also in the Outlook app, never reach browser-router; the Chrome extension `chrome-link-router` opens those in the Teams app.
 
 Register it as the default browser with `browser-router --set-default` or `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
 
@@ -2620,6 +2620,16 @@ browser-router --dry-run https://teams.microsoft.com/l/meetup-join/...
 browser-router https://example.com
 kubectl oidc-login get-token --browser-command=browser-router ...
 ```
+
+### `chrome-link-router` (Chrome extension)
+Opens the links of some sites in their apps also when they are clicked in Chrome itself, in a tab or in a web app such as Outlook, which never hands them to browser-router. It is a Manifest V3 extension without code in `chrome-link-router/`: every route is a redirect rule in `rules.json` (`declarativeNetRequest`) from the URLs of a site to the URL scheme of its app, and Chrome opens the link in the app that handles that scheme. Chrome applies the rules to every top-level navigation, also after server redirects such as Outlook Safe Links, and only on the hosts in `host_permissions` of `manifest.json`.
+
+Routes:
+- Teams: `https://teams.microsoft.com/l/...` and `/meet/...` (and the same on `teams.cloud.microsoft`) become `web+msteams:/l/...`, which opens the Teams app, as browser-router does for links from other apps; navigations that Teams starts itself stay as they are.
+
+To add a route, add a rule with a new `id` to `rules.json` and the hosts of its URLs to `host_permissions`, then click Reload at the extension in `chrome://extensions`.
+
+Load it once per Chrome profile: open `chrome://extensions`, turn on Developer mode, click Load unpacked and pick `chrome-link-router` of the repo. The `key` in `manifest.json` fixes its ID (`pjdgjggkcakidfjfchanemeicledahda`) on every machine. Chrome loads it from that folder at every start, also in a profile restored by `setup.sh` while the repo is at the same path; `setup.sh chrome-apps` says when it is not loaded.
 
 ### `browser-2fa-window`
 Opens a URL in a small chromeless browser window that stays above other windows, meant for interactive authentication (2FA/OIDC) prompts. The window uses the regular browser profile, so an existing single sign-on session is reused.

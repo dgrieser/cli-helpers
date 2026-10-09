@@ -635,10 +635,18 @@ restore_chrome() {
 # without them: written again from its web app database, with their icons, jump
 # lists and the links they open (e.g. mailto, web+msteams), which become the
 # default where no default of your own is set; for any profile here, restored
-# or not, also before Chrome is installed
+# or not, also before Chrome is installed; then a reminder to load the
+# extension chrome-link-router, which opens links clicked in Chrome in these
+# apps: Chrome only loads it by hand, a restored profile keeps it while the
+# repo is at the same path
 setup_chrome_apps() {
+    local extension="${REPO_DIR}/chrome-link-router"
+    local preferences="${HOME}/.config/google-chrome/Default/Preferences"
     info "Chrome apps: write the desktop entries of the apps installed in Chrome, with their icons and the links they open"
     run "${REPO_DIR}/lib/cli-helpers/chrome-web-apps" || failed+=("chrome-apps: lib/cli-helpers/chrome-web-apps")
+    [ -f "${preferences}" ] || return 0
+    grep -qF "\"path\":\"${extension}\"" "${preferences}" && return 0
+    warning "The Chrome extension chrome-link-router is not loaded, so links clicked in Chrome do not open in their apps: open chrome://extensions, turn on Developer mode, Load unpacked: ${extension}"
 }
 
 # the sessions, histories, memories and settings of Claude Code, Codex and
