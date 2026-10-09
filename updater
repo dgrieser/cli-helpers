@@ -2389,7 +2389,7 @@ software-300-threema@comms() {
     verbose "${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host"
     ${SUDO} flatpak override --system ch.threema.threema-desktop --filesystem=host
 }
-# Files extensions in Python, e.g. the one of gnome-apply-settings that focuses Cancel in delete dialogs
+# Files extensions in Python, e.g. safe-delete.py of gnome-apply-settings (Shift+Delete trashes, Cancel focused in delete dialogs)
 software-310-nautilus-python@base@gnome() { apt_upgrade "python3-nautilus"; }
 software-311-gnome-extension-manager@base@gnome() { apt_upgrade "gnome-shell-extension-manager"; }
 software-312-gnome-tweaks@base@gnome() { apt_upgrade "gnome-tweaks"; }
