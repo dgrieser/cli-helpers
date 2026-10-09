@@ -165,6 +165,19 @@ gsettings set org.gnome.nautilus.list-view default-visible-columns "['name', 'ow
 gsettings set org.gnome.nautilus.list-view default-column-order "['name', 'permissions', 'owner', 'group', 'size', 'date_modified', 'type', 'mime_type', 'where', 'date_modified_with_time', 'date_accessed', 'date_created', 'recency', 'starred']"
 gsettings set org.gnome.nautilus.icon-view captions "['type', 'size', 'date_modified']"
 gsettings set org.gtk.gtk4.Settings.FileChooser show-hidden true
+# Files: the dialogs that confirm a permanent delete or emptying the trash focus Cancel,
+# not Delete; Files has no setting for it, so a nautilus-python extension changes it,
+# which needs python3-nautilus (updater base) and takes effect when Files starts again
+nautilus_extension="delete-dialog-cancel.py"
+nautilus_extensions="${HOME}/.local/share/nautilus-python/extensions"
+if [ ! -L "${nautilus_extensions}/${nautilus_extension}" ]; then
+    mkdir -p "${nautilus_extensions}"
+    ln -sfn "/usr/local/lib/cli-helpers/nautilus-python/${nautilus_extension}" "${nautilus_extensions}/${nautilus_extension}"
+    echo "Files loads ${nautilus_extension} when it starts again (nautilus -q quits it)" 1>&2
+fi
+if ! dpkg -s python3-nautilus > /dev/null 2>&1; then
+    echo "WARNING: python3-nautilus is not installed, so Files does not load ${nautilus_extension}; run: updater base" 1>&2
+fi
 
 # tiling assistant: no popup, no example layouts
 gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false

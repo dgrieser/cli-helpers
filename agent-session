@@ -116,9 +116,11 @@ Options:
     -g, --grep GREP     Filter listed sessions by a regex match in their messages
     -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
     -r, --raw           Raw output
-    --resume SESSION    Resume the session with SESSION in its directory
+    --resume SESSION    Resume the session with SESSION in its directory,
+                        asking to create the directory when it is missing
     --fork SESSION      Fork the session with SESSION, asking for the folder
-                        and the agent
+                        and the agent, and to create the folder when it is
+                        missing
     --bash-completion   Print completion candidates and exit
     --verbose           Verbose output
 
@@ -161,10 +163,12 @@ Interactive keys:
 
 Asked for the selected session, esc stepping back one question and out of
 the first one into the picker again:
-    Resume              Resume the session in its original directory
+    Resume              Resume the session in its original directory,
+                        asking to create it when it is missing
     Focus terminal      In place of Resume for a running session: bring the
                         terminal it runs in to the front, the picker stays open
-    Fork                Continue it, asking for the folder and the agent
+    Fork                Continue it, asking for the folder and the agent, and
+                        to create the folder when it is missing
     Copy                Copy raw Markdown to the clipboard
     Print               Print it, asking for rendered Markdown or raw
 
@@ -1394,6 +1398,22 @@ raw_session_file() {
     jq -rs "${jq_filter}" "${filepath}"
 }
 
+# A session whose folder is gone since can still be resumed, and a fork can go
+# to a folder that is not there yet: both CLIs only need the folder to exist, so
+# it is created when the answer is yes. No folder at all is left to the caller
+# to fail on.
+ask_create_directory() {
+    local directory="${1}"
+
+    [ -z "${directory}" ] && return 0
+    [ -d "${directory}" ] && return 0
+    command -v prompt-yes-no >/dev/null 2>&1 || fail "prompt-yes-no not found"
+    prompt-yes-no --no-abort-message \
+        "Folder '$(display_path "${directory}")' is missing. Create it?" \
+        </dev/tty || return 1
+    mkdir -p -- "${directory}" || fail "Cannot create directory: ${directory}"
+}
+
 # Continue the session itself, with the given directory as the working root. Both
 # CLIs look a session up in the project of that directory, so this only works for
 # the directory the session was recorded in - except for codex, which takes the
@@ -1624,7 +1644,8 @@ ask_fork() {
         case "${step}" in
             directory)
                 directory="$(ask_fork_directory "${session_directory}")" || return 0
-                step="agent"
+                # no to creating a missing folder asks for the folder again
+                ask_create_directory "${directory}" && step="agent"
                 ;;
             agent)
                 if target_agent="$(ask_fork_agent "${agent}")"; then
@@ -1674,7 +1695,12 @@ session_ask() {
             action)
                 action="$(ask_session_action "${running}")" || return 0
                 case "${action}" in
-                    resume | clipboard | clipboard-last)
+                    resume)
+                        # asked while the picker is open, so no steps back to
+                        # the action instead of leaving the picker
+                        ask_create_directory "${session_directory}" && break
+                        ;;
+                    clipboard | clipboard-last)
                         break
                         ;;
                     focus)
@@ -1697,10 +1723,11 @@ session_ask() {
                 esac
                 ;;
             directory)
-                if directory="$(ask_fork_directory "${session_directory}")"; then
-                    step="agent"
-                else
+                if ! directory="$(ask_fork_directory "${session_directory}")"; then
                     step="action"
+                elif ask_create_directory "${directory}"; then
+                    # no to creating a missing folder asks for the folder again
+                    step="agent"
                 fi
                 ;;
             agent)
@@ -1784,7 +1811,8 @@ fork_session() {
     local fork_command
 
     command -v "${target_agent}" >/dev/null 2>&1 || fail "${target_agent} not found"
-    [ -d "${directory}" ] || fail "Directory not found: ${directory}"
+    [ -n "${directory}" ] || fail "Directory not found: ${directory}"
+    ask_create_directory "${directory}" || fail "Directory not found: ${directory}"
 
     cwd="$(session_cwd "${agent}" "${filepath}")"
     cd -- "${directory}" || fail "Cannot enter directory: ${directory}"
@@ -1882,7 +1910,7 @@ fzf_action() {
         resume)
             cwd="$(session_cwd "${agent}" "${filepath}")"
             [ -n "${cwd}" ] || fail "Session has no working directory"
-            [ -d "${cwd}" ] || fail "Session directory not found: ${cwd}"
+            ask_create_directory "${cwd}" || fail "Session directory not found: ${cwd}"
             resume_session "${agent}" "${filepath}" "${cwd}"
             ;;
         *)

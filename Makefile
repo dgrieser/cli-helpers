@@ -41,10 +41,10 @@ APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
 # rquickshare, cam-settings, screen-color, git, streamdown, mimeapps, zoom,
 # teamviewer, spotify, himalaya, wireplumber, glow, sublime-text, jq, qwen), the dconf
 # settings of extensions and apps, the Chrome settings and search engines,
-# systemd user units and a cron file
+# systemd user units, a cron file and the Files extension of gnome-apply-settings
 CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator gradia gimp vim rquickshare \
 	cam-settings screen-color git streamdown mimeapps zoom teamviewer spotify spotify-user himalaya \
-	wireplumber wireplumber-radeon glow sublime-text jq qwen dconf chrome systemd-user cron
+	wireplumber wireplumber-radeon glow sublime-text jq qwen dconf chrome systemd-user cron nautilus-python
 # a shell pipe, not a list: config file names can hold spaces (Sublime Text's)
 CONFIGFILES := (cd $(SHAREDDIR) && find $(CONFIGDIRS) -type f -not -path '*/__pycache__/*' | sort)
 # commands that are also importable Python modules: they get installed a second
