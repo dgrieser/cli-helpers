@@ -1881,7 +1881,10 @@ software-022-glow@base() {
 }
 software-023-sshpass@base() { apt_upgrade sshpass; }
 software-024-secret-tool@base() { apt_upgrade libsecret-tools python3-gi gir1.2-secret-1 python3-cryptography; }
-software-025-nodejs@dev@base() { install_nodejs; }
+software-025-nodejs@dev@base() {
+    install_nodejs || return 1
+    completion_update node node --completion-bash
+}
 software-026-cli-tools@base() {
     apt_upgrade ripgrep fd-find zoxide tree htop tmux tig shellcheck \
         parallel pv pigz lz4 lzip lzop unrar rlwrap expect inotify-tools gawk dialog ncal at \
@@ -2141,7 +2144,10 @@ software-060-chrome@dev@gui() {
     return "${status}"
 }
 
-software-070-mw@dev@mw() { npm_update @mittwald/cli; }
+software-070-mw@dev@mw() {
+    npm_update @mittwald/cli || return 1
+    completion_link mw "${CURRENT_USER_HOME}/.cache/mw/autocomplete/functions/bash/mw.bash" mw autocomplete --refresh-cache
+}
 software-080-claude@dev@agents() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
@@ -2152,7 +2158,10 @@ software-080-claude@dev@agents() {
     config_update claude "${CURRENT_USER_HOME}/.claude" || return 1
     claude_plugins_update "${lib_dir}/claude/settings.json"
 }
-software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
+software-100-kubectl-mw@dev@k8s@mw() {
+    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw" || return $?
+    completion_update kubectl-mw kubectl-mw completion bash
+}
 software-110-nerd-fonts@base@gui() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl tar fc-cache || return 1
@@ -2200,7 +2209,10 @@ software-110-nerd-fonts@base@gui() {
     ${SUDO_USER} fc-cache -f "${font_dir}" || return 1
     echo "${version}" | ${SUDO_USER} tee "${version_file}" > /dev/null
 }
-software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
+software-120-nickpit@dev@agents() {
+    install_git_release "https://github.com/dgrieser/nickpit" || return $?
+    completion_update nickpit nickpit completion bash
+}
 software-121-mittwald-outlook-bridge@mw@gui() {
     local env_file="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge/env"
     local package_unit="/usr/lib/systemd/user/mittwald-outlook-bridge.service"
@@ -2310,7 +2322,10 @@ slack_repo_remove() {
 }
 software-131-slackdump@comms() { install_git_release "https://github.com/rusq/slackdump" --pattern "slackdump_*_linux_{arch}.deb"; }
 
-software-150-gitlab-ci-local@dev() { install_git_release "https://github.com/firecow/gitlab-ci-local"; }
+software-150-gitlab-ci-local@dev() {
+    install_git_release "https://github.com/firecow/gitlab-ci-local" || return $?
+    completion_update gitlab-ci-local gitlab-ci-local --completion
+}
 # the man page goes to the prefix of the install path, as the bundled
 # install-man-page.sh does, but without running the upstream script as root
 software-160-yq@dev() {
@@ -2432,12 +2447,16 @@ software-191-swctl@dev@mw() {
     install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl" || return $?
     completion_update swctl swctl completion bash
 }
-software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
+software-200-boodschapper@mw() {
+    install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper" || return $?
+    completion_update boodschapper boodschapper completion bash
+}
 software-210-himalaya@comms() {
     local account="mail@david-grieser.de"
     # secret-tool talks to the keyring of the user's session
     local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
     install_git_release "https://github.com/pimalaya/himalaya" --binary himalaya || return $?
+    completion_update himalaya himalaya completion bash || return 1
     # the mail account; its password comes from the GNOME keyring through secret-tool
     needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
     config_update himalaya "${CURRENT_USER_HOME}/.config/himalaya" || return 1
@@ -2509,7 +2528,10 @@ software-255-losslesscut@media@gui() {
     install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-{arch}.tar.bz2" --bundle --binary "losslesscut" \
         && apparmor_allow_userns losslesscut losslesscut
 }
-software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
+software-260-lazygit@dev() {
+    install_git_release "https://github.com/jesseduffield/lazygit" || return $?
+    completion_update lazygit lazygit completion bash
+}
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
 software-280-spotify@media@gui() {
@@ -2561,6 +2583,7 @@ software-316-window-is-ready-filter@gnome@gnome-extensions() {
 software-320-opencode@dev@agents() {
     install_git_release "https://github.com/anomalyco/opencode" --pattern "opencode-linux-{arch}.tar.gz" || return $?
     tool_ready opencode || return $(( $? == 1 ? 0 : 1 ))
+    completion_update opencode opencode completion || return 1
     config_update opencode "${CURRENT_USER_HOME}/.config/opencode" || return 1
     opencode_auth_update
 }
@@ -2684,6 +2707,7 @@ software-360-helm@dev@k8s() {
     needs sops || return $(( $? == 3 ? 0 : 1 ))
     helm_plugin_update "secrets" "https://github.com/hensur/helm-secrets-py.git" \
         && helm_plugin_update "helm-git" "https://github.com/aslafy-z/helm-git" \
+        && helm_plugin_update "diff" "https://github.com/databus23/helm-diff" \
         || return 1
     # the chart repositories; nickpit's is a git one, read by helm-git
     local name
@@ -2712,10 +2736,14 @@ software-362-jsonnet@dev@k8s() {
 }
 software-363-logcli@dev@k8s() { install_git_release "https://github.com/grafana/loki" --pattern "logcli_*_{arch}.deb"; }
 software-364-operator-sdk@dev@k8s() {
-    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_{arch}" --name "operator-sdk"
+    install_git_release "https://github.com/operator-framework/operator-sdk" --pattern "operator-sdk_linux_{arch}" --name "operator-sdk" || return $?
+    completion_update operator-sdk operator-sdk completion bash
 }
 software-366-promql@dev@k8s() { install_git_release "https://github.com/nalbury/promql-cli"; }
-software-367-kubectl-neat@dev@k8s() { install_git_release "https://github.com/itaysk/kubectl-neat"; }
+software-367-kubectl-neat@dev@k8s() {
+    install_git_release "https://github.com/itaysk/kubectl-neat" || return $?
+    completion_update kubectl-neat kubectl-neat completion bash
+}
 # pkgs.k8s.io has one repo per minor version, so follow the latest stable minor
 software-365-kubectl@dev@k8s() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
@@ -2783,6 +2811,7 @@ software-420-qwen@dev@agents() {
 software-430-codex@dev@agents() {
     npm_update @openai/codex || return 1
     tool_ready codex || return $(( $? == 1 ? 0 : 1 ))
+    completion_update codex codex completion bash || return 1
     needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
     # the settings, profiles, providers and the caveman SessionStart hook; the
     # trusted projects, approved commands (rules) and logins stay the machine's own
@@ -2807,7 +2836,10 @@ codex_caveman_update() {
     verbose "${npx_cmd[*]} skills add JuliusBrussee/caveman -a codex -g -y"
     (cd /tmp && "${npx_cmd[@]}" skills add JuliusBrussee/caveman -a codex -g -y)
 }
-software-440-kilocode@dev@agents() { npm_update @kilocode/cli --allow-scripts=@kilocode/cli; }
+software-440-kilocode@dev@agents() {
+    npm_update @kilocode/cli --allow-scripts=@kilocode/cli || return 1
+    completion_update kilo kilo completion
+}
 software-445-ollama@dev() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl || return 1
@@ -2880,6 +2912,8 @@ software-450-aws@dev() {
     [ -d "${aws_target_parent_folder}/${aws_name}" ] && install_args+=("--update")
     ${SUDO} "${aws_folder_path}/aws/install" "${install_args[@]}" || return 1
     "${aws_target_parent_folder}/bin/${aws_name}" --version || return 1
+    # the completion is a program of the AWS CLI, bash only has to call it
+    completion_update aws printf 'complete -C aws_completer aws\n'
 }
 
 software-460-aws-v1@dev() {
@@ -2950,7 +2984,10 @@ software-495-r-quick-share@desktop@gui() {
         | ${SUDO_USER} tee "${autostart}" > /dev/null
 }
 software-500-atoss-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/atoss-cli"; }
-software-510-jw-cli@personal() { install_git_release "https://github.com/dgrieser/jw-cli"; }
+software-510-jw-cli@personal() {
+    install_git_release "https://github.com/dgrieser/jw-cli" || return $?
+    completion_update jw jw completion bash
+}
 software-520-pup@dev() { install_git_release "https://github.com/ericchiang/pup" --pattern "*linux_{arch}*"; }
 software-530-wscat@dev() { npm_update wscat; }
 software-535-npm-tools@dev() {
