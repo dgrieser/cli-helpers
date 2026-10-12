@@ -1,9 +1,9 @@
 # Files extension (nautilus-python, linked into ~/.local/share/nautilus-python/extensions
 # by gnome-apply-settings) so that Files does not delete permanently by accident; Files
 # has no settings for either:
-# - Shift+Delete does what Delete does: it moves to the trash instead of deleting
-#   permanently. Only in the trash and where there is no trash does it delete
-#   permanently, after asking, like Delete.
+# - Shift+Delete asks first, with Cancel focused, and then only moves to the trash, like
+#   Delete does without asking, instead of deleting permanently. Only in the trash and
+#   where there is no trash does it delete permanently, after asking, like Delete.
 # - the dialogs that confirm a permanent delete or emptying the trash focus Cancel, as
 #   Files 50.0 did, not Delete or Empty Trash as Files 50.2 does again (Enter sits next
 #   to Delete)
@@ -30,7 +30,47 @@ def delete(widget, args):
     return any(action.activate(Gtk.ShortcutActionFlags(0), widget, None) for action in DELETE_ACTIONS)
 
 
-DELETE = Gtk.CallbackAction.new(delete)
+def can_trash(view):
+    # Files enables move-to-trash only outside the trash and for a selection it can
+    # trash. GTK 4 cannot ask a widget whether an action is enabled, but a button with
+    # the action follows it with its sensitivity, once it is in the view
+    probe = Gtk.Button(action_name="view.move-to-trash", visible=False)
+    probe.set_parent(view)
+    enabled = probe.get_sensitive()
+    probe.unparent()
+    return enabled
+
+
+def on_confirm_trash(dialog, response, view):
+    if response == "trash":
+        view.activate_action("view.move-to-trash", None)
+
+
+def confirm_trash(view):
+    dialog = Adw.AlertDialog.new("Move to Trash?",
+                                 "Shift+Delete moves the selected items to the trash, "
+                                 "it does not delete them permanently.")
+    dialog.add_response("cancel", "_Cancel")
+    dialog.add_response("trash", "_Move to Trash")
+    dialog.set_response_appearance("trash", Adw.ResponseAppearance.DESTRUCTIVE)
+    # Cancel has the focus, so Enter cancels, and so does Escape
+    dialog.set_default_response("cancel")
+    dialog.set_close_response("cancel")
+    dialog.connect("response", on_confirm_trash, view)
+    dialog.present(view)
+
+
+def shift_delete(widget, args):
+    # outside the trash, Shift+Delete asks first and then moves to the trash, as Delete
+    # does without asking; in the trash and where there is no trash, it does what Delete
+    # does, which asks itself before it deletes permanently
+    if can_trash(widget):
+        confirm_trash(widget)
+        return True
+    return delete(widget, args)
+
+
+SHIFT_DELETE = Gtk.CallbackAction.new(shift_delete)
 
 
 def rebind_shift_delete(view):
@@ -42,7 +82,7 @@ def rebind_shift_delete(view):
         for shortcut in controller:
             action = shortcut.get_action()
             if isinstance(action, Gtk.NamedAction) and action.get_action_name() in SHIFT_DELETE_ACTIONS:
-                shortcut.set_action(DELETE)
+                shortcut.set_action(SHIFT_DELETE)
         return True
     return False
 
