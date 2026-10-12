@@ -102,6 +102,8 @@ Options:
   -t, --types TYPES   comma separated list of install types (deprecated)
   -x, --exclude NAME  leave out a software or group (repeatable), e.g. base -x firmware
   -l, --list          list the groups with their software and exit
+  --no-config         update the software only, leave the user's configs and
+                      dconf settings as they are
   --verbose           verbose mode
   --bash-completion   print shell completion candidates and exit
 EOF
@@ -1144,6 +1146,10 @@ config_update() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
     local merge_args=()
+    if [ "${no_config}" -eq 1 ]; then
+        echo "${APP_NAME}: not applying the config ${name} (--no-config)" 1>&2
+        return 0
+    fi
     [ "${dry_run}" -eq 1 ] && merge_args+=("--dry-run")
     # a missing config file is copied, an existing one only gets the shipped
     # settings, entries, functions and variables merged in
@@ -1167,6 +1173,10 @@ dconf_update() {
     local value
     local changed=0
 
+    if [ "${no_config}" -eq 1 ]; then
+        echo "${APP_NAME}: not applying the dconf settings of ${name} (--no-config)" 1>&2
+        return 0
+    fi
     require_cmd dconf || return 1
     if [ ! -f "${file}" ]; then
         error "${file} is missing, run make install"
@@ -1260,6 +1270,11 @@ wireplumber_update() {
     local file
     local changed=0
 
+    # nothing merged, so WirePlumber is not restarted either
+    if [ "${no_config}" -eq 1 ]; then
+        echo "${APP_NAME}: not applying the config ${name} (--no-config)" 1>&2
+        return 0
+    fi
     while IFS= read -r file; do
         cmp -s "${src_dir}/${file}" "${dst_dir}/${file}" || changed=1
     done < <(find -L "${src_dir}" -type f -printf '%P\n')
@@ -2957,6 +2972,7 @@ selected_install_types=()
 excluded_install_types=()
 dry_run=0
 verbose=0
+no_config=0
 update_failed=0
 
 LOGFILE_PATH="/var/log/${APP_NAME}.log"
@@ -2966,7 +2982,7 @@ discover_software
 while [ $# -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "-h --help -d --dry-run -x --exclude -l --list -t --types --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
+            echo "-h --help -d --dry-run -x --exclude -l --list -t --types --no-config --verbose all ${possible_groups[*]} ${possible_install_types[*]}"
             exit 0
             ;;
         -h|--help)
@@ -3004,6 +3020,9 @@ while [ $# -gt 0 ]; do
                     usage
                 fi
             done
+            ;;
+        --no-config)
+            no_config=1
             ;;
         --verbose)
             verbose=1
