@@ -167,9 +167,9 @@ gsettings set org.gnome.nautilus.icon-view captions "['type', 'size', 'date_modi
 gsettings set org.gtk.gtk4.Settings.FileChooser show-hidden true
 # Files: Shift+Delete asks with Cancel focused and then moves to the trash like Delete,
 # which does not ask, and the dialogs that confirm a permanent delete or emptying the
-# trash focus Cancel, not Delete; Files has no settings for them, so a nautilus-python
-# extension changes them, which needs python3-nautilus (updater base) and takes effect
-# when Files starts again
+# trash focus Cancel, not Delete, with Tab going from Cancel straight to Delete; Files
+# has no settings for them, so a nautilus-python extension changes them, which needs
+# python3-nautilus (updater base) and takes effect when Files starts again
 nautilus_extension="safe-delete.py"
 nautilus_extensions="${HOME}/.local/share/nautilus-python/extensions"
 if [ ! -L "${nautilus_extensions}/${nautilus_extension}" ]; then
