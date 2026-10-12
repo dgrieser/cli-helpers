@@ -14,7 +14,10 @@
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
 # NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
-# setup.sh --list lists its steps, setup.sh STEP... runs only those.
+# setup.sh --list lists its steps, setup.sh STEP... runs only those. On a headless
+# system (see headless) it leaves out what only a desktop needs: the steps of
+# GUI_STEPS unless they are named, the gui software of updater, the GNOME
+# extension, the desktop entries and the GNOME part of the VPN plugin.
 
 # the step functions are called by their name in STEPS
 # shellcheck disable=SC2329
@@ -34,7 +37,8 @@ declare -A CATEGORY_DESCRIPTIONS=(
     [desktop]="desktop apps"
     [personal]="your own tools and automations"
 )
-SPECIAL_GROUPS=(base gnome gnome-extensions)
+# gui is no category, it marks the software of the others that only a desktop needs
+SPECIAL_GROUPS=(base gnome gnome-extensions gui)
 MITTWALD_GITLAB="gitlab.mittwald.it"
 # the VPN connection to it, which gen of ~/bin dials
 VPN_NAME="mittwald"
@@ -74,6 +78,8 @@ STEPS=(
     "browser       set_default_browser   -      browser-router as the default browser"
     "gnome         gnome_settings        -      the GNOME settings and app shortcuts"
 )
+# the steps only a desktop needs, left out of a full run on a headless system
+GUI_STEPS=(sublime chrome chrome-apps browser gnome)
 
 failed=()
 
@@ -283,8 +289,8 @@ setup_keyring() {
             fi
             type="$(secret-tool lookup type nm-connection name "${name}" part keyfile \
                 | base64 -d | sed -n 's/^type=//p' | head -n 1)"
-            if [ "${type}" = vpn ] && ! dpkg -s network-manager-openvpn-gnome > /dev/null 2>&1; then
-                run sudo apt-get install -y network-manager-openvpn-gnome || failed+=("apt-get install network-manager-openvpn-gnome")
+            if [ "${type}" = vpn ] && ! dpkg -s "${OPENVPN_PACKAGE}" > /dev/null 2>&1; then
+                run sudo apt-get install -y "${OPENVPN_PACKAGE}" || failed+=("apt-get install ${OPENVPN_PACKAGE}")
             fi
             run "${keyring_cli}" nm-restore "${name}" || failed+=("keyring-cli nm-restore ${name}")
         done
@@ -308,23 +314,28 @@ setup_dirs() {
 install_cli_helpers() {
     local target="install"
     local desktop_target="install-desktop"
+    local -a make_args=()
     info "Installing cli-helpers"
     if ask "Install as symlinks back to this repo (for working on it; no installs copies)?"; then
         target="install-links"
         desktop_target="install-desktop-links"
     fi
+    # no GNOME extension and no desktop entries without a desktop
+    [ "${HEADLESS}" -eq 1 ] && make_args+=(INSTALL_USER_ASSETS=0)
     if [ -n "${MAKE_SUDO}" ]; then
         # Root installs the system files, but the bridge must point at our HOME.
         run sudo make -C "${REPO_DIR}" "${target}" "HOME=${HOME}" INSTALL_USER_ASSETS=0 \
             || fail "Failed to run make ${target}"
-        run make -C "${REPO_DIR}" install-gnome-extension "${desktop_target}" \
-            || fail "Failed to install the per-user assets"
+        if [ "${HEADLESS}" -eq 0 ]; then
+            run make -C "${REPO_DIR}" install-gnome-extension "${desktop_target}" \
+                || fail "Failed to install the per-user assets"
+        fi
         if command -v gnome-shell > /dev/null 2>&1 && command -v gnome-extensions > /dev/null 2>&1; then
             run gnome-extensions enable cli-helpers-window-bridge@dgrieser.de \
                 || warning "Could not enable the GNOME extension; log out and back in, then enable it"
         fi
     else
-        run make -C "${REPO_DIR}" "${target}" || fail "Failed to run make ${target}"
+        run make -C "${REPO_DIR}" "${target}" "${make_args[@]}" || fail "Failed to run make ${target}"
     fi
     # without sudo the .pth file in the system's site-packages is only warned about
     if [ "$(cat /usr/lib/python3/dist-packages/usr-local-python3.pth 2>/dev/null)" != "/usr/local/lib/python3/dist-packages" ]; then
@@ -354,13 +365,14 @@ restore_bin() {
 }
 
 # the VPN of Mittwald, fully set up before the glab login to gitlab.mittwald.it:
-# the OpenVPN plugin of NetworkManager with its GNOME part, the connection loaded
+# the OpenVPN plugin of NetworkManager with its GNOME part (not on a headless
+# system), the connection loaded
 # (from the keyring when the keyring step did not restore it) and gen to dial it
 setup_vpn() {
     local packages=() package
     info "VPN: the OpenVPN plugin of NetworkManager, the ${VPN_NAME} connection and ${GEN} to dial it"
-    # gen switches the wifi with iw
-    for package in network-manager-openvpn network-manager-openvpn-gnome iw; do
+    # on a desktop the GNOME part, which brings the plugin; gen switches the wifi with iw
+    for package in "${OPENVPN_PACKAGE}" iw; do
         dpkg -s "${package}" > /dev/null 2>&1 || packages+=("${package}")
     done
     if [ "${#packages[@]}" -gt 0 ]; then
@@ -954,13 +966,27 @@ check_categories() {
     done < <(/usr/local/bin/updater --list)
 }
 
+# members GROUP: the software of GROUP, without the gui software on a headless
+# system, as updater skips it there
 members() {
-    /usr/local/bin/updater --list | awk -F '\t' -v group="${1}" '$1 == group { gsub(/ /, ", ", $2); print $2 }'
+    /usr/local/bin/updater --list | awk -F '\t' -v group="${1}" -v headless="${HEADLESS}" '
+        $1 == "gui" && headless == 1 { split($2, list, " "); for (i in list) gui[list[i]] = 1 }
+        $1 == group { wanted = $2 }
+        END {
+            n = split(wanted, list, " ")
+            out = ""
+            for (i = 1; i <= n; i++) {
+                if (list[i] in gui) continue
+                out = out (out == "" ? "" : ", ") list[i]
+            }
+            print out
+        }'
 }
 
 select_categories() {
     local category
     local description
+    local list
     selected=()
     if command -v gnome-shell > /dev/null 2>&1; then
         info "GNOME extensions: $(members gnome-extensions)"
@@ -968,8 +994,14 @@ select_categories() {
     fi
     for category in "${CATEGORIES[@]}"; do
         description="${CATEGORY_DESCRIPTIONS[${category}]:-}"
+        list="$(members "${category}")"
+        # on a headless system a category of desktop apps only has nothing to install
+        if [ -z "${list}" ]; then
+            echo "Skipping ${category}${description:+ (${description})}: nothing in it for a headless system" 1>&2
+            continue
+        fi
         info "${category}${description:+: ${description}}"
-        echo "$(members "${category}")" 1>&2
+        echo "${list}" 1>&2
         ask "Install ${category}?" && selected+=("${category}")
     done
 }
@@ -1144,12 +1176,24 @@ done
 [ -t 0 ] || fail "Run ${APP_NAME} in a terminal, it asks questions"
 command -v python3 > /dev/null 2>&1 || fail "python3 is required for the prompts"
 
-# the steps to run, all of them without STEP
-steps=() functions=()
+# no desktop installed, e.g. a server or a Raspberry Pi OS Lite
+HEADLESS=0
+"${REPO_DIR}/headless" && HEADLESS=1
+# the OpenVPN plugin of NetworkManager, with its GNOME part on a desktop
+OPENVPN_PACKAGE="network-manager-openvpn-gnome"
+[ "${HEADLESS}" -eq 1 ] && OPENVPN_PACKAGE="network-manager-openvpn"
+
+# the steps to run, all of them without STEP; on a headless system not the
+# GUI_STEPS, unless they are named
+steps=() functions=() skipped=()
 needs_backup=0
 for step in "${STEPS[@]}"; do
     read -r name func backup _ <<< "${step}"
     [ "${#wanted[@]}" -gt 0 ] && ! printf '%s\n' "${wanted[@]}" | grep -qxF -- "${name}" && continue
+    if [ "${HEADLESS}" -eq 1 ] && [ "${#wanted[@]}" -eq 0 ] && printf '%s\n' "${GUI_STEPS[@]}" | grep -qxF -- "${name}"; then
+        skipped+=("${name}")
+        continue
+    fi
     steps+=("${name}")
     functions+=("${func}")
     [ "${backup}" = backup ] && needs_backup=1
@@ -1162,6 +1206,7 @@ if [ "${#wanted[@]}" -gt 0 ]; then
 else
     info "Setting up this machine from ${REPO_DIR}"
 fi
+[ "${#skipped[@]}" -gt 0 ] && info "This system is headless, skipping: ${skipped[*]}"
 bootstrap
 [ "${needs_backup}" -eq 1 ] && choose_backup
 for func in "${functions[@]}"; do
@@ -1171,6 +1216,10 @@ done
 
 # new GNOME extensions and group memberships (docker) only apply to a new session
 if printf '%s\n' "${steps[@]}" | grep -qxE 'base|categories'; then
-    info "Log out and back in, so new GNOME extensions and groups take effect"
+    if [ "${HEADLESS}" -eq 1 ]; then
+        info "Log out and back in, so new groups take effect"
+    else
+        info "Log out and back in, so new GNOME extensions and groups take effect"
+    fi
 fi
 finish

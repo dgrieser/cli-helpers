@@ -13,6 +13,9 @@ FLATHUB_REPO_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
 
 possible_install_types=()
 possible_groups=()
+# the software named on the command line rather than through a group; a gui
+# one is installed on a headless system too
+named_install_types=()
 software_install_types=()
 declare -A software_handlers=()
 declare -A software_disabled=()
@@ -95,6 +98,8 @@ Run ${APP_NAME} to update software.
 SOFTWARE         Software or group to update, all if omitted.
                  Software: $(echo "${possible_install_types[@]}" | tr ' ' ',')
                  Groups: $([ "${#possible_groups[@]}" -gt 0 ] && echo "${possible_groups[@]}" | tr ' ' ',' || echo "none")
+                 On a headless system (see headless) the gui software is
+                 skipped, unless it is named itself.
 
 Options:
   -h, --help          display this help and exit
@@ -169,8 +174,17 @@ select_install_type() {
     fi
     if is_install_type "${arg}"; then
         is_install_type_selected "${arg}" || selected_install_types+=("${arg}")
+        named_install_types+=("${arg}")
         return 0
     fi
+    return 1
+}
+
+is_install_type_named() {
+    local item
+    for item in "${named_install_types[@]}"; do
+        [ "${item}" = "${1}" ] && return 0
+    done
     return 1
 }
 
@@ -319,12 +333,22 @@ software_unavailable_reason() {
     echo "only built for ${arches// /, }, not ${PLATFORM}"
 }
 
+# is_headless: whether no desktop is installed (see headless); without headless
+# (cli-helpers not installed again yet) a desktop, as before
+is_headless() {
+    command -v headless >/dev/null 2>&1 && headless
+}
+
 # the members of a group that only works on some systems are skipped elsewhere,
-# e.g. the gnome group without GNOME Shell
+# e.g. the gnome group without GNOME Shell, or the gui group (desktop apps and
+# what only a desktop needs) on a headless system
 group_unavailable_reason() {
     case "${1}" in
         gnome)
             command -v gnome-shell >/dev/null 2>&1 || echo "GNOME Shell is not installed"
+            ;;
+        gui)
+            is_headless && echo "this system is headless, name it to install it anyway"
             ;;
     esac
 }
@@ -339,7 +363,7 @@ run_selected_software() {
     local -a queue=()
     local -A unavailable=()
 
-    for group in gnome; do
+    for group in gnome gui; do
         reason="$(group_unavailable_reason "${group}")"
         [ -n "${reason}" ] && unavailable["${group}"]="${reason}"
     done
@@ -360,7 +384,10 @@ run_selected_software() {
         fi
         reason="$(software_unavailable_reason "${item}")"
         for group in "${!unavailable[@]}"; do
-            is_group_member "${group}" "${item}" && reason="${unavailable[${group}]}"
+            is_group_member "${group}" "${item}" || continue
+            # a gui software named on the command line is wanted anyway
+            [ "${group}" = "gui" ] && is_install_type_named "${item}" && continue
+            reason="${unavailable[${group}]}"
         done
         if [ -n "${reason}" ]; then
             echo "${APP_NAME}: Skipping ${item}: ${reason}" 1>&2
@@ -1753,6 +1780,8 @@ install_adb() {
 # Group names are lowercase and "all" is reserved. A group may carry the name of a
 # software only if that software is a member of it (e.g. mw is both the mittwald CLI
 # and the group of all mittwald tools); "updater mw" then updates the whole group.
+# The gui group marks software only a desktop needs (desktop apps, fonts, the lid and
+# audio of a laptop): on a headless system it is skipped unless it is named itself.
 software-010-firmware@base() {
     require_cmd fwupdmgr || return 1
     ${SUDO} fwupdmgr get-devices --force \
@@ -1763,7 +1792,7 @@ software-010-firmware@base() {
         yes | ${SUDO} fwupdmgr update
     fi
 }
-software-011-hardware@base() {
+software-011-hardware@base@gui() {
     # the built-in WWAN modem (Intel XMM7360 or 5G) is never used, so its driver stays
     # unloaded; only on a laptop that has one
     module_blacklist iosm "built-in Intel WWAN modem, never used" || return 1
@@ -1788,7 +1817,7 @@ software-017-dev-helpers@dev() { helper_repo_update "dgrieser/dev-helpers"; }
 software-018-kubectl-helpers@k8s() { helper_repo_update "dgrieser/kubectl-helpers"; }
 software-019-mw-helpers@mw() { helper_repo_update "gitlab.mittwald.it/dgrieser/mw-helpers"; }
 software-020-apt@base() { apt_upgrade; }
-software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli wl-clipboard python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging python3-networkmanager jq unzip file 7zip; }
+software-021-packages@base() { apt_upgrade git make curl vim fzf hstr trash-cli python3-pip python3-argcomplete python3-tabulate python3-yaml python3-tomlkit python3-packaging python3-networkmanager jq unzip file 7zip; }
 software-022-glow@base() {
     apt_upgrade glow || return 1
     config_update glow "${CURRENT_USER_HOME}/.config/glow"
@@ -1797,9 +1826,9 @@ software-023-sshpass@base() { apt_upgrade sshpass; }
 software-024-secret-tool@base() { apt_upgrade libsecret-tools python3-gi gir1.2-secret-1 python3-cryptography; }
 software-025-nodejs@dev@base() { install_nodejs; }
 software-026-cli-tools@base() {
-    apt_upgrade ripgrep fd-find zoxide tree htop tmux tig gitk meld shellcheck \
+    apt_upgrade ripgrep fd-find zoxide tree htop tmux tig shellcheck \
         parallel pv pigz lz4 lzip lzop unrar rlwrap expect inotify-tools gawk dialog ncal at \
-        recode wdiff fdupes symlinks reptyr
+        recode wdiff fdupes symlinks reptyr w3m lynx ranger colorized-logs ansifilter
 }
 software-027-network-tools@base() {
     apt_upgrade nmap net-tools traceroute whois ipcalc sipcalc prips ldnsutils socat sshfs \
@@ -1819,15 +1848,14 @@ software-030-npm@dev@base() {
     fi
     npm_update npm
 }
-software-031-desktop-tools@base() {
-    apt_upgrade xclip xdotool wmctrl xinput xkbset v4l-utils pamixer \
-        w3m w3m-img lynx ranger colorized-logs ansifilter || return 1
+software-031-desktop-tools@base@gui() {
+    apt_upgrade xclip wl-clipboard xdotool wmctrl xinput xkbset v4l-utils pamixer w3m-img || return 1
     # the presets of cam-settings (v4l2-ctl) and the monitor colors of screen-color
     config_update cam-settings "${CURRENT_USER_HOME}/.config/cam-settings" \
         && config_update screen-color "${CURRENT_USER_HOME}/.config/screen-color"
 }
 software-032-disk-tools@base() {
-    apt_upgrade gparted partclone gddrescue sdparm mmc-utils fio genisoimage xorriso zsync \
+    apt_upgrade partclone gddrescue sdparm mmc-utils fio genisoimage xorriso zsync \
         lm-sensors msr-tools ipmitool cpu-checker acct autofs smartmontools
 }
 software-033-dev-tools@dev() {
@@ -1835,18 +1863,18 @@ software-033-dev-tools@dev() {
         rpm2cpio wabt gcovr pycodestyle maven musl-dev php-cli php-curl php-sqlite3 php-bz2 \
         isympy3 mkdocs oidc-agent
 }
-software-034-desktop-apps@base() {
-    apt_upgrade eog evince clapper drawing vlc keepassxc dconf-editor qdirstat filezilla || return 1
+software-034-desktop-apps@base@gui() {
+    apt_upgrade eog evince clapper drawing vlc keepassxc dconf-editor qdirstat filezilla gitk meld gparted || return 1
     # the default apps: VLC for audio, Image Viewer for images, Sublime Text for text,
     # ssh://, tel: and webcal: links (video stays with the system's player)
     config_update mimeapps "${CURRENT_USER_HOME}/.config"
 }
-software-035-office@base() { apt_upgrade libreoffice evolution evolution-ews evolution-plugin-pstimport; }
-software-036-media-apps@media() { apt_upgrade audacity kdenlive blender calibre puddletag glabels; }
-software-037-wireshark@dev() { apt_upgrade wireshark; }
+software-035-office@base@gui() { apt_upgrade libreoffice evolution evolution-ews evolution-plugin-pstimport; }
+software-036-media-apps@media@gui() { apt_upgrade audacity kdenlive blender calibre puddletag glabels; }
+software-037-wireshark@dev@gui() { apt_upgrade wireshark; }
 software-038-java@dev() { apt_upgrade openjdk-21-jre; }
-software-039-qemu@dev() { apt_upgrade qemu-system qemu-utils ovmf swtpm spice-client-gtk quickemu; }
-software-040-flatpak@base() { flatpak_update; }
+software-039-qemu@dev@gui() { apt_upgrade qemu-system qemu-utils ovmf swtpm spice-client-gtk quickemu; }
+software-040-flatpak@base@gui() { flatpak_update; }
 software-041-vim@base() {
     local plug="${CURRENT_USER_HOME}/.vim/autoload/plug.vim"
     needs packages vim || return $(( $? == 3 ? 0 : 1 ))
@@ -1868,7 +1896,7 @@ software-041-vim@base() {
     # ~/.vimrc and ~/.vim/plugin/jq-lsp.vim, merged into the user's
     config_update vim "${CURRENT_USER_HOME}"
 }
-software-042-power-trigger@base() {
+software-042-power-trigger@base@gui() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
     local logind_conf="/etc/systemd/logind.conf.d/50-power-trigger.conf"
@@ -1925,14 +1953,14 @@ software-043-dotfile-backups@base() {
     verbose "${SUDO} tee ${cron_file}"
     echo "${content}" | ${SUDO} tee "${cron_file}" > /dev/null && ${SUDO} chmod 0644 "${cron_file}"
 }
-software-044-terminator@base() {
+software-044-terminator@base@gui() {
     apt_upgrade terminator || return 1
     tool_ready terminator || return $(( $? == 1 ? 0 : 1 ))
     config_update terminator "${CURRENT_USER_HOME}/.config/terminator" || return 1
     # the own plugin, from its repo
     helper_repo_update "dgrieser/terminator-plugin-balance-splits" install
 }
-software-045-sublime@base() {
+software-045-sublime@base@gui() {
     apt_add_with_repo "sublime-text" "https://download.sublimetext.com/" "apt/stable/" "" "https://download.sublimetext.com/sublimehq-pub.gpg" \
         || return 1
     local package_control="${CURRENT_USER_HOME}/.config/sublime-text/Packages/User/Package Control.sublime-settings"
@@ -2033,7 +2061,7 @@ chrome_first_start() {
     done
 }
 
-software-060-chrome@dev() {
+software-060-chrome@dev@gui() {
     # rewritten by make install to $(LIBDIR)
     local lib_dir="/usr/local/lib/cli-helpers"
     local profile_args=()
@@ -2068,7 +2096,7 @@ software-080-claude@dev@agents() {
     claude_plugins_update "${lib_dir}/claude/settings.json"
 }
 software-100-kubectl-mw@dev@k8s@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/kubectl-mw"; }
-software-110-nerd-fonts@base() {
+software-110-nerd-fonts@base@gui() {
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl tar fc-cache || return 1
     local repo_url="https://github.com/ryanoasis/nerd-fonts"
@@ -2116,7 +2144,7 @@ software-110-nerd-fonts@base() {
     echo "${version}" | ${SUDO_USER} tee "${version_file}" > /dev/null
 }
 software-120-nickpit@dev@agents() { install_git_release "https://github.com/dgrieser/nickpit"; }
-software-121-mittwald-outlook-bridge@mw() {
+software-121-mittwald-outlook-bridge@mw@gui() {
     local env_file="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge/env"
     local package_unit="/usr/lib/systemd/user/mittwald-outlook-bridge.service"
     # the WebKitGTK runtime of the webview build's sign-in window; its deb depends
@@ -2145,7 +2173,7 @@ software-122-git-commit-ai@dev@agents() {
         warning "cmai has no API key, set it with: cmai --api-key \"\${MITTWALD_AI_API_KEY}\" (from a shell that has it)"
     fi
 }
-software-130-slack@comms() {
+software-130-slack@comms@gui() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq dpkg apt-get || return 1
@@ -2256,16 +2284,52 @@ software-170-forskap@dev() {
 software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
 software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
 software-182-patchzwoelf@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/patchzwoelf"; }
+# playwright_chromium DIR: Playwright's Chromium for the playwright installed in
+# DIR/node_modules, fetched as the user (into ~/.cache/ms-playwright), and the
+# system libraries it needs, which a bare server lacks
+playwright_chromium() {
+    local dir="${1}"
+    local playwright="${dir}/node_modules/.bin/playwright"
+    local user_env=("env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}")
+    local executable
+    [ -n "${SUDO_USER}" ] && user_env=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "${user_env[@]}")
+
+    if [ ! -x "${playwright}" ]; then
+        [ "${dry_run}" -eq 1 ] && return 0
+        error "${playwright} is missing"
+        return 1
+    fi
+    executable="$("${user_env[@]}" node -e 'process.stdout.write(require(process.argv[1]).chromium.executablePath())' \
+        "${dir}/node_modules/playwright")" || return 1
+    if [ ! -x "${executable}" ]; then
+        if [ "${dry_run}" -eq 1 ]; then
+            echo "Would install Playwright's Chromium (${executable})" 1>&2
+            return 0
+        fi
+        verbose "${user_env[*]} ${playwright} install chromium --no-shell"
+        "${user_env[@]}" "${playwright}" install chromium --no-shell || return 1
+    fi
+    ldd "${executable}" 2>/dev/null | grep -q "not found" || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install the system libraries of Playwright's Chromium" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} env PATH=${PATH} ${playwright} install-deps chromium"
+    ${SUDO} env PATH="${PATH}" "${playwright}" install-deps chromium
+}
 software-185-bahn-probonio-bot@personal() {
     # uploads the Deutschland-Ticket bill to Probonio; its make install copies it to
-    # /usr/local/lib/bahn-probonio-bot with its own node_modules
+    # /usr/local/lib/bahn-probonio-bot with its own node_modules; without Google
+    # Chrome, e.g. on a headless system, it uses Playwright's Chromium
     local dir="${CURRENT_USER_HOME}/workspace/dgrieser/bahn-probonio-bot"
     local lib_dir="/usr/local/lib/bahn-probonio-bot"
     local file
     local changed=0
     needs packages make || return $(( $? == 3 ? 0 : 1 ))
     needs nodejs npm || return $(( $? == 3 ? 0 : 1 ))
-    needs chrome google-chrome || return $(( $? == 3 ? 0 : 1 ))
+    if ! is_headless; then
+        needs chrome google-chrome || return $(( $? == 3 ? 0 : 1 ))
+    fi
     needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
     apt_upgrade poppler-utils || return 1
     git_repo_update "dgrieser/bahn-probonio-bot" "${dir}" || return 1
@@ -2278,21 +2342,23 @@ software-185-bahn-probonio-bot@personal() {
     done
     if [ "${changed}" -eq 0 ]; then
         echo "${APP_NAME}: ${lib_dir} is up to date" 1>&2
-        return 0
-    fi
-    if [ "${dry_run}" -eq 1 ]; then
+    elif [ "${dry_run}" -eq 1 ]; then
         echo "Would install ${dir} into ${lib_dir} (make install)" 1>&2
-        return 0
+    else
+        repo_setup_dirs "${dir}" || return 1
+        # npm is nvm's, so as the user with this PATH
+        local make_cmd=("make")
+        [ -n "${SUDO_USER}" ] && make_cmd=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}" "make")
+        verbose "${make_cmd[*]} -C ${dir} install"
+        "${make_cmd[@]}" -C "${dir}" install || return 1
+        if ! secret-tool lookup service bahn-probonio-bot key bahn-username > /dev/null 2>&1; then
+            echo "${APP_NAME}: no bahn-probonio-bot credentials in the keyring yet, run: probonio-store-credentials; probonio-submit-bill --login" 1>&2
+        fi
     fi
-    repo_setup_dirs "${dir}" || return 1
-    # npm is nvm's, so as the user with this PATH
-    local make_cmd=("make")
-    [ -n "${SUDO_USER}" ] && make_cmd=("sudo" "-n" "-u" "${CURRENT_USER_NAME}" "env" "PATH=${PATH}" "HOME=${CURRENT_USER_HOME}" "make")
-    verbose "${make_cmd[*]} -C ${dir} install"
-    "${make_cmd[@]}" -C "${dir}" install || return 1
-    if ! secret-tool lookup service bahn-probonio-bot key bahn-username > /dev/null 2>&1; then
-        echo "${APP_NAME}: no bahn-probonio-bot credentials in the keyring yet, run: probonio-store-credentials; probonio-submit-bill --login" 1>&2
-    fi
+    # its make install does not fetch Chromium, only its make setup does; also
+    # when the bot is up to date, as an earlier run may not have fetched it
+    [ -x /opt/google/chrome/chrome ] && return 0
+    playwright_chromium "${lib_dir}"
 }
 # each release ships the same build with and without the version in its name
 software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli" --pattern "snaxus-cli-linux-{arch}.tar.gz" --binary "snaxus"; }
@@ -2314,14 +2380,14 @@ software-210-himalaya@comms() {
     fi
 }
 
-software-230-zed@dev() {
+software-230-zed@dev@gui() {
     curl_update "zed" "https://zed.dev/install.sh" || return 1
     tool_ready "${CURRENT_USER_HOME}/.local/bin/zed" || return $(( $? == 1 ? 0 : 1 ))
     # settings and keymap; a merged file is rewritten without its comments
     config_update zed "${CURRENT_USER_HOME}/.config/zed"
 }
 software-240-hwatch@dev() { install_git_release "https://github.com/blacknon/hwatch"; }
-software-250-gradia@desktop() {
+software-250-gradia@desktop@gui() {
     local app="be.alexandervanhee.gradia"
     flatpak_update "${app}" flathub || return 1
     # its custom export command opens the image in GIMP on the host (flatpak-spawn --host)
@@ -2336,14 +2402,14 @@ software-250-gradia@desktop() {
     # its settings live in the keyfile of the sandbox, not in dconf
     config_update gradia "${CURRENT_USER_HOME}/.var/app/${app}/config/glib-2.0/settings"
 }
-software-251-obs@media() {
+software-251-obs@media@gui() {
     flatpak_update "com.obsproject.Studio" flathub \
         && flatpak_update "com.obsproject.Studio.Plugin.BackgroundRemoval" flathub \
         && flatpak_update "com.obsproject.Studio.Plugin.DroidCam" flathub
 }
 # only plugins built for GIMP 3 (branch 3); the 2-40 ones (BIMP, FocusBlur, Lensfun,
 # LiquidRescale) install fine but are never loaded by GIMP 3
-software-252-gimp@media() {
+software-252-gimp@media@gui() {
     local version
     flatpak_update "org.gimp.GIMP" flathub \
         && flatpak_update "org.gimp.GIMP.Plugin.Fourier//3" flathub \
@@ -2364,20 +2430,20 @@ software-252-gimp@media() {
     config_update gimp "${CURRENT_USER_HOME}/.config/GIMP/${version}" || return 1
     dconf_update gimp
 }
-software-253-cobang@desktop() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
-software-254-inkscape@media() {
+software-253-cobang@desktop@gui() { flatpak_update "vn.hoabinh.quan.CoBang" flathub; }
+software-254-inkscape@media@gui() {
     # the Inkscape PPA has newer releases than Ubuntu
     apt_add_with_repo "inkscape" "https://ppa.launchpadcontent.net/inkscape.dev/stable/ubuntu" "${OS_RELEASE_VERSION_CODENAME}" "main" \
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38" "56BDFFD2F1C96B3D1575E3B85C9A0B86CD2FCB38"
 }
-software-255-losslesscut@media() {
+software-255-losslesscut@media@gui() {
     install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-{arch}.tar.bz2" --bundle --binary "losslesscut" \
         && apparmor_allow_userns losslesscut losslesscut
 }
 software-260-lazygit@dev() { install_git_release "https://github.com/jesseduffield/lazygit"; }
 software-270-viddy@dev() { install_git_release "https://github.com/sachaos/viddy"; }
 
-software-280-spotify@media() {
+software-280-spotify@media@gui() {
     local user_dir
     local found=0
     apt_add_with_repo "spotify-client" "https://repository.spotify.com/" "stable" "non-free" "https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc" \
@@ -2400,7 +2466,7 @@ software-290-trivy@dev@k8s() {
 }
 software-292-sops@dev@k8s() { install_git_release "https://github.com/getsops/sops" --pattern "*_{arch}.deb"; }
 
-software-300-threema@comms() {
+software-300-threema@comms@gui() {
     flatpak_update "ch.threema.threema-desktop" --from "https://releases.threema.ch/flatpak/threema-desktop/ch.threema.threema-desktop.flatpakref" || return 1
     [ "${dry_run}" -eq 1 ] && return 0
     # access to all files, e.g. to send attachments from anywhere (system-wide override, needs root)
@@ -2476,7 +2542,7 @@ opencode_auth_update() {
 }
 
 
-software-330-zoom@comms() {
+software-330-zoom@comms@gui() {
     needs packages jq || return $(( $? == 3 ? 0 : 1 ))
     needs packages curl || return $(( $? == 3 ? 0 : 1 ))
     require_cmd curl jq dpkg apt-get || return 1
@@ -2518,7 +2584,7 @@ software-330-zoom@comms() {
     # English, tray icon, mini window, no sound or GIFs in chats, no global screenshot keys
     config_update zoom "${CURRENT_USER_HOME}/.config"
 }
-software-335-teamviewer@desktop() {
+software-335-teamviewer@desktop@gui() {
     apt_add_with_repo "teamviewer" "https://linux.teamviewer.com/deb" "stable" "main" \
         "https://linux.teamviewer.com/pubkey/currentkey.asc" "AB2985BDE164897BA46EA69A234FAACB575B15D1" \
         || return 1
@@ -2606,7 +2672,7 @@ software-365-kubectl@dev@k8s() {
     apt_add_with_repo "kubectl" "https://pkgs.k8s.io/core:/stable:/${minor}/deb/"
 }
 
-software-370-wezterm@desktop() {
+software-370-wezterm@desktop@gui() {
     local wezterm_distribution
     case "${OS_RELEASE_ID}" in
         ubuntu)
@@ -2628,7 +2694,7 @@ software-370-wezterm@desktop() {
         --release "nightly" \
         --pattern "wezterm-nightly.${wezterm_distribution}.deb"
 }
-software-376-samba@desktop() {
+software-376-samba@desktop@gui() {
     # folders shared from Files (usershares), as before
     apt_upgrade samba nautilus-share
 }
@@ -2798,7 +2864,7 @@ software-490-yazi@base() {
 }
 software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_{arch}.deb"; }
 software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb"; }
-software-495-r-quick-share@desktop() {
+software-495-r-quick-share@desktop@gui() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
     install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return $?
     # its settings: started minimized at login, closing the window keeps it running

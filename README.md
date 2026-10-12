@@ -48,6 +48,10 @@ Finally it offers to make browser-router the default browser (`browser-router --
 apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
 `./setup.sh --list` lists these steps in this order, and `./setup.sh STEP...` runs only those, still in this order (a step
 that restores from the backup asks for the backup first), e.g. `./setup.sh etc` for the files of `/etc` alone.
+On a headless system (no desktop installed, see `headless`), e.g. a server or a Raspberry Pi OS Lite, a full run
+leaves out what only a desktop needs: the steps `sublime`, `chrome`, `chrome-apps`, `browser` and `gnome` (naming one
+still runs it), the GNOME extension and the desktop entries of cli-helpers, the GNOME part of the OpenVPN plugin, and
+the `gui` software of `updater`; a category with nothing else in it is not asked for.
 
 Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
 `setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents
@@ -2188,6 +2192,27 @@ loggedin --id
 loggedin --home
 ```
 
+### `headless`
+Tells whether this system is headless: no desktop is installed that a graphical session could start, as every desktop
+installs its session in `/usr/share/xsessions` (X11) or `/usr/share/wayland-sessions` (Wayland), e.g. not on a server or
+a Raspberry Pi OS Lite. Whether a session runs now does not matter, so a desktop reached by SSH or a cron job on one is
+not headless. `updater` and `setup.sh` use it to leave out the desktop apps.
+
+**Usage:** `headless [-h|--help] [-v|--verbose]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-v, --verbose` | Print `headless`, or `desktop` with the session file found. |
+| `-h, --help` | Show the usage message and exit. |
+
+Exit status `0` means headless, `1` means a desktop is installed, `2` a usage error.
+
+**Examples:**
+```bash
+headless --verbose
+headless || echo "a desktop is installed"
+```
+
 ### `updater`
 Updates a selectable set of system packages, desktop applications, and CLI tools using their appropriate package managers, vendor repositories, install scripts, or Git releases. With no software arguments, it processes every supported type except entries explicitly disabled in the script.
 
@@ -2207,7 +2232,7 @@ Updates a selectable set of system packages, desktop applications, and CLI tools
 
 The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`.
 
-Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed. Software built only for some architectures is skipped on the others (the `software_arches` list in `updater`, by the userland's `dpkg --print-architecture`): Zoom, Slack, Spotify, Chrome, Threema and the Android SDK are amd64 only; AWS CLI v2, Claude Code, forskap, Ollama, opencode, Sublime Text, WezTerm and Zed are amd64 and arm64; TeamViewer adds armhf. Codeium (in Vim and Sublime Text) is only set up on amd64. Release downloads through `install-git-release` pick the build for the architecture, and a software whose release has none is skipped too.
+Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed. The group `gui` marks the software only a desktop needs (desktop apps, fonts, terminal emulators, the lid and audio of a laptop); on a headless system (see `headless`) it is skipped when it comes from a group, `all` or no argument, e.g. `updater base`, but installed when it is named itself, e.g. `updater sublime`. Software built only for some architectures is skipped on the others (the `software_arches` list in `updater`, by the userland's `dpkg --print-architecture`): Zoom, Slack, Spotify, Chrome, Threema and the Android SDK are amd64 only; AWS CLI v2, Claude Code, forskap, Ollama, opencode, Sublime Text, WezTerm and Zed are amd64 and arm64; TeamViewer adds armhf. Codeium (in Vim and Sublime Text) is only set up on amd64. Release downloads through `install-git-release` pick the build for the architecture, and a software whose release has none is skipped too.
 
 Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya and its jq module, glow, Sublime Text, the Qwen commands, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files, and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder). `--no-config` skips both, and WirePlumber is not restarted then.
 
@@ -2225,6 +2250,7 @@ updater --dry-run apt flatpak
 updater codex claude
 updater --list
 updater base k8s
+updater base -x gui
 updater --verbose all
 make update UPDATE_ARGS='--dry-run apt'
 ```

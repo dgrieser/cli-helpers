@@ -1,0 +1,38 @@
+#!/bin/bash
+# Exits 0 when this system is headless: no desktop is installed that a graphical
+# session could start, as every desktop installs its session as an X11 one in
+# xsessions or a Wayland one in wayland-sessions, e.g. not on a server or a
+# Raspberry Pi OS Lite. Whether a session runs now does not matter, so a desktop
+# reached by SSH or a cron job on one is not headless.
+
+usage() {
+    echo "usage: $(basename "${0}") [-h|--help] [-v|--verbose]" 1>&2
+    exit 2
+}
+
+verbose=0
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -v|--verbose)
+            verbose=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+for dir in /usr/share /usr/local/share; do
+    for session in "${dir}"/xsessions/*.desktop "${dir}"/wayland-sessions/*.desktop; do
+        [ -f "${session}" ] || continue
+        [ "${verbose}" -eq 1 ] && echo "desktop (${session})"
+        exit 1
+    done
+done
+
+[ "${verbose}" -eq 1 ] && echo "headless"
+exit 0
