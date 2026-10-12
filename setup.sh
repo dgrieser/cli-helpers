@@ -593,11 +593,22 @@ restore_downloads() {
 
 # the session of Sublime Text from sublime-text/ of the backup: the windows and
 # tabs it had open, with their unsaved text; before updater installs it, so
-# its first start opens them; a running one would write its own session over it
+# its first start opens them; a session that is here already (a Sublime Text
+# that started once writes a new, empty one) is asked about and moved aside to
+# Local.before-restore-DATE, not deleted, as a kept one would hide the backup's;
+# a running one would write its own session over it
 restore_sublime() {
-    local dir="${HOME}/.config/sublime-text/Local"
+    local dir="${HOME}/.config/sublime-text/Local" moved
     has_part sublime-text || return 0
     info "Sublime Text: restore its session (the open files and their unsaved text) from the backup"
+    if diff -rq "${BACKUP_DIR}/sublime-text" "${dir}" > /dev/null 2>&1; then
+        echo "sublime-text: ${dir} has the session of the backup already" 1>&2
+        return 0
+    fi
+    if [ -e "${dir}" ] && ! ask "Replace the Sublime Text session here with the one of the backup (it is moved aside)?"; then
+        echo "Kept ${dir}" 1>&2
+        return 0
+    fi
     if pgrep -x sublime_text > /dev/null 2>&1; then
         warning "Sublime Text is running and would write its session over the restored one"
         while pgrep -x sublime_text > /dev/null 2>&1; do
@@ -606,6 +617,10 @@ restore_sublime() {
                 return 0
             fi
         done
+    fi
+    if [ -e "${dir}" ]; then
+        moved="${dir}.before-restore-$(date +%Y%m%d-%H%M%S)"
+        run mv "${dir}" "${moved}" || { failed+=("sublime-text, cannot move ${dir} aside"); return 0; }
     fi
     restore_part sublime-text "${dir}"
 }
