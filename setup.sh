@@ -4,7 +4,7 @@
 # keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
 # with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker),
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
-# if you like, gitlab.com), the dotfiles of
+# if you like, gitlab.com), the host key of js01, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
 # of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text, the profile of
 # Google Chrome with the key of its passwords and cookies, the desktop entries of the apps
@@ -55,6 +55,7 @@ STEPS=(
     # before the VPN is dialed for the glab login: tun-up gives it the internal names
     "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker"
     "gh-glab       install_gh_glab       -      gh and glab with their logins"
+    "js01          store_js01_key        -      the host key of js01 in ~/.ssh/known_hosts, for the sshpass login of js01"
     "sublime       restore_sublime       backup the session of Sublime Text"
     "chrome        restore_chrome        backup the profile of Google Chrome with the key of its passwords and cookies"
     "chrome-apps   setup_chrome_apps     -      the desktop entries of the apps installed in Chrome, with their icons and the links they open"
@@ -500,6 +501,24 @@ install_gh_glab() {
     command -v gh > /dev/null 2>&1 && login_github
     command -v glab > /dev/null 2>&1 && login_gitlab "${MITTWALD_GITLAB}"
     command -v glab > /dev/null 2>&1 && login_gitlab gitlab.com optional
+}
+
+# the host key of js01 in ~/.ssh/known_hosts, which no backup holds: the js01
+# alias of bash_aliases.d logs in with sshpass, which exits silently on the
+# question for an unknown host key; js01 is only reachable through the VPN
+store_js01_key() {
+    info "js01: store its host key in ~/.ssh/known_hosts"
+    if ssh-keygen -F js01 > /dev/null 2>&1; then
+        echo "Kept the host key of js01 in ${HOME}/.ssh/known_hosts" 1>&2
+        return 0
+    fi
+    if ! dial_vpn "${MITTWALD_GITLAB}"; then
+        warning "No VPN, the host key of js01 is not stored"
+        failed+=("VPN for ssh-keyscan js01")
+        return 0
+    fi
+    echo "+ ssh-keyscan -H js01 >> ${HOME}/.ssh/known_hosts" 1>&2
+    ssh-keyscan -H js01 >> "${HOME}/.ssh/known_hosts" 2> /dev/null || failed+=("ssh-keyscan -H js01")
 }
 
 # the Keys folder of the documents folder and the shell histories from Keys/

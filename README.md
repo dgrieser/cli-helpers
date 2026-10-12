@@ -28,7 +28,9 @@ roaming scans; a `systemd-resolved` stub on `docker0` with the DNS of Docker poi
 internal names too; the internal names are `@@SECRET:NAME@@` in the repo, filled in from the keyring item
 `type=dotfile-secret name=NAME`, and a file that differs is only replaced when you say so), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
-when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), restores the session of Sublime Text (its open windows
+when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), stores the
+host key of js01 in `~/.ssh/known_hosts` (`ssh-keyscan -H js01`, through the VPN; the `js01` alias logs in with `sshpass`,
+which fails silently on an unknown host key), restores the session of Sublime Text (its open windows
 and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome
 with the key of its passwords and cookies (`keyring-cli import --match application=chrome --overwrite`; a profile that is
 already there is only replaced when you say so, and moved aside to `google-chrome.before-restore-<date>`), writes the desktop
