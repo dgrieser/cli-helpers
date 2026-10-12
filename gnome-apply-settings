@@ -69,6 +69,16 @@ gsettings set org.gnome.desktop.peripherals.mouse speed 0.002904647435897436
 gsettings set org.gnome.desktop.peripherals.touchpad click-method 'fingers'
 gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll false
 gsettings set org.gnome.desktop.peripherals.touchpad tap-to-click false
+# two-finger scrolling at half speed; GNOME has no setting for it, so a libinput
+# plugin scales the finger motion, which mutter loads from ~/.config/libinput/plugins
+# on login
+libinput_plugin="50-touchpad-scroll-speed.lua"
+libinput_plugins="${HOME}/.config/libinput/plugins"
+if [ ! -L "${libinput_plugins}/${libinput_plugin}" ]; then
+    mkdir -p "${libinput_plugins}"
+    ln -sfn "/usr/local/lib/cli-helpers/libinput/${libinput_plugin}" "${libinput_plugins}/${libinput_plugin}"
+    echo "GNOME loads ${libinput_plugin} after logging out and in again" 1>&2
+fi
 
 # power: never suspend on AC (the timeout only applies if a type is set again)
 gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
