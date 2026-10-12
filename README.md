@@ -75,7 +75,8 @@ make list-install             # show install destinations
 ```
 
 To install without `sudo` afterwards, run `sudo make setup-dirs` once: it creates the install folders (`BINDIR`,
-`LIBDIR`, `PYTHONDIR`, the completions folder) owned by `root:<your group>` and group-writable. The group is the
+`LIBDIR`, `PYTHONDIR`, the completions folder) owned by `root:<your group>` and group-writable, and does the same for
+the system completions folder `/usr/share/bash-completion/completions` (`SYSTEM_COMPLETIONSDIR`). The group is the
 primary group of the user who ran `sudo`; override it with `INSTALL_GROUP=...`. The `.pth` file still needs root
 once (`sudo make install-pth`), since it lives in the system's `/usr/lib/python3/dist-packages`.
 

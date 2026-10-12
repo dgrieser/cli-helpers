@@ -1663,6 +1663,63 @@ install_git_release() {
     return "${status}"
 }
 
+# completion_update NAME COMMAND...: writes the bash completion that COMMAND prints
+# to the system completions folder as NAME.bash, where bash-completion loads it on
+# the first completion of NAME; setup-dirs makes the folder group-writable, so it
+# only needs sudo without that or for a file root wrote
+completion_update() {
+    local name="${1}"; shift
+    local dir="/usr/share/bash-completion/completions"
+    local file="${dir}/${name}.bash"
+    local content
+    local sudo="${SUDO}"
+    # a dry run does not install the command
+    if [ "${dry_run}" -eq 1 ] && ! command -v "${1}" > /dev/null 2>&1; then
+        echo "Would write ${file}" 1>&2
+        return 0
+    fi
+    if ! content="$("$@")" || [ -z "${content}" ]; then
+        error "Failed to generate the bash completion of ${name} with: $*"
+        return 1
+    fi
+    [ "${content}" = "$(cat "${file}" 2>/dev/null)" ] && return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would write ${file}" 1>&2
+        return 0
+    fi
+    [ -w "${dir}" ] && { [ ! -e "${file}" ] || [ -w "${file}" ]; } && sudo=""
+    verbose "$* | ${sudo:+${sudo} }tee ${file}"
+    printf '%s\n' "${content}" | ${sudo} tee "${file}" > /dev/null
+}
+
+# completion_link NAME FILE COMMAND...: for a command that writes its bash completion
+# to FILE in the user's config itself (stdout only gets a hint), runs COMMAND as the
+# user and links FILE into the system completions folder as NAME.bash, like
+# completion_update
+completion_link() {
+    local name="${1}"
+    local target="${2}"
+    shift 2
+    local dir="/usr/share/bash-completion/completions"
+    local file="${dir}/${name}.bash"
+    local sudo="${SUDO}"
+    if [ "${dry_run}" -eq 0 ]; then
+        verbose "${SUDO_USER:+${SUDO_USER} }$*"
+        if ! ${SUDO_USER} "$@" > /dev/null || [ ! -s "${target}" ]; then
+            error "Failed to generate the bash completion of ${name} with: $*"
+            return 1
+        fi
+    fi
+    [ "$(readlink "${file}")" = "${target}" ] && return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would link ${file} to ${target}" 1>&2
+        return 0
+    fi
+    [ -w "${dir}" ] && sudo=""
+    verbose "${sudo:+${sudo} }ln -sfn ${target} ${file}"
+    ${sudo} ln -sfn "${target}" "${file}"
+}
+
 # Ubuntu lets a program create user namespaces only when its AppArmor profile allows
 # it, so an Electron app from a release bundle aborts at start: its sandbox needs
 # them, or else a chrome-sandbox owned by root with mode 4755; like the profiles
@@ -2281,8 +2338,14 @@ software-170-forskap@dev() {
     user_units_stopped=()
     user_service_enable forskapd.socket
 }
-software-180-nexus-cli@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli"; }
-software-181-netbox-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli"; }
+software-180-nexus-cli@dev@mw() {
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/nexus-cli" || return $?
+    completion_link nexus-cli "${CURRENT_USER_HOME}/.config/nexus-cli/bash-completion.sh" nexus-cli bash-completion
+}
+software-181-netbox-cli@mw() {
+    install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/m3/tools/netbox-cli" || return $?
+    completion_link netbox-cli "${CURRENT_USER_HOME}/.config/netbox-cli/bash-completion.sh" netbox-cli bash-completion
+}
 software-182-patchzwoelf@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/patchzwoelf"; }
 # playwright_chromium DIR: Playwright's Chromium for the playwright installed in
 # DIR/node_modules, fetched as the user (into ~/.cache/ms-playwright), and the
@@ -2361,8 +2424,14 @@ software-185-bahn-probonio-bot@personal() {
     playwright_chromium "${lib_dir}"
 }
 # each release ships the same build with and without the version in its name
-software-190-snaxus-cli@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli" --pattern "snaxus-cli-linux-{arch}.tar.gz" --binary "snaxus"; }
-software-191-swctl@dev@mw() { install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl"; }
+software-190-snaxus-cli@mw() {
+    install_git_release "https://gitlab.mittwald.it/mittwald/tools/snaxus-cli" --pattern "snaxus-cli-linux-{arch}.tar.gz" --binary "snaxus" || return $?
+    completion_link snaxus "${CURRENT_USER_HOME}/.config/snaxus/bash-completion.sh" snaxus bash-completion
+}
+software-191-swctl@dev@mw() {
+    install_git_release "https://gitlab.mittwald.it/mittwald/infrastructure/software/tools/software-ctl" --pattern "*Linux_{arch}*" --name "swctl" || return $?
+    completion_update swctl swctl completion bash
+}
 software-200-boodschapper@mw() { install_git_release "https://gitlab.mittwald.it/asylum/gereedschappen/boodschapper"; }
 software-210-himalaya@comms() {
     local account="mail@david-grieser.de"

@@ -9,6 +9,10 @@ PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
 # login shell never reaches); python3 reads it at startup
 PTHFILE ?= /usr/lib/python3/dist-packages/usr-local-python3.pth
 COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
+# the distribution's completions folder: a command with a completion there keeps
+# it, and setup-dirs makes it group-writable too, so completions can be added
+# there without root
+SYSTEM_COMPLETIONSDIR ?= /usr/share/bash-completion/completions
 # the group that may install without root: the invoking user's primary group
 INSTALL_GROUP ?= $(shell id -gn "$${SUDO_USER:-$$(id -un)}")
 COMPLETION := bash_completion/cli-helpers
@@ -100,7 +104,7 @@ setup-dirs:
 		echo "ERROR: setup-dirs needs root, run: sudo make setup-dirs" 1>&2; \
 		exit 1; \
 	fi
-	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)"; do \
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)" "$(DESTDIR)$(SYSTEM_COMPLETIONSDIR)"; do \
 		mkdir -p "$$dir" && chown root:"$(INSTALL_GROUP)" "$$dir" && chmod g+w "$$dir" || exit 1; \
 	done
 
@@ -211,7 +215,7 @@ install-completions:
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
 	install -m 0644 "$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
 	for name in $(SCRIPTS) $(LINKS); do \
-		if [ -e "/usr/share/bash-completion/completions/$$name" ]; then \
+		if [ -e "$(SYSTEM_COMPLETIONSDIR)/$$name" ]; then \
 			echo "Skipping completion for $$name (system completion exists)"; \
 			continue; \
 		fi; \
@@ -222,7 +226,7 @@ install-completions-links:
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
 	ln -sfn "$(REPO_DIR)/$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
 	for name in $(SCRIPTS) $(LINKS); do \
-		if [ -e "/usr/share/bash-completion/completions/$$name" ]; then \
+		if [ -e "$(SYSTEM_COMPLETIONSDIR)/$$name" ]; then \
 			echo "Skipping completion for $$name (system completion exists)"; \
 			continue; \
 		fi; \
