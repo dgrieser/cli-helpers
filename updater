@@ -1939,8 +1939,9 @@ software-041-vim@base() {
     local plug="${CURRENT_USER_HOME}/.vim/autoload/plug.vim"
     needs packages vim || return $(( $? == 3 ? 0 : 1 ))
     # the plugins the vimrc uses: Codeium (its status in the statusline, sign in
-    # once with :Codeium Auth), only on amd64 like the vimrc, and vim-plug, which
-    # updates itself with :PlugUpgrade
+    # once with :Codeium Auth, or setup.sh restores its API key from the
+    # keyring), only on amd64 like the vimrc, and vim-plug, which updates itself
+    # with :PlugUpgrade
     if [ "${PLATFORM}" = "amd64" ]; then
         git_repo_update "Exafunction/codeium.vim" "${CURRENT_USER_HOME}/.vim/pack/Exafunction/start/codeium.vim" || return 1
     fi

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
-# keys, SSH config and network connections, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
+# keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
 # with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker),
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
 # if you like, gitlab.com), the host key of js01, the dotfiles of
@@ -51,7 +51,7 @@ K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-pr
 # is "backup" for a step that restores from the backup; setup.sh STEP... runs
 # only these, still in this order
 STEPS=(
-    "keyring       setup_keyring         backup the keyring files of the backup, then the SSH keys, SSH config and network connections in the keyring"
+    "keyring       setup_keyring         backup the keyring files of the backup, then the SSH keys, SSH config, network connections and API key of Codeium in the keyring"
     "cli-helpers   setup_cli_helpers     -      the install folders and cli-helpers itself"
     # gen needs the prompts, vpn-up and wifi of cli-helpers
     "bin           restore_bin           backup your own scripts of ~/bin, gen among them dials the VPN"
@@ -226,13 +226,16 @@ has_part() {
 
 # the keyring of the old machine: the keyring files of the backup are imported into
 # the login keyring, early, so the logins and tokens in it are there for the
-# later steps; then the SSH keys and network connections (e.g. the Mittwald
-# wifi and VPN) stored in the keyring with keyring-cli are restored
+# later steps; then the SSH keys, the SSH config, the network connections (e.g.
+# the Mittwald wifi and VPN) and the API key of Codeium stored in the keyring
+# with keyring-cli are restored
 setup_keyring() {
     local keyring_cli="${REPO_DIR}/keyring-cli"
+    local codeium_config="${XDG_DATA_HOME:-${HOME}}/.codeium/config.json"
+    local codeium_sublime_key="${HOME}/.codeium/sublime/codeium-api-key.txt"
     local packages=() package file name type
     local -a files=() names
-    info "Keyring: import the old keyring files of the backup (keyrings/), then restore the SSH keys, the SSH config and the network connections stored in the keyring"
+    info "Keyring: import the old keyring files of the backup (keyrings/), then restore the SSH keys, the SSH config, the network connections and the API key of Codeium stored in the keyring"
     if ! busctl --user status org.freedesktop.secrets > /dev/null 2>&1; then
         warning "No keyring service running, skipping the keyring"
         failed+=("keyring")
@@ -273,6 +276,17 @@ setup_keyring() {
             echo "Kept ${HOME}/.ssh/config" 1>&2
         elif ask "Restore the SSH config of the keyring to ~/.ssh/config?"; then
             run "${keyring_cli}" ssh-config-restore || failed+=("keyring-cli ssh-config-restore")
+        fi
+    fi
+
+    # the API key of Codeium, which its Vim plugin reads from its config (else
+    # it asks for :Codeium Auth) and its Sublime Text plugin from a key file of
+    # its own (else it asks for Codeium: Sign In); a key that is there is kept
+    if secret-tool lookup type codeium name api-key > /dev/null 2>&1; then
+        if [ -n "$(jq -r '.apiKey // empty' "${codeium_config}" 2>/dev/null)" ] && [ -s "${codeium_sublime_key}" ]; then
+            echo "Kept the API key of Codeium in ${codeium_config} and ${codeium_sublime_key}" 1>&2
+        elif ask "Restore the API key of Codeium of the keyring for its plugins of Vim and Sublime Text?"; then
+            run "${keyring_cli}" codeium-restore || failed+=("keyring-cli codeium-restore")
         fi
     fi
 

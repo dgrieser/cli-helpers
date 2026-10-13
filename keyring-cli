@@ -4,6 +4,12 @@ APP_NAME="$(basename "${0}")"
 
 SECRETS_SERVICE="org.freedesktop.secrets"
 SECRETS_PATH="/org/freedesktop/secrets"
+# the config of Codeium, where its Vim plugin reads and writes its API key
+# (apiKey): .codeium under XDG_DATA_HOME when set, else under HOME
+CODEIUM_CONFIG="${XDG_DATA_HOME:-${HOME}}/.codeium/config.json"
+# the file with only the API key, which its Sublime Text plugin reads, always
+# under HOME
+CODEIUM_SUBLIME_KEY="${HOME}/.codeium/sublime/codeium-api-key.txt"
 
 usage() {
     cat <<EOF 1>&2
@@ -47,6 +53,16 @@ Commands:
   ssh-config-restore [FILE]
                         Write the stored SSH client config to FILE (default:
                         ~/.ssh/config)
+  codeium-store [FILE]  Store the API key of Codeium of FILE: the config of
+                        its Vim plugin (default: ~/.codeium/config.json, under
+                        \$XDG_DATA_HOME when set) or the key file of its
+                        Sublime Text plugin (default when the config has no
+                        key: ~/.codeium/sublime/codeium-api-key.txt)
+  codeium-restore [FILE]
+                        Write the stored API key of Codeium into the config
+                        FILE of the Vim plugin, keeping the other settings in
+                        it; without FILE into the default config and key file
+                        of both plugins
 
 SOURCE and TARGET are a keyring name (e.g. old-login), its label, an alias
 (e.g. default) or its D-Bus object path. Locked keyrings are unlocked first,
@@ -56,21 +72,24 @@ SSH keys are stored as items with the attributes type=ssh-key, name=NAME and
 part=private or part=public, the SSH client config as type=ssh-config,
 name=config. Keep a passphrase on the key: any process of the
 session can read the items of an unlocked keyring. Network connections are
-stored as type=nm-connection, name=NAME and part=keyfile or part=file.
+stored as type=nm-connection, name=NAME and part=keyfile or part=file, the API
+key of Codeium as type=codeium, name=api-key.
 
 Options:
   -n, --dry-run         merge, import: Show what would be copied, without
                         writing
   -o, --overwrite       merge, import: Replace TARGET items with the same attributes
                         whose label or secret differs
-                        ssh-store, ssh-config-store, nm-store: Replace a stored
-                        SSH key, SSH config or connection with the same name
+                        ssh-store, ssh-config-store, nm-store, codeium-store:
+                        Replace a stored SSH key, SSH config, connection with
+                        the same name or API key of Codeium
                         ssh-restore, ssh-config-restore, nm-restore: Replace
                         existing files and connections
+                        codeium-restore: Replace another API key in the files
   -m, --match KEY=VALUE merge, import: Copy only the items with the attribute
                         KEY set to VALUE; repeat to require several attributes
-  -k, --keyring KEYRING ssh-store: Store into KEYRING (default: the default
-                        keyring)
+  -k, --keyring KEYRING ssh-store, ssh-config-store, codeium-store: Store into
+                        KEYRING (default: the default keyring)
   -h, --help            Show this help message and exit
 EOF
     exit 1
@@ -778,6 +797,106 @@ ssh_config_restore() {
     echo "Restored ${file}"
 }
 
+# codeium_lookup: print the stored API key of Codeium
+codeium_lookup() {
+    secret-tool lookup type codeium name api-key 2>/dev/null
+}
+
+# codeium_key FILE: print the API key of Codeium in FILE, the config of the Vim
+# plugin (apiKey) or the key file of the Sublime Text plugin (the bare key)
+codeium_key() {
+    local key
+    key="$(jq -er '.apiKey // empty' "${1}" 2>/dev/null)" && { echo "${key}"; return 0; }
+    key="$(cat "${1}" 2>/dev/null)" || return 1
+    [[ "${key}" =~ ^[^[:space:]{}]+$ ]] || return 1
+    echo "${key}"
+}
+
+# codeium_store [FILE]: without FILE the key of the Vim plugin, else the one of
+# the Sublime Text plugin
+codeium_store() {
+    local file="${1}" key
+    local -a keyring_option=()
+    if [ -z "${file}" ]; then
+        file="${CODEIUM_CONFIG}"
+        codeium_key "${file}" > /dev/null || [ ! -f "${CODEIUM_SUBLIME_KEY}" ] || file="${CODEIUM_SUBLIME_KEY}"
+    fi
+    [ -f "${file}" ] || fail "file not found: ${file}"
+    key="$(codeium_key "${file}")" || fail "no API key of Codeium in ${file}"
+    if [ -n "${keyring}" ]; then
+        keyring_path="$(resolve_collection "${keyring}")" || fail "keyring not found: ${keyring}"
+        keyring_option=( --collection="${keyring_path}" )
+    fi
+    if [ "$(codeium_lookup)" = "${key}" ]; then
+        echo "The API key of Codeium of ${file} is stored already"
+        return 0
+    fi
+    if codeium_lookup > /dev/null && [ "${overwrite}" -eq 0 ]; then
+        fail "another API key of Codeium is in the keyring (use --overwrite to replace)"
+    fi
+    printf '%s' "${key}" | secret-tool store "${keyring_option[@]}" --label="Codeium API key" \
+        type codeium name api-key || fail "cannot store the API key of Codeium of ${file}"
+    echo "Stored the API key of Codeium of ${file}"
+}
+
+# codeium_restore_config FILE: the API key of codeium_restore into the config
+# FILE of the Vim plugin, with the other settings in it kept; Vim reads it when
+# it starts
+codeium_restore_config() {
+    local file="${1}" config="{}" current
+    if [ -s "${file}" ]; then
+        config="$(jq -ce 'objects' "${file}" 2>/dev/null)" || { error "no JSON object: ${file}"; return 1; }
+        current="$(jq -r '.apiKey // empty' <<< "${config}")"
+        if [ "${current}" = "${key}" ]; then
+            echo "${file} has the stored API key of Codeium already"
+            return 0
+        fi
+        if [ -n "${current}" ] && [ "${overwrite}" -eq 0 ]; then
+            error "${file} has another API key of Codeium (use --overwrite to replace)"
+            return 1
+        fi
+    fi
+    config="$(jq -c --arg key "${key}" '.apiKey = $key' <<< "${config}")" || { error "cannot write ${file}"; return 1; }
+    mkdir -p "$(dirname "${file}")" || { error "cannot create directory: $(dirname "${file}")"; return 1; }
+    (umask 077 && printf '%s\n' "${config}" > "${file}") || { error "cannot write ${file}"; return 1; }
+    echo "Restored the API key of Codeium to ${file}"
+}
+
+# codeium_restore_key_file FILE: the API key of codeium_restore as the key file
+# of the Sublime Text plugin, which reads it whole when Sublime Text starts, so
+# without a newline
+codeium_restore_key_file() {
+    local file="${1}" current
+    if [ -s "${file}" ]; then
+        current="$(cat "${file}")"
+        if [ "${current}" = "${key}" ]; then
+            echo "${file} has the stored API key of Codeium already"
+            return 0
+        fi
+        if [ "${overwrite}" -eq 0 ]; then
+            error "${file} has another API key of Codeium (use --overwrite to replace)"
+            return 1
+        fi
+    fi
+    mkdir -p "$(dirname "${file}")" || { error "cannot create directory: $(dirname "${file}")"; return 1; }
+    (umask 077 && printf '%s' "${key}" > "${file}") || { error "cannot write ${file}"; return 1; }
+    echo "Restored the API key of Codeium to ${file}"
+}
+
+# codeium_restore [FILE]: the stored API key into FILE, the config of the Vim
+# plugin, or without FILE for both plugins
+codeium_restore() {
+    local key status=0
+    key="$(codeium_lookup)" && [ -n "${key}" ] || fail "no API key of Codeium in the keyring"
+    if [ -n "${1}" ]; then
+        codeium_restore_config "${1}"
+        return
+    fi
+    codeium_restore_config "${CODEIUM_CONFIG}" || status=1
+    codeium_restore_key_file "${CODEIUM_SUBLIME_KEY}" || status=1
+    return "${status}"
+}
+
 # ssh_list: secret-tool search prints the attributes to stderr
 ssh_list() {
     local name fingerprint
@@ -828,7 +947,7 @@ arguments=()
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         --bash-completion)
-            echo "list create merge import ssh-store ssh-list ssh-load ssh-restore ssh-config-store ssh-config-restore nm-store nm-list nm-restore -n --dry-run -o --overwrite -m --match -k --keyring -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
+            echo "list create merge import ssh-store ssh-list ssh-load ssh-restore ssh-config-store ssh-config-restore codeium-store codeium-restore nm-store nm-list nm-restore -n --dry-run -o --overwrite -m --match -k --keyring -h --help $(collection_paths 2>/dev/null | while read -r path; do collection_name "${path}"; echo; done)"
             exit 0
             ;;
         -h|--help)
@@ -866,7 +985,7 @@ while [ "${#}" -gt 0 ]; do
 done
 
 case "${command}" in
-    list|create|merge|import|ssh-store|ssh-list|ssh-load|ssh-restore|ssh-config-store|ssh-config-restore|nm-store|nm-list|nm-restore)
+    list|create|merge|import|ssh-store|ssh-list|ssh-load|ssh-restore|ssh-config-store|ssh-config-restore|codeium-store|codeium-restore|nm-store|nm-list|nm-restore)
         ;;
     "")
         usage
@@ -881,10 +1000,10 @@ if [ "${command}" != "merge" ] && [ "${command}" != "import" ] && [ "${dry_run}"
     usage
 fi
 case "${command}" in
-    merge|import|ssh-store|ssh-restore|ssh-config-store|ssh-config-restore|nm-store|nm-restore) ;;
+    merge|import|ssh-store|ssh-restore|ssh-config-store|ssh-config-restore|codeium-store|codeium-restore|nm-store|nm-restore) ;;
     *)
         if [ "${overwrite}" -eq 1 ]; then
-            error "--overwrite only applies to merge, import, ssh-store, ssh-restore, ssh-config-store, ssh-config-restore, nm-store and nm-restore"
+            error "--overwrite only applies to merge, import, ssh-store, ssh-restore, ssh-config-store, ssh-config-restore, codeium-store, codeium-restore, nm-store and nm-restore"
             usage
         fi
         ;;
@@ -895,15 +1014,20 @@ if [ "${command}" != "merge" ] && [ "${command}" != "import" ] && [ "${#matches[
 fi
 # the attributes of --match as JSON object, split at the first =
 match_json="$(jq -cn '[$ARGS.positional[] | {(.[:index("=")]): .[index("=") + 1:]}] | add // {}' --args "${matches[@]}")"
-if [ "${command}" != "ssh-store" ] && [ "${command}" != "ssh-config-store" ] && [ -n "${keyring}" ]; then
-    error "--keyring only applies to ssh-store and ssh-config-store"
-    usage
-fi
+case "${command}" in
+    ssh-store|ssh-config-store|codeium-store) ;;
+    *)
+        if [ -n "${keyring}" ]; then
+            error "--keyring only applies to ssh-store, ssh-config-store and codeium-store"
+            usage
+        fi
+        ;;
+esac
 case "${command}" in
     list|ssh-list|nm-list) minimum=0; maximum=0 ;;
     create|ssh-store|ssh-load|nm-store|nm-restore) minimum=1; maximum=1 ;;
     ssh-restore|import) minimum=1; maximum=2 ;;
-    ssh-config-store|ssh-config-restore) minimum=0; maximum=1 ;;
+    ssh-config-store|ssh-config-restore|codeium-store|codeium-restore) minimum=0; maximum=1 ;;
     merge) minimum=2; maximum=2 ;;
 esac
 if [ "${#arguments[@]}" -lt "${minimum}" ] || [ "${#arguments[@]}" -gt "${maximum}" ]; then
@@ -940,6 +1064,8 @@ case "${command}" in
     ssh-restore) ssh_restore_key "${arguments[0]}" "${arguments[1]}"; exit 0 ;;
     ssh-config-store) ssh_config_store "${arguments[0]}"; exit 0 ;;
     ssh-config-restore) ssh_config_restore "${arguments[0]}"; exit 0 ;;
+    codeium-store) codeium_store "${arguments[0]}"; exit 0 ;;
+    codeium-restore) codeium_restore "${arguments[0]}"; exit ;;
     nm-store) nm_store_connection "${arguments[0]}"; exit 0 ;;
     nm-list) nm_list; exit 0 ;;
     nm-restore) nm_restore_connection "${arguments[0]}"; exit 0 ;;

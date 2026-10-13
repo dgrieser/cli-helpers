@@ -17,9 +17,9 @@ To set up a new machine, clone the repo and run `./setup.sh` from a terminal as 
 attached drives and media (`setup-backup --find`), and you can also enter another folder or go without one. Every
 restore step then finds its part in that folder by the layout of `setup-backup` and skips a missing one; a file
 that is already on the machine is kept. It imports the old keyring files of the backup (`keyring-cli import`) and offers to restore the SSH
-keys, the SSH config and the network connections stored in the keyring (`keyring-cli ssh-restore`,
+keys, the SSH config, the network connections and the API key of Codeium stored in the keyring (`keyring-cli ssh-restore`,
 `keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
-Mittwald wifi and VPN), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
+Mittwald wifi and VPN, `keyring-cli codeium-restore` for its plugins of Vim and Sublime Text), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
 copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the OpenVPN plugin
 of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs the files of
 `lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
@@ -61,7 +61,7 @@ closed Sublime Text, so the session has the latest unsaved text), the profile of
 `~/.claude` with `~/.claude.json`, `~/.codex` and opencode's `~/.config/opencode` with `~/.local/share/opencode`, without
 their logins, caches and installed programs, and what only the git repos of `~/workspace` and `~/workspace.worktree` hold: uncommitted changes, stashes, branches no remote has and the worktrees). Without a folder it offers the attached drives and media (mounted under
 `/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
-config in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
+config and the API key of Codeium (of `~/.codeium/config.json` of its Vim plugin, else of `~/.codeium/sublime/codeium-api-key.txt` of its Sublime Text plugin) in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
 
 The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
@@ -2474,15 +2474,17 @@ cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
 ```
 
 ### `keyring-cli`
-Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, merges all items of one keyring into another with `secret-tool`, imports keyring files from a backup, and stores SSH keys and NetworkManager connections. Needs `secret-tool`, `busctl` and `jq`; `create`, `merge` and `import` also need PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), `import` also `python3-cryptography`: `secret-tool` cannot create a keyring, and it cannot store binary secrets (not UTF-8 or with NUL bytes, e.g. the app secrets of the xdg desktop portal). `updater secret-tool` installs all of them (`libsecret-tools`, `python3-gi`, `gir1.2-secret-1`, `python3-cryptography`; `jq` comes with `updater packages`).
+Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, merges all items of one keyring into another with `secret-tool`, imports keyring files from a backup, and stores SSH keys, NetworkManager connections and the API key of Codeium. Needs `secret-tool`, `busctl` and `jq`; `create`, `merge` and `import` also need PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), `import` also `python3-cryptography`: `secret-tool` cannot create a keyring, and it cannot store binary secrets (not UTF-8 or with NUL bytes, e.g. the app secrets of the xdg desktop portal). `updater secret-tool` installs all of them (`libsecret-tools`, `python3-gi`, `gir1.2-secret-1`, `python3-cryptography`; `jq` comes with `updater packages`).
 
 `merge` keeps label and attributes of each item. A target item with the same attributes is the same entry: it is kept, unless `--overwrite` is given and its label or secret differs. The source keyring is not changed. Locked keyrings are unlocked first through the keyring's unlock prompt, also with `--dry-run`. Items without attributes cannot be read by `secret-tool` and are skipped.
 
 `import` reads a gnome-keyring file, e.g. a backup of `~/.local/share/keyrings/login.keyring` from an old machine, and asks for its password in the terminal; a running gnome-keyring does not reliably load a keyring file copied into its folder. Its items go into the target keyring like with `merge`, binary secrets included.
 
-`nm-store` stores a NetworkManager connection (e.g. a wifi with 802.1x certificates or an OpenVPN connection) as its profile file, which holds its secrets and is read with `sudo`, plus every certificate and key file the profile names, with the attributes `type=nm-connection`, `name=NAME` and `part=keyfile|file`. `nm-restore` writes these files back (moved into the current `HOME` when the home of the user differs) and loads the profile from `/etc/NetworkManager/system-connections/NAME.nmconnection`. `setup.sh` imports a keyring backup early and then restores the stored SSH keys and network connections.
+`nm-store` stores a NetworkManager connection (e.g. a wifi with 802.1x certificates or an OpenVPN connection) as its profile file, which holds its secrets and is read with `sudo`, plus every certificate and key file the profile names, with the attributes `type=nm-connection`, `name=NAME` and `part=keyfile|file`. `nm-restore` writes these files back (moved into the current `HOME` when the home of the user differs) and loads the profile from `/etc/NetworkManager/system-connections/NAME.nmconnection`. `setup.sh` imports a keyring backup early and then restores the stored SSH keys, SSH config, network connections and API key of Codeium.
 
 `ssh-store` stores an SSH private key and its `.pub` file as two items with the attributes `type=ssh-key`, `name=<file name>` and `part=private|public`. `ssh-config-store` stores the SSH client config (`~/.ssh/config`, or what it links to) as one item with `type=ssh-config` and `name=config`, so it stays out of any repo; `ssh-config-restore` writes it back with mode `600` and replaces a symlink instead of writing through it. `ssh-load` pipes the key into `ssh-add -`, so the key is not written to disk. `ssh-restore` writes the key files back with mode `600` (private) and `644` (public). Keep a passphrase on the key: any process of the session can read the items of an unlocked keyring.
+
+`codeium-store` stores the API key of Codeium as one item with `type=codeium` and `name=api-key`: the `apiKey` of `~/.codeium/config.json` (or `$XDG_DATA_HOME/.codeium/config.json` when set), where its Vim plugin keeps it after `:Codeium Auth`, else the content of `~/.codeium/sublime/codeium-api-key.txt`, where its Sublime Text plugin keeps it after `Codeium: Sign In`; `FILE` may be either. Storing the same key again changes nothing. `codeium-restore` writes it back for both plugins with mode `600`: into the config of Vim, keeping the other settings in it, and as the key file of Sublime Text, which holds only the key without a newline. With `FILE` it only writes that config of Vim. Vim and Sublime Text read the key when they start.
 
 **Usage:** `keyring-cli COMMAND [OPTIONS]`
 
@@ -2501,10 +2503,12 @@ Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, c
 | `ssh-restore NAME [DIR]` | Write the stored SSH key `NAME` to `DIR/NAME` and `DIR/NAME.pub` (default `DIR`: `~/.ssh`). |
 | `ssh-config-store [FILE]` | Store the SSH client config `FILE` (default: `~/.ssh/config`). |
 | `ssh-config-restore [FILE]` | Write the stored SSH client config to `FILE` (default: `~/.ssh/config`). |
+| `codeium-store [FILE]` | Store the API key of Codeium of `FILE`, the config of its Vim plugin or the key file of its Sublime Text plugin (default: `~/.codeium/config.json`, else `~/.codeium/sublime/codeium-api-key.txt`). |
+| `codeium-restore [FILE]` | Write the stored API key of Codeium into the config `FILE` of its Vim plugin, keeping the other settings in it; without `FILE` into `~/.codeium/config.json` and `~/.codeium/sublime/codeium-api-key.txt`. |
 | `-n, --dry-run` | `merge`, `import`: show what would be copied, without writing. |
-| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `ssh-config-store`, `nm-store`: replace a stored SSH key, SSH config or connection with the same name. `ssh-restore`, `ssh-config-restore`, `nm-restore`: replace existing files and connections. |
+| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `ssh-config-store`, `nm-store`, `codeium-store`: replace a stored SSH key, SSH config, connection with the same name or API key of Codeium. `ssh-restore`, `ssh-config-restore`, `nm-restore`: replace existing files and connections. `codeium-restore`: replace another API key in the files. |
 | `-m, --match KEY=VALUE` | `merge`, `import`: copy only the items with the attribute `KEY` set to `VALUE`; repeat to require several attributes. E.g. `application=chrome` for the key of Chrome (`Chrome Safe Storage`), which encrypts its saved passwords and cookies. |
-| `-k, --keyring KEYRING` | `ssh-store`, `ssh-config-store`: store into `KEYRING` instead of the default keyring. |
+| `-k, --keyring KEYRING` | `ssh-store`, `ssh-config-store`, `codeium-store`: store into `KEYRING` instead of the default keyring. |
 | `-h, --help` | Show the usage message. |
 
 **Examples:**
@@ -2522,16 +2526,18 @@ keyring-cli ssh-store ~/.ssh/id_ed25519
 keyring-cli ssh-list
 keyring-cli ssh-load id_ed25519
 keyring-cli ssh-restore id_ed25519
+keyring-cli codeium-store /media/old/home/USER/.codeium/config.json
+keyring-cli codeium-restore
 ```
 
 ---
 
 ### `setup-backup`
-Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` in the keyring when the stored copy is missing or differs, since `setup.sh` restores the SSH config from there. The backup holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe.
+Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` and the API key of Codeium (`apiKey` of `~/.codeium/config.json`, else `~/.codeium/sublime/codeium-api-key.txt`) in the keyring when the stored copy is missing or differs, since `setup.sh` restores both from there. The backup holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe.
 
 | Folder | What | Where `setup.sh` asks for it |
 |---|---|---|
-| `keyrings/` | `~/.local/share/keyrings/*.keyring`, with the SSH keys, SSH config and network connections stored in them | "Keyring file or folder" |
+| `keyrings/` | `~/.local/share/keyrings/*.keyring`, with the SSH keys, SSH config, network connections and API key of Codeium stored in them | "Keyring file or folder" |
 | `reminder/` | `~/.cache/reminder`, modification times kept | "Reminder folder or archive" |
 | `history/` | `~/.bash_super_history`, `~/.kube_history` | dotfiles: "Path of a backup of ~/..." |
 | `Keys/` | the `Keys` folder of the documents folder (without editor swap files), plus the SSH keys `~/.ssh/config` names that are in neither it nor the keyring | dotfiles: copy it to `Documents/Keys` |

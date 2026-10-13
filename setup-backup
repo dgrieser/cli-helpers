@@ -9,8 +9,9 @@
 # memories and settings of Claude Code, Codex and opencode, and what only the
 # git repos of the workspace hold: uncommitted changes, stashes, local branches
 # and tags, and the worktrees of ~/workspace.worktree.
-# Before the keyring files are copied it offers to store the current SSH config in the keyring, so setup.sh
-# restores that one and not an older copy.
+# Before the keyring files are copied it offers to store the current SSH config
+# and the API key of Codeium in the keyring, so setup.sh restores those and not
+# older copies.
 
 APP_NAME="$(basename "${0}")"
 # the prompts and keyring-cli next to it, so it also runs from the repo before
@@ -22,6 +23,11 @@ REMINDER_DIR="${HOME}/.cache/reminder"
 # the history files of bash_aliases.d's install-home
 HISTORY_FILES=(.bash_super_history .kube_history)
 SSH_CONFIG="${HOME}/.ssh/config"
+# where the Vim plugin of Codeium keeps its API key (apiKey): .codeium under
+# XDG_DATA_HOME when set, else under HOME; its Sublime Text plugin keeps only
+# the key in a file of its own, always under HOME
+CODEIUM_CONFIG="${XDG_DATA_HOME:-${HOME}}/.codeium/config.json"
+CODEIUM_SUBLIME_KEY="${HOME}/.codeium/sublime/codeium-api-key.txt"
 HOME_BIN="${HOME}/bin"
 # the private scripts of ~/bin that are not in this public repo: setup.sh dials
 # the VPN with gen before the glab login, and .power runs ssh with the password
@@ -72,8 +78,9 @@ or asks for a folder when there are none. setup.sh asks once for that folder
 and finds every part in it by this layout:
 
   keyrings/     the keyring files of ${KEYRING_DIR} (with several, the
-                ones checked in a list), with the SSH keys, the SSH config and
-                the network connections stored in them
+                ones checked in a list), with the SSH keys, the SSH config,
+                the network connections and the API key of Codeium stored in
+                them
   reminder/     the reminders of ${REMINDER_DIR}
   history/      ${HISTORY_FILES[*]}
   Keys/         the Keys folder of the documents folder, plus the SSH keys
@@ -146,6 +153,29 @@ store_ssh_config() {
     fi
     ask "Store ${SSH_CONFIG} in the keyring (keyring-cli ssh-config-store)?" || return 0
     "${BIN_DIR}/keyring-cli" ssh-config-store --overwrite "${SSH_CONFIG}" || failed+=("keyring-cli ssh-config-store")
+}
+
+# the API key of Codeium in the keyring is what setup.sh restores for both
+# plugins, like the SSH config, so a missing or outdated one is offered to be
+# stored: the one of the Vim plugin, else the one of the Sublime Text plugin
+store_codeium_key() {
+    local file="${CODEIUM_CONFIG}" key stored
+    command -v secret-tool > /dev/null 2>&1 && command -v jq > /dev/null 2>&1 || return 0
+    key="$(jq -r '.apiKey // empty' "${file}" 2>/dev/null)"
+    if [ -z "${key}" ] && [ -s "${CODEIUM_SUBLIME_KEY}" ]; then
+        file="${CODEIUM_SUBLIME_KEY}"
+        key="$(cat "${file}")"
+    fi
+    [ -n "${key}" ] || return 0
+    stored="$(secret-tool lookup type codeium name api-key 2>/dev/null)"
+    [ "${stored}" = "${key}" ] && return 0
+    if [ -z "${stored}" ]; then
+        info "The API key of Codeium is not stored in the keyring"
+    else
+        info "The API key of Codeium in the keyring differs from the one of ${file}"
+    fi
+    ask "Store the API key of Codeium of ${file} in the keyring (keyring-cli codeium-store)?" || return 0
+    "${BIN_DIR}/keyring-cli" codeium-store --overwrite "${file}" || failed+=("keyring-cli codeium-store")
 }
 
 # the keyring files to back up into keyring_files: with several and a
@@ -603,6 +633,7 @@ folder="${folder/#\~/${HOME}}"
 [ -d "${folder}" ] || fail "No such folder: ${folder}"
 
 [ -t 0 ] && store_ssh_config
+[ -t 0 ] && store_codeium_key
 # Sublime Text writes its session (and the unsaved text) only now and then and
 # when it closes, so a running one may have newer text than the session file
 if [ -d "${SUBLIME_DIR}" ] && pgrep -x sublime_text > /dev/null 2>&1; then
