@@ -12,12 +12,16 @@ So the folder is never upgraded in place:
 - pip resolves the union in a dry run; when that differs from what is installed,
   or the folder was built for another python version, all pinned versions are
   installed into a fresh folder, which then replaces the old one
+- a package apt already has is left out: the apt one comes first on sys.path,
+  so a copy in the folder would never be imported, only its metadata found, e.g.
+  the pytest plugin of a newer platformdirs, which pytest then failed to import
 - the commands of the packages are linked into the bin dir, replacing only
   links into the folder or dangling ones, so a command of the same name from
   elsewhere wins
 - a requirement that apt shadows with an unsuitable version is reported
 """
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -125,8 +129,26 @@ def describe(entry):
     return version
 
 
-def resolve(packages):
-    """Return {name: (display name, version, direct ref)} pip would install for the packages."""
+def imported_first(target, pth):
+    """Return the names of the packages on sys.path before the folder, the apt ones."""
+    # the folder comes right after the folder of its .pth file
+    site_dir = os.path.dirname(os.path.abspath(pth))
+    if site_dir in sys.path:
+        paths = sys.path[:sys.path.index(site_dir) + 1]
+    else:
+        paths = [path for path in sys.path if os.path.abspath(path) != target]
+    names = set()
+    for dist in importlib.metadata.distributions(path=paths):
+        # e.g. Debian's stubs in /usr/lib/python3.X/dist-packages carry no metadata
+        name = dist.metadata.get("Name")
+        if name:
+            names.add(canonical(name))
+    return names
+
+
+def resolve(packages, provided):
+    """Return {name: (display name, version, direct ref)} pip would install for the packages,
+    without the ones in provided."""
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "report.json")
         # --target also skips the externally-managed check, nothing is written
@@ -139,8 +161,13 @@ def resolve(packages):
     resolved = {}
     for item in data.get("install", []):
         metadata = item["metadata"]
+        key = canonical(metadata["name"])
+        if key in provided:
+            if item.get("requested"):
+                log(f"{metadata['name']} is not installed, apt has it")
+            continue
         ref = direct_ref(item.get("download_info", {})) if item.get("is_direct") else None
-        resolved[canonical(metadata["name"])] = (metadata["name"], metadata["version"], ref)
+        resolved[key] = (metadata["name"], metadata["version"], ref)
     return resolved
 
 
@@ -273,7 +300,7 @@ def main():
     manifests[args.name] = args.packages
     requested = sorted({package for packages in manifests.values() for package in packages})
 
-    wanted = resolve(requested) if requested else {}
+    wanted = resolve(requested, imported_first(target, args.pth)) if requested else {}
     current = installed(target)
     stale = bool(current) and built_for(target) != PYTHON_VERSION
     changed = stale or current != wanted
