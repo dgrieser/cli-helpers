@@ -10,6 +10,34 @@ else
     . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-clipboard"
 fi
 
+# the ages are colored the way agent-session colors them: green and italic below
+# an hour, faded after that
+C_AGE_SHORT=$'\033[38;5;40;3m'
+C_AGE_LONG=$'\033[38;5;245m'
+C_SIZE=$'\033[38;5;242m'
+C_RESET=$'\033[0m'
+# the color of each type of text that format_entries detects; related types
+# share one, and plain text keeps the color of the terminal
+declare -A type_colors=(
+    [secret]=$'\033[38;5;160;1m'
+    [diff]=$'\033[38;5;204m'
+    [url]=$'\033[38;5;39m'
+    [path]=$'\033[38;5;75m'
+    [uuid]=$'\033[38;5;172m'
+    [hash]=$'\033[38;5;172m'
+    [semver]=$'\033[38;5;213m'
+    [num]=$'\033[38;5;213m'
+    [json]=$'\033[38;5;222m'
+    [yaml]=$'\033[38;5;186m'
+    [xml]=$'\033[38;5;180m'
+    [html]=$'\033[38;5;180m'
+    [md]=$'\033[38;5;141m'
+    [tsv]=$'\033[38;5;79m'
+    [csv]=$'\033[38;5;79m'
+    [shell]=$'\033[38;5;42m'
+    [code]=$'\033[38;5;152m'
+)
+
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [COMMAND] [OPTIONS]
@@ -20,7 +48,7 @@ clipboard. Secrets (clip --secret, clip-secret) are never recorded.
 
 Commands:
   select [QUERY]        Pick an entry with fzf and copy it (default)
-  list                  List the entries, newest first: index, age, size, text
+  list                  List the entries, newest first: index, age, size, type, text
   show ENTRY            Print an entry
   restore ENTRY         Copy an entry into the clipboard again
   delete ENTRY...       Remove entries
@@ -31,10 +59,15 @@ Commands:
 
 ENTRY is an index of list (0 is the newest) or the start of an entry's hash.
 
+The type of an entry is guessed from its first lines: secret, diff, url, path,
+uuid, hash, semver, num, json, xml, html, md, yaml, tsv, csv, shell, code, or
+text. Each type has its own color, and the preview of select renders md with
+glow, highlights code and pretty-prints json. Search a type with ^TYPE.
+
 Options:
   -p, --print           select: print the entry instead of copying it
   -n, --limit N         list: only the newest N entries
-  --raw                 list: tab separated hash, mtime, bytes, age, size, text
+  --raw                 list: tab separated hash, mtime, bytes, age, size, type, text
   -y, --yes             clear: do not ask first
   -h, --help            Show this help message and exit
 
@@ -97,50 +130,327 @@ resolve_entry() {
     echo "${hash}"
 }
 
-# prints the entries as "<mtime> <size> <hash>" lines on stdin describe them,
-# as a list for people or tab separated (--raw)
+# the awk program of format_entries; it is kept here and not inline, because its
+# patterns need single quotes
+read -r -d '' FORMAT_ENTRIES_AWK <<'AWK'
+function trim(s) {
+    sub(/^[ \t]+/, "", s)
+    sub(/[ \t]+$/, "", s)
+    return s
+}
+
+function size(bytes) {
+    if (bytes < 1024) return bytes "B"
+    if (bytes < 1048576) return sprintf("%.1fK", bytes / 1024)
+    return sprintf("%.1fM", bytes / 1048576)
+}
+
+function paint(color, s) {
+    return (colors && color != "") ? color s reset : s
+}
+
+# S followed by as many spaces as make it WIDTH wide, its colors not counted
+function pad(s, width,   plain) {
+    plain = s
+    gsub(/\033\[[0-9;]*m/, "", plain)
+    return s sprintf("%" (length(plain) < width ? width - length(plain) : 0) "s", "")
+}
+
+# whether every scanned line is matched by the pattern PATTERN
+function every(count, pattern,   i) {
+    for (i = 1; i <= count; i++)
+        if (trim(T[i]) !~ pattern)
+            return 0
+    return 1
+}
+
+# whether the line S holds what looks like a credential: a private key, a token
+# of a known service, a bearer token, or a value assigned to a key named like one
+function secret_line(s,   value) {
+    if (s ~ /-----BEGIN [A-Z ]*PRIVATE KEY-----/)
+        return 1
+    if (s ~ /(^|[^A-Za-z0-9_-])(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.)/)
+        return 1
+    if (s ~ /[Bb]earer [A-Za-z0-9._~+\/-]{20,}/)
+        return 1
+    if (match(tolower(s), /(password|passwd|secret|token|api[_-]?key)["']?[ \t]*[:=][ \t]*["']?[a-z0-9+\/=_.!@#%^&*-]{8,}/)) {
+        value = substr(s, RSTART, RLENGTH)
+        sub(/^[^:=]*[:=][ \t]*["']?/, "", value)
+        return value ~ /[0-9]/ && value ~ /[A-Za-z]/
+    }
+    return 0
+}
+
+# whether the single word S looks like a password or a key: all kinds of
+# characters, and either a sign among them that names do not have, or long and
+# random the way base64 is, without the runs of lower-case letters of a name
+function secret_token(s,   copy, digits, uppers, lowers) {
+    if (s ~ /[ \t]/ || s ~ /:\/\// || s ~ /^[~.\/]/ || length(s) < 10 || length(s) > 128)
+        return 0
+    if (s !~ /[a-z]/ || s !~ /[A-Z]/ || s !~ /[0-9]/)
+        return 0
+    if (s ~ /^[^@ ]+@[A-Za-z0-9.-]+\.[A-Za-z]+$/)
+        return 0
+    if (s ~ /[!#$%&*+:;<=>?@^|~,\[\]{}]/ && s !~ /\(.*\)/)
+        return 1
+    if (length(s) < 24 || s !~ /^[A-Za-z0-9+\/=_-]+$/ || s ~ /[a-z]{7}/)
+        return 0
+    copy = s; digits = gsub(/[0-9]/, "", copy)
+    copy = s; uppers = gsub(/[A-Z]/, "", copy)
+    copy = s; lowers = gsub(/[a-z]/, "", copy)
+    return digits >= 2 && uppers >= 2 && lowers >= 2
+}
+
+# the type of the entry whose first lines are L[1..n]; eof tells whether that is
+# all of it. The first type that fits wins, so the narrow ones come first and
+# code, the loosest, last.
+function detect(   i, j, m, t, first, single, low, word, rest, words, copy, count, parts, separator, ok, keys, score, fence, h1, h2, tables, items, quote, link, bold, span, emphasis, code) {
+    split("", T)
+    m = 0
+    for (i = 1; i <= n; i++)
+        if (L[i] ~ /[^ \t]/)
+            T[++m] = L[i]
+    if (m == 0)
+        return "text"
+    first = trim(T[1])
+    single = eof && m == 1
+    low = tolower(first)
+
+    for (i = 1; i <= m; i++)
+        if (secret_line(T[i]))
+            return "secret"
+    if (single && secret_token(first))
+        return "secret"
+
+    if (T[1] ~ /^#![^ \t]*\/(env[ \t]+)?(ba|z|k|da|fi)?sh([ \t]|$)/)
+        return "shell"
+    if (T[1] ~ /^(diff |Index: |@@ -[0-9]|From [0-9a-f]+ )/ || (m > 1 && T[1] ~ /^--- / && T[2] ~ /^\+\+\+ /))
+        return "diff"
+    if (every(m, "^([A-Za-z][A-Za-z0-9+.-]*://|mailto:)[^ \t]+$"))
+        return "url"
+    if (every(m, "^((~|\\.|\\.\\.)?/[^ \t]*|~)$"))
+        return "path"
+
+    if (single) {
+        if (first ~ /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)
+            return "uuid"
+        if (((first ~ /^[0-9a-f]+$/ || first ~ /^[0-9A-F]+$/) && length(first) >= 7 && first ~ /[0-9]/ && first ~ /[a-fA-F]/) \
+            || first ~ /^(sha1|sha256|sha512|md5):[0-9a-f]+$/)
+            return "hash"
+        if (first ~ /^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/)
+            return "semver"
+        if (first ~ /^[-+]?([0-9]+([.,][0-9]+)?|[0-9]+([,.' ][0-9][0-9][0-9])+([.,][0-9]+)?)([eE][-+]?[0-9]+)?%?$/ \
+            || first ~ /^0x[0-9a-fA-F]+$/)
+            return "num"
+    }
+
+    # an opening bracket alone on its line is the start of a block of code just
+    # as well, so then the line after it decides
+    if (first ~ /^\{[ \t]*("|\}|$)/ \
+        || first ~ /^\[[ \t]*("|\{|\[|\]|$|(-?[0-9][0-9.eE+-]*|true|false|null)[ \t]*(,|\]|$))/)
+        if (first !~ /^[\[{][ \t]*$/ || m == 1 || T[2] ~ /^[ \t]*("|\{|\[|\]|\}|-?[0-9]|true|false|null)/)
+            return "json"
+
+    if (low ~ /^<!doctype html/ \
+        || low ~ /^<(html|head|body|div|span|p|a|b|i|table|tr|td|ul|ol|li|br|hr|img|script|style|meta|link|h[1-6]|section|article|nav|header|footer|main|form|input|button|iframe|svg)([ \t>\/]|$)/)
+        return "html"
+    if (first ~ /^<(\?xml|!DOCTYPE|!--|[A-Za-z][A-Za-z0-9:_.-]*([ \t>\/]|$))/)
+        return "xml"
+
+    # Markdown by points: fences, sub-headings and tables count twice, any other
+    # mark once, and two points make Markdown, so that a single "# comment" or a
+    # word in backticks alone does not
+    fence = h1 = h2 = tables = items = quote = link = bold = span = emphasis = 0
+    for (i = 1; i <= m; i++) {
+        t = T[i]
+        if (t ~ /^(```|~~~)/) fence = 1
+        if (t ~ /^##+ [^ ]/) h2 = 1
+        else if (t ~ /^# [^ ]/) h1 = 1
+        if (t ~ /^[ \t]*\|.*\|[ \t]*$/) tables++
+        if (t ~ /^[ \t]*([-*+]|[0-9]+[.)])[ \t]+[^ \t]/) items++
+        if (t ~ /^>[ \t]?[^ \t]/) quote = 1
+        if (t ~ /\[[^]]+\]\([^) \t]+\)/) link = 1
+        if (t ~ /(^|[ (])(\*\*|__)[^ *_](.*[^ *_])?(\*\*|__)([ .,;:!?)]|$)/) bold = 1
+        if (t ~ /`[^`]+`/) span = 1
+        if (t ~ /(^|[ (])[*_][^ *_]([^*_]*[^ *_])?[*_]([ .,;:!?)]|$)/) emphasis = 1
+    }
+    score = 2 * fence + 2 * h2 + h1 + 2 * (tables >= 2) + (items >= 2) + quote + link + bold + span + emphasis
+    if (score >= 2)
+        return "md"
+
+    if (m > 1 && (first ~ /^(---|#)/ || first ~ /^(- )?["']?[A-Za-z0-9_.\/-]+["']?:([ \t]|$)/)) {
+        keys = 0
+        for (i = 1; i <= m; i++) {
+            t = T[i]
+            if (t ~ /^[ \t]*#/ || t ~ /^(---|\.\.\.)[ \t]*$/)
+                continue
+            if (t ~ /^[ \t]*(- )?["']?[A-Za-z0-9_.\/-]+["']?:([ \t]|$)/)
+                keys++
+            else if (t !~ /^[ \t]*- / && t !~ /^[ \t]+[^ \t]/)
+                break
+        }
+        if (i > m && keys > 0)
+            return "yaml"
+    }
+
+    if (m > 1) {
+        copy = T[1]
+        count = gsub(/\t/, "", copy)
+        for (i = 2; i <= m; i++) {
+            copy = T[i]
+            if (gsub(/\t/, "", copy) != count)
+                break
+        }
+        if (count > 0 && i > m)
+            return "tsv"
+    }
+
+    # a header row of names, no sentence and no code, and as many separators in
+    # every row as in the header
+    if (m > 1 && T[1] !~ /[(){}=<>]/ && first !~ /[.!?]$/) {
+        for (j = 1; j <= 2; j++) {
+            separator = j == 1 ? "," : ";"
+            count = split(T[1], parts, separator)
+            ok = count > 1
+            for (i = 1; i <= count && ok; i++)
+                if (trim(parts[i]) == "")
+                    ok = 0
+            for (i = 2; i <= m && ok; i++)
+                if (split(T[i], parts, separator) != count)
+                    ok = 0
+            if (ok)
+                return "csv"
+        }
+    }
+
+    # the first line that is no comment, starting with a command: a command
+    # that is no word of English as well needs no more, the others need signs
+    # of a command line after them, like an option, a pipe or a path
+    for (i = 1; i <= m && T[i] ~ /^[ \t]*#/; i++)
+        ;
+    if (i <= m) {
+        t = trim(T[i])
+        if (t ~ /^(\$|sudo)[ \t]/)
+            return "shell"
+        word = t
+        sub(/[ \t].*/, "", word)
+        rest = substr(t, length(word) + 1)
+        sub(/\.$/, "", rest)
+        if ((word in commands && split(t, words, /[ \t]+/) <= 2) \
+            || ((word in commands || word in command_words) && rest ~ /[-|&>$\/~=.:@]/))
+            return "shell"
+    }
+
+    code = 0
+    for (i = 1; i <= m; i++) {
+        t = trim(T[i])
+        if (t ~ /[;{}]$/ || t ~ /\)[ \t]*(:|\{|=>)$/ \
+            || t ~ /^(if|elif|else|for|foreach|while|switch|catch)[ \t]*[({:]/ \
+            || (t ~ /^(def|class|function|func|fn|import|from|package|namespace|use|public|private|protected|static|const|let|var|return|struct|enum|interface|impl|async)[ \t]/ && t ~ /[(){}=;:<>\[\]]/) \
+            || t ~ /^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|WITH)[ \t]/ \
+            || t ~ /^(#include|#define|<\?php|@[A-Za-z]+(\(|$)|\/\/ |\/\*)/ \
+            || t ~ /(=>|->|::|!=|==|&&|\|\||\+=)/ \
+            || t ~ /^[A-Za-z_$][A-Za-z0-9_$.]*\(.*\)$/)
+            code++
+    }
+    if (code > 0 && code * 3 >= m)
+        return "code"
+    return "text"
+}
+
+BEGIN {
+    count = split(palette, pairs, " ")
+    for (i = 1; i <= count; i++) {
+        split(pairs[i], pair, "=")
+        color[pair[1]] = pair[2]
+    }
+    split("git gh glab docker podman kubectl helm ssh scp sftp rsync curl wget apt apt-get dpkg snap flatpak systemctl journalctl npm npx yarn pnpm pip pip3 cargo terraform ansible ansible-playbook sudo chmod chown mkdir rmdir tar unzip pkill htop jq yq xargs dig nslookup openssl gpg composer brew mw clip clip-history", words, " ")
+    for (i in words)
+        commands[words[i]] = 1
+    split("cd ls cat less grep rg find sed awk echo printf export source rm cp mv ln zip ps kill top df du mount umount tail head watch env ping host make go node python python3 php vim nano code ip nc", words, " ")
+    for (i in words)
+        command_words[words[i]] = 1
+}
+
+{
+    file = dir "/" $4
+    # enough lines to tell the type, and as many as fill the line of the entry,
+    # joined by a sign for the line break; control characters (tabs, escape
+    # sequences) would garble the list
+    split("", L)
+    n = 0
+    text = ""
+    lines = 0
+    while ((more = (getline line < file)) > 0) {
+        line = substr(line, 1, 4096)
+        sub(/\r$/, "", line)
+        L[++n] = line
+        if (length(text) <= width) {
+            gsub(/[[:cntrl:]]/, " ", line)
+            text = (lines++ ? text "↵" : "") line
+        }
+        if (n >= 40 && length(text) > width)
+            break
+    }
+    eof = more <= 0
+    close(file)
+    if (length(text) > width)
+        text = substr(text, 1, width - 1) "…"
+    type = detect()
+
+    if (format == "raw") {
+        printf "%s\t%d\t%d\t%s\t%s\t%s\t%s\n", $4, $2, $3, $1, size($3), type, text
+        next
+    }
+    cells = pad($1, 5) "  " paint(size_color, sprintf("%5s", size($3))) \
+        "  " paint(type in color ? color[type] : size_color, sprintf("%-6s", type)) \
+        "  " paint(type in color ? color[type] : "", text)
+    if (format == "fzf")
+        printf "%s\t%s\t%s\n", $4, type, cells
+    else
+        printf "%-4d %s\n", NR - 1, cells
+}
+AWK
+
+# prints the entries described by the "<mtime> <size> <hash>" lines on stdin in
+# the format of ${format}: a list for people, colored on a terminal (list), tab
+# separated (raw), or the lines of select, which lead with the hash and the type
+# for the picker to keep hidden, and are colored
 format_entries() {
     local dir="${1}"
     local width=200
+    local colors=0
+    local age_colors=()
+    local palette=""
+    local entries
+    local type
     local now
 
-    if [ "${raw}" -eq 0 ] && [ -t 1 ]; then
-        width="$(( $(tput cols 2>/dev/null || echo 120) - 22 ))"
+    entries="$(cat)"
+    [ -n "${entries}" ] || return 0
+    if [ "${format}" = "fzf" ] || { [ "${format}" = "list" ] && [ -t 1 ]; }; then
+        colors=1
+        age_colors=(--color "1h=${C_AGE_SHORT}" --color "${C_AGE_LONG}")
+        for type in "${!type_colors[@]}"; do
+            palette+="${type}=${type_colors[${type}]} "
+        done
+    fi
+    if [ "${format}" = "list" ] && [ -t 1 ]; then
+        width="$(( $(tput cols 2>/dev/null || echo 120) - 27 ))"
         [ "${width}" -lt 20 ] && width=20
     fi
     printf -v now '%(%s)T' -1
-    awk -v dir="${dir}" -v now="${now}" -v width="${width}" -v raw="${raw}" '
-        function age(seconds) {
-            if (seconds < 60) return int(seconds) "s"
-            if (seconds < 3600) return int(seconds / 60) "m"
-            if (seconds < 86400) return int(seconds / 3600) "h"
-            if (seconds < 604800) return int(seconds / 86400) "d"
-            return int(seconds / 604800) "w"
-        }
-        function size(bytes) {
-            if (bytes < 1024) return bytes "B"
-            if (bytes < 1048576) return sprintf("%.1fK", bytes / 1024)
-            return sprintf("%.1fM", bytes / 1048576)
-        }
-        {
-            file = dir "/" $3
-            # only as many lines as fill the line of the entry, joined by a
-            # sign for the line break; control characters (tabs, escape
-            # sequences) would garble the list
-            text = ""
-            lines = 0
-            while (length(text) <= width && (getline line < file) > 0) {
-                gsub(/[[:cntrl:]]/, " ", line)
-                text = (lines++ ? text "↵" : "") line
-            }
-            close(file)
-            if (length(text) > width)
-                text = substr(text, 1, width - 1) "…"
-            if (raw)
-                printf "%s\t%d\t%d\t%s\t%s\t%s\n", $3, $1, $2, age(now - $1), size($2), text
-            else
-                printf "%-4d %4s %7s  %s\n", NR - 1, age(now - $1), size($2), text
-        }'
+    # all ages from one toage call and against one reference point, with the
+    # precision of agent-session: seconds only below a minute, minutes below two
+    # hours, hours below two days
+    cut -d' ' -f1 <<< "${entries}" \
+        | toage --lines --units wdhms --min 1s \
+              --drop-seconds 1m --drop-minutes 2h --drop-hours 2d \
+              "${age_colors[@]}" --now "${now}" \
+        | paste -d' ' - <(printf '%s\n' "${entries}") \
+        | awk -v dir="${dir}" -v width="${width}" -v format="${format}" -v colors="${colors}" \
+              -v palette="${palette}" -v size_color="${C_SIZE}" -v reset="${C_RESET}" \
+              "${FORMAT_ENTRIES_AWK}"
 }
 
 list_entries() {
@@ -239,18 +549,21 @@ select_entry() {
     cli_helpers_require_command fzf || exit 1
     [ -n "$(cli_helpers_clip_history_list | head -n 1)" ] || fail "The clipboard history is empty"
     printf -v script '%q' "${SCRIPT_PATH}"
-    # the hash leads each line, hidden; only the text is searched
-    selection="$(raw=1 list_entries | fzf \
-        --delimiter $'\t' \
-        --with-nth 4.. \
+    # the hash and the type lead each line, hidden, separated by tabs; the
+    # columns after them are separated by runs of spaces, which a tab would
+    # stretch to the next tab stop. Only the type and the text are searched.
+    selection="$(format=fzf list_entries | fzf \
+        --ansi \
+        --delimiter '\t| {2,}' \
+        --with-nth 3.. \
         --nth 3.. \
         --no-sort \
         --query "${query}" \
         --expect alt-enter \
         --header 'enter: copy, alt-enter: print, ctrl-d: delete, esc: exit' \
-        --preview "${script} show {1}" \
+        --preview "${script} --fzf-preview {1} {2}" \
         --preview-window 'down,50%,wrap' \
-        --bind "ctrl-d:execute-silent(${script} delete {1})+reload(${script} list --raw)" \
+        --bind "ctrl-d:execute-silent(${script} delete {1})+reload(${script} --fzf-list)" \
         --color "bg+:${COLOR_SELECTION_BACKGROUND:-238},header:${COLOR_TABLE_HEADER:-238}:italic")" || abort
     { read -r key; IFS= read -r line; } <<< "${selection}"
     hash="${line%%$'\t'*}"
@@ -259,6 +572,117 @@ select_entry() {
         cat "$(history_dir)/${hash}"
     else
         restore_hash "${hash}"
+    fi
+}
+
+# renders the Markdown on stdin for the preview of select, with the colors glow
+# leaves out when it writes into a pipe
+render_markdown() {
+    COLORTERM=truecolor CLICOLOR_FORCE=1 \
+        glow --style "${GLOW_STYLE:-dark}" --width "${FZF_PREVIEW_COLUMNS:-80}" 2>/dev/null
+}
+
+# render_code LANGUAGE FILE: renders FILE as a code block that glow highlights as
+# LANGUAGE; the fence is longer than any run of backticks in the text
+render_code() {
+    local language="${1}"
+    local file="${2}"
+    local fence='```'
+
+    while grep -qF -- "${fence}" "${file}"; do
+        fence+='`'
+    done
+    {
+        printf '%s%s\n' "${fence}" "${language}"
+        cat "${file}"
+        [ -n "$(tail -c 1 "${file}")" ] && echo
+        printf '%s\n' "${fence}"
+    } | render_markdown
+}
+
+# guess_language FILE: prints the language of the code in FILE, guessed from its
+# first lines, or nothing
+guess_language() {
+    local head
+
+    head="$(grep -m 5 -v '^[[:space:]]*$' "${1}")"
+    if grep -qE '^<\?php' <<< "${head}"; then
+        echo php
+    elif grep -qE '^(def |class [A-Za-z_]+(\(.*\))?:|from [A-Za-z_.]+ import |import [A-Za-z_.]+$)' <<< "${head}"; then
+        echo python
+    elif grep -qE '^(package [a-z]|func )' <<< "${head}"; then
+        echo go
+    elif grep -qiE '^(select|insert|update|delete|create|alter|with) ' <<< "${head}"; then
+        echo sql
+    elif grep -qE '^(fn |use [a-z_]+::|impl |let mut )' <<< "${head}"; then
+        echo rust
+    elif grep -qE '^#include' <<< "${head}"; then
+        echo c
+    elif grep -qE '^(public|private|protected) ' <<< "${head}"; then
+        echo java
+    elif grep -qE '^(const|let|var|function|import|export) ' <<< "${head}"; then
+        echo javascript
+    fi
+}
+
+# fzf_preview HASH TYPE: prints the entry HASH for the preview of select, the way
+# its TYPE reads best; whatever a renderer cannot handle is printed as it is
+fzf_preview() {
+    local hash="${1}"
+    local type="${2}"
+    local file
+    local output
+    local separator
+    local path
+
+    cli_helpers_clip_history_has "${hash}" || exit 0
+    file="$(history_dir)/${hash}" || exit 1
+    # the output is only printed once it is complete, so that a renderer that
+    # fails halfway does not leave half of the text ahead of all of it
+    case "${type}" in
+        md)
+            # glow prints a bare URL twice, as the text of its link and as its
+            # target; a zero-width space after the scheme keeps the URL from
+            # becoming a link, and does not show
+            command -v glow >/dev/null 2>&1 && output="$(
+                sed -E "s#(^|[[:space:]])([A-Za-z][A-Za-z0-9+.-]*)://#\\1\\2"$'\xe2\x80\x8b'"://#g" "${file}" \
+                    | render_markdown)"
+            ;;
+        yaml | xml | html | diff | shell | code)
+            if command -v glow >/dev/null 2>&1; then
+                case "${type}" in
+                    shell) output="$(render_code bash "${file}")" ;;
+                    code) output="$(render_code "$(guess_language "${file}")" "${file}")" ;;
+                    *) output="$(render_code "${type}" "${file}")" ;;
+                esac
+            fi
+            ;;
+        json)
+            output="$(jq -C . "${file}" 2>/dev/null)" || output=""
+            ;;
+        tsv | csv)
+            separator=$'\t'
+            if [ "${type}" = "csv" ]; then
+                separator=","
+                head -n 1 "${file}" | grep -q ',' || separator=";"
+            fi
+            output="$(column -t -s "${separator}" -o '  │  ' < "${file}" 2>/dev/null)" || output=""
+            ;;
+        secret)
+            printf '%sThis looks like a secret, ctrl-d removes it%s\n\n' "${type_colors[secret]}" "${C_RESET}"
+            ;;
+        path)
+            IFS= read -r path < "${file}"
+            [[ "${path}" =~ ^~(/|$) ]] && path="${HOME}${path:1}"
+            if [ "$(wc -l < "${file}")" -le 1 ] && [ -e "${path}" ]; then
+                output="$(cat "${file}"; echo; ls -la --color=always -- "${path}" 2>&1)"
+            fi
+            ;;
+    esac
+    if [ -n "${output}" ]; then
+        printf '%s\n' "${output}"
+    else
+        cat "${file}"
     fi
 }
 
@@ -271,7 +695,7 @@ command=""
 arguments=()
 print=0
 yes=0
-raw=0
+format="list"
 limit=""
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -292,7 +716,17 @@ while [ "${#}" -gt 0 ]; do
             limit="${1}"
             ;;
         --raw)
-            raw=1
+            format="raw"
+            ;;
+        # the parts of select that fzf calls back
+        --fzf-list)
+            command="${1}"
+            ;;
+        --fzf-preview)
+            [ "${#}" -ge 3 ] || fail "Missing arguments for --fzf-preview"
+            command="${1}"
+            arguments=("${2}" "${3}")
+            shift 2
             ;;
         -y|--yes)
             yes=1
@@ -319,7 +753,7 @@ done
 
 [ -z "${command}" ] && command="select"
 [ "${print}" -eq 1 ] && [ "${command}" != "select" ] && fail "--print only works with select"
-{ [ -n "${limit}" ] || [ "${raw}" -eq 1 ]; } && [ "${command}" != "list" ] && fail "--limit and --raw only work with list"
+{ [ -n "${limit}" ] || [ "${format}" = "raw" ]; } && [ "${command}" != "list" ] && fail "--limit and --raw only work with list"
 [ "${yes}" -eq 1 ] && [ "${command}" != "clear" ] && fail "--yes only works with clear"
 
 case "${command}" in
@@ -357,6 +791,12 @@ case "${command}" in
     path)
         [ "${#arguments[@]}" -eq 0 ] || usage
         history_dir
+        ;;
+    --fzf-list)
+        format=fzf list_entries
+        ;;
+    --fzf-preview)
+        fzf_preview "${arguments[@]}"
         ;;
     *)
         error "Unknown command: ${command}"

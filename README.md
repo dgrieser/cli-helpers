@@ -456,17 +456,36 @@ Keeps a history of copied text and puts entries back into the clipboard, by comm
 
 The history is one file per text in `~/.local/share/cli-helpers/clip-history` (or `CLIP_HISTORY_DIR`), named after the text's sha1. The folder is `0700` and the files are `0600`. The same text copied again only moves to the top, and there is no limit on the number of entries. Text that is only whitespace is not recorded.
 
+The picker and `list` (on a terminal) color their columns like `agent-session`: ages under an hour are green and italic, older ones faded, and sizes grey. Ages come from one `toage` call, with the same precision as in `agent-session`. Every entry also gets a type, guessed quickly from its first 40 lines by the first rule that fits. The text is colored by its type, and plain text keeps the color of the terminal. In the picker, `^TYPE` (for example `^json`) searches by type, because only the type and the text are searched.
+
+| Type | Detected by | Preview |
+|---|---|---|
+| `secret` | A private key, a token of a known service (`ghp_`, `glpat-`, `xox?-`, `sk-`, `AKIA…`, JWT), a bearer token, a value assigned to a key such as `password` or `token`, or a single word with letters, digits and signs that looks like a password or a random key | A warning above the text |
+| `diff` | `diff`, `Index:`, `@@` or `---`/`+++` at the start | Highlighted by `glow` |
+| `url` | Every line a URL (`scheme://…` or `mailto:`) | Text |
+| `path` | Every line an absolute, `~/` or `./` path without spaces | Text and `ls -la` when it is a single path that exists |
+| `uuid`, `hash` | A single UUID; a single hex word with 7 or more characters (a commit, a sha1), or `sha256:…` | Text |
+| `semver`, `num` | A single version such as `v1.24.3-rc.1`; a single number | Text |
+| `json` | Starts with `{` or `[` the way JSON does | Pretty-printed by `jq` |
+| `html`, `xml` | Starts with a common HTML tag or doctype; starts with `<?xml` or a tag | Highlighted by `glow` |
+| `md` | Two points of Markdown: fences, sub-headings and tables give two, and a heading, a list, a quote, a link, bold, emphasis or a code span give one each | Rendered by `glow` |
+| `yaml` | Lines of `key:`, list items and indented continuations, at least two | Highlighted by `glow` |
+| `tsv`, `csv` | The same number of tabs in every line; a header row of names and the same number of `,` (or `;`) in every line | Aligned by `column` |
+| `shell` | A shell shebang, `$ ` or `sudo`, or a known command at the start (a command that is also an English word, such as `make` or `find`, needs options, a pipe or a path after it) | Highlighted by `glow` |
+| `code` | At least a third of the lines look like code: they end with `;`, `{` or `}`, start with a keyword, or hold `=>`, `->`, `::` or `==` | Highlighted by `glow`, with a guessed language |
+| `text` | Anything else | Text |
+
 **Usage:** `clip-history [select [QUERY] | list [-n N] [--raw] | show ENTRY | restore ENTRY | delete ENTRY... | clear [-y] | add [FILE] | watch | path]`
 
 `ENTRY` is an index of `list` (`0` is the newest) or the start of an entry's hash (at least 4 characters).
 
 | Command / Flag | Description |
 |---|---|
-| `select [QUERY]` | Pick an entry with fzf and copy it into the clipboard and the primary selection (the default command). The preview shows the whole text. |
+| `select [QUERY]` | Pick an entry with fzf and copy it into the clipboard and the primary selection (the default command). The preview shows the whole text, rendered by its type. |
 | `-p, --print` | `select`: print the entry instead of copying it. |
-| `list` | List the entries, newest first: index, age, size, and the start of the text, with `↵` for line breaks. |
+| `list` | List the entries, newest first: index, age, size, type, and the start of the text, with `↵` for line breaks. |
 | `-n, --limit N` | `list`: only the newest `N` entries. |
-| `--raw` | `list`: tab-separated hash, mtime, bytes, age, size and text. |
+| `--raw` | `list`: tab-separated hash, mtime, bytes, age, size, type and text, without colors. |
 | `show ENTRY` | Print an entry. |
 | `restore ENTRY` | Copy an entry into the clipboard again, which moves it to the top. |
 | `delete ENTRY...` | Remove entries. |
