@@ -2,7 +2,8 @@
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
 # keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
-# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker),
+# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker
+# and wifi power save off), the 6 GHz fix of a MediaTek MT7921/MT7922 wifi card,
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
 # if you like, gitlab.com), the host key of js01, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
@@ -57,7 +58,10 @@ STEPS=(
     "bin           restore_bin           backup your own scripts of ~/bin, gen among them dials the VPN"
     "vpn           setup_vpn             -      the OpenVPN plugin of NetworkManager, the ${VPN_NAME} connection and gen to dial it"
     # before the VPN is dialed for the glab login: tun-up gives it the internal names
-    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker"
+    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker, and wifi power save off"
+    # after etc, so the reconnect applies its power save setting, and before the
+    # VPN is dialed for the glab login, as the driver reload drops the wifi
+    "wifi          fix_wifi              -      the 6 GHz fix of a MediaTek MT7921/MT7922 wifi card (fix-mt7922-6ghz-roaming)"
     "gh-glab       install_gh_glab       -      gh and glab with their logins"
     "js01          store_js01_key        -      the host key of js01 in ~/.ssh/known_hosts, for the sshpass login of js01"
     "sublime       restore_sublime       backup the session of Sublime Text"
@@ -434,15 +438,15 @@ render_secrets() {
 # the files of lib/cli-helpers/etc into /etc, before the VPN is dialed: the
 # dispatcher scripts of NetworkManager (tun-up sends all DNS through the VPN while
 # it is up, with the Mittwald domains to search, and sets the Slack status, as the
-# Mittwald wifi does, which also gets calmer roaming scans), the stub of
-# systemd-resolved on docker0 and the DNS of docker pointing at it, so containers
+# Mittwald wifi does, which also gets calmer roaming scans), wifi power save off,
+# the stub of systemd-resolved on docker0 and the DNS of docker pointing at it, so containers
 # resolve the internal names too; the internal names are @@SECRET:NAME@@ in this
 # public repo (render_secrets); a file that differs here is only replaced when
 # you say so
 install_etc_files() {
     local src_dir="${REPO_DIR}/lib/cli-helpers/etc" src dst mode tmp
     local -a files=() changed=() restart=()
-    info "/etc: the dispatcher scripts of NetworkManager (all DNS through the ${VPN_NAME} VPN while it is up), the stub of systemd-resolved on docker0 and the DNS of docker"
+    info "/etc: the dispatcher scripts of NetworkManager (all DNS through the ${VPN_NAME} VPN while it is up), wifi power save off, the stub of systemd-resolved on docker0 and the DNS of docker"
     # an array, not a read loop: ask reads the terminal
     mapfile -d '' -t files < <(find "${src_dir}" -type f -print0 | sort -z)
     tmp="$(mktemp)"
@@ -471,11 +475,33 @@ install_etc_files() {
     # files when they start; docker reads it on its first start when not running
     printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/resolved\.conf\.d/' && restart+=(systemd-resolved)
     printf '%s\n' "${changed[@]}" | grep -q '^/etc/docker/' && systemctl is-active --quiet docker && restart+=(docker)
+    # NetworkManager reads conf.d again on a reload, a setting there applies from
+    # the next connection on
+    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/NetworkManager/conf\.d/'; then
+        run sudo systemctl reload NetworkManager || failed+=("systemctl reload NetworkManager")
+    fi
     [ "${#restart[@]}" -eq 0 ] && return 0
     # these are no unit files, but the units installed before (apt, snaps) make
     # every restart warn about a missing daemon-reload
     run sudo systemctl daemon-reload || failed+=("systemctl daemon-reload")
     run sudo systemctl restart "${restart[@]}" || failed+=("systemctl restart ${restart[*]}")
+}
+
+# the fix of fix-mt7922-6ghz-roaming on a MediaTek MT7921/MT7922 wifi card, with
+# the regulatory domain DE: without it every roam to a 6 GHz access point fails
+# and drops the link; the script does nothing again once applied, else it reloads
+# the driver, so the wifi is waited for before the next steps download
+fix_wifi() {
+    info "Wifi: the 6 GHz fix of a MediaTek MT7921/MT7922 card (fix-mt7922-6ghz-roaming)"
+    if ! compgen -G '/sys/bus/pci/drivers/mt7921e/0000:*' > /dev/null; then
+        echo "No wifi card driven by mt7921e, nothing to fix" 1>&2
+        return 0
+    fi
+    if ! run "${REPO_DIR}/fix-mt7922-6ghz-roaming"; then
+        failed+=("fix-mt7922-6ghz-roaming, see ~/.local/state/fix-mt7922-6ghz-roaming.log")
+        return 0
+    fi
+    run nm-online -q -t 60 || warning "No network connection 60 s after the driver reload"
 }
 
 # gitlab.mittwald.it is only reachable through the VPN (or from the office)

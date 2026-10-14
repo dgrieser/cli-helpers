@@ -24,9 +24,11 @@ copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the Open
 of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs the files of
 `lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
 is up, with the Mittwald domains to search, and sets the Slack status, as the Mittwald wifi does, which also gets calmer
-roaming scans; a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
+roaming scans; wifi power save off, which Ubuntu turns on; a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
 internal names too; the internal names are `@@SECRET:NAME@@` in the repo, filled in from the keyring item
-`type=dotfile-secret name=NAME`, and a file that differs is only replaced when you say so), installs `gh` and
+`type=dotfile-secret name=NAME`, and a file that differs is only replaced when you say so), runs
+`fix-mt7922-6ghz-roaming` on a MediaTek MT7921/MT7922 wifi card (its driver reload drops the wifi for a few seconds,
+so it waits for the network again), installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to gitlab.mittwald.it it asks you to dial the VPN
 when the host is not reachable, with `~/bin/gen` if you like, and then offers the `glab` login to gitlab.com), stores the
 host key of js01 in `~/.ssh/known_hosts` (`ssh-keyscan -H js01`, through the VPN; the `js01` alias logs in with `sshpass`,
@@ -2370,7 +2372,7 @@ sudo debian-dist-check --fix      # fix this system's sources.list
 ```
 
 ### `fix-mt7922-6ghz-roaming`
-Makes 6 GHz wifi work on MediaTek MT7921/MT7922 cards (driver `mt7921e`), which otherwise drop 6 GHz links and fall back to 5 GHz every few minutes. It turns off the firmware CLC with `options mt7921_common disable_clc=1` in `/etc/modprobe.d/mt7921.conf` and pins the regulatory domain with a udev rule (`/etc/udev/rules.d/99-wireless-regdom.rules`), so a roam no longer falls back to the WORLD domain, where 6 GHz is no-IR. It aborts on other hardware, reloads the driver (the wifi drops for a few seconds), checks the 6 GHz channels and logs to `~/.local/state/fix-mt7922-6ghz-roaming.log`. A pinned domain does not follow the country of the APs any more, so set it again abroad (`iw reg set 00` is the world domain).
+Makes 6 GHz wifi work on MediaTek MT7921/MT7922 cards (driver `mt7921e`), which otherwise drop 6 GHz links and fall back to 5 GHz every few minutes. It turns off the firmware CLC with `options mt7921_common disable_clc=1` in `/etc/modprobe.d/mt7921.conf` and pins the regulatory domain with a udev rule (`/etc/udev/rules.d/99-wireless-regdom.rules`), so a roam no longer falls back to the WORLD domain, where 6 GHz is no-IR. It aborts on other hardware, reloads the driver (the wifi drops for a few seconds), checks the 6 GHz channels and logs to `~/.local/state/fix-mt7922-6ghz-roaming.log`. A pinned domain does not follow the country of the APs any more, so set it again abroad (`iw reg set 00` is the world domain). `setup.sh wifi` runs it with the domain `DE` on a machine with such a card.
 
 **Usage:** `fix-mt7922-6ghz-roaming [OPTIONS]`
 
