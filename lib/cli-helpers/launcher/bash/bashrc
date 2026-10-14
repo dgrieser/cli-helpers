@@ -1,0 +1,19 @@
+# launcher-terminal: the startup file of bash in the launcher window (bash --rcfile),
+# read in place of ~/.bashrc: that one, then the launcher's short prompt. A
+# ~/.config/cli-helpers/launcher-terminal/bash/bashrc of your own takes precedence.
+
+# no reminders in the launcher window: ~/.bashrc prints them with reminder --print,
+# which finds this function instead of the command while ~/.bashrc is read
+reminder() { :; }
+[ -f ~/.bashrc ] && . ~/.bashrc
+unset -f reminder
+
+# the short prompt in place of powerline-shell's: prompt.bash of cli-helpers sets PS1
+# before every prompt in _powerline_ps1, so the launcher's version of it sets this
+# one, starting on a clean line like the original. It leaves the window title alone,
+# the launcher finds its window by that title
+PS1="▶ "
+_powerline_ps1() {
+    declare -F _eol_mark >/dev/null && _eol_mark
+    PS1="▶ "
+}

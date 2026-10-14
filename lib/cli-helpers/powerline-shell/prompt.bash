@@ -1,6 +1,6 @@
 # The bash prompt of powerline-shell, sourced by ~/.bashrc; installed by updater
-# (software pip-tools) together with config.json. A shell with TERM_SIMPLE set
-# (launcher-terminal) gets that short prompt instead.
+# (software pip-tools) together with config.json. launcher-terminal replaces
+# _powerline_ps1 with its short prompt (launcher/bash/bashrc).
 
 ### PS1 settings
 # mark a command whose output left the cursor mid-line, and start the prompt on
@@ -34,13 +34,6 @@ function _powerline_ps1()
     title "${new_title}"
 }
 
-function _simple_ps1()
-{
-    # same clean-line reset as _powerline_ps1
-    _eol_mark
-    PS1="${TERM_SIMPLE}"
-}
-
 function title()
 {
    echo -en "\e]2;$1\a"
@@ -48,9 +41,6 @@ function title()
 
 
 ### prompt settings
-if [[ $TERM != linux && $TERM_SIMPLE != "" && ! $PROMPT_COMMAND =~ _simple_ps1 ]]; then
-    PROMPT_COMMAND="_simple_ps1; $PROMPT_COMMAND"
-fi
-if [[ $TERM != linux && $TERM_SIMPLE == "" && ! $PROMPT_COMMAND =~ _powerline_ps1 ]]; then
+if [[ $TERM != linux && ! $PROMPT_COMMAND =~ _powerline_ps1 ]]; then
     PROMPT_COMMAND="_powerline_ps1; $PROMPT_COMMAND"
 fi

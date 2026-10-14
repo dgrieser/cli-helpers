@@ -1,4 +1,12 @@
 #!/bin/bash
+# for a command run in the launcher window: close the window right after it (the
+# launcher watches LAUNCHER_EXIT_FILE, which it gives the shell in its window);
+# anywhere else it does nothing, so an alias can end with it in every shell
+if [ "${1}" = "--exit" ]; then
+    [ -n "${LAUNCHER_EXIT_FILE}" ] && touch "${LAUNCHER_EXIT_FILE}"
+    exit 0
+fi
+
 # the real location: linked into $(BINDIR) by make install-links, the launcher uses
 # the shared files of the checkout it comes from (its Ptyxis files, the window
 # helpers), even while $(LIBDIR) links to another checkout
@@ -15,6 +23,24 @@ name="Launcher-Terminal"
 bin_path="${0}"
 bin_name="$(basename "${bin_path}")"
 
+real_config="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+# a file of the launcher's own setup of a terminal:
+# ~/.config/cli-helpers/launcher-terminal/<terminal>/<name> when the user keeps one,
+# else the one shipped with cli-helpers (the repo's when run from it)
+launcher_file() {
+    local dir
+    for dir in "${real_config}/cli-helpers/${bin_name}/${1}" "${SCRIPT_DIR}/lib/cli-helpers/launcher/${1}" \
+        "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/${1}"; do
+        if [ -f "${dir}/${2}" ]; then
+            echo "${dir}/${2}"
+            return 0
+        fi
+    done
+    echo "ERROR: ${1}/${2} of the launcher not found" >&2
+    return 1
+}
+
 # inside the terminal window: the launcher calls itself as the terminal's command,
 # because a single-instance terminal (Ptyxis, GNOME Terminal) hands the window to
 # its already running process, so the pid of the started terminal says nothing.
@@ -23,10 +49,15 @@ bin_name="$(basename "${bin_path}")"
 # whose process died from a signal, but close it on a clean exit
 if [ "${1}" = "--shell" ]; then
     echo "$$" > "${2}"
-    # so a command run in the launcher can close it once it is done
+    # so a command run in the launcher can close it once it is done (--exit)
     export LAUNCHER_EXIT_FILE="${3}"
-    export TERM_SIMPLE="▶ "
-    "${SHELL:-/bin/bash}"
+    shell="${SHELL:-/bin/bash}"
+    # bash reads the launcher's startup file: ~/.bashrc, then the short prompt
+    if [ "${shell##*/}" = bash ] && rcfile="$(launcher_file bash bashrc)"; then
+        "${shell}" --rcfile "${rcfile}"
+    else
+        "${shell}"
+    fi
     exit 0
 fi
 
@@ -46,7 +77,6 @@ EXIT_FILE="/tmp/${bin_name}-$$.exit"
 rm -rf "${PID_FILE}" "${EXIT_FILE}"
 trap 'rm -rf "${PID_FILE}" "${EXIT_FILE}"' EXIT
 
-real_config="${XDG_CONFIG_HOME:-${HOME}/.config}"
 real_data="${XDG_DATA_HOME:-${HOME}/.local/share}"
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/${bin_name}"
 ptyxis_dir="${runtime_dir}/ptyxis"
@@ -69,22 +99,6 @@ shadow_dir() {
     # already, fail instead of creating the new one inside the real directory it
     # points to
     [ "${#entries[@]}" -eq 0 ] || ln -sn -t "${shadow}" "${entries[@]}"
-}
-
-# a file of the launcher's own setup of a terminal:
-# ~/.config/cli-helpers/launcher-terminal/<terminal>/<name> when the user keeps one,
-# else the one shipped with cli-helpers (the repo's when run from it)
-launcher_file() {
-    local dir
-    for dir in "${real_config}/cli-helpers/${bin_name}/${1}" "${SCRIPT_DIR}/lib/cli-helpers/launcher/${1}" \
-        "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/${1}"; do
-        if [ -f "${dir}/${2}" ]; then
-            echo "${dir}/${2}"
-            return 0
-        fi
-    done
-    echo "ERROR: ${1}/${2} of the launcher not found" >&2
-    return 1
 }
 
 # the look of the launcher window, the same in every terminal: launcher/theme, and

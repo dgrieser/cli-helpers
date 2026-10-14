@@ -2506,7 +2506,7 @@ remapkeys
 ```
 
 ### `launcher-terminal`
-Opens a quick-launch window in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`): always on top, with the short `TERM_SIMPLE` prompt, and left where GNOME places new windows. It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
+Opens a quick-launch window in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`): always on top, with the short prompt `▶ `, and left where GNOME places new windows. It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
 
 The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `color0` to `color15` (the 16 ANSI colors), `width` (in percent of the screen's) and `aspect-ratio` (width:height like `10:3`, or one number like `3.3`), one `key = value` per line, colors as `#rrggbb`. By default that is a dark greyish purple background (`#3c2f46`), a black cursor, Agave Nerd Font Mono 14, the xterm colors and a window 45 % of the screen wide at 5:1. The screen is the monitor under the pointer, where GNOME opens the window (without one found, the primary monitor, else 1920 px). A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
 
@@ -2523,17 +2523,22 @@ When Terminator is the default terminal, the launcher runs a Terminator process 
 
 Any other terminal is started with `xdg-terminal-exec`, which passes no terminal options, so the window looks like any other window of that terminal and has its default size.
 
-Only Terminator gives a borderless window without a taskbar entry, and no terminal fades the window while unfocused. The launcher runs itself as the terminal's command and starts your `$SHELL` from there, because a single-instance terminal (Ptyxis, GNOME Terminal) leaves no process of its own to watch; it closes the window by hanging up that shell. A command run in it can close it right after it finishes with `touch "$LAUNCHER_EXIT_FILE"`.
+Only Terminator gives a borderless window without a taskbar entry, and no terminal fades the window while unfocused. The launcher runs itself as the terminal's command and starts your `$SHELL` from there, because a single-instance terminal (Ptyxis, GNOME Terminal) leaves no process of its own to watch; it closes the window by hanging up that shell. A command run in it can close it right after it finishes with `launcher-terminal --exit`, which touches `$LAUNCHER_EXIT_FILE`, the file the launcher gives the shell in its window; anywhere else it does nothing, so an alias can end with it in every shell.
+
+When `$SHELL` is bash, it starts with the launcher's own startup file, `$(LIBDIR)/launcher/bash/bashrc` (`bash --rcfile`; a `~/.config/cli-helpers/launcher-terminal/bash/bashrc` of your own takes precedence): it reads your `~/.bashrc` without printing its reminders (`reminder --print`), then puts the short prompt in place of powerline-shell's by replacing `_powerline_ps1` of `prompt.bash`, so neither `~/.bashrc` nor the prompt needs to know about the launcher. Any other shell starts as it is.
 
 The desktop entry is installed by `make install-desktop`; `app-shortcut launcher-terminal` starts it through that entry and is bound to `<Shift><Control>l` and `AudioMedia`.
 
-**Usage:** `launcher-terminal`
+**Usage:** `launcher-terminal [--exit]`
 
-Takes no arguments.
+| Argument / Flag | Description |
+|---|---|
+| `--exit` | Close the launcher window once the command it ends has run; outside the launcher it does nothing. |
 
 **Examples:**
 ```bash
 launcher-terminal
+alias lcmd='lastcmd | to_clip && launcher-terminal --exit'
 ```
 
 ### `cron-to-ical`
