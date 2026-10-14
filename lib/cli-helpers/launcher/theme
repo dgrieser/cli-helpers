@@ -1,0 +1,44 @@
+# launcher-terminal: the look of the launcher window, the same in every terminal it
+# supports. On every start the launcher puts these values into the placeholders of
+# its files for the terminal (@font@ in launcher/ptyxis, launcher/terminator). A
+# theme in ~/.config/cli-helpers/launcher-terminal/theme is read on top of this one,
+# so it only needs the keys it changes.
+# One "key = value" per line, colors as #rrggbb.
+
+# a Pango font description: family, then size
+font = Agave Nerd Font Mono 13
+
+foreground = #d7dde5
+background = #32383f
+
+# the cursor, and the text under it
+cursor = #d7dde5
+cursor-text = #32383f
+
+# of the background: 1 is opaque, 0.9 lets 10 % of the desktop through
+opacity = 1
+
+# the size of the window: its width in percent of the screen's (the monitor under the
+# pointer, where GNOME opens it), its height from the aspect ratio, width:height or
+# one number (3.3)
+width = 59
+aspect-ratio = 5:1
+
+# the 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan, white, then
+# their bright variants in the same order; these are xterm's
+color0 = #000000
+color1 = #cd0000
+color2 = #00cd00
+color3 = #cdcd00
+color4 = #0000ee
+color5 = #cd00cd
+color6 = #00cdcd
+color7 = #e5e5e5
+color8 = #7f7f7f
+color9 = #ff0000
+color10 = #00ff00
+color11 = #ffff00
+color12 = #5c5cff
+color13 = #ff00ff
+color14 = #00ffff
+color15 = #ffffff

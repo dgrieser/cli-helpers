@@ -42,6 +42,32 @@ cli_helpers_gnome_display_config() {
     "$(cli_helpers_repo_dir)/gnome-display-config" "$@"
 }
 
+# the monitors as gnome-display-config list --geometry prints them (<name> <x> <y>
+# <width> <height> <scale>), all or the one named, from the file the window bridge
+# extension rewrites whenever they change: instant, where asking Mutter takes Python
+# a tenth of a second. Fails when there is none, or when the gnome-shell that wrote
+# it no longer runs (the extension removes it when it is disabled)
+cli_helpers_monitors_cached() {
+    local display="${1:-}" file key pid comm line found=1
+    file="${XDG_RUNTIME_DIR:-/run/user/${UID}}/cli-helpers/monitors"
+    [ -f "${file}" ] || return 1
+    {
+        read -r key pid && [ "${key}" = pid ] || return 1
+        read -r comm 2>/dev/null < "/proc/${pid}/comm" && [ "${comm}" = gnome-shell ] || return 1
+        while read -r line; do
+            if [ -z "${display}" ] || [ "${line%% *}" = "${display}" ]; then
+                echo "${line}"
+                found=0
+            fi
+        done
+    } < "${file}"
+    return "${found}"
+}
+
+cli_helpers_terminal_cell_size() {
+    "$(cli_helpers_repo_dir)/terminal-cell-size" "$@"
+}
+
 cli_helpers_clipboard_set_text_file() {
     local selection="${1}"
     local input_file="${2}"

@@ -133,6 +133,30 @@ function monitorName(index) {
         `${monitor.x},${monitor.y}`;
 }
 
+// The monitors in a file, rewritten whenever they change, so a script knows their
+// geometry instantly instead of asking Mutter's DisplayConfig, which takes Python a
+// tenth of a second: "pid <gnome-shell>", then per monitor
+// "<connector> <x> <y> <width> <height> <scale>" in logical pixels, the lines of
+// gnome-display-config list --geometry. It is only valid while that gnome-shell
+// runs, and it is removed when the extension is disabled (on the lock screen as
+// well), so a reader never gets a stale one.
+const MONITORS_FILE = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'cli-helpers', 'monitors']);
+
+function writeMonitors() {
+    const lines = [`pid ${Gio.Credentials.new().get_unix_pid()}`];
+    Main.layoutManager.monitors.forEach((monitor, index) => {
+        // the scale like Python's %g, as gnome-display-config prints it
+        const scale = Number(global.display.get_monitor_scale(index).toPrecision(6));
+        lines.push(`${monitorName(index)} ${monitor.x} ${monitor.y} ${monitor.width} ${monitor.height} ${scale}`);
+    });
+    try {
+        GLib.mkdir_with_parents(GLib.path_get_dirname(MONITORS_FILE), 0o700);
+        GLib.file_set_contents(MONITORS_FILE, `${lines.join('\n')}\n`);
+    } catch (error) {
+        console.warn(`cli-helpers: cannot write ${MONITORS_FILE}: ${error.message}`);
+    }
+}
+
 function windowId(window) {
     return String(window.get_id());
 }
@@ -218,9 +242,16 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
             null,
             null
         );
+        writeMonitors();
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', writeMonitors);
     }
 
     disable() {
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
+        }
+        GLib.unlink(MONITORS_FILE);
         if (this._busId) {
             Gio.bus_unown_name(this._busId);
             this._busId = null;

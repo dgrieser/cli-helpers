@@ -48,7 +48,8 @@ trap 'rm -rf "${PID_FILE}" "${EXIT_FILE}"' EXIT
 
 real_config="${XDG_CONFIG_HOME:-${HOME}/.config}"
 real_data="${XDG_DATA_HOME:-${HOME}/.local/share}"
-ptyxis_dir="${XDG_RUNTIME_DIR:-/tmp}/${bin_name}"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/${bin_name}"
+ptyxis_dir="${runtime_dir}/ptyxis"
 
 # a stand-in for one of the user's directories: every entry links to the real one,
 # except the ones named, which the launcher's Ptyxis gets of its own
@@ -86,6 +87,165 @@ launcher_file() {
     return 1
 }
 
+# the look of the launcher window, the same in every terminal: launcher/theme, and
+# on top of it the keys of ~/.config/cli-helpers/launcher-terminal/theme
+declare -A theme=()
+
+theme_read() {
+    local file="${1}" line key value number=0
+    if [ ! -f "${file}" ]; then
+        echo "ERROR: ${file} not found" >&2
+        return 1
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        ((number++))
+        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+        if ! [[ "${line}" =~ ^[[:space:]]*([a-z0-9-]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
+            echo "ERROR: ${file}:${number}: not a key = value line" >&2
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "${key}" in
+            font)
+                # it ends up in quotes in the terminals' configs
+                if [[ "${value}" =~ [\'\"\\] ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} cannot hold quotes or backslashes" >&2
+                    return 1
+                fi
+                ;;
+            opacity)
+                if ! [[ "${value}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a number from 0 to 1, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            width)
+                if ! [[ "${value}" =~ ^([1-9][0-9]?(\.[0-9]+)?|100)$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a percentage from 1 to 100, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            aspect-ratio)
+                if ! [[ "${value}" =~ ^[0-9]+(\.[0-9]+)?(:[0-9]+(\.[0-9]+)?)?$ ]] \
+                    || ! [[ "${value%%:*}" =~ [1-9] && "${value#*:}" =~ [1-9] ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is width:height (10:3) or one number (3.3), not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            foreground | background | cursor | cursor-text | color[0-9] | color1[0-5])
+                if ! [[ "${value}" =~ ^#[0-9a-fA-F]{6}$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a color like #32383f, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            *)
+                echo "ERROR: ${file}:${number}: unknown key ${key}" >&2
+                return 1
+                ;;
+        esac
+        theme["${key}"]="${value}"
+    done < "${file}"
+}
+
+theme_load() {
+    local key colors=()
+    if [ -f "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" ]; then
+        theme_read "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" || return 1
+    else
+        theme_read "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/theme" || return 1
+    fi
+    if [ -f "${real_config}/cli-helpers/${bin_name}/theme" ]; then
+        theme_read "${real_config}/cli-helpers/${bin_name}/theme" || return 1
+    fi
+    for key in font foreground background cursor cursor-text opacity width aspect-ratio color{0..15}; do
+        if [ -z "${theme[${key}]}" ]; then
+            echo "ERROR: the theme of the launcher has no ${key}" >&2
+            return 1
+        fi
+    done
+    # the forms only some terminals take: the 16 colors as one list (Terminator), a
+    # background that lets the desktop through only below opacity 1
+    for key in {0..15}; do
+        colors+=("${theme[color${key}]}")
+    done
+    theme[palette]="$(IFS=:; echo "${colors[*]}")"
+    if [[ "${theme[opacity]}" == 1* ]]; then
+        theme[background-type]=solid
+    else
+        theme[background-type]=transparent
+    fi
+}
+
+# a file of the launcher's setup of a terminal, with the theme's values in place of
+# its placeholders (@font@ for the theme's font)
+theme_fill() {
+    local file="${1}" content key
+    content="$(< "${file}")" || return 1
+    for key in "${!theme[@]}"; do
+        content="${content//"@${key}@"/"${theme[${key}]}"}"
+    done
+    if [[ "${content}" =~ @[a-z0-9-]+@ ]]; then
+        echo "ERROR: ${file}: the theme of the launcher has no ${BASH_REMATCH[0]//@/}" >&2
+        return 1
+    fi
+    printf '%s\n' "${content}"
+}
+
+# the width of the monitor the window opens on: GNOME opens a new window on the one
+# under the pointer. window-screen-geometry reads it from the file the window bridge
+# extension keeps up to date
+screen_width() {
+    local monitor="" geometry
+    # on Wayland the window bridge of the GNOME Shell extension knows the monitor;
+    # asked directly it answers in a few ms, window-screen-focused takes 30 ms more
+    if cli_helpers_is_wayland; then
+        monitor="$(dbus-send --session --print-reply=literal --dest=de.david.grieser.CliHelpers.WindowBridge \
+            /de/david/grieser/CliHelpers/WindowBridge de.david.grieser.CliHelpers.WindowBridge.GetPointerMonitor 2>/dev/null)"
+        monitor="${monitor//[[:space:]]/}"
+    fi
+    [ -n "${monitor}" ] || monitor="$(window-screen-focused --mouse 2>/dev/null)" \
+        || monitor="$(window-screen-focused --primary 2>/dev/null)"
+    geometry="$(window-screen-geometry --raw "${monitor}" 2>/dev/null)"
+    if [[ "${geometry}" =~ ^([0-9]+)x ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "WARNING: the width of the screen is unknown, the launcher takes 1920 px" >&2
+        echo 1920
+    fi
+}
+
+# the size of the launcher window in pixels: the theme's width in percent of the
+# screen's, the height from its aspect ratio
+window_width=0
+window_height=0
+window_size() {
+    read -r window_width window_height < <(awk -v screen="$(screen_width)" -v percent="${theme[width]}" \
+        -v ratio="${theme[aspect-ratio]}" 'BEGIN {
+            if (split(ratio, part, ":") == 2)
+                ratio = part[1] / part[2]
+            width = int(screen * percent / 100 + 0.5)
+            print width, int(width / ratio + 0.5)
+        }')
+}
+
+# the size of a cell for the theme's font in a VTE terminal, in pixels: <width> <height>.
+# Measuring takes Python and Pango a quarter of a second, so it is kept until the font
+# or the text scaling changes
+cell_size() {
+    local scale key line size cache="${runtime_dir}/cell-size"
+    scale="$(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null)"
+    key="${theme[font]}|${scale:-1}"
+    line="$(cat "${cache}" 2>/dev/null)"
+    if [ "${line%|*}" = "${key}" ]; then
+        echo "${line##*|}"
+        return 0
+    fi
+    size="$(cli_helpers_terminal_cell_size --text-scale "${scale:-1}" "${theme[font]}")" || return 1
+    mkdir -p "${runtime_dir}" && echo "${key}|${size}" > "${cache}"
+    echo "${size}"
+}
+
 # Ptyxis can neither hide its header bar nor open a window with another profile from
 # its command line, so the launcher runs a Ptyxis process of its own on stand-ins for
 # the config and data directories: settings in a keyfile instead of dconf (the
@@ -94,9 +254,15 @@ launcher_file() {
 # nothing of the user's Ptyxis is touched. Rebuilt on every start, as only one
 # launcher runs at a time
 ptyxis_prepare() {
-    local css keyfile palette
+    local css keyfile palette cell_width cell_height
     css="$(launcher_file ptyxis gtk.css)" && keyfile="$(launcher_file ptyxis settings.keyfile)" \
-        && palette="$(launcher_file ptyxis launcher.palette)" || return 1
+        && palette="$(launcher_file ptyxis launcher.palette)" && theme_load || return 1
+    # Ptyxis takes the size in cells; around them its terminal has a padding of 6 px
+    # left and right, 7 px above and 4 px below (its style.css)
+    read -r cell_width cell_height < <(cell_size) && [ -n "${cell_height}" ] || return 1
+    window_size
+    theme[columns]=$(( (window_width - 12) / cell_width ))
+    theme[rows]=$(( (window_height - 11) / cell_height ))
     rm -rf "${ptyxis_dir}"
     shadow_dir "${real_config}" "${ptyxis_dir}/config" gtk-4.0 glib-2.0 dconf org.gnome.Ptyxis \
         && shadow_dir "${real_config}/gtk-4.0" "${ptyxis_dir}/config/gtk-4.0" gtk.css \
@@ -108,8 +274,17 @@ ptyxis_prepare() {
         [ -f "${real_config}/gtk-4.0/gtk.css" ] && echo "@import url(\"file://${real_config}/gtk-4.0/gtk.css\");"
         cat "${css}"
     } > "${ptyxis_dir}/config/gtk-4.0/gtk.css" \
-        && cp "${keyfile}" "${ptyxis_dir}/config/glib-2.0/settings/keyfile" \
-        && cp "${palette}" "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes/launcher.palette"
+        && theme_fill "${keyfile}" > "${ptyxis_dir}/config/glib-2.0/settings/keyfile" \
+        && theme_fill "${palette}" > "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes/launcher.palette"
+}
+
+# Terminator takes the launcher's own config (borderless, always on top, the
+# launcher's profile) and a size in pixels on its command line, the config filled
+# with the theme
+terminator_prepare() {
+    local config
+    config="$(launcher_file terminator config)" && theme_load && mkdir -p "${runtime_dir}/terminator" \
+        && theme_fill "${config}" > "${runtime_dir}/terminator/config" && window_size
 }
 
 terminal_cmd=()
@@ -130,12 +305,11 @@ case "${terminal_id%%:*}" in
         fi
         ;;
     terminator.desktop)
-        # Terminator takes the launcher's own config (borderless, always on top, the
-        # launcher's profile) and a size on its command line; --no-dbus keeps the
-        # window out of a Terminator that already runs with the user's config
-        if command -v terminator >/dev/null 2>&1 && terminator_config="$(launcher_file terminator config)"; then
-            terminal_cmd=(terminator "--config=${terminator_config}" --no-dbus "--title=${name}"
-                --geometry=1000x200 "--working-directory=${PWD}" --execute)
+        # --no-dbus keeps the window out of a Terminator that already runs with the
+        # user's config
+        if command -v terminator >/dev/null 2>&1 && terminator_prepare; then
+            terminal_cmd=(terminator "--config=${runtime_dir}/terminator/config" --no-dbus "--title=${name}"
+                "--geometry=${window_width}x${window_height}" "--working-directory=${PWD}" --execute)
         fi
         ;;
 esac

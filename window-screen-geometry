@@ -56,7 +56,9 @@ done
 [ -z "${display}" ] && usage
 
 if cli_helpers_is_wayland; then
-    line="$(cli_helpers_gnome_display_config list --geometry --display "${display}")"
+    # the file the window bridge extension keeps up to date, else Mutter (Python)
+    line="$(cli_helpers_monitors_cached "${display}")" \
+        || line="$(cli_helpers_gnome_display_config list --geometry --display "${display}")"
     [ -z "${line}" ] && fail "Display '${display}' not found"
     read -r _name x y width height scale <<< "${line}"
     if [ "${apply_scale}" -eq 0 ]; then
