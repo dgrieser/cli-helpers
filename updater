@@ -2037,6 +2037,12 @@ software-045-sublime@base@gui() {
     verbose "${SUDO_USER} sed -i '/^[[:space:]]*\"Codeium\",\?[[:space:]]*$/d' ${package_control}"
     ${SUDO_USER} sed -i '/^[[:space:]]*"Codeium",\?[[:space:]]*$/d' "${package_control}"
 }
+software-046-clip-history@base@gui() {
+    # rewritten by make install to $(LIBDIR)
+    local lib_dir="/usr/local/lib/cli-helpers"
+    # records the text copied anywhere in GNOME for clip-history
+    user_service_enable clip-history.service "${lib_dir}/systemd-user/clip-history.service"
+}
 software-050-adb@dev() { install_adb; }
 software-051-android-sdk@dev() { apt_upgrade google-android-platform-36-installer google-android-build-tools-36.0.0-installer; }
 software-055-docker@dev() {

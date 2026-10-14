@@ -57,6 +57,10 @@ const IFACE_XML = `
       <arg type="s" direction="in" name="window_id"/>
       <arg type="b" direction="out" name="closed"/>
     </method>
+    <signal name="ClipboardChanged">
+      <arg type="s" name="selection"/>
+      <arg type="b" name="sensitive"/>
+    </signal>
   </interface>
 </node>`;
 
@@ -230,6 +234,16 @@ function clipboardType(selection) {
     throw new Error(`Invalid clipboard selection: ${selection}`);
 }
 
+// A password manager marks the text it copies with this type (KDE's convention,
+// which KeePassXC and others follow on every desktop), so a clipboard history
+// leaves it out.
+const SENSITIVE_MIMETYPE = 'x-kde-passwordManagerHint';
+
+function hasText(mimetypes) {
+    return mimetypes.some(type => type.startsWith('text/plain') ||
+        type === 'UTF8_STRING' || type === 'STRING' || type === 'TEXT');
+}
+
 export default class CliHelpersWindowBridgeExtension extends Extension {
     enable() {
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
@@ -244,9 +258,15 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         );
         writeMonitors();
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', writeMonitors);
+        this._selectionOwnerChangedId = global.display.get_selection().connect('owner-changed',
+            (_selection, selectionType, source) => this._clipboardOwnerChanged(selectionType, source));
     }
 
     disable() {
+        if (this._selectionOwnerChangedId) {
+            global.display.get_selection().disconnect(this._selectionOwnerChangedId);
+            this._selectionOwnerChangedId = null;
+        }
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
@@ -260,6 +280,21 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
             this._dbusImpl.unexport();
             this._dbusImpl = null;
         }
+    }
+
+    // Every new text in the clipboard, whoever copied it, for clip-history watch
+    // to record. Only that it changed is announced, not the text: the watcher
+    // asks for it with GetClipboardText. The primary selection changes with
+    // every selected word, so it is left out.
+    _clipboardOwnerChanged(selectionType, source) {
+        if (selectionType !== Meta.SelectionType.SELECTION_CLIPBOARD || !source || !this._dbusImpl)
+            return;
+
+        const mimetypes = source.get_mimetypes();
+        if (!hasText(mimetypes))
+            return;
+        this._dbusImpl.emit_signal('ClipboardChanged',
+            GLib.Variant.new('(sb)', ['clipboard', mimetypes.includes(SENSITIVE_MIMETYPE)]));
     }
 
     _windows() {

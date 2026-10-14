@@ -1,0 +1,246 @@
+#!/bin/bash
+# the clipboard of the clip-* tools: reading and writing it, and its history.
+#
+# The history is one file per copied text, named after the text's sha1, in
+# $CLIP_HISTORY_DIR (default ~/.local/share/cli-helpers/clip-history), newest
+# first by mtime: copying a text again only moves it to the top.
+# A secret (clip --secret) is never recorded: before it reaches the clipboard its
+# sha1 goes into a marker in the runtime folder (tmpfs), and every text whose
+# sha1 is marked is skipped, no matter which way it would reach the history.
+
+. "$(dirname "${BASH_SOURCE[0]}")/lib-desktop"
+
+# cli_helpers_clipboard_write SELECTION FILE: puts the text in FILE into the
+# clipboard, the primary selection or both
+cli_helpers_clipboard_write() {
+    local selection="${1}"
+    local input_file="${2}"
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_clipboard_set_text_file "${selection}" "${input_file}" && return 0
+        cli_helpers_require_command wl-copy wl-clipboard || return 1
+        if [ "${selection}" = "clipboard" ] || [ "${selection}" = "both" ]; then
+            wl-copy < "${input_file}" || return 1
+        fi
+        if [ "${selection}" = "primary" ] || [ "${selection}" = "both" ]; then
+            wl-copy --primary < "${input_file}" || return 1
+        fi
+    else
+        cli_helpers_require_command xclip || return 1
+        # xclip stays in the background to serve the selection, so it must not
+        # hold on to the output of its caller
+        if [ "${selection}" = "clipboard" ] || [ "${selection}" = "both" ]; then
+            xclip -i -selection clipboard < "${input_file}" &>/dev/null || return 1
+        fi
+        if [ "${selection}" = "primary" ] || [ "${selection}" = "both" ]; then
+            xclip -i -selection primary < "${input_file}" &>/dev/null || return 1
+        fi
+    fi
+}
+
+# cli_helpers_clipboard_read SELECTION: prints the text of the clipboard or the
+# primary selection exactly as it is, without a newline added
+cli_helpers_clipboard_read() {
+    local selection="${1}"
+
+    if cli_helpers_is_wayland; then
+        cli_helpers_clipboard_get_text "${selection}" && return 0
+        cli_helpers_require_command wl-paste wl-clipboard || return 1
+        if [ "${selection}" = "primary" ]; then
+            wl-paste --primary --no-newline 2>/dev/null
+        else
+            wl-paste --no-newline 2>/dev/null
+        fi
+    else
+        cli_helpers_require_command xclip || return 1
+        xclip -o -selection "${selection}" 2>/dev/null
+    fi
+}
+
+# cli_helpers_clipboard_clear SELECTION: empties the clipboard, the primary
+# selection or both
+cli_helpers_clipboard_clear() {
+    local selection="${1}"
+
+    if [ "${selection}" = "both" ]; then
+        cli_helpers_clipboard_clear clipboard && cli_helpers_clipboard_clear primary
+        return
+    fi
+    if cli_helpers_is_wayland; then
+        cli_helpers_clipboard_clear_text "${selection}" && return 0
+        cli_helpers_require_command wl-copy wl-clipboard || return 1
+        if [ "${selection}" = "primary" ]; then
+            wl-copy --primary --clear
+        else
+            wl-copy --clear
+        fi
+    else
+        cli_helpers_require_command xclip || return 1
+        echo | xclip -r -selection "${selection}" &>/dev/null
+    fi
+}
+
+# cli_helpers_clip_hash [FILE]: prints the sha1 of FILE, or of stdin
+cli_helpers_clip_hash() {
+    local hash _
+
+    if [ -n "${1:-}" ]; then
+        read -r hash _ < <(sha1sum < "${1}")
+    else
+        read -r hash _ < <(sha1sum)
+    fi
+    [ -n "${hash}" ] || return 1
+    echo "${hash}"
+}
+
+# cli_helpers_clip_runtime_dir: prints the folder of the clipboard's transient
+# files (staged input, secret markers), in tmpfs and only the user's, creating it
+cli_helpers_clip_runtime_dir() {
+    local base="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
+    local dir
+
+    # outside of a login session there is no runtime folder: a folder of the
+    # user's own in /tmp then, never one someone else created there before
+    if [ -d "${base}" ] && [ -w "${base}" ]; then
+        dir="${base}/cli-helpers/clip"
+    else
+        dir="${TMPDIR:-/tmp}/cli-helpers-${UID}/clip"
+    fi
+    if [ ! -d "${dir}" ]; then
+        (umask 077 && mkdir -p "${dir}") || return 1
+    fi
+    if [ ! -O "${dir}" ]; then
+        echo "ERROR: ${dir} is not owned by $(id -un)" 1>&2
+        return 1
+    fi
+    echo "${dir}"
+}
+
+# cli_helpers_clip_secret_mark HASH: marks the text with HASH as a secret and
+# prints the id of the marker, for cli_helpers_clip_secret_hash and _unmark
+cli_helpers_clip_secret_mark() {
+    local hash="${1}"
+    local dir
+    local file
+
+    dir="$(cli_helpers_clip_runtime_dir)/secrets" || return 1
+    (umask 077 && mkdir -p "${dir}") || return 1
+    file="$(mktemp "${dir}/XXXXXXXXXXXX")" || return 1
+    echo "${hash}" > "${file}" || return 1
+    echo "${file##*/}"
+}
+
+# cli_helpers_clip_secret_marker ID: prints the path of the marker ID
+cli_helpers_clip_secret_marker() {
+    local id="${1}"
+    local dir
+
+    [[ "${id}" =~ ^[A-Za-z0-9]+$ ]] || return 1
+    dir="$(cli_helpers_clip_runtime_dir)/secrets" || return 1
+    echo "${dir}/${id}"
+}
+
+# cli_helpers_clip_secret_hash ID: prints the hash marked by ID, fails when the
+# marker is gone
+cli_helpers_clip_secret_hash() {
+    local file
+    local hash
+
+    file="$(cli_helpers_clip_secret_marker "${1}")" || return 1
+    [ -f "${file}" ] || return 1
+    read -r hash < "${file}" && [ -n "${hash}" ] || return 1
+    echo "${hash}"
+}
+
+# cli_helpers_clip_secret_unmark ID: removes the marker ID
+cli_helpers_clip_secret_unmark() {
+    local file
+
+    file="$(cli_helpers_clip_secret_marker "${1}")" || return 1
+    rm -f "${file}"
+}
+
+# cli_helpers_clip_is_secret HASH: whether a marker holds HASH
+cli_helpers_clip_is_secret() {
+    local hash="${1}"
+    local dir
+    local file
+    local marked
+
+    dir="$(cli_helpers_clip_runtime_dir)/secrets" || return 1
+    for file in "${dir}"/*; do
+        [ -f "${file}" ] || continue
+        read -r marked < "${file}" && [ "${marked}" = "${hash}" ] && return 0
+    done
+    return 1
+}
+
+# cli_helpers_clip_history_dir: prints the history folder, creating it (0700)
+cli_helpers_clip_history_dir() {
+    local dir="${CLIP_HISTORY_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/cli-helpers/clip-history}"
+
+    # only the folder itself 0700, its parents are shared ones
+    if [ ! -d "${dir}" ]; then
+        mkdir -p "$(dirname "${dir}")" || return 1
+        mkdir -m 0700 "${dir}" 2>/dev/null || [ -d "${dir}" ] || return 1
+    fi
+    echo "${dir}"
+}
+
+# cli_helpers_clip_history_add FILE: records the text in FILE, unless recording
+# is off (CLIP_HISTORY=0), the text is only whitespace, or it is a secret; a text
+# recorded before only moves to the top
+cli_helpers_clip_history_add() {
+    local input_file="${1}"
+    local dir
+    local hash
+    local tmp_file
+
+    [ "${CLIP_HISTORY:-1}" = "0" ] && return 0
+    [ -n "$(tr -d '[:space:]' < "${input_file}" | head -c 1)" ] || return 0
+    hash="$(cli_helpers_clip_hash "${input_file}")" || return 1
+    cli_helpers_clip_is_secret "${hash}" && return 0
+    dir="$(cli_helpers_clip_history_dir)" || return 1
+    if [ -f "${dir}/${hash}" ]; then
+        touch "${dir}/${hash}"
+        return
+    fi
+    # written next to its place and moved there, so no one reads half of it;
+    # mktemp creates it 0600
+    tmp_file="$(mktemp "${dir}/.add.XXXXXX")" || return 1
+    if ! cat "${input_file}" > "${tmp_file}" || ! mv -f "${tmp_file}" "${dir}/${hash}"; then
+        rm -f "${tmp_file}"
+        return 1
+    fi
+}
+
+# cli_helpers_clip_history_remove HASH: removes the entry HASH, if there is one
+cli_helpers_clip_history_remove() {
+    local hash="${1}"
+    local dir
+
+    [[ "${hash}" =~ ^[0-9a-f]{40}$ ]] || return 1
+    dir="$(cli_helpers_clip_history_dir)" || return 1
+    rm -f "${dir}/${hash}"
+}
+
+# cli_helpers_clip_history_list: prints "<mtime> <size> <hash>" per entry, newest
+# first (mtime in seconds since the epoch, with fractions)
+cli_helpers_clip_history_list() {
+    local dir
+
+    dir="$(cli_helpers_clip_history_dir)" || return 1
+    find "${dir}" -mindepth 1 -maxdepth 1 -type f -not -name '.*' -printf '%T@ %s %f\n' | sort -rn
+}
+
+# cli_helpers_clip_history_latest: prints the path of the newest entry, fails
+# when the history is empty
+cli_helpers_clip_history_latest() {
+    local dir
+    local _mtime _size hash
+
+    dir="$(cli_helpers_clip_history_dir)" || return 1
+    read -r _mtime _size hash < <(cli_helpers_clip_history_list)
+    [ -n "${hash}" ] || return 1
+    echo "${dir}/${hash}"
+}

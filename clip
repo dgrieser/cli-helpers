@@ -1,21 +1,48 @@
 #!/bin/bash
-CLIPBOARD_PRIVATE_FILE="${HOME}/.cache/clipboard-private"
+APP_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
-if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
-    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
-elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
-    . "${SCRIPT_DIR}/lib-desktop"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard"
+elif [ -f "${SCRIPT_DIR}/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib-clipboard"
 else
-    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-clipboard"
 fi
 
 usage() {
-    echo "usage: $(basename "${0}") [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [<file, or stdin>]" 2>&1
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [-s|--secret] [-t|--timeout SECONDS] [-H|--history-only] [<file, or stdin>]
+
+Copies text from a file or stdin into the clipboard and records it in the
+history of clip-history. A secret is never recorded, and it is taken out of the
+clipboard again after a timeout (clip-secret is clip --secret).
+
+Options:
+  --print                  Also print the copied text
+  -c, --clipboard          Copy to the clipboard only (default: clipboard and primary)
+  -p, --primary            Copy to the primary selection only
+  -n, --no-newline         Strip all newline and carriage return characters
+  -H, --history-only       Only record the text in the history, leave the
+                           clipboard as it is
+  -s, --secret             Do not record the text, clear it after the timeout
+                           (the newest history entry takes its place)
+  -t, --timeout SECONDS    Timeout of a secret, 0 keeps it (default: ${CLIP_SECRET_TIMEOUT:-30},
+                           CLIP_SECRET_TIMEOUT); implies --secret
+  -h, --help               Show this help message and exit
+
+Environment:
+  CLIP_HISTORY=0           Do not record anything
+  CLIP_SECRET_RESTORE=0    Only clear a secret, do not restore the newest entry
+EOF
     exit 1
 }
 
 error() {
-    echo "ERROR: ${1}" 2>&1
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
 }
 
 fail() {
@@ -27,6 +54,10 @@ PRINT=0
 FILE=""
 CLIPBOARD="both"
 SKIP_NEWLINE=0
+SECRET=0
+HISTORY_ONLY=0
+[ "${APP_NAME}" = "clip-secret" ] && SECRET=1
+TIMEOUT="${CLIP_SECRET_TIMEOUT:-30}"
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -45,6 +76,18 @@ while [ "${#}" -gt 0 ]; do
         -n|--no-newline)
             SKIP_NEWLINE=1
             ;;
+        -H|--history-only)
+            HISTORY_ONLY=1
+            ;;
+        -s|--secret)
+            SECRET=1
+            ;;
+        -t|--timeout)
+            shift
+            [ -z "${1}" ] && usage
+            TIMEOUT="${1}"
+            SECRET=1
+            ;;
         *)
             if [ -z "${FILE}" ]; then
                 FILE="${1}"
@@ -57,60 +100,92 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
+[[ "${TIMEOUT}" =~ ^[0-9]+$ ]] || fail "Timeout '${TIMEOUT}' is no number of seconds"
+if [ "${HISTORY_ONLY}" -eq 1 ]; then
+    [ "${SECRET}" -eq 1 ] && fail "--history-only cannot record a secret"
+    [ "${CLIPBOARD}" != "both" ] && fail "--history-only does not copy into a selection"
+    [ "${CLIP_HISTORY:-1}" = "0" ] && warning "CLIP_HISTORY=0, so nothing is recorded"
+fi
 [ "${FILE}" = "-" ] && FILE=""
 [ -n "${FILE}" ] && [ ! -f "${FILE}" ] && fail "File '${FILE}' does not exist"
 
+STAGE_FILE=""
+trap '[ -n "${STAGE_FILE}" ] && rm -f "${STAGE_FILE}"' EXIT
+
+# the text to copy in a file of its own, in tmpfs: a secret never lands on disk
+stage_file() {
+    local dir
+
+    dir="$(cli_helpers_clip_runtime_dir)" || return 1
+    STAGE_FILE="$(mktemp "${dir}/stage.XXXXXX")" || return 1
+}
+
+# clears the secret marked as ID after the timeout, in a session of its own, so
+# it still runs once the terminal it was copied in is closed
+schedule_clear() {
+    local id="${1}"
+    local clip_clear="${SCRIPT_DIR}/clip-clear"
+
+    [ -x "${clip_clear}" ] || clip_clear="clip-clear"
+    setsid -f "${clip_clear}" --secret "${id}" --after "${TIMEOUT}" < /dev/null &>/dev/null
+}
+
 copy_file() {
     local input_file="${1}"
-    local tmp_file=""
-    
-    if [ "${SKIP_NEWLINE}" -eq 1 ]; then
-        tmp_file="$(mktemp "/tmp/clip.XXXXXX")"
-        trap "rm -f '${tmp_file}'" EXIT
-        cat "${input_file}" | tr -d '\n' | tr -d '\r' > "${tmp_file}"
-        input_file="${tmp_file}"
-    fi
-    touch "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
+    local hash
+    local id=""
 
-    if cli_helpers_is_wayland; then
-        if ! cli_helpers_clipboard_set_text_file "${CLIPBOARD}" "${input_file}"; then
-            cli_helpers_require_command wl-copy wl-clipboard || return 1
-            if [ "${CLIPBOARD}" = "clipboard" ] || [ "${CLIPBOARD}" = "both" ]; then
-                wl-copy < "${input_file}"
-            fi
-            if [ "${CLIPBOARD}" = "primary" ] || [ "${CLIPBOARD}" = "both" ]; then
-                wl-copy --primary < "${input_file}"
-            fi
-        fi
-    else
-        if [ "${CLIPBOARD}" = "clipboard" ]; then
-            DISPLAY=$(xdisplay) xclip -i -sel c < "${input_file}" &>/dev/null
-        elif [ "${CLIPBOARD}" = "primary" ]; then
-            DISPLAY=$(xdisplay) xclip -i -sel p < "${input_file}" &>/dev/null
-        else
-            DISPLAY=$(xdisplay) xclip -i -sel c < "${input_file}" &>/dev/null
-            DISPLAY=$(xdisplay) xclip -i -sel p < "${input_file}" &>/dev/null
-        fi
+    if [ "${HISTORY_ONLY}" -eq 1 ]; then
+        cli_helpers_clip_history_add "${input_file}" || return 1
+        [ "${PRINT}" -eq 1 ] && cat "${input_file}"
+        return 0
+    fi
+    if [ "${SECRET}" -eq 1 ]; then
+        hash="$(cli_helpers_clip_hash "${input_file}")" || return 1
+        # marked before it reaches the clipboard, so that nothing records it
+        id="$(cli_helpers_clip_secret_mark "${hash}")" || fail "Cannot mark the secret"
+        cli_helpers_clip_history_remove "${hash}"
+    fi
+    if ! cli_helpers_clipboard_write "${CLIPBOARD}" "${input_file}"; then
+        [ -n "${id}" ] && cli_helpers_clip_secret_unmark "${id}"
+        return 1
+    fi
+    if [ "${SECRET}" -eq 0 ]; then
+        cli_helpers_clip_history_add "${input_file}"
+    elif [ "${TIMEOUT}" -gt 0 ]; then
+        schedule_clear "${id}"
     fi
 
     [ "${PRINT}" -eq 1 ] && cat "${input_file}"
-    rm -f "${CLIPBOARD_PRIVATE_FILE}" 2>/dev/null || true
+    return 0
+}
+
+# the input as it is, or without its line breaks
+read_input() {
+    if [ "${SKIP_NEWLINE}" -eq 1 ]; then
+        tr -d '\r\n'
+    else
+        cat -
+    fi
 }
 
 # read from file
 if [ -n "${FILE}" ]; then
+    if [ "${SKIP_NEWLINE}" -eq 1 ]; then
+        stage_file || fail "Cannot stage the text to copy"
+        read_input < "${FILE}" > "${STAGE_FILE}"
+        FILE="${STAGE_FILE}"
+    fi
     copy_file "${FILE}" || exit 1
     exit 0
 fi
 
 # read from stdin if available
 if [ -p /dev/stdin ]; then
-    tmpfile="$(mktemp "/tmp/clip.XXXXXX")"
-    cat - > "${tmpfile}"
-    copy_file "${tmpfile}"
-    status=$?
-    rm -f "${tmpfile}"
-    exit "${status}"
+    stage_file || fail "Cannot stage the text to copy"
+    read_input > "${STAGE_FILE}"
+    copy_file "${STAGE_FILE}"
+    exit "${?}"
 fi
 
 usage

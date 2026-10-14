@@ -1,0 +1,366 @@
+#!/bin/bash
+APP_NAME="$(basename "${0}")"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+SCRIPT_PATH="${SCRIPT_DIR}/${APP_NAME}"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard"
+elif [ -f "${SCRIPT_DIR}/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib-clipboard"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-clipboard"
+fi
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [COMMAND] [OPTIONS]
+
+Keeps a history of the text copied with clip (and, with the clip-history
+service, of the text copied anywhere in GNOME) and puts entries back into the
+clipboard. Secrets (clip --secret, clip-secret) are never recorded.
+
+Commands:
+  select [QUERY]        Pick an entry with fzf and copy it (default)
+  list                  List the entries, newest first: index, age, size, text
+  show ENTRY            Print an entry
+  restore ENTRY         Copy an entry into the clipboard again
+  delete ENTRY...       Remove entries
+  clear                 Remove all entries
+  add [FILE]            Record the text of FILE, or of stdin
+  watch                 Record every text copied in GNOME (the clip-history service)
+  path                  Print the folder of the history
+
+ENTRY is an index of list (0 is the newest) or the start of an entry's hash.
+
+Options:
+  -p, --print           select: print the entry instead of copying it
+  -n, --limit N         list: only the newest N entries
+  --raw                 list: tab separated hash, mtime, bytes, age, size, text
+  -y, --yes             clear: do not ask first
+  -h, --help            Show this help message and exit
+
+Keys of select:
+  enter                 Copy the entry
+  alt-enter             Print the entry
+  ctrl-d                Remove the entry
+  esc                   Exit
+
+Environment:
+  CLIP_HISTORY_DIR      The folder of the history
+                        (default: ~/.local/share/cli-helpers/clip-history)
+  CLIP_HISTORY=0        Do not record anything
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+history_dir() {
+    cli_helpers_clip_history_dir || fail "Cannot create the history folder"
+}
+
+# resolve_entry ENTRY: prints the hash of ENTRY, an index or the start of a hash
+resolve_entry() {
+    local entry="${1}"
+    local dir
+    local hash
+    local matches
+
+    dir="$(history_dir)" || return 1
+    if [[ "${entry}" =~ ^[0-9]+$ ]] && [ "${#entry}" -lt 40 ]; then
+        hash="$(cli_helpers_clip_history_list | sed -n "$((10#${entry} + 1))p" | cut -d' ' -f3)"
+        [ -n "${hash}" ] || { error "There is no entry ${entry}"; return 1; }
+    elif [[ "${entry}" =~ ^[0-9a-f]{4,40}$ ]]; then
+        matches=("${dir}/${entry}"*)
+        [ -f "${matches[0]}" ] || { error "There is no entry ${entry}"; return 1; }
+        [ "${#matches[@]}" -eq 1 ] || { error "${entry} is the start of ${#matches[@]} entries"; return 1; }
+        hash="${matches[0]##*/}"
+    else
+        error "${entry} is no index and no hash"
+        return 1
+    fi
+    echo "${hash}"
+}
+
+# prints the entries as "<mtime> <size> <hash>" lines on stdin describe them,
+# as a list for people or tab separated (--raw)
+format_entries() {
+    local dir="${1}"
+    local width=200
+    local now
+
+    if [ "${raw}" -eq 0 ] && [ -t 1 ]; then
+        width="$(( $(tput cols 2>/dev/null || echo 120) - 22 ))"
+        [ "${width}" -lt 20 ] && width=20
+    fi
+    printf -v now '%(%s)T' -1
+    awk -v dir="${dir}" -v now="${now}" -v width="${width}" -v raw="${raw}" '
+        function age(seconds) {
+            if (seconds < 60) return int(seconds) "s"
+            if (seconds < 3600) return int(seconds / 60) "m"
+            if (seconds < 86400) return int(seconds / 3600) "h"
+            if (seconds < 604800) return int(seconds / 86400) "d"
+            return int(seconds / 604800) "w"
+        }
+        function size(bytes) {
+            if (bytes < 1024) return bytes "B"
+            if (bytes < 1048576) return sprintf("%.1fK", bytes / 1024)
+            return sprintf("%.1fM", bytes / 1048576)
+        }
+        {
+            file = dir "/" $3
+            # only as many lines as fill the line of the entry, joined by a
+            # sign for the line break; control characters (tabs, escape
+            # sequences) would garble the list
+            text = ""
+            lines = 0
+            while (length(text) <= width && (getline line < file) > 0) {
+                gsub(/[[:cntrl:]]/, " ", line)
+                text = (lines++ ? text "↵" : "") line
+            }
+            close(file)
+            if (length(text) > width)
+                text = substr(text, 1, width - 1) "…"
+            if (raw)
+                printf "%s\t%d\t%d\t%s\t%s\t%s\n", $3, $1, $2, age(now - $1), size($2), text
+            else
+                printf "%-4d %4s %7s  %s\n", NR - 1, age(now - $1), size($2), text
+        }'
+}
+
+list_entries() {
+    local dir
+
+    dir="$(history_dir)" || exit 1
+    if [ -n "${limit}" ]; then
+        cli_helpers_clip_history_list | head -n "${limit}" | format_entries "${dir}"
+    else
+        cli_helpers_clip_history_list | format_entries "${dir}"
+    fi
+}
+
+show_entry() {
+    local hash
+    local dir
+
+    hash="$(resolve_entry "${1}")" || exit 1
+    dir="$(history_dir)" || exit 1
+    cat "${dir}/${hash}"
+}
+
+# copies the entry HASH into the clipboard and the primary selection, the way
+# clip does, which moves it to the top of the history
+restore_hash() {
+    local file
+
+    file="$(history_dir)/${1}" || exit 1
+    cli_helpers_clipboard_write both "${file}" || fail "Cannot copy the entry into the clipboard"
+    cli_helpers_clip_history_add "${file}"
+}
+
+restore_entry() {
+    local hash
+
+    hash="$(resolve_entry "${1}")" || exit 1
+    restore_hash "${hash}"
+}
+
+delete_entries() {
+    local entry
+    local hash
+    local hashes=()
+
+    # all of them looked up first: every removal moves the indexes after it
+    for entry in "${@}"; do
+        hash="$(resolve_entry "${entry}")" || exit 1
+        hashes+=("${hash}")
+    done
+    for hash in "${hashes[@]}"; do
+        cli_helpers_clip_history_remove "${hash}" || fail "Cannot remove entry ${hash}"
+    done
+}
+
+clear_entries() {
+    local dir
+    local count
+
+    dir="$(history_dir)" || exit 1
+    count="$(cli_helpers_clip_history_list | wc -l)"
+    if [ "${count}" -eq 0 ]; then
+        echo "The clipboard history is empty" 1>&2
+        return 0
+    fi
+    if [ "${yes}" -eq 0 ]; then
+        command -v prompt-no-yes >/dev/null 2>&1 || fail "prompt-no-yes not found, use --yes"
+        prompt-no-yes "Remove all ${count} entries of the clipboard history?" || abort
+    fi
+    find "${dir}" -mindepth 1 -maxdepth 1 -type f -delete || fail "Cannot clear ${dir}"
+}
+
+add_entry() {
+    local file="${1}"
+    local stage_file
+
+    if [ -n "${file}" ] && [ "${file}" != "-" ]; then
+        [ -f "${file}" ] || fail "File '${file}' does not exist"
+        cli_helpers_clip_history_add "${file}" || fail "Cannot record ${file}"
+        return 0
+    fi
+    [ -t 0 ] && usage
+    # staged in tmpfs, like clip does it
+    stage_file="$(mktemp "$(cli_helpers_clip_runtime_dir)/stage.XXXXXX")" || fail "Cannot stage the text"
+    trap 'rm -f "${stage_file}"' EXIT
+    cat - > "${stage_file}"
+    cli_helpers_clip_history_add "${stage_file}" || fail "Cannot record the text"
+}
+
+select_entry() {
+    local query="${1}"
+    local script
+    local selection
+    local key
+    local line
+    local hash
+
+    cli_helpers_require_command fzf || exit 1
+    [ -n "$(cli_helpers_clip_history_list | head -n 1)" ] || fail "The clipboard history is empty"
+    printf -v script '%q' "${SCRIPT_PATH}"
+    # the hash leads each line, hidden; only the text is searched
+    selection="$(raw=1 list_entries | fzf \
+        --delimiter $'\t' \
+        --with-nth 4.. \
+        --nth 3.. \
+        --no-sort \
+        --query "${query}" \
+        --expect alt-enter \
+        --header 'enter: copy, alt-enter: print, ctrl-d: delete, esc: exit' \
+        --preview "${script} show {1}" \
+        --preview-window 'down,50%,wrap' \
+        --bind "ctrl-d:execute-silent(${script} delete {1})+reload(${script} list --raw)" \
+        --color "bg+:${COLOR_SELECTION_BACKGROUND:-238},header:${COLOR_TABLE_HEADER:-238}:italic")" || abort
+    { read -r key; IFS= read -r line; } <<< "${selection}"
+    hash="${line%%$'\t'*}"
+    [ -n "${hash}" ] || abort
+    if [ "${print}" -eq 1 ] || [ "${key}" = "alt-enter" ]; then
+        cat "$(history_dir)/${hash}"
+    else
+        restore_hash "${hash}"
+    fi
+}
+
+watch_clipboard() {
+    cli_helpers_is_wayland || fail "watch needs a GNOME session on Wayland"
+    exec "$(cli_helpers_repo_dir)/gnome-clipboard-bridge" watch "${SCRIPT_PATH}" add
+}
+
+command=""
+arguments=()
+print=0
+yes=0
+raw=0
+limit=""
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "select list show restore delete clear add watch path -p --print -n --limit --raw -y --yes -h --help"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -p|--print)
+            print=1
+            ;;
+        -n|--limit)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" =~ ^[0-9]+$ ]] || fail "Limit '${1}' is no number"
+            limit="${1}"
+            ;;
+        --raw)
+            raw=1
+            ;;
+        -y|--yes)
+            yes=1
+            ;;
+        --)
+            shift
+            arguments+=("${@}")
+            break
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -z "${command}" ]; then
+                command="${1}"
+            else
+                arguments+=("${1}")
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${command}" ] && command="select"
+[ "${print}" -eq 1 ] && [ "${command}" != "select" ] && fail "--print only works with select"
+{ [ -n "${limit}" ] || [ "${raw}" -eq 1 ]; } && [ "${command}" != "list" ] && fail "--limit and --raw only work with list"
+[ "${yes}" -eq 1 ] && [ "${command}" != "clear" ] && fail "--yes only works with clear"
+
+case "${command}" in
+    select)
+        select_entry "${arguments[*]}"
+        ;;
+    list)
+        [ "${#arguments[@]}" -eq 0 ] || usage
+        list_entries
+        ;;
+    show)
+        [ "${#arguments[@]}" -eq 1 ] || usage
+        show_entry "${arguments[0]}"
+        ;;
+    restore)
+        [ "${#arguments[@]}" -eq 1 ] || usage
+        restore_entry "${arguments[0]}"
+        ;;
+    delete)
+        [ "${#arguments[@]}" -ge 1 ] || usage
+        delete_entries "${arguments[@]}"
+        ;;
+    clear)
+        [ "${#arguments[@]}" -eq 0 ] || usage
+        clear_entries
+        ;;
+    add)
+        [ "${#arguments[@]}" -le 1 ] || usage
+        add_entry "${arguments[0]}"
+        ;;
+    watch)
+        [ "${#arguments[@]}" -eq 0 ] || usage
+        watch_clipboard
+        ;;
+    path)
+        [ "${#arguments[@]}" -eq 0 ] || usage
+        history_dir
+        ;;
+    *)
+        error "Unknown command: ${command}"
+        usage
+        ;;
+esac

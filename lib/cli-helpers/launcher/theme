@@ -9,11 +9,11 @@
 font = Agave Nerd Font Mono 13
 
 foreground = #d7dde5
-background = #32383f
+background = #33233f
 
 # the cursor, and the text under it
-cursor = #d7dde5
-cursor-text = #32383f
+cursor = #000000
+cursor-text = #ffffff
 
 # of the background: 1 is opaque, 0.9 lets 10 % of the desktop through
 opacity = 1
@@ -21,7 +21,7 @@ opacity = 1
 # the size of the window: its width in percent of the screen's (the monitor under the
 # pointer, where GNOME opens it), its height from the aspect ratio, width:height or
 # one number (3.3)
-width = 59
+width = 45
 aspect-ratio = 5:1
 
 # the 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan, white, then

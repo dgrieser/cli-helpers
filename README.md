@@ -382,9 +382,11 @@ cam-settings preset apply evening_light
 ## Clipboard
 
 ### `clip`
-Copies text from a file or stdin into the clipboard, handling both Wayland (`wl-copy`) and X11 (`xclip`), with options to target the clipboard and/or primary selection, strip newlines, and optionally echo the content.
+Copies text from a file or stdin into the clipboard and records it in the history of `clip-history`. It handles both Wayland (the GNOME extension, else `wl-copy`) and X11 (`xclip`). Options target the clipboard and/or primary selection, strip newlines, and echo the content.
 
-**Usage:** `clip [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [<file, or stdin>]`
+A secret (`--secret`, or `clip-secret`) is never recorded. Before it reaches the clipboard, its sha1 goes into a marker in `$XDG_RUNTIME_DIR/cli-helpers/clip/secrets`. Every history write skips marked text, also the text the `clip-history` service records from GUI copies. An entry the history already holds for the same text is removed. After the timeout, `clip-clear --secret` takes the secret out of each selection that still holds it, in a session of its own, so closing the terminal does not stop it. The newest history entry then goes back into the clipboard, which is usually what it held before the secret. Text you copy in the meantime stays untouched. The input is staged in `$XDG_RUNTIME_DIR` (tmpfs), so a secret never lands on disk.
+
+**Usage:** `clip [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [-s|--secret] [-t|--timeout SECONDS] [-H|--history-only] [<file, or stdin>]`
 
 | Argument / Flag | Description |
 |---|---|
@@ -392,29 +394,45 @@ Copies text from a file or stdin into the clipboard, handling both Wayland (`wl-
 | `-c, --clipboard` | Copy to the clipboard selection only (default is both clipboard and primary). |
 | `-p, --primary` | Copy to the primary selection only. |
 | `-n, --no-newline` | Strip all newline and carriage-return characters before copying. |
+| `-s, --secret` | Do not record the text, and clear it after the timeout. |
+| `-H, --history-only` | Only record the text in the history, leave the clipboard as it is (like `clip-history add`). Excludes `--secret`, `--timeout`, `--clipboard` and `--primary`. |
+| `-t, --timeout SECONDS` | Timeout of a secret, `0` keeps it in the clipboard (default `30`, or `CLIP_SECRET_TIMEOUT`). Implies `--secret`. |
 | `<file>` | File to copy; if omitted (or `-`), content is read from stdin. |
+
+| Environment | Description |
+|---|---|
+| `CLIP_HISTORY=0` | Do not record anything. |
+| `CLIP_HISTORY_DIR` | The folder of the history (default `~/.local/share/cli-helpers/clip-history`). |
+| `CLIP_SECRET_TIMEOUT` | Default timeout of a secret in seconds. |
+| `CLIP_SECRET_RESTORE=0` | Only clear an expired secret, do not put the newest history entry back. |
 
 **Examples:**
 ```bash
 clip notes.txt
 git rev-parse HEAD | clip -c -n
 echo "hello" | clip --print
+git log -1 --format=%H | clip -n --history-only
+ssh pi two github | clip -n --secret
+generate-password | clip -t 10
 ```
 
 ### `clip-clear`
-Clears the contents of the clipboard or primary selection on either Wayland or X11.
+Clears the contents of the clipboard or primary selection on either Wayland or X11. With `--secret` it is the clean-up that `clip --secret` schedules. It clears the marked secret only in the selections that still hold it, and puts the newest history entry back into the clipboard (unless `CLIP_SECRET_RESTORE=0`).
 
-**Usage:** `clip-clear [-c|--clipboard|-p|--primary]`
+**Usage:** `clip-clear [-c|--clipboard|-p|--primary] [--after SECONDS] [--secret ID]`
 
 | Argument / Flag | Description |
 |---|---|
 | `-c, --clipboard` | Clear the clipboard selection (default). |
 | `-p, --primary` | Clear the primary selection. |
+| `--after SECONDS` | Wait `SECONDS` before clearing. |
+| `--secret ID` | Clear the secret that `clip --secret` marked as `ID`, in the clipboard and the primary selection, and remove the marker. Does nothing once the marker is gone. |
 
 **Examples:**
 ```bash
 clip-clear
 clip-clear --primary
+clip-clear --after 60 &
 ```
 
 ### `clip-files`
@@ -431,6 +449,50 @@ Copies the names and contents of one or more files into the clipboard (via `clip
 ```bash
 clip-files main.go util.go
 clip-files --markdown README.md
+```
+
+### `clip-history`
+Keeps a history of copied text and puts entries back into the clipboard, by command or with an fzf picker. `clip` records everything it copies. The user service `clip-history.service` (`clip-history watch`, installed and started by `updater clip-history`) also records the text copied anywhere in GNOME. For that, the cli-helpers GNOME extension announces every clipboard change with the D-Bus signal `ClipboardChanged`, and `gnome-clipboard-bridge watch` reads the new text. The extension leaves out the primary selection and text that a password manager marks with `x-kde-passwordManagerHint` (KeePassXC does this). Secrets copied with `clip --secret` or `clip-secret` are never recorded. After you update the extension, log out and in again: GNOME on Wayland loads extension code only at login.
+
+The history is one file per text in `~/.local/share/cli-helpers/clip-history` (or `CLIP_HISTORY_DIR`), named after the text's sha1. The folder is `0700` and the files are `0600`. The same text copied again only moves to the top, and there is no limit on the number of entries. Text that is only whitespace is not recorded.
+
+**Usage:** `clip-history [select [QUERY] | list [-n N] [--raw] | show ENTRY | restore ENTRY | delete ENTRY... | clear [-y] | add [FILE] | watch | path]`
+
+`ENTRY` is an index of `list` (`0` is the newest) or the start of an entry's hash (at least 4 characters).
+
+| Command / Flag | Description |
+|---|---|
+| `select [QUERY]` | Pick an entry with fzf and copy it into the clipboard and the primary selection (the default command). The preview shows the whole text. |
+| `-p, --print` | `select`: print the entry instead of copying it. |
+| `list` | List the entries, newest first: index, age, size, and the start of the text, with `↵` for line breaks. |
+| `-n, --limit N` | `list`: only the newest `N` entries. |
+| `--raw` | `list`: tab-separated hash, mtime, bytes, age, size and text. |
+| `show ENTRY` | Print an entry. |
+| `restore ENTRY` | Copy an entry into the clipboard again, which moves it to the top. |
+| `delete ENTRY...` | Remove entries. |
+| `clear` | Remove all entries, after asking. |
+| `-y, --yes` | `clear`: do not ask first. |
+| `add [FILE]` | Record the text of `FILE`, or of stdin. |
+| `watch` | Record every text copied in GNOME (what the service runs). |
+| `path` | Print the folder of the history. |
+
+| Key in `select` | Description |
+|---|---|
+| `enter` | Copy the entry. |
+| `alt-enter` | Print the entry. |
+| `ctrl-d` | Remove the entry. |
+| `esc` | Exit. |
+
+**Examples:**
+```bash
+clip-history
+clip-history select ssh
+clip-history list -n 10
+clip-history restore 1
+clip-history delete 0 3
+cmd="$(clip-history select --print)"
+updater clip-history
+systemctl --user status clip-history
 ```
 
 ### `clip-image`
@@ -513,6 +575,17 @@ Polls the clipboard (or primary selection) once per second and prints its conten
 ```bash
 clip-paste-wait
 clip-paste-wait --primary
+```
+
+### `clip-secret`
+`clip --secret`: copies a secret, such as a password, a token or a 2FA code, into the clipboard without recording it in the history, and clears it after the timeout (default 30 seconds). The newest history entry then goes back into the clipboard. It takes the same options as `clip`.
+
+**Usage:** `clip-secret [-c|--clipboard|-p|--primary] [-n|--no-newline] [-t|--timeout SECONDS] [<file, or stdin>]`
+
+**Examples:**
+```bash
+ssh pi two github | clip-secret -n
+generate-password | clip-secret -n -t 10
 ```
 
 ### `copy-base64`
@@ -2435,7 +2508,7 @@ remapkeys
 ### `launcher-terminal`
 Opens a quick-launch window in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`): always on top, with the short `TERM_SIMPLE` prompt, and left where GNOME places new windows. It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
 
-The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `color0` to `color15` (the 16 ANSI colors), `width` (in percent of the screen's) and `aspect-ratio` (width:height like `10:3`, or one number like `3.3`), one `key = value` per line, colors as `#rrggbb`. By default that is background `#32383f`, Agave Nerd Font Mono 13, the xterm colors and a window 59 % of the screen wide at 5:1. The screen is the monitor under the pointer, where GNOME opens the window (without one found, the primary monitor, else 1920 px). A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
+The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `color0` to `color15` (the 16 ANSI colors), `width` (in percent of the screen's) and `aspect-ratio` (width:height like `10:3`, or one number like `3.3`), one `key = value` per line, colors as `#rrggbb`. By default that is a dark purple background (`#33233f`), a black cursor, Agave Nerd Font Mono 13, the xterm colors and a window 45 % of the screen wide at 5:1. The screen is the monitor under the pointer, where GNOME opens the window (without one found, the primary monitor, else 1920 px). A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
 
 ```
 background = #1e1e2e
