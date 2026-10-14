@@ -21,8 +21,9 @@ Options:
   --after SECONDS      Wait SECONDS before clearing
   --secret ID          Clear the secret clip --secret marked as ID, in the
                        clipboard and the primary selection, but only where it
-                       still is; the newest history entry takes its place in
-                       the clipboard, unless CLIP_SECRET_RESTORE=0
+                       still is; what the clipboard held before the secret
+                       comes back, if the history holds it too, unless
+                       CLIP_SECRET_RESTORE=0
   -h, --help           Show this help message and exit
 EOF
     exit 1
@@ -46,8 +47,15 @@ clear_secret() {
 
     # gone already: another clear-up took care of it
     secret_hash="$(cli_helpers_clip_secret_hash "${id}")" || return 0
+    # what the clipboard held before, but only text the history holds as well:
+    # what the history leaves out, such as a password copied by a password
+    # manager right before the secret, does not come back either
     if [ "${CLIP_SECRET_RESTORE:-1}" != "0" ]; then
-        restore_file="$(cli_helpers_clip_history_latest)" || restore_file=""
+        restore_file="$(cli_helpers_clip_secret_previous "${id}")" || restore_file=""
+        if [ -n "${restore_file}" ] && { [ ! -s "${restore_file}" ] ||
+            ! cli_helpers_clip_history_has "$(cli_helpers_clip_hash "${restore_file}")"; }; then
+            restore_file=""
+        fi
     fi
     for selection in clipboard primary; do
         [ "$(cli_helpers_clipboard_read "${selection}" | cli_helpers_clip_hash)" = "${secret_hash}" ] || continue

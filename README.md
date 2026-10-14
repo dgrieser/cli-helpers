@@ -384,7 +384,7 @@ cam-settings preset apply evening_light
 ### `clip`
 Copies text from a file or stdin into the clipboard and records it in the history of `clip-history`. It handles both Wayland (the GNOME extension, else `wl-copy`) and X11 (`xclip`). Options target the clipboard and/or primary selection, strip newlines, and echo the content.
 
-A secret (`--secret`, or `clip-secret`) is never recorded. Before it reaches the clipboard, its sha1 goes into a marker in `$XDG_RUNTIME_DIR/cli-helpers/clip/secrets`. Every history write skips marked text, also the text the `clip-history` service records from GUI copies. An entry the history already holds for the same text is removed. After the timeout, `clip-clear --secret` takes the secret out of each selection that still holds it, in a session of its own, so closing the terminal does not stop it. The newest history entry then goes back into the clipboard, which is usually what it held before the secret. Text you copy in the meantime stays untouched. The input is staged in `$XDG_RUNTIME_DIR` (tmpfs), so a secret never lands on disk.
+A secret (`--secret`, or `clip-secret`) is never recorded. Before it reaches the clipboard, its sha1 goes into a marker in `$XDG_RUNTIME_DIR/cli-helpers/clip/secrets`. Every history write skips marked text, also the text the `clip-history` service records from GUI copies. An entry the history already holds for the same text is removed. Before the secret reaches the clipboard, `clip` also keeps what the clipboard holds at that moment, next to the marker. After the timeout, `clip-clear --secret` takes the secret out of each selection that still holds it, in a session of its own, so closing the terminal does not stop it. Then the kept text goes back into the clipboard, but only if the history holds it too. So text the history leaves out never comes back, for example a password that a password manager copied right before the secret. In that case, or when the clipboard was empty, the clipboard is only cleared. If the secret replaced another secret that has not expired yet, the text from before that one is kept, so an expired secret never comes back. Text you copy in the meantime stays untouched. The input is staged in `$XDG_RUNTIME_DIR` (tmpfs), so a secret never lands on disk.
 
 **Usage:** `clip [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [-s|--secret] [-t|--timeout SECONDS] [-H|--history-only] [<file, or stdin>]`
 
@@ -404,7 +404,7 @@ A secret (`--secret`, or `clip-secret`) is never recorded. Before it reaches the
 | `CLIP_HISTORY=0` | Do not record anything. |
 | `CLIP_HISTORY_DIR` | The folder of the history (default `~/.local/share/cli-helpers/clip-history`). |
 | `CLIP_SECRET_TIMEOUT` | Default timeout of a secret in seconds. |
-| `CLIP_SECRET_RESTORE=0` | Only clear an expired secret, do not put the newest history entry back. |
+| `CLIP_SECRET_RESTORE=0` | Only clear an expired secret, do not put back what the clipboard held before. |
 
 **Examples:**
 ```bash
@@ -417,7 +417,7 @@ generate-password | clip -t 10
 ```
 
 ### `clip-clear`
-Clears the contents of the clipboard or primary selection on either Wayland or X11. With `--secret` it is the clean-up that `clip --secret` schedules. It clears the marked secret only in the selections that still hold it, and puts the newest history entry back into the clipboard (unless `CLIP_SECRET_RESTORE=0`).
+Clears the contents of the clipboard or primary selection on either Wayland or X11. With `--secret` it is the clean-up that `clip --secret` schedules. It clears the marked secret only in the selections that still hold it. It puts back into the clipboard what it held before the secret, if the history holds that text too (unless `CLIP_SECRET_RESTORE=0`).
 
 **Usage:** `clip-clear [-c|--clipboard|-p|--primary] [--after SECONDS] [--secret ID]`
 
@@ -578,7 +578,7 @@ clip-paste-wait --primary
 ```
 
 ### `clip-secret`
-`clip --secret`: copies a secret, such as a password, a token or a 2FA code, into the clipboard without recording it in the history, and clears it after the timeout (default 30 seconds). The newest history entry then goes back into the clipboard. It takes the same options as `clip`.
+`clip --secret`: copies a secret, such as a password, a token or a 2FA code, into the clipboard without recording it in the history, and clears it after the timeout (default 30 seconds). What the clipboard held before then goes back into it, if the history holds that text too. It takes the same options as `clip`.
 
 **Usage:** `clip-secret [-c|--clipboard|-p|--primary] [-n|--no-newline] [-t|--timeout SECONDS] [<file, or stdin>]`
 
@@ -2508,7 +2508,7 @@ remapkeys
 ### `launcher-terminal`
 Opens a quick-launch window in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`): always on top, with the short `TERM_SIMPLE` prompt, and left where GNOME places new windows. It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
 
-The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `color0` to `color15` (the 16 ANSI colors), `width` (in percent of the screen's) and `aspect-ratio` (width:height like `10:3`, or one number like `3.3`), one `key = value` per line, colors as `#rrggbb`. By default that is a dark purple background (`#33233f`), a black cursor, Agave Nerd Font Mono 13, the xterm colors and a window 45 % of the screen wide at 5:1. The screen is the monitor under the pointer, where GNOME opens the window (without one found, the primary monitor, else 1920 px). A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
+The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `color0` to `color15` (the 16 ANSI colors), `width` (in percent of the screen's) and `aspect-ratio` (width:height like `10:3`, or one number like `3.3`), one `key = value` per line, colors as `#rrggbb`. By default that is a dark greyish purple background (`#3c2f46`), a black cursor, Agave Nerd Font Mono 14, the xterm colors and a window 45 % of the screen wide at 5:1. The screen is the monitor under the pointer, where GNOME opens the window (without one found, the primary monitor, else 1920 px). A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
 
 ```
 background = #1e1e2e

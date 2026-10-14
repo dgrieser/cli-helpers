@@ -6,10 +6,10 @@
 # One "key = value" per line, colors as #rrggbb.
 
 # a Pango font description: family, then size
-font = Agave Nerd Font Mono 13
+font = Agave Nerd Font Mono 14
 
 foreground = #d7dde5
-background = #33233f
+background = #3c2f46
 
 # the cursor, and the text under it
 cursor = #000000

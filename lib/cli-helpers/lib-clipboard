@@ -7,6 +7,8 @@
 # A secret (clip --secret) is never recorded: before it reaches the clipboard its
 # sha1 goes into a marker in the runtime folder (tmpfs), and every text whose
 # sha1 is marked is skipped, no matter which way it would reach the history.
+# What the clipboard held before the secret is kept there too, next to the
+# marker, for clip-clear to put back once the secret expires.
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib-desktop"
 
@@ -152,16 +154,31 @@ cli_helpers_clip_secret_hash() {
     echo "${hash}"
 }
 
-# cli_helpers_clip_secret_unmark ID: removes the marker ID
-cli_helpers_clip_secret_unmark() {
-    local file
+# cli_helpers_clip_secret_previous ID: prints the path of the file that keeps
+# what the clipboard held before the secret ID (there is none when it was empty)
+cli_helpers_clip_secret_previous() {
+    local id="${1}"
+    local dir
 
-    file="$(cli_helpers_clip_secret_marker "${1}")" || return 1
-    rm -f "${file}"
+    [[ "${id}" =~ ^[A-Za-z0-9]+$ ]] || return 1
+    dir="$(cli_helpers_clip_runtime_dir)/previous" || return 1
+    echo "${dir}/${id}"
 }
 
-# cli_helpers_clip_is_secret HASH: whether a marker holds HASH
-cli_helpers_clip_is_secret() {
+# cli_helpers_clip_secret_unmark ID: removes the marker ID and what it kept of
+# the clipboard before
+cli_helpers_clip_secret_unmark() {
+    local file
+    local previous_file
+
+    file="$(cli_helpers_clip_secret_marker "${1}")" || return 1
+    previous_file="$(cli_helpers_clip_secret_previous "${1}")" || return 1
+    rm -f "${file}" "${previous_file}"
+}
+
+# cli_helpers_clip_secret_find HASH: prints the id of a marker holding HASH,
+# fails when no marker does
+cli_helpers_clip_secret_find() {
     local hash="${1}"
     local dir
     local file
@@ -170,9 +187,17 @@ cli_helpers_clip_is_secret() {
     dir="$(cli_helpers_clip_runtime_dir)/secrets" || return 1
     for file in "${dir}"/*; do
         [ -f "${file}" ] || continue
-        read -r marked < "${file}" && [ "${marked}" = "${hash}" ] && return 0
+        if read -r marked < "${file}" && [ "${marked}" = "${hash}" ]; then
+            echo "${file##*/}"
+            return 0
+        fi
     done
     return 1
+}
+
+# cli_helpers_clip_is_secret HASH: whether a marker holds HASH
+cli_helpers_clip_is_secret() {
+    cli_helpers_clip_secret_find "${1}" >/dev/null
 }
 
 # cli_helpers_clip_history_dir: prints the history folder, creating it (0700)
@@ -214,6 +239,16 @@ cli_helpers_clip_history_add() {
     fi
 }
 
+# cli_helpers_clip_history_has HASH: whether the history holds the entry HASH
+cli_helpers_clip_history_has() {
+    local hash="${1}"
+    local dir
+
+    [[ "${hash}" =~ ^[0-9a-f]{40}$ ]] || return 1
+    dir="$(cli_helpers_clip_history_dir)" || return 1
+    [ -f "${dir}/${hash}" ]
+}
+
 # cli_helpers_clip_history_remove HASH: removes the entry HASH, if there is one
 cli_helpers_clip_history_remove() {
     local hash="${1}"
@@ -231,16 +266,4 @@ cli_helpers_clip_history_list() {
 
     dir="$(cli_helpers_clip_history_dir)" || return 1
     find "${dir}" -mindepth 1 -maxdepth 1 -type f -not -name '.*' -printf '%T@ %s %f\n' | sort -rn
-}
-
-# cli_helpers_clip_history_latest: prints the path of the newest entry, fails
-# when the history is empty
-cli_helpers_clip_history_latest() {
-    local dir
-    local _mtime _size hash
-
-    dir="$(cli_helpers_clip_history_dir)" || return 1
-    read -r _mtime _size hash < <(cli_helpers_clip_history_list)
-    [ -n "${hash}" ] || return 1
-    echo "${dir}/${hash}"
 }

@@ -25,14 +25,14 @@ Options:
   -H, --history-only       Only record the text in the history, leave the
                            clipboard as it is
   -s, --secret             Do not record the text, clear it after the timeout
-                           (the newest history entry takes its place)
+                           (what the clipboard held before comes back)
   -t, --timeout SECONDS    Timeout of a secret, 0 keeps it (default: ${CLIP_SECRET_TIMEOUT:-30},
                            CLIP_SECRET_TIMEOUT); implies --secret
   -h, --help               Show this help message and exit
 
 Environment:
   CLIP_HISTORY=0           Do not record anything
-  CLIP_SECRET_RESTORE=0    Only clear a secret, do not restore the newest entry
+  CLIP_SECRET_RESTORE=0    Only clear a secret, do not restore what was before
 EOF
     exit 1
 }
@@ -130,10 +130,53 @@ schedule_clear() {
     setsid -f "${clip_clear}" --secret "${id}" --after "${TIMEOUT}" < /dev/null &>/dev/null
 }
 
+# prints a file (tmpfs) with the text the clipboard holds now, for clip-clear to
+# put back once the secret expires; when that is a secret too, still waiting to
+# expire, the text it replaced instead, so that an expired secret never comes
+# back; prints nothing when there is nothing to keep
+read_previous() {
+    local dir
+    local file
+    local previous_id
+    local earlier_file
+
+    dir="$(cli_helpers_clip_runtime_dir)" || return 0
+    file="$(mktemp "${dir}/previous.XXXXXX")" || return 0
+    cli_helpers_clipboard_read clipboard > "${file}"
+    if previous_id="$(cli_helpers_clip_secret_find "$(cli_helpers_clip_hash "${file}")")"; then
+        earlier_file="$(cli_helpers_clip_secret_previous "${previous_id}")"
+        if [ -s "${earlier_file}" ]; then
+            cp -f "${earlier_file}" "${file}"
+        else
+            : > "${file}"
+        fi
+    fi
+    if [ -s "${file}" ]; then
+        echo "${file}"
+    else
+        rm -f "${file}"
+    fi
+}
+
+# keeps the text of PREVIOUS_FILE as what the clipboard held before the secret ID
+keep_previous() {
+    local id="${1}"
+    local previous_file="${2}"
+    local target
+
+    if target="$(cli_helpers_clip_secret_previous "${id}")" &&
+        (umask 077 && mkdir -p "${target%/*}") && mv -f "${previous_file}" "${target}"; then
+        return 0
+    fi
+    rm -f "${previous_file}"
+    return 1
+}
+
 copy_file() {
     local input_file="${1}"
     local hash
     local id=""
+    local previous_file=""
 
     if [ "${HISTORY_ONLY}" -eq 1 ]; then
         cli_helpers_clip_history_add "${input_file}" || return 1
@@ -142,8 +185,17 @@ copy_file() {
     fi
     if [ "${SECRET}" -eq 1 ]; then
         hash="$(cli_helpers_clip_hash "${input_file}")" || return 1
+        # read before the secret is marked, so it is never mistaken for an
+        # earlier copy of the same secret
+        if [ "${TIMEOUT}" -gt 0 ] && [ "${CLIPBOARD}" != "primary" ]; then
+            previous_file="$(read_previous)"
+        fi
         # marked before it reaches the clipboard, so that nothing records it
-        id="$(cli_helpers_clip_secret_mark "${hash}")" || fail "Cannot mark the secret"
+        id="$(cli_helpers_clip_secret_mark "${hash}")" || {
+            [ -n "${previous_file}" ] && rm -f "${previous_file}"
+            fail "Cannot mark the secret"
+        }
+        [ -n "${previous_file}" ] && keep_previous "${id}" "${previous_file}"
         cli_helpers_clip_history_remove "${hash}"
     fi
     if ! cli_helpers_clipboard_write "${CLIPBOARD}" "${input_file}"; then

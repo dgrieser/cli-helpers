@@ -214,7 +214,6 @@ clear_entries() {
 
 add_entry() {
     local file="${1}"
-    local stage_file
 
     if [ -n "${file}" ] && [ "${file}" != "-" ]; then
         [ -f "${file}" ] || fail "File '${file}' does not exist"
@@ -222,11 +221,11 @@ add_entry() {
         return 0
     fi
     [ -t 0 ] && usage
-    # staged in tmpfs, like clip does it
-    stage_file="$(mktemp "$(cli_helpers_clip_runtime_dir)/stage.XXXXXX")" || fail "Cannot stage the text"
-    trap 'rm -f "${stage_file}"' EXIT
-    cat - > "${stage_file}"
-    cli_helpers_clip_history_add "${stage_file}" || fail "Cannot record the text"
+    # staged in tmpfs, like clip does it; global, so that the trap still sees it
+    STAGE_FILE="$(mktemp "$(cli_helpers_clip_runtime_dir)/stage.XXXXXX")" || fail "Cannot stage the text"
+    trap 'rm -f "${STAGE_FILE}"' EXIT
+    cat - > "${STAGE_FILE}"
+    cli_helpers_clip_history_add "${STAGE_FILE}" || fail "Cannot record the text"
 }
 
 select_entry() {
