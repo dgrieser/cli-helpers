@@ -1,44 +1,58 @@
 # launcher-terminal: the look of the launcher window, the same in every terminal it
 # supports. On every start the launcher puts these values into the placeholders of
-# its files for the terminal (@font@ in launcher/ptyxis, launcher/terminator). A
+# its files for the terminal (@font@ in launcher/ptyxis, launcher/terminator), and
+# the prompt into the shell's startup file (launcher/bash/bashrc). A
 # theme in ~/.config/cli-helpers/launcher-terminal/theme is read on top of this one,
 # so it only needs the keys it changes.
-# One "key = value" per line, colors as #rrggbb.
+# One "key = value" per line, colors as #rrggbb; a value in double quotes keeps the
+# spaces at its ends.
 
 # a Pango font description: family, then size
-font = Agave Nerd Font Mono 14
+font = Agave Nerd Font Mono 13
 
-foreground = #d7dde5
-background = #3c2f46
+# the prompt of bash, followed by a space; bash's escapes work (\w for the
+# directory), and a spec of color-parse in braces colors it from there on
+# ({fg=green:bold}\w {end}❯); a space in front, as the text has no padding left
+prompt = " ❯"
+
+# the colors are Material's, as Ptyxis ships them
+foreground = #c3c7d1
+background = #1e282c
 
 # the cursor, and the text under it
-cursor = #000000
-cursor-text = #ffffff
+cursor = #657b83
+cursor-text = #1e282c
 
 # of the background: 1 is opaque, 0.9 lets 10 % of the desktop through
 opacity = 1
 
+# the space around the text in pixels, 1 to 4 numbers like in CSS: all sides; top
+# and bottom, left and right; top, left and right, bottom; top, right, bottom, left
+# (Ptyxis only; Terminator keeps its own). Above and below as in Ptyxis, whose 3 px
+# and margin of 1 px below make 4
+padding = 7 0 4 0
+
 # the size of the window: its width in percent of the screen's (the monitor under the
 # pointer, where GNOME opens it), its height from the aspect ratio, width:height or
 # one number (3.3)
-width = 45
-aspect-ratio = 5:1
+width = 60
+aspect-ratio = 7:1
 
 # the 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan, white, then
-# their bright variants in the same order; these are xterm's
-color0 = #000000
-color1 = #cd0000
-color2 = #00cd00
-color3 = #cdcd00
-color4 = #0000ee
-color5 = #cd00cd
-color6 = #00cdcd
-color7 = #e5e5e5
-color8 = #7f7f7f
-color9 = #ff0000
-color10 = #00ff00
-color11 = #ffff00
-color12 = #5c5cff
-color13 = #ff00ff
-color14 = #00ffff
+# their bright variants in the same order
+color0 = #073641
+color1 = #eb606b
+color2 = #c3e88d
+color3 = #f7eb95
+color4 = #80cbc3
+color5 = #ff2490
+color6 = #aeddff
+color7 = #ffffff
+color8 = #002b36
+color9 = #eb606b
+color10 = #c3e88d
+color11 = #f7eb95
+color12 = #7dc6bf
+color13 = #6c71c3
+color14 = #34434d
 color15 = #ffffff

@@ -11,9 +11,40 @@ unset -f reminder
 # the short prompt in place of powerline-shell's: prompt.bash of cli-helpers sets PS1
 # before every prompt in _powerline_ps1, so the launcher's version of it sets this
 # one, starting on a clean line like the original. It leaves the window title alone,
-# the launcher finds its window by that title
-PS1="▶ "
+# the launcher finds its window by that title. The prompt comes from the launcher's
+# theme (LAUNCHER_PROMPT), followed by a space
+_launcher_ps1="${LAUNCHER_PROMPT:- ❯}"
+
+# a spec of color-parse in braces ({fg=green:bold}, {end}) colors the prompt from there
+# on; braces of a variable (${...}) and braces without a spec color-parse knows stay
+# as they are, and a colored prompt ends with a reset
+_launcher_ps1_colors() {
+    local rest="${1}" pattern='\{([^{}]+)\}' ps1="" tag before code colored=0
+    while [[ "${rest}" =~ ${pattern} ]]; do
+        tag="${BASH_REMATCH[0]}"
+        before="${rest%%"${tag}"*}"
+        rest="${rest#*"${tag}"}"
+        code=""
+        # with a text, color-parse leaves stdin alone: the codes come before the x
+        [[ "${before}" == *\$ ]] || code="$(color-parse "${BASH_REMATCH[1]}" x 2>/dev/null)"
+        code="${code%x*}"
+        if [ -n "${code}" ]; then
+            ps1+="${before}\[${code}\]"
+            colored=1
+        else
+            ps1+="${before}${tag}"
+        fi
+    done
+    ps1+="${rest}"
+    [ "${colored}" -eq 1 ] && ps1+='\[\e[0m\]'
+    printf '%s' "${ps1}"
+}
+[[ "${_launcher_ps1}" == *\{* ]] && _launcher_ps1="$(_launcher_ps1_colors "${_launcher_ps1}")"
+unset -f _launcher_ps1_colors
+_launcher_ps1+=" "
+
+PS1="${_launcher_ps1}"
 _powerline_ps1() {
     declare -F _eol_mark >/dev/null && _eol_mark
-    PS1="▶ "
+    PS1="${_launcher_ps1}"
 }

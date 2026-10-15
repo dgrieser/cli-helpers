@@ -41,6 +41,121 @@ launcher_file() {
     return 1
 }
 
+# the look of the launcher window, the same in every terminal: launcher/theme, and
+# on top of it the keys of ~/.config/cli-helpers/launcher-terminal/theme
+declare -A theme=()
+
+theme_read() {
+    local file="${1}" line key value number=0
+    if [ ! -f "${file}" ]; then
+        echo "ERROR: ${file} not found" >&2
+        return 1
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        ((number++))
+        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+        if ! [[ "${line}" =~ ^[[:space:]]*([a-z0-9-]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
+            echo "ERROR: ${file}:${number}: not a key = value line" >&2
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        # in double quotes, a value keeps the spaces at its ends (prompt = " ❯")
+        [[ "${value}" =~ ^\"(.*)\"$ ]] && value="${BASH_REMATCH[1]}"
+        case "${key}" in
+            font)
+                # it ends up in quotes in the terminals' configs
+                if [[ "${value}" =~ [\'\"\\] ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} cannot hold quotes or backslashes" >&2
+                    return 1
+                fi
+                ;;
+            opacity)
+                if ! [[ "${value}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a number from 0 to 1, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            padding)
+                if ! [[ "${value}" =~ ^[0-9]{1,2}([[:space:]]+[0-9]{1,2}){0,3}$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is 1 to 4 numbers of pixels from 0 to 99 like in CSS (4 0), not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            width)
+                if ! [[ "${value}" =~ ^([1-9][0-9]?(\.[0-9]+)?|100)$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a percentage from 1 to 100, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            aspect-ratio)
+                if ! [[ "${value}" =~ ^[0-9]+(\.[0-9]+)?(:[0-9]+(\.[0-9]+)?)?$ ]] \
+                    || ! [[ "${value%%:*}" =~ [1-9] && "${value#*:}" =~ [1-9] ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is width:height (10:3) or one number (3.3), not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            prompt)
+                # bash's prompt, read through an environment variable: no quotes needed
+                ;;
+            foreground | background | cursor | cursor-text | color[0-9] | color1[0-5])
+                if ! [[ "${value}" =~ ^#[0-9a-fA-F]{6}$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a color like #32383f, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            *)
+                echo "ERROR: ${file}:${number}: unknown key ${key}" >&2
+                return 1
+                ;;
+        esac
+        theme["${key}"]="${value}"
+    done < "${file}"
+}
+
+theme_load() {
+    local key colors=() sides
+    if [ -f "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" ]; then
+        theme_read "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" || return 1
+    else
+        theme_read "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/theme" || return 1
+    fi
+    if [ -f "${real_config}/cli-helpers/${bin_name}/theme" ]; then
+        theme_read "${real_config}/cli-helpers/${bin_name}/theme" || return 1
+    fi
+    for key in font prompt foreground background cursor cursor-text opacity padding width aspect-ratio \
+        color{0..15}; do
+        if [ -z "${theme[${key}]}" ]; then
+            echo "ERROR: the theme of the launcher has no ${key}" >&2
+            return 1
+        fi
+    done
+    # the forms only some terminals take: the 16 colors as one list (Terminator), a
+    # background that lets the desktop through only below opacity 1
+    for key in {0..15}; do
+        colors+=("${theme[color${key}]}")
+    done
+    theme[palette]="$(IFS=:; echo "${colors[*]}")"
+    # the padding on each side, top, right, bottom, left, from its 1 to 4 numbers the
+    # way CSS reads them, and as CSS (Ptyxis' gtk.css)
+    read -ra sides <<< "${theme[padding]}"
+    case "${#sides[@]}" in
+        1) sides=("${sides[0]}" "${sides[0]}" "${sides[0]}" "${sides[0]}") ;;
+        2) sides=("${sides[0]}" "${sides[1]}" "${sides[0]}" "${sides[1]}") ;;
+        3) sides=("${sides[0]}" "${sides[1]}" "${sides[2]}" "${sides[1]}") ;;
+    esac
+    theme[padding-top]="$((10#${sides[0]}))"
+    theme[padding-right]="$((10#${sides[1]}))"
+    theme[padding-bottom]="$((10#${sides[2]}))"
+    theme[padding-left]="$((10#${sides[3]}))"
+    theme[padding-css]="${theme[padding-top]}px ${theme[padding-right]}px ${theme[padding-bottom]}px ${theme[padding-left]}px"
+    if [[ "${theme[opacity]}" == 1* ]]; then
+        theme[background-type]=solid
+    else
+        theme[background-type]=transparent
+    fi
+}
+
 # inside the terminal window: the launcher calls itself as the terminal's command,
 # because a single-instance terminal (Ptyxis, GNOME Terminal) hands the window to
 # its already running process, so the pid of the started terminal says nothing.
@@ -52,8 +167,11 @@ if [ "${1}" = "--shell" ]; then
     # so a command run in the launcher can close it once it is done (--exit)
     export LAUNCHER_EXIT_FILE="${3}"
     shell="${SHELL:-/bin/bash}"
-    # bash reads the launcher's startup file: ~/.bashrc, then the short prompt
+    # bash reads the launcher's startup file: ~/.bashrc, then the short prompt, the
+    # theme's (its errors are the launcher's to report, the startup file has one of
+    # its own to fall back on)
     if [ "${shell##*/}" = bash ] && rcfile="$(launcher_file bash bashrc)"; then
+        theme_load 2>/dev/null && export LAUNCHER_PROMPT="${theme[prompt]}"
         "${shell}" --rcfile "${rcfile}"
     else
         "${shell}"
@@ -99,96 +217,6 @@ shadow_dir() {
     # already, fail instead of creating the new one inside the real directory it
     # points to
     [ "${#entries[@]}" -eq 0 ] || ln -sn -t "${shadow}" "${entries[@]}"
-}
-
-# the look of the launcher window, the same in every terminal: launcher/theme, and
-# on top of it the keys of ~/.config/cli-helpers/launcher-terminal/theme
-declare -A theme=()
-
-theme_read() {
-    local file="${1}" line key value number=0
-    if [ ! -f "${file}" ]; then
-        echo "ERROR: ${file} not found" >&2
-        return 1
-    fi
-    while IFS= read -r line || [ -n "${line}" ]; do
-        ((number++))
-        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
-        if ! [[ "${line}" =~ ^[[:space:]]*([a-z0-9-]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
-            echo "ERROR: ${file}:${number}: not a key = value line" >&2
-            return 1
-        fi
-        key="${BASH_REMATCH[1]}"
-        value="${BASH_REMATCH[2]}"
-        case "${key}" in
-            font)
-                # it ends up in quotes in the terminals' configs
-                if [[ "${value}" =~ [\'\"\\] ]]; then
-                    echo "ERROR: ${file}:${number}: ${key} cannot hold quotes or backslashes" >&2
-                    return 1
-                fi
-                ;;
-            opacity)
-                if ! [[ "${value}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
-                    echo "ERROR: ${file}:${number}: ${key} is a number from 0 to 1, not ${value}" >&2
-                    return 1
-                fi
-                ;;
-            width)
-                if ! [[ "${value}" =~ ^([1-9][0-9]?(\.[0-9]+)?|100)$ ]]; then
-                    echo "ERROR: ${file}:${number}: ${key} is a percentage from 1 to 100, not ${value}" >&2
-                    return 1
-                fi
-                ;;
-            aspect-ratio)
-                if ! [[ "${value}" =~ ^[0-9]+(\.[0-9]+)?(:[0-9]+(\.[0-9]+)?)?$ ]] \
-                    || ! [[ "${value%%:*}" =~ [1-9] && "${value#*:}" =~ [1-9] ]]; then
-                    echo "ERROR: ${file}:${number}: ${key} is width:height (10:3) or one number (3.3), not ${value}" >&2
-                    return 1
-                fi
-                ;;
-            foreground | background | cursor | cursor-text | color[0-9] | color1[0-5])
-                if ! [[ "${value}" =~ ^#[0-9a-fA-F]{6}$ ]]; then
-                    echo "ERROR: ${file}:${number}: ${key} is a color like #32383f, not ${value}" >&2
-                    return 1
-                fi
-                ;;
-            *)
-                echo "ERROR: ${file}:${number}: unknown key ${key}" >&2
-                return 1
-                ;;
-        esac
-        theme["${key}"]="${value}"
-    done < "${file}"
-}
-
-theme_load() {
-    local key colors=()
-    if [ -f "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" ]; then
-        theme_read "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" || return 1
-    else
-        theme_read "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/theme" || return 1
-    fi
-    if [ -f "${real_config}/cli-helpers/${bin_name}/theme" ]; then
-        theme_read "${real_config}/cli-helpers/${bin_name}/theme" || return 1
-    fi
-    for key in font foreground background cursor cursor-text opacity width aspect-ratio color{0..15}; do
-        if [ -z "${theme[${key}]}" ]; then
-            echo "ERROR: the theme of the launcher has no ${key}" >&2
-            return 1
-        fi
-    done
-    # the forms only some terminals take: the 16 colors as one list (Terminator), a
-    # background that lets the desktop through only below opacity 1
-    for key in {0..15}; do
-        colors+=("${theme[color${key}]}")
-    done
-    theme[palette]="$(IFS=:; echo "${colors[*]}")"
-    if [[ "${theme[opacity]}" == 1* ]]; then
-        theme[background-type]=solid
-    else
-        theme[background-type]=transparent
-    fi
 }
 
 # a file of the launcher's setup of a terminal, with the theme's values in place of
@@ -271,12 +299,12 @@ ptyxis_prepare() {
     local css keyfile palette cell_width cell_height
     css="$(launcher_file ptyxis gtk.css)" && keyfile="$(launcher_file ptyxis settings.keyfile)" \
         && palette="$(launcher_file ptyxis launcher.palette)" && theme_load || return 1
-    # Ptyxis takes the size in cells; around them its terminal has a padding of 6 px
-    # left and right, 7 px above and 4 px below (its style.css)
+    # Ptyxis takes the size in cells; around them its terminal has the theme's padding
+    # (launcher/ptyxis/gtk.css)
     read -r cell_width cell_height < <(cell_size) && [ -n "${cell_height}" ] || return 1
     window_size
-    theme[columns]=$(( (window_width - 12) / cell_width ))
-    theme[rows]=$(( (window_height - 11) / cell_height ))
+    theme[columns]=$(( (window_width - theme[padding-left] - theme[padding-right]) / cell_width ))
+    theme[rows]=$(( (window_height - theme[padding-top] - theme[padding-bottom]) / cell_height ))
     rm -rf "${ptyxis_dir}"
     shadow_dir "${real_config}" "${ptyxis_dir}/config" gtk-4.0 glib-2.0 dconf org.gnome.Ptyxis \
         && shadow_dir "${real_config}/gtk-4.0" "${ptyxis_dir}/config/gtk-4.0" gtk.css \
@@ -286,7 +314,7 @@ ptyxis_prepare() {
     {
         # the user's own stylesheet still applies
         [ -f "${real_config}/gtk-4.0/gtk.css" ] && echo "@import url(\"file://${real_config}/gtk-4.0/gtk.css\");"
-        cat "${css}"
+        theme_fill "${css}"
     } > "${ptyxis_dir}/config/gtk-4.0/gtk.css" \
         && theme_fill "${keyfile}" > "${ptyxis_dir}/config/glib-2.0/settings/keyfile" \
         && theme_fill "${palette}" > "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes/launcher.palette"

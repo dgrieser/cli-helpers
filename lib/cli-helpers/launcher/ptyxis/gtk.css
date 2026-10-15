@@ -1,10 +1,18 @@
 /* launcher-terminal: Ptyxis without its header bar. Only the launcher's own Ptyxis
-   process loads this file (its XDG_CONFIG_HOME), other windows keep theirs. */
+   process loads this file (its XDG_CONFIG_HOME), other windows keep theirs. The
+   @-placeholders get the values of launcher/theme on every start. */
 
 /* the header bar is 46 px high in libadwaita; pulling its revealer up by exactly
    that collapses it, pulling further makes GTK warn about negative sizes */
 toolbarview > revealer.top-bar {
   margin-top: -46px;
+}
+
+/* the theme's padding around the text, in place of Ptyxis' own (7 px above, 6 px
+   left and right, 3 px and a margin of 1 px below) */
+vte-terminal.padded {
+  margin: 0;
+  padding: @padding-css@;
 }
 
 /* no "80 × 24" overlay while the launcher is moved into place */
