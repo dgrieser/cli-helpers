@@ -105,11 +105,11 @@ Options:
     -d, --days DAYS     Only list sessions active within DAYS (default: 60)
     -c, --current-directory
                         Only list sessions from the current directory; the
-                        picker always starts with all of them
+                        picker starts with all sessions of it, open or not
     -A, --all-directories
                         List sessions from all directories (the default)
     -o, --open          Only list the sessions open in a running agent; the
-                        picker always starts with them
+                        picker starts with them, without -c over every folder
     -p, --print         Print the session table instead of opening the picker
     -P, --prompt-column Show the first prompt as a column of its own; without it
                         the prompt stays searchable in the picker
@@ -154,6 +154,8 @@ Interactive keys:
                         from, <all> first; the cursor starts on the folder the
                         picker was started in, or on <all> while a folder is
                         picked; enter picks, esc and ctrl-space go back
+    ctrl-d              Toggle the folder the picker was started in, with all
+                        of its sessions, open or not, and every folder
     ctrl-s              Take that folder from the selected session
     ctrl-a              Walk the agent filter: both, claude only, codex only
     ctrl-f              Focus the terminal a running session is open in
@@ -1283,6 +1285,29 @@ print_fzf_toggle_view() {
     fi
 }
 
+# ctrl-d goes straight to the sessions of the folder the picker was started in,
+# open or not, as the open ones of a single folder are seldom the ones looked for
+# there; pressed again it goes back to every folder, leaving the open filter as
+# it is. Out of the folders view it shows the sessions again, the way enter does.
+print_fzf_toggle_directory() {
+    if [ "${current_directory_only}" -eq 1 ] \
+        && [ "${current_directory}" = "${launch_directory}" ]; then
+        current_directory_only=0
+    else
+        current_directory="${launch_directory}"
+        current_directory_only=1
+        open_only=0
+    fi
+    if [ "${fzf_view}" = "folders" ]; then
+        fzf_view="sessions"
+        write_fzf_state
+        printf '%s+%s' "$(print_fzf_preview show)" "${fzf_view_actions}"
+        return
+    fi
+    write_fzf_state
+    printf '%s' "${fzf_view_actions}"
+}
+
 # enter answers the question of the view: a folder becomes the scope of the
 # sessions, which are shown again; a session is asked what is to happen with it.
 print_fzf_enter() {
@@ -2357,6 +2382,7 @@ browse_sessions() {
     local focus_command
     local toggle_open_command
     local toggle_view_command
+    local toggle_directory_command
     local enter_command
     local scope_session_command
     local state_file_argument
@@ -2382,9 +2408,10 @@ browse_sessions() {
     # state file, named after it
     trap 'rm -f "${fzf_state_file}" "${fzf_state_file}".* "${fzf_answer_file}"' EXIT
     # the open sessions are few and run anywhere, so the picker starts with all
-    # of them wherever they were started; ctrl-space narrows the folder down
-    open_only=1
-    current_directory_only=0
+    # of them wherever they were started; ctrl-space narrows the folder down.
+    # Held to the current directory by -c, it starts with every session of that
+    # instead, and -o keeps it to the open ones there.
+    [ "${current_directory_only}" -eq 0 ] && open_only=1
     write_fzf_state
 
     printf -v script_command '%q' "${script_path}"
@@ -2426,10 +2453,11 @@ browse_sessions() {
     # enter and ctrl-space depend on the view, so they are decided the same way;
     # enter is told the row, which fzf fills in
     toggle_view_command="$(fzf_state_command --fzf-toggle-view "${reload_actions}")"
+    toggle_directory_command="$(fzf_state_command --fzf-toggle-directory "${reload_actions}")"
     enter_command="${script_command} --fzf-state ${state_file_argument} --fzf-answers ${answer_file_argument}"
     enter_command+=" --fzf-enter $(printf '%q' "${reload_actions}") {2} {3}"
 
-    key_descriptions="/:search,enter:use,tab:open or all,ctrl-space:folders"
+    key_descriptions="/:search,enter:use,tab:open or all,ctrl-space:folders,ctrl-d:this folder"
     key_descriptions+=",ctrl-s:session folder,ctrl-f:focus"
     key_descriptions+=",ctrl-a:agent,ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit"
 
@@ -2452,6 +2480,7 @@ browse_sessions() {
         --bind "/:execute(${search_command} >/dev/tty)+${reload_actions}" \
         --bind "tab:execute-silent(${toggle_open_command})+${reload_actions}" \
         --bind "ctrl-space:transform:${toggle_view_command}" \
+        --bind "ctrl-d:transform:${toggle_directory_command}" \
         --bind "ctrl-s:execute-silent(${scope_session_command})+${reload_actions}" \
         --bind "ctrl-a:execute-silent(${cycle_agent_command})+${reload_actions}" \
         --bind "ctrl-r:reload(${list_command})+refresh-preview" \
@@ -2534,6 +2563,7 @@ fzf_batch=""
 fzf_refresh=0
 fzf_toggle_open=0
 fzf_toggle_view=0
+fzf_toggle_directory=0
 fzf_view_actions=""
 fzf_enter=0
 fzf_enter_agent=""
@@ -2617,6 +2647,12 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-toggle-view"
             fzf_toggle_view=1
+            fzf_view_actions="${1}"
+            ;;
+        --fzf-toggle-directory)
+            shift
+            [ "${#}" -gt 0 ] || fail "Missing argument for --fzf-toggle-directory"
+            fzf_toggle_directory=1
             fzf_view_actions="${1}"
             ;;
         --fzf-enter)
@@ -2782,6 +2818,10 @@ if [ -n "${fzf_state_file}" ]; then
         print_fzf_toggle_view
         exit 0
     fi
+    if [ "${fzf_toggle_directory}" -eq 1 ]; then
+        print_fzf_toggle_directory
+        exit 0
+    fi
     if [ "${fzf_enter}" -eq 1 ]; then
         print_fzf_enter "${fzf_enter_agent}" "${fzf_enter_filepath}"
         exit 0
@@ -2809,7 +2849,7 @@ elif [ "${fzf_print_prompt}" -eq 1 ] || [ "${fzf_print_escape}" -eq 1 ] \
     || [ "${fzf_scope_session}" -eq 1 ] \
     || [ "${fzf_cycle_agent}" -eq 1 ] || [ "${fzf_search}" -eq 1 ] \
     || [ "${fzf_toggle_open}" -eq 1 ] || [ "${fzf_toggle_view}" -eq 1 ] \
-    || [ "${fzf_enter}" -eq 1 ]; then
+    || [ "${fzf_toggle_directory}" -eq 1 ] || [ "${fzf_enter}" -eq 1 ]; then
     fail "The picker actions require --fzf-state"
 fi
 
