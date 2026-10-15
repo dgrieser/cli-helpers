@@ -361,6 +361,46 @@ resolve_glow_style() {
     [ "${GLOW_STYLE}" = "auto" ] && GLOW_STYLE="dark"
 }
 
+# Strip CSI escapes from $1 into the global PLAIN. Each distinct sequence is
+# removed with a literal (quoted) replace; a glob/extglob pattern replace is
+# orders of magnitude slower in bash on long coloured lines.
+strip_ansi() {
+    local re=$'\e\\[[0-9;?]*[A-Za-z]'
+    PLAIN="${1}"
+    while [[ "${PLAIN}" =~ ${re} ]]; do
+        PLAIN="${PLAIN//"${BASH_REMATCH[0]}"/}"
+    done
+}
+
+# Clip an ANSI-coloured line to at most $2 visible columns into the global
+# CLIPPED (a global rather than echo, to avoid a $()-subshell fork per line).
+# CSI escapes are copied through at zero width; every other character counts
+# as one column. If visible text (not just padding) is cut, the last kept
+# column becomes "…". Lines that already fit are returned unchanged.
+clip_ansi() {
+    local s="${1}" max="${2}" esc_re=$'^\e\\[[0-9;?]*[A-Za-z]'
+    strip_ansi "${s}"
+    if [ "${#PLAIN}" -le "${max}" ]; then
+        CLIPPED="${s}"
+        return
+    fi
+    local out="" n=0 i=0 len="${#s}" c
+    while [ "${i}" -lt "${len}" ] && [ "${n}" -lt "${max}" ]; do
+        c="${s:i:1}"
+        if [ "${c}" = $'\e' ] && [[ "${s:i}" =~ ${esc_re} ]]; then
+            out+="${BASH_REMATCH[0]}"
+            i=$((i + ${#BASH_REMATCH[0]}))
+            continue
+        fi
+        out+="${c}"
+        n=$((n + 1))
+        i=$((i + 1))
+    done
+    strip_ansi "${s:i}"
+    [[ "${PLAIN}" == *[![:space:]]* ]] && out="${out%?}…"
+    CLIPPED="${out}"
+}
+
 # Render the selected reminder with glow into the global right_lines, wrapped to
 # the given width. Cached on (file, width) via preview_key so that toggling done
 # (which leaves the selection unchanged) does not re-run glow.
@@ -392,9 +432,15 @@ build_right_lines() {
     # rather than as a path: done reminders are named "<name>.md_<timestamp>", and
     # glow only treats a path as Markdown by its extension (it hangs on .md_*),
     # whereas stdin is always rendered as Markdown.
+    # glow pads each line to the -w width PLUS the style's 2-column left margin,
+    # and lets unbreakable tokens (long paths, URLs) run past even that. A line
+    # wider than the pane wraps in the terminal, doubling the row height and
+    # breaking the separator. So ask for w - 3 (padded output = w - 1, keeping
+    # the last terminal column free) and clip whatever still overflows.
     while IFS= read -r line; do
-        right_lines+=("${line}")
-    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 1))" 2>/dev/null < "${src}")
+        clip_ansi "${line}" "$((w - 1))"
+        right_lines+=("${CLIPPED}")
+    done < <(COLORTERM=truecolor CLICOLOR_FORCE=1 glow -s "${GLOW_STYLE}" -w "$((w - 3))" 2>/dev/null < "${src}")
     # glow prepends a blank top-margin line; drop it.
     if [ "${#right_lines[@]}" -gt 0 ]; then
         local first
