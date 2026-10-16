@@ -22,6 +22,11 @@ regular browser window.
 The window uses the regular browser profile, so an existing single sign-on
 session is reused.
 
+On Wayland (GNOME), a badge at the bottom of the window shows the domain the
+login runs on, so the login windows of different identity providers can be
+told apart. For a loopback URL, such as the entry point of kubelogin, that is
+the domain it redirects to.
+
 The window closes by itself once its title reports a finished login (for
 example the "Authenticated" page of kubelogin). It stays open for as long as
 the title does not match; there is no timeout.
@@ -39,6 +44,8 @@ Options:
                            Case-insensitive extended regex matched against the
                            window title to detect a finished login
                            (default: built-in list of success titles)
+  -l, --label TEXT         Text of the badge (default: the login domain)
+      --no-label           Do not show the badge
   -q, --quiet              Do not print the window id
   -h, --help               Show this help message and exit
 EOF
@@ -158,6 +165,47 @@ else:
     fi
 }
 
+# The host of a URL, lowercased, without user info and port.
+url_host() {
+    local url="${1}" rest hostport host
+
+    rest="${url#*://}"
+    hostport="${rest%%[/?#]*}"
+    host="${hostport##*@}"
+    case "${host}" in
+        \[*\]*)
+            host="${host%%\]*}]"
+            ;;
+        *:*)
+            host="${host%%:*}"
+            ;;
+    esac
+    echo "${host}" | tr '[:upper:]' '[:lower:]'
+}
+
+# The domain the login runs on. A loopback URL is the entry point of a command
+# line login (kubelogin), which redirects to the identity provider. Like in
+# browser-router, only a bare entry point is asked for that redirect, so nothing
+# with a path or a query is ever requested twice.
+login_domain() {
+    local url="${1}" host rest redirect
+
+    host="$(url_host "${url}")"
+    case "${host}" in
+        localhost|127.0.0.1|\[::1\])
+            # path, query and fragment
+            rest="${url#*://}"
+            rest="${rest#"${rest%%[/?#]*}"}"
+            if [ -z "${rest}" ] || [ "${rest}" = "/" ]; then
+                redirect="$(curl -s -o /dev/null --max-time 1 \
+                    --write-out '%{redirect_url}' "${url}" 2>/dev/null)"
+                [ -n "${redirect}" ] && host="$(url_host "${redirect}")"
+            fi
+            ;;
+    esac
+    echo "${host}"
+}
+
 monitor_token() {
     local position="${1}" token="" focused_helper mode
 
@@ -232,6 +280,8 @@ timeout="${DEFAULT_TIMEOUT}"
 above=1
 close=1
 close_pattern="${DEFAULT_CLOSE_PATTERN}"
+label=""
+show_label=1
 quiet=0
 url=""
 
@@ -270,6 +320,14 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             close_pattern="${1}"
+            ;;
+        -l|--label)
+            shift
+            [ -z "${1}" ] && usage
+            label="${1}"
+            ;;
+        --no-label)
+            show_label=0
             ;;
         -q|--quiet)
             quiet=1
@@ -351,6 +409,12 @@ else
     fi
 fi
 
+# Only the window bridge can draw the badge, so the domain is looked up on
+# Wayland only.
+if [ "${show_label}" -eq 1 ] && [ -z "${label}" ] && cli_helpers_is_wayland; then
+    label="$(login_domain "${url}")"
+fi
+
 known_windows="$(window_ids | tr '\n' ' ')"
 
 # --app gives a window without tab strip and address bar. The geometry flags are
@@ -381,6 +445,10 @@ if cli_helpers_is_wayland; then
     if [ "${above}" -eq 1 ]; then
         cli_helpers_gnome_window_bridge set-above "${window_id}" >/dev/null 2>&1 || \
             warning "Could not keep the window above other windows"
+    fi
+    if [ "${show_label}" -eq 1 ] && [ -n "${label}" ]; then
+        cli_helpers_gnome_window_bridge set-label "${window_id}" "${label}" >/dev/null 2>&1 || \
+            warning "Could not label the window. The window bridge extension needs a GNOME Shell restart to pick up set-label."
     fi
     cli_helpers_gnome_window_bridge focus "${window_id}" >/dev/null 2>&1
 else

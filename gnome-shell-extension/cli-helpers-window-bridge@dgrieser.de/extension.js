@@ -57,6 +57,11 @@ const IFACE_XML = `
       <arg type="s" direction="in" name="window_id"/>
       <arg type="b" direction="out" name="closed"/>
     </method>
+    <method name="SetWindowLabel">
+      <arg type="s" direction="in" name="window_id"/>
+      <arg type="s" direction="in" name="text"/>
+      <arg type="b" direction="out" name="set"/>
+    </method>
     <signal name="ClipboardChanged">
       <arg type="s" name="selection"/>
       <arg type="b" name="sensitive"/>
@@ -226,6 +231,25 @@ function serializeWindow(window) {
     };
 }
 
+// A badge at the bottom of a window, so windows that look alike (the login
+// windows of different identity providers, for example) can be told apart. It
+// is a child of the window actor, so it moves, stacks and goes away with the
+// window. It lets clicks through.
+const LABEL_STYLE = 'background-color: rgba(0, 0, 0, 0.75); color: #ffffff; ' +
+    'font-size: 10pt; font-weight: bold; padding: 3px 10px; border-radius: 12px;';
+const LABEL_MARGIN = 10;
+
+// The actor covers the whole buffer, which includes the shadows of a
+// client-side decorated window, so the label is placed by the frame instead.
+function placeWindowLabel(window, label) {
+    const frame = window.get_frame_rect();
+    const buffer = window.get_buffer_rect();
+    const [, , width, height] = label.get_preferred_size();
+    label.set_position(
+        Math.round(frame.x - buffer.x + (frame.width - width) / 2),
+        Math.round(frame.y - buffer.y + frame.height - height - LABEL_MARGIN));
+}
+
 function clipboardType(selection) {
     if (selection === 'clipboard')
         return St.ClipboardType.CLIPBOARD;
@@ -246,6 +270,8 @@ function hasText(mimetypes) {
 
 export default class CliHelpersWindowBridgeExtension extends Extension {
     enable() {
+        // the label of each labeled window, by window
+        this._labels = new Map();
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
         this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
         this._busId = Gio.bus_own_name(
@@ -271,6 +297,9 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
         }
+        for (const label of this._labels.values())
+            label.destroy();
+        this._labels.clear();
         GLib.unlink(MONITORS_FILE);
         if (this._busId) {
             Gio.bus_unown_name(this._busId);
@@ -395,6 +424,33 @@ export default class CliHelpersWindowBridgeExtension extends Extension {
         if (!window || !window.can_close())
             return false;
         window.delete(currentTime());
+        return true;
+    }
+
+    // Replaces the label of the window; an empty text removes it.
+    SetWindowLabel(id, text) {
+        const window = this._findWindow(id);
+        const actor = window?.get_compositor_private();
+        if (!actor)
+            return false;
+
+        this._labels.get(window)?.destroy();
+        if (!text)
+            return true;
+
+        const label = new St.Label({text, style: LABEL_STYLE});
+        actor.add_child(label);
+        this._labels.set(window, label);
+        label.connect('destroy', () => {
+            if (this._labels.get(window) === label)
+                this._labels.delete(window);
+        });
+        // The buffer follows the frame only after the client has drawn the
+        // new size, so the label is placed again on both.
+        const place = () => placeWindowLabel(window, label);
+        window.connectObject('size-changed', place, label);
+        actor.connectObject('notify::size', place, label);
+        place();
         return true;
     }
 }

@@ -2784,6 +2784,8 @@ Opens a URL in a small chromeless browser window that stays above other windows,
 
 The window is opened with the browser's `--app` mode, which leaves out the tab strip and the address bar. On X11 the browser applies the geometry itself; on Wayland the window is moved and resized through the window bridge afterwards, which needs a GNOME Shell restart after the extension has been updated.
 
+The address bar is gone, so on Wayland a badge at the bottom of the window shows the domain the login runs on, drawn by the window bridge extension (again, after a GNOME Shell restart). That way the login windows of different identity providers, such as two Keycloak instances, can be told apart. For a loopback URL such as `http://localhost:8000`, the entry point of `kubelogin`, the domain is the one it redirects to; like in `browser-router`, only a bare entry point is asked for that redirect, never a URL with a path or a query. The badge shows the domain of the first page only and does not follow later navigation. On X11 there is no badge.
+
 Once the window title reports a finished login (for example the `Authenticated` page of kubelogin, or a title like `Login successful` or `You can close this window`), the window closes by itself after a second. A background watcher polls the title for as long as the window is open; there is no timeout, and nothing gets closed when the title never matches.
 
 **Usage:** `browser-2fa-window [OPTIONS] URL`
@@ -2796,6 +2798,8 @@ Once the window title reports a finished login (for example the `Authenticated` 
 - `--no-above` — do not keep the window above other windows
 - `--no-close` — do not close the window after authentication
 - `--close-pattern REGEX` — case-insensitive extended regex matched against the window title to detect a finished login (default: built-in list of success titles)
+- `-l`, `--label TEXT` — text of the badge (default: the login domain)
+- `--no-label` — do not show the badge
 - `-q`, `--quiet` — do not print the window ID
 - `-h`, `--help` — show the help message and exit
 
