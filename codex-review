@@ -4,15 +4,34 @@ APP_NAME="$(basename "${0}")"
 
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} [--print] [base [BRANCH] | uncommitted | commit [SHA]]
+usage: ${APP_NAME} [OPTIONS] [base [BRANCH] | uncommitted | commit [SHA]]
 
-Open Codex's /review picker, or select a review target for an interactive review.
-For a selected interactive review, press Enter after it finishes to run /copy.
-Use --print for a non-interactive review whose stdout is only the final response.
-BRANCH and SHA are required with --print; without them, Codex's picker chooses.
+Runs a Codex review of the current Git repository. Interactive mode opens Codex
+in a private tmux session; after a selected review finishes, press Enter once
+to run /copy. With --print, only the final review response goes to stdout.
 
-    -p, --print   Run non-interactively and print the review response
-    -h, --help    Display this help
+Interactive:
+    ${APP_NAME}                       Open Codex's /review picker
+    ${APP_NAME} base                  Open Codex's base branch picker
+    ${APP_NAME} base BRANCH           Review changes against local BRANCH
+    ${APP_NAME} base default          Review changes against the default
+                                       branch, as detected by git-default
+    ${APP_NAME} uncommitted           Review staged, unstaged, and untracked
+                                       changes
+    ${APP_NAME} commit                Open Codex's commit picker
+    ${APP_NAME} commit SHA            Review commit SHA (any commit ref, among
+                                       the last 100 commits)
+
+Non-interactive:
+    ${APP_NAME} --print base BRANCH   Review changes against BRANCH
+    ${APP_NAME} --print base default  Review changes against the default branch
+    ${APP_NAME} --print uncommitted   Review staged, unstaged, and untracked
+                                       changes
+    ${APP_NAME} --print commit SHA    Review commit SHA (any commit ref)
+
+Options:
+    -p, --print         Run non-interactively and print the review response
+    -h, --help          Display this help
 
     --bash-completion   Print completion candidates and exit
 EOF
@@ -34,6 +53,7 @@ completion() {
     case "${prev}" in
         # Codex's branch picker only lists local branches.
         base)
+            echo default
             git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
             return
             ;;
@@ -83,6 +103,12 @@ done
 
 command -v codex >/dev/null 2>&1 || fail "codex not found"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
+
+if [ "${mode}" = base ] && [ "${target}" = default ]; then
+    command -v git-default >/dev/null 2>&1 || fail "git-default not found (from dev-helpers)"
+    # git-default reports its own error.
+    target="$(git-default)" || exit 1
+fi
 
 if [ "${mode}" = commit ] && [ -n "${target}" ]; then
     # Codex's commit picker matches typed text against commit subjects too, so
