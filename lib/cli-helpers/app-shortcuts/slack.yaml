@@ -1,6 +1,7 @@
 description: Slack
 bindings: ['<Shift><Control>k']
 focus:
-  class: [Slack]
+  # its app id on Wayland, its WM class under XWayland
+  class: [slack, Slack]
 launch:
   desktop: slack
