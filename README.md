@@ -756,6 +756,24 @@ codex-chat --print-history
 ### `codex-session`
 Symlink to [`agent-session`](#agent-session) that only uses sessions of the Codex CLI.
 
+### `codex-review`
+Starts Codex's `/review` picker, or runs a selected review. Interactive mode needs `tmux` and a terminal. After a selected review finishes, press Enter once to run `/copy`; the Codex session then remains interactive. Detaching stops the private tmux session and Codex process.
+
+**Usage:** `codex-review [--print] [base [BRANCH] | uncommitted | commit [SHA]]`
+
+```bash
+codex-review                  # Open /review picker
+codex-review base             # Select base branch review in Codex
+codex-review base main        # Select main in Codex's branch picker
+codex-review uncommitted      # Review working tree in Codex
+codex-review commit HEAD      # Select HEAD in Codex's commit picker
+codex-review --print base main
+codex-review --print uncommitted
+codex-review --print commit HEAD
+```
+
+`--print` uses `codex exec review`. Only the final review response goes to stdout; Codex diagnostics remain on stderr. Branch or commit argument is required in this mode.
+
 ### `opencode-run`
 Starts an interactive OpenCode session that immediately runs a slash command or submits a prompt, so a command like `lintfix` can be kicked off from the shell and then be watched and worked with in the TUI.
 

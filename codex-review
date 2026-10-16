@@ -1,0 +1,134 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [--print] [base [BRANCH] | uncommitted | commit [SHA]]
+
+Open Codex's /review picker, or select a review target for an interactive review.
+For a selected interactive review, press Enter after it finishes to run /copy.
+Use --print for a non-interactive review whose stdout is only the final response.
+BRANCH and SHA are required with --print; without them, Codex's picker chooses.
+
+    -p, --print   Run non-interactively and print the review response
+    -h, --help    Display this help
+EOF
+    exit 1
+}
+
+fail() {
+    echo "ERROR: ${1}" 1>&2
+    exit 1
+}
+
+mode=""
+target=""
+print=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help) usage ;;
+        -p|--print) print=1 ;;
+        base|uncommitted|commit)
+            [ -z "${mode}" ] || fail "Choose one review target"
+            mode="${1}"
+            ;;
+        -*) fail "Unknown option: ${1}" ;;
+        *)
+            [ "${mode}" = base ] || [ "${mode}" = commit ] || fail "Unexpected argument: ${1}"
+            [ -z "${target}" ] || fail "Too many arguments"
+            target="${1}"
+            ;;
+    esac
+    shift
+done
+
+command -v codex >/dev/null 2>&1 || fail "codex not found"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
+
+if [ "${print}" -eq 1 ]; then
+    [ -n "${mode}" ] || usage
+    case "${mode}" in
+        base|commit) [ -n "${target}" ] || usage ;;
+    esac
+
+    answer_file="$(mktemp)" || fail "Could not create temporary file"
+    trap 'rm -f "${answer_file}"' EXIT
+
+    case "${mode}" in
+        base) review_args=(--base "${target}") ;;
+        uncommitted) review_args=(--uncommitted) ;;
+        commit) review_args=(--commit "${target}") ;;
+    esac
+
+    codex exec review "${review_args[@]}" --output-last-message "${answer_file}" >/dev/null || exit $?
+    cat "${answer_file}"
+    exit
+fi
+
+command -v tmux >/dev/null 2>&1 || fail "tmux not found (required for interactive mode)"
+[ -t 0 ] && [ -t 1 ] || fail "Interactive mode needs a terminal"
+tput clear >/dev/null 2>&1 || fail "Terminal lacks screen controls; set TERM to your terminal type"
+
+socket="codex-review-$$"
+session="review"
+
+tmux_review() {
+    tmux -L "${socket}" "${@}"
+}
+
+wait_for_screen() {
+    local needle="${1}"
+    local timeout="${2}"
+    local deadline=$((SECONDS + timeout))
+    local screen=""
+    while [ "${SECONDS}" -le "${deadline}" ]; do
+        screen="$(tmux_review capture-pane -p -t "${session}" 2>/dev/null)" || return 1
+        [[ "${screen}" == *"${needle}"* ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+tmux_review new-session -d -s "${session}" codex || fail "Could not start Codex in tmux"
+# Detaching also ends this wrapper; always stop its private server on exit.
+trap 'tmux_review kill-server >/dev/null 2>&1' EXIT
+tmux_review set-option -g status off
+
+wait_for_screen "Ask Codex to do anything" 60 || fail "Codex did not become ready"
+tmux_review send-keys -t "${session}" -l /review
+tmux_review send-keys -t "${session}" Enter
+# Codex may use the first Enter to accept the slash-command suggestion.
+if ! wait_for_screen "Select a review preset" 5; then
+    tmux_review send-keys -t "${session}" Enter
+    wait_for_screen "Select a review preset" 60 || fail "Codex review picker did not open"
+fi
+
+case "${mode}" in
+    base)
+        tmux_review send-keys -t "${session}" Enter
+        wait_for_screen "Select a base branch" 60 || fail "Codex branch picker did not open"
+        ;;
+    uncommitted)
+        tmux_review send-keys -t "${session}" Down Enter
+        ;;
+    commit)
+        tmux_review send-keys -t "${session}" Down Down Enter
+        wait_for_screen "Select a commit to review" 60 || fail "Codex commit picker did not open"
+        ;;
+esac
+
+if [ -n "${target}" ]; then
+    tmux_review send-keys -t "${session}" -l "${target}"
+    tmux_review send-keys -t "${session}" Enter
+elif [ "${mode}" = base ] || [ "${mode}" = commit ]; then
+    tmux_review send-keys -t "${session}" Enter
+fi
+
+if [ -n "${mode}" ]; then
+    # One Enter after the review runs /copy, then restores normal Enter behavior.
+    tmux_review bind-key -n Enter run-shell "tmux -L ${socket} unbind-key -n Enter; tmux -L ${socket} send-keys -t ${session} -l /copy; tmux -L ${socket} send-keys -t ${session} Enter"
+fi
+
+env -u TMUX tmux -L "${socket}" attach-session -t "${session}"
