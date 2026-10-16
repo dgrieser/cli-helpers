@@ -761,12 +761,22 @@ Starts Codex's `/review` picker, or runs a selected review. Interactive mode nee
 
 **Usage:** `codex-review [--print] [base [BRANCH] | uncommitted | commit [SHA]]`
 
+| Argument / Flag | Description |
+|---|---|
+| `base [BRANCH]` | Review changes against a base branch. `BRANCH` is typed into Codex's branch picker, which lists local branches only. |
+| `uncommitted` | Review staged, unstaged, and untracked changes. |
+| `commit [SHA]` | Review the changes of one commit. `SHA` can be any commit ref; it is resolved to the full SHA first, because Codex's commit picker also matches the typed text against commit subjects. The picker only lists the last 100 commits; `--print` takes any commit. |
+| `-p, --print` | Run non-interactively with `codex exec review` and print the review response. |
+| `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags and review targets, local branches after `base`, `HEAD`, local branches and tags after `commit`). |
+
+**Examples:**
 ```bash
 codex-review                  # Open /review picker
 codex-review base             # Select base branch review in Codex
 codex-review base main        # Select main in Codex's branch picker
 codex-review uncommitted      # Review working tree in Codex
-codex-review commit HEAD      # Select HEAD in Codex's commit picker
+codex-review commit HEAD      # Select the HEAD commit in Codex's commit picker
 codex-review --print base main
 codex-review --print uncommitted
 codex-review --print commit HEAD

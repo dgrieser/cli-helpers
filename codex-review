@@ -13,6 +13,8 @@ BRANCH and SHA are required with --print; without them, Codex's picker chooses.
 
     -p, --print   Run non-interactively and print the review response
     -h, --help    Display this help
+
+    --bash-completion   Print completion candidates and exit
 EOF
     exit 1
 }
@@ -22,12 +24,47 @@ fail() {
     exit 1
 }
 
+# Arguments: the word before the cursor, then the command line words after the
+# command name, the last one being the word that is completed.
+completion() {
+    local prev="${1}"
+    local word=""
+    shift
+
+    case "${prev}" in
+        # Codex's branch picker only lists local branches.
+        base)
+            git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+            return
+            ;;
+        commit)
+            echo HEAD
+            git for-each-ref --format='%(refname:short)' refs/heads refs/tags 2>/dev/null
+            return
+            ;;
+    esac
+
+    echo "-p --print -h --help --bash-completion"
+    [ "${#}" -gt 0 ] && set -- "${@:1:$(( ${#} - 1 ))}"
+    for word in "${@}"; do
+        case "${word}" in
+            base|uncommitted|commit) return ;;
+        esac
+    done
+    echo "base uncommitted commit"
+}
+
 mode=""
 target=""
 print=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
+        --bash-completion)
+            shift
+            completion "${@}"
+            exit 0
+            ;;
         -h|--help) usage ;;
         -p|--print) print=1 ;;
         base|uncommitted|commit)
@@ -46,6 +83,13 @@ done
 
 command -v codex >/dev/null 2>&1 || fail "codex not found"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
+
+if [ "${mode}" = commit ] && [ -n "${target}" ]; then
+    # Codex's commit picker matches typed text against commit subjects too, so
+    # a ref like HEAD would select a commit titled "...headless...".
+    sha="$(git rev-parse --verify --quiet "${target}^{commit}")" || fail "Unknown commit: ${target}"
+    target="${sha}"
+fi
 
 if [ "${print}" -eq 1 ]; then
     [ -n "${mode}" ] || usage
