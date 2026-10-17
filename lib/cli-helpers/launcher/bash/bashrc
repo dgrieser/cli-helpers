@@ -44,7 +44,18 @@ unset -f _launcher_ps1_colors
 _launcher_ps1+=" "
 
 PS1="${_launcher_ps1}"
+# before the first prompt, the line holds only what was typed while ~/.bashrc was
+# read, echoed by the terminal; readline draws it again after the prompt. So the
+# first prompt clears its line instead of marking it as output without a newline,
+# and does so itself: readline draws it once it has turned the echo off, while
+# the rest of PROMPT_COMMAND would leave time to echo more
+_launcher_first_prompt=1
 _powerline_ps1() {
+    if [ -n "${_launcher_first_prompt}" ]; then
+        unset _launcher_first_prompt
+        PS1="\[\r\e[K\]${_launcher_ps1}"
+        return
+    fi
     declare -F _eol_mark >/dev/null && _eol_mark
     PS1="${_launcher_ps1}"
 }
