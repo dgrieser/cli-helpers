@@ -1,8 +1,8 @@
 #!/bin/bash
 # Backs up on the old machine every file setup.sh restores on the new one: the
 # keyring files, the reminders, the shell histories, the Keys folder of the
-# documents folder with the SSH keys the SSH config names, the private
-# scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
+# documents folder with the SSH keys the SSH config names, the keys of
+# ~/.ssh/authorized_keys that may log in over SSH, the private scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
 # the Mittwald lists of ~/.kube/mittwald that the kubectl-helpers read, the
 # session of Sublime Text with its open files, the profile of Google Chrome
 # with the keyring file of its key, the Downloads folder, the sessions, histories,
@@ -23,6 +23,8 @@ REMINDER_DIR="${HOME}/.cache/reminder"
 # the history files of bash_aliases.d's install-home
 HISTORY_FILES=(.bash_super_history .kube_history)
 SSH_CONFIG="${HOME}/.ssh/config"
+# the keys that may log in to this machine over SSH
+AUTHORIZED_KEYS="${HOME}/.ssh/authorized_keys"
 # where the Vim plugin of Codeium keeps its API key (apiKey): .codeium under
 # XDG_DATA_HOME when set, else under HOME; its Sublime Text plugin keeps only
 # the key in a file of its own, always under HOME
@@ -85,7 +87,9 @@ and finds every part in it by this layout:
   history/      ${HISTORY_FILES[*]}
   Keys/         the Keys folder of the documents folder, plus the SSH keys
                 ~/.ssh/config names that are in neither it nor the keyring
-  bin/          ${HOME_BIN_FILES[*]} of ${HOME_BIN}
+  ssh/          authorized_keys of ${AUTHORIZED_KEYS%/*}, the keys that may log
+                in over SSH; setup.sh adds the ones the new machine lacks
+  bin/         ${HOME_BIN_FILES[*]} of ${HOME_BIN}
   kube-mittwald/
                 the lists of ${KUBE_MITTWALD_DIR}
   sublime-text/ the session of Sublime Text of ${SUBLIME_DIR}: the open
@@ -276,6 +280,22 @@ backup_keys() {
         [ -f "${key}.pub" ] && cp -pL "${key}.pub" "${target}/${name}.pub"
         echo "Keys: ${name} of ~/.ssh, in neither ${keys_dir} nor the keyring" 1>&2
     done < <(awk 'tolower($1) == "identityfile" && $2 ~ /^~\/\.ssh\/[^\/]+$/ {print substr($2, 8)}' "${SSH_CONFIG}" | sort -u)
+}
+
+# the keys that may log in over SSH, which no other part holds: the public keys
+# of other machines and apps
+backup_ssh() {
+    local target="${1}/ssh"
+    if [ ! -s "${AUTHORIZED_KEYS}" ]; then
+        echo "ssh: none" 1>&2
+        return 0
+    fi
+    # -L: a link is backed up as the file it points to
+    if ! { mkdir -p "${target}" && cp -pL "${AUTHORIZED_KEYS}" "${target}/authorized_keys"; }; then
+        failed+=("ssh")
+        return 0
+    fi
+    echo "ssh: $(grep -c -v -E '^[[:space:]]*(#|$)' "${target}/authorized_keys") keys of ${AUTHORIZED_KEYS}" 1>&2
 }
 
 backup_bin() {
@@ -664,6 +684,7 @@ backup_keyrings "${backup}"
 backup_reminders "${backup}"
 backup_histories "${backup}"
 backup_keys "${backup}"
+backup_ssh "${backup}"
 backup_bin "${backup}"
 backup_kube_mittwald "${backup}"
 backup_sublime "${backup}"

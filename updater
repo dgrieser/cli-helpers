@@ -2973,7 +2973,20 @@ software-490-yazi@base() {
     config_update yazi "${CURRENT_USER_HOME}/.config/yazi"
 }
 software-493-rgrc@base() { install_git_release "https://github.com/lazywalker/rgrc" --pattern "*_{arch}.deb"; }
-software-494-sftpgo@dev() { install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb"; }
+software-494-sftpgo@dev() {
+    install_git_release "https://github.com/drakkan/sftpgo" --pattern "*_{arch}.deb" || return $?
+    # its package starts the SFTP server on port 2022 of all interfaces, which is
+    # not used here; once disabled, the upgrades of the package leave it off
+    systemctl is-enabled --quiet sftpgo.service 2>/dev/null \
+        || systemctl is-active --quiet sftpgo.service 2>/dev/null \
+        || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would stop and disable the service sftpgo.service" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} systemctl disable --now sftpgo.service"
+    ${SUDO} systemctl disable --now sftpgo.service
+}
 software-495-r-quick-share@desktop@gui() {
     local autostart="${CURRENT_USER_HOME}/.config/autostart/RQuickShare.desktop"
     install_git_release "https://github.com/Martichou/rquickshare" --pattern "r-quick-share-main_*_{arch}.deb" || return $?

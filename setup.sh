@@ -5,7 +5,8 @@
 # with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker
 # and wifi power save off), the 6 GHz fix of a MediaTek MT7921/MT7922 wifi card,
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
-# if you like, gitlab.com), the host key of js01, the dotfiles of
+# if you like, gitlab.com), the host key of js01, the keys of
+# ~/.ssh/authorized_keys that may log in over SSH, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
 # of reminder, the lists of ~/.kube/mittwald, the Downloads folder, the session of Sublime Text, the profile of
 # Google Chrome with the key of its passwords and cookies, the desktop entries of the apps
@@ -64,6 +65,7 @@ STEPS=(
     "wifi          fix_wifi              -      the 6 GHz fix of a MediaTek MT7921/MT7922 wifi card (fix-mt7922-6ghz-roaming)"
     "gh-glab       install_gh_glab       -      gh and glab with their logins"
     "js01          store_js01_key        -      the host key of js01 in ~/.ssh/known_hosts, for the sshpass login of js01"
+    "ssh           restore_ssh           backup the keys of ~/.ssh/authorized_keys, which may log in to this machine over SSH"
     "sublime       restore_sublime       backup the session of Sublime Text"
     "chrome        restore_chrome        backup the profile of Google Chrome with the key of its passwords and cookies"
     "chrome-apps   setup_chrome_apps     -      the desktop entries of the apps installed in Chrome, with their icons and the links they open"
@@ -192,7 +194,7 @@ choose_backup() {
         return 0
     fi
     found=0
-    for dir in keyrings reminder history Keys bin kube-mittwald sublime-text chrome downloads agents git; do
+    for dir in keyrings reminder history Keys ssh bin kube-mittwald sublime-text chrome downloads agents git; do
         [ -d "${choice}/${dir}" ] && found=1
     done
     if [ "${found}" -eq 0 ]; then
@@ -373,6 +375,35 @@ login_github() {
         gh auth login
     done
     echo "Logged in to github.com" 1>&2
+}
+
+# the keys that may log in over SSH from ssh/authorized_keys of the backup,
+# added to ~/.ssh/authorized_keys without the ones it has already, as a fresh
+# install may have an empty one
+restore_ssh() {
+    local src="${BACKUP_DIR}/ssh/authorized_keys" dst="${HOME}/.ssh/authorized_keys" key count=0
+    has_part ssh || return 0
+    if [ ! -f "${src}" ]; then
+        echo "No ssh/authorized_keys in the backup" 1>&2
+        return 0
+    fi
+    info "SSH: add the keys of authorized_keys from the backup"
+    if ! { { [ -d "${HOME}/.ssh" ] || mkdir -m 700 "${HOME}/.ssh"; } && touch "${dst}" && chmod 600 "${dst}"; }; then
+        failed+=("restore ssh/authorized_keys")
+        return 0
+    fi
+    # a last line without a newline would run into the first added key
+    [ -s "${dst}" ] && [ -n "$(tail -c 1 "${dst}")" ] && echo >> "${dst}"
+    while IFS= read -r key || [ -n "${key}" ]; do
+        [[ "${key}" =~ ^[[:space:]]*(#|$) ]] && continue
+        grep -qxF -- "${key}" "${dst}" && continue
+        if ! printf '%s\n' "${key}" >> "${dst}"; then
+            failed+=("restore ssh/authorized_keys")
+            return 0
+        fi
+        count=$((count + 1))
+    done < "${src}"
+    echo "ssh: added ${count} keys to ${dst}" 1>&2
 }
 
 # the own scripts of ~/bin from bin/ of the backup, before the VPN: gen dials it
