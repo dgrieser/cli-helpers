@@ -137,13 +137,28 @@ get_title() {
 
 # Render every active reminder with glow, newest first.
 print_reminders() {
-    local reminders=() f
+    local reminders=() f width_args=()
     while IFS= read -r f; do
         [ -n "${f}" ] && reminders+=("${f}")
     done < <(list_files_ordered)
     if [ "${#reminders[@]}" -eq 0 ]; then
         echo "No reminders." 1>&2
         return 0
+    fi
+    # glow pads each line to its wrap width PLUS the style's 2-column left
+    # margin, and a "width" set in glow.yml overrides the terminal size. On a
+    # narrower terminal (e.g. a small SSH window) every padded line wraps,
+    # adding a blank row after each one. So cap the width at cols - 4 (padded
+    # output = cols - 2, as glow lets lines with inline code run a column or
+    # two past it); without a configured width, glow's own limit of 120 applies.
+    if [ -t 1 ]; then
+        local cfg cols width=""
+        cfg="${GLOW_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/glow/glow.yml}"
+        [ -f "${cfg}" ] && width="$(sed -nE 's/^[[:space:]]*width:[[:space:]]*"?([0-9]+)"?[[:space:]]*(#.*)?$/\1/p' "${cfg}" | head -1)"
+        [ "${width:-0}" -gt 0 ] || width=120
+        cols="$(tput cols 2>/dev/null)"
+        [[ "${cols}" =~ ^[0-9]+$ ]] && [ "$((cols - 4))" -lt "${width}" ] && width="$((cols - 4))"
+        [ "${width}" -gt 0 ] && width_args=(-w "${width}")
     fi
     {
         echo "# YOUR REMINDERS"
@@ -152,7 +167,7 @@ print_reminders() {
             cat "${f}"
             echo
         done
-    } | glow
+    } | glow "${width_args[@]}"
 }
 
 

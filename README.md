@@ -1803,7 +1803,7 @@ An interactive terminal tool for managing Markdown reminders stored in `~/.cache
 
 | Argument / Flag | Description |
 |---|---|
-| `-p, --print, --list` | Render all active reminders with `glow` and exit. |
+| `-p, --print, --list` | Render all active reminders with `glow` and exit, wrapped to fit the terminal width. |
 | `-a, --add` | Open an editor to compose a single new reminder, save it, and exit. |
 | `-h, --help` | Show the help message and exit. |
 
