@@ -2535,6 +2535,32 @@ software-255-losslesscut@media@gui() {
     install_git_release "https://github.com/mifi/lossless-cut" --pattern "LosslessCut-linux-{arch}.tar.bz2" --bundle --binary "losslesscut" \
         && apparmor_allow_userns losslesscut losslesscut
 }
+software-256-ipod-shuffle-4g@media() {
+    # writes the database of an iPod Shuffle 4th gen (jw-ipod runs it), with the
+    # voiceover from pico2wave; the script of master, as the last release (v1.5
+    # of 2020) is behind it
+    local url="https://raw.githubusercontent.com/nims11/IPod-Shuffle-4g/master/ipod-shuffle-4g.py"
+    local bin_path="/usr/local/bin/ipod-shuffle-4g"
+    local tmp_file
+    needs packages curl || return $(( $? == 3 ? 0 : 1 ))
+    require_cmd curl || return 1
+    apt_upgrade python3-mutagen libttspico-utils || return 1
+
+    tmp_file="$(mktemp)" || return 1
+    trap 'rm -f "${tmp_file}"; trap - RETURN' RETURN
+    verbose "curl -fsSL ${url} -o ${tmp_file}"
+    curl -fsSL "${url}" -o "${tmp_file}" || return 1
+    if cmp -s "${tmp_file}" "${bin_path}"; then
+        echo "${APP_NAME}: ipod-shuffle-4g is up to date" 1>&2
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would install ${url} to ${bin_path}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO} install -m 0755 ${tmp_file} ${bin_path}"
+    ${SUDO} install -m 0755 "${tmp_file}" "${bin_path}"
+}
 software-260-lazygit@dev() {
     install_git_release "https://github.com/jesseduffield/lazygit" || return $?
     completion_update lazygit lazygit completion bash
