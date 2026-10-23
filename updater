@@ -1888,7 +1888,7 @@ software-025-nodejs@dev@base() {
 software-026-cli-tools@base() {
     apt_upgrade ripgrep fd-find zoxide tree htop tmux tig shellcheck \
         parallel pv pigz lz4 lzip lzop unrar rlwrap expect inotify-tools gawk dialog ncal at \
-        recode wdiff fdupes symlinks reptyr w3m lynx rsstail ranger colorized-logs ansifilter
+        recode wdiff fdupes symlinks reptyr w3m lynx ranger colorized-logs ansifilter
 }
 software-027-network-tools@base() {
     apt_upgrade nmap net-tools traceroute whois ipcalc sipcalc prips ldnsutils socat sshfs \
@@ -3147,9 +3147,11 @@ software-583-pip-libs@base() {
     pip_update pip-libs elevenlabs perplexityai pyht slack-bolt keyboard playsound pytapo environs
 }
 software-584-pip-tools@base() {
-    # the own fork, with the mycmd segment the prompt config uses
+    # the own fork, with the mycmd segment the prompt config uses; rsstail is the
+    # python one rsstail-jw-music needs (--format, -e), apt's rsstail is another
+    # program with another CLI
     pip_update pip-tools streamdown "powerline-shell @ git+https://github.com/dgrieser/powerline-shell.git" \
-        csv2md markdown-to-mrkdwn oletools || return 1
+        csv2md markdown-to-mrkdwn oletools rsstail || return 1
     # the prompt config, with the fork's mycmd and virtual_env segments, and
     # prompt.bash, the prompt functions ~/.bashrc sources
     config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell" || return 1
