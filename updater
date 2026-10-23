@@ -1888,7 +1888,7 @@ software-025-nodejs@dev@base() {
 software-026-cli-tools@base() {
     apt_upgrade ripgrep fd-find zoxide tree htop tmux tig shellcheck \
         parallel pv pigz lz4 lzip lzop unrar rlwrap expect inotify-tools gawk dialog ncal at \
-        recode wdiff fdupes symlinks reptyr w3m lynx ranger colorized-logs ansifilter
+        recode wdiff fdupes symlinks reptyr w3m lynx rsstail ranger colorized-logs ansifilter
 }
 software-027-network-tools@base() {
     apt_upgrade nmap net-tools traceroute whois ipcalc sipcalc prips ldnsutils socat sshfs \
