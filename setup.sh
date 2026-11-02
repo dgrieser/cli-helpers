@@ -466,9 +466,11 @@ setup_vpn() {
 # settings of the keyring (type=vpn-home name=host / network / dns-search /
 # ipsec-id / ipsec-key), so the key is in no command line; a split tunnel: only the
 # home network and the names of the DNS search domains (~domain for routing only)
-# go through it; a keyfile that differs is only replaced when you say so
+# go through it, as /etc/strongswan.d/charon-nm-no-routes.conf keeps charon-nm
+# from routing everything; a keyfile that differs is only replaced when you say so
 setup_vpn_home() {
     local package="network-manager-strongswan" hook="/etc/apt/apt.conf.d/99charon-nm-psk-patch"
+    local routes_conf="/etc/strongswan.d/charon-nm-no-routes.conf"
     local -A vpn=()
     local field missing=() uuid dst tmp
     dst="/etc/NetworkManager/system-connections/${HOME_VPN_NAME}.nmconnection"
@@ -492,6 +494,30 @@ setup_vpn_home() {
     fi
     rm -f "${tmp}"
     run sudo "${CHARON_NM_PATCH}" || failed+=("charon-nm-psk-patch")
+
+    # charon-nm routes all the traffic selectors of the gateway (all of IPv4)
+    # through the tunnel in its own routing table, which overrides never-default
+    # and the routes of NetworkManager; without, NetworkManager routes only the
+    # home network through it. A running charon-nm reads it when it starts again.
+    tmp="$(mktemp)"
+    printf '%s\n' "# setup.sh vpn-home: the routes of a VPN come from NetworkManager only" \
+        "charon-nm {" "    plugins {" "        kernel-netlink {" "            install_routes_xfrmi = no" \
+        "        }" "    }" "}" > "${tmp}"
+    if ! sudo cmp -s "${tmp}" "${routes_conf}"; then
+        if run sudo install -m 644 -o root -g root "${tmp}" "${routes_conf}"; then
+            # NetworkManager starts it again for the next connection
+            if pgrep -x charon-nm > /dev/null; then
+                if nmcli -g GENERAL.STATE connection show id "${HOME_VPN_NAME}" 2>/dev/null | grep -q .; then
+                    warning "charon-nm routes all traffic through the VPN ${HOME_VPN_NAME} until it starts again: disconnect the VPN, then run sudo pkill -x charon-nm"
+                else
+                    run sudo pkill -x charon-nm || failed+=("pkill charon-nm")
+                fi
+            fi
+        else
+            failed+=("install ${routes_conf}")
+        fi
+    fi
+    rm -f "${tmp}"
 
     for field in "${HOME_VPN_FIELDS[@]}"; do
         vpn[${field}]="$(secret-tool lookup type vpn-home name "${field}" 2>/dev/null)"
