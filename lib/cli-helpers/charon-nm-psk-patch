@@ -1,0 +1,82 @@
+#!/bin/bash
+# Patches charon-nm, the strongSwan backend of NetworkManager, for an IKEv2 PSK
+# VPN gateway with a short key and a changing identity, in two places of src/charon-nm/nm/nm_service.c:
+# - it accepts a pre-shared key shorter than 20 characters, as some gateways
+#   hand out:
+#       if (strlen(str) < 20) { ... "Pre-shared key is too short." ... }
+# - remote-identity=%any accepts whatever identity the gateway sends, as Android
+#   does with a pre-shared key, instead of falling back to its hostname: a
+#   gateway may send its WAN IPv6 address, which changes with the prefix of the
+#   provider. The pre-shared key still authenticates the gateway. Without
+#   remote-identity the fallback to the hostname stays:
+#       if (!gateway || gateway->get_type(gateway) == ID_ANY) { <hostname> }
+# The original binary of strongswan-nm is diverted with dpkg-divert to
+# charon-nm.distrib, so upgrades install there, and the patched copy is put in
+# its place. Run as root, again after every
+# upgrade of strongswan-nm (setup.sh installs a DPkg::Post-Invoke hook for it);
+# it does nothing when the patched copy is up to date. On x86_64 only: each patch
+# matches exact bytes and fails if they are not there once, leaving the original
+# binary in place.
+# charon-nm-psk-patch --remove undoes it.
+
+BIN="/usr/lib/ipsec/charon-nm"
+ORIG="${BIN}.distrib"
+
+fail() {
+    echo "charon-nm-psk-patch: ${1}" 1>&2
+    exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+
+diverted() {
+    [ "$(dpkg-divert --truename "${BIN}")" = "${ORIG}" ]
+}
+
+if [ "${1}" = "--remove" ]; then
+    diverted || exit 0
+    rm -f "${BIN}"
+    dpkg-divert --local --rename --divert "${ORIG}" --remove "${BIN}" > /dev/null || fail "dpkg-divert --remove failed"
+    echo "charon-nm-psk-patch: restored the original ${BIN}" 1>&2
+    exit 0
+fi
+
+# strongswan-nm not installed: nothing to patch
+diverted || [ -e "${BIN}" ] || exit 0
+[ "$(uname -m)" = x86_64 ] || fail "only x86_64 is supported, not $(uname -m)"
+if ! diverted; then
+    dpkg-divert --local --rename --divert "${ORIG}" --add "${BIN}" > /dev/null || fail "dpkg-divert --add failed"
+fi
+# strongswan-nm removed while diverted
+[ -e "${ORIG}" ] || { rm -f "${BIN}"; exit 0; }
+
+tmp="$(mktemp "${BIN}.XXXXXX")" || fail "mktemp failed"
+trap 'rm -f "${tmp}"' EXIT
+if ! python3 -I - "${ORIG}" "${tmp}" <<'EOF'
+import sys
+data = open(sys.argv[1], "rb").read()
+# (what, bytes to find, offset of the patch in them, replacement)
+patches = [
+    # cmp $0x13,%rax; jbe rel32  ->  cmp $0x13,%rax; nopw 0x0(%rax,%rax,1)
+    ("the length check of the pre-shared key", "4883f8130f86", 4, "660f1f440000"),
+    # call *0x8(%rax) (get_type); test %eax,%eax; je <hostname>; movb $0x0 (loose)
+    # -> the je becomes two NOPs, so ID_ANY stays the gateway identity
+    ("the fallback of remote-identity=%any to the hostname", "ff500885c0740dc685", 5, "9090"),
+]
+for what, find, at, new in patches:
+    find, new = bytes.fromhex(find), bytes.fromhex(new)
+    if data.count(find) != 1:
+        sys.exit(what + " is not there exactly once")
+    at += data.index(find)
+    data = data[:at] + new + data[at + len(new):]
+open(sys.argv[2], "wb").write(data)
+EOF
+then
+    # the original at least works for keys of 20 characters and more
+    cmp -s "${ORIG}" "${BIN}" || install -m 755 "${ORIG}" "${BIN}"
+    fail "not patched, ${BIN} is the original"
+fi
+cmp -s "${tmp}" "${BIN}" && exit 0
+chmod 755 "${tmp}"
+mv -f "${tmp}" "${BIN}" || fail "could not replace ${BIN}"
+echo "charon-nm-psk-patch: patched ${BIN} for short pre-shared keys and remote-identity=%any" 1>&2

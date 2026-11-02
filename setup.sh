@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
-# keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the Mittwald VPN
+# keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the IKEv2 VPN home, the Mittwald VPN
 # with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS of docker
 # and wifi power save off), the 6 GHz fix of a MediaTek MT7921/MT7922 wifi card,
 # the base software, gh and glab with their logins (glab to gitlab.mittwald.it and,
@@ -45,6 +45,13 @@ MITTWALD_GITLAB="gitlab.mittwald.it"
 # the VPN connection to it, which gen of ~/bin dials
 VPN_NAME="mittwald"
 GEN="${HOME}/bin/gen"
+# the IKEv2 VPN home with a pre-shared key; its gateway, the home
+# network routed through it, the DNS search domains for it, the identity and the
+# key are in the keyring as type=vpn-home name=host / network / dns-search /
+# ipsec-id / ipsec-key
+HOME_VPN_NAME="home"
+HOME_VPN_FIELDS=(host network dns-search ipsec-id ipsec-key)
+CHARON_NM_PATCH="/usr/local/sbin/charon-nm-psk-patch"
 # the shorthands of k-ctx: c switches the cluster, s goes to an identifier, n
 # switches the namespace, "for" loops over clusters and bm is the baremetal parent
 K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-prefix for
@@ -58,6 +65,7 @@ STEPS=(
     # gen needs the prompts, vpn-up and wifi of cli-helpers
     "bin           restore_bin           backup your own scripts of ~/bin, gen among them dials the VPN"
     "vpn           setup_vpn             -      the OpenVPN plugin of NetworkManager, the ${VPN_NAME} connection and gen to dial it"
+    "vpn-home      setup_vpn_home        -      the strongSwan plugin of NetworkManager, patched for short keys, and the ${HOME_VPN_NAME} connection (IKEv2 PSK, settings from the keyring)"
     # before the VPN is dialed for the glab login: tun-up gives it the internal names
     "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker, and wifi power save off"
     # after etc, so the reconnect applies its power save setting, and before the
@@ -446,6 +454,109 @@ setup_vpn() {
         warning "No ${GEN} to dial the VPN, restore it with the backup of ~/bin"
         failed+=("${GEN}")
     fi
+}
+
+# the IKEv2 VPN home with a pre-shared key: the strongSwan plugin
+# of NetworkManager, its charon-nm patched to take a key shorter than 20
+# characters and to accept with remote-identity=%any the identity the gateway
+# sends, e.g. its WAN IPv6 address that changes with the prefix of the
+# provider (see lib/cli-helpers/charon-nm-psk-patch, installed as root to
+# ${CHARON_NM_PATCH} with a DPkg::Post-Invoke hook that patches again after every
+# upgrade), and the connection as a keyfile of NetworkManager, written with the
+# settings of the keyring (type=vpn-home name=host / network / dns-search /
+# ipsec-id / ipsec-key), so the key is in no command line; a split tunnel: only the
+# home network and the names of the DNS search domains (~domain for routing only)
+# go through it; a keyfile that differs is only replaced when you say so
+setup_vpn_home() {
+    local package="network-manager-strongswan" hook="/etc/apt/apt.conf.d/99charon-nm-psk-patch"
+    local -A vpn=()
+    local field missing=() uuid dst tmp
+    dst="/etc/NetworkManager/system-connections/${HOME_VPN_NAME}.nmconnection"
+    info "VPN home: the strongSwan plugin of NetworkManager, patched for short keys, and the ${HOME_VPN_NAME} connection (IKEv2 PSK, settings from the keyring)"
+    if ! dpkg -s "${package}" > /dev/null 2>&1; then
+        if run sudo apt-get install -y "${package}"; then
+            run sudo nmcli connection reload || failed+=("nmcli connection reload")
+        else
+            failed+=("apt-get install ${package}")
+            return 0
+        fi
+    fi
+
+    # a copy owned by root, as apt runs it as root
+    run sudo install -D -m 755 -o root -g root "${REPO_DIR}/lib/cli-helpers/charon-nm-psk-patch" "${CHARON_NM_PATCH}" \
+        || failed+=("install ${CHARON_NM_PATCH}")
+    tmp="$(mktemp)"
+    echo "DPkg::Post-Invoke { \"if [ -x ${CHARON_NM_PATCH} ]; then ${CHARON_NM_PATCH} || true; fi\"; };" > "${tmp}"
+    if ! sudo cmp -s "${tmp}" "${hook}"; then
+        run sudo install -m 644 -o root -g root "${tmp}" "${hook}" || failed+=("install ${hook}")
+    fi
+    rm -f "${tmp}"
+    run sudo "${CHARON_NM_PATCH}" || failed+=("charon-nm-psk-patch")
+
+    for field in "${HOME_VPN_FIELDS[@]}"; do
+        vpn[${field}]="$(secret-tool lookup type vpn-home name "${field}" 2>/dev/null)"
+        [ -n "${vpn[${field}]}" ] || missing+=("${field}")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warning "Missing in the keyring for the VPN ${HOME_VPN_NAME}: ${missing[*]} (store each: secret-tool store --label=\"VPN home NAME\" type vpn-home name NAME)"
+        failed+=("VPN connection ${HOME_VPN_NAME}, ${missing[*]} missing in the keyring")
+        return 0
+    fi
+
+    # the UUID of a loaded connection is kept, so NetworkManager sees the same one
+    uuid="$(nmcli -g connection.uuid connection show id "${HOME_VPN_NAME}" 2>/dev/null | head -n 1)"
+    [ -n "${uuid}" ] || uuid="$(cat /proc/sys/kernel/random/uuid)"
+    tmp="$(mktemp)"
+    cat > "${tmp}" <<EOF
+[connection]
+id=${HOME_VPN_NAME}
+uuid=${uuid}
+type=vpn
+autoconnect=false
+
+[vpn]
+service-type=org.freedesktop.NetworkManager.strongswan
+address=${vpn[host]}
+method=psk
+local-identity=${vpn[ipsec-id]}
+remote-identity=%any
+virtual=yes
+encap=no
+ipcomp=no
+proposal=no
+password-flags=0
+
+[vpn-secrets]
+password=${vpn[ipsec-key]}
+
+[ipv4]
+dns-search=${vpn[dns-search]%;};
+method=auto
+never-default=true
+route1=${vpn[network]}
+
+[ipv6]
+addr-gen-mode=default
+method=auto
+never-default=true
+EOF
+    if sudo cmp -s "${tmp}" "${dst}"; then
+        echo "VPN connection ${HOME_VPN_NAME} is up to date" 1>&2
+        rm -f "${tmp}"
+        return 0
+    fi
+    # no diff, the keyfile holds the secrets
+    if sudo test -e "${dst}" && ! ask "Replace the ${HOME_VPN_NAME} connection ${dst}, it differs from the one of the keyring?"; then
+        echo "Kept ${dst}" 1>&2
+        rm -f "${tmp}"
+        return 0
+    fi
+    if run sudo install -D -m 600 -o root -g root "${tmp}" "${dst}"; then
+        run sudo nmcli connection load "${dst}" || failed+=("nmcli connection load ${dst}")
+    else
+        failed+=("install ${dst}")
+    fi
+    rm -f "${tmp}"
 }
 
 # render_secrets FILE: FILE with every @@SECRET:NAME@@ filled in from the keyring

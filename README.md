@@ -21,7 +21,7 @@ keys, the SSH config, the network connections and the API key of Codeium stored 
 `keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
 Mittwald wifi and VPN, `keyring-cli codeium-restore` for its plugins of Vim and Sublime Text), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
 copies, restores your own scripts of `~/bin`, sets up the Mittwald VPN (the OpenVPN plugin
-of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), installs the files of
+of NetworkManager with its GNOME part, the `mittwald` connection loaded, `~/bin/gen` to dial it), sets up the IKEv2 VPN `home` (the strongSwan plugin of NetworkManager, its `charon-nm` patched by `lib/cli-helpers/charon-nm-psk-patch` to take a pre-shared key shorter than 20 characters and, with `remote-identity=%any`, whatever identity the gateway sends (e.g. its changing IPv6 address), again after every upgrade by a `DPkg::Post-Invoke` hook, a split tunnel for the home network and its DNS domain only, and the connection written with the settings of the keyring: `type vpn-home` with `name host`, `name network`, `name dns-search` (e.g. `~home.example`, `~` for routing only, several separated by `;`), `name ipsec-id` and `name ipsec-key`), installs the files of
 `lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
 is up, with the Mittwald domains to search, and sets the Slack status, as the Mittwald wifi does, which also gets calmer
 roaming scans; wifi power save off, which Ubuntu turns on; a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
