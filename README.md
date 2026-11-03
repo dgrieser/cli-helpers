@@ -1857,18 +1857,34 @@ brutto-netto --tax-class 3 --children 2 --state bayern --save
 ```
 
 ### `perplexity-invoices`
-Lists and downloads the invoices (Rechnungen) of a perplexity.ai subscription, from the API the settings page of perplexity.ai uses (`/rest/stripe/customer-invoices`, paged until the last one), as PDFs from Stripe. It logs in with the cookies of perplexity.ai of Google Chrome, read from the profile and decrypted with the key Chrome keeps in the keyring (`Chrome Safe Storage`, through `secret-tool`). Cloudflare only lets the requests through with the `cf_clearance` cookie of Chrome and the user agent of the same Chrome version, so both are sent along; when Cloudflare still refuses, opening perplexity.ai in Chrome once renews its check. Needs `python3-cryptography` and `libsecret-tools`.
+Lists, downloads and mails the invoices (Rechnungen) of a perplexity.ai subscription, from the API the settings page of perplexity.ai uses (`/rest/stripe/customer-invoices`, paged until the last one), as PDFs from Stripe. It logs in with the cookies of perplexity.ai of Google Chrome, read from the profile and decrypted with the key Chrome keeps in the keyring (`Chrome Safe Storage`, through `secret-tool`). Cloudflare only lets the requests through with the `cf_clearance` cookie of Chrome and the user agent of the same Chrome version, so both are sent along; when Cloudflare still refuses, opening perplexity.ai in Chrome once renews its check. Needs `python3-cryptography` and `libsecret-tools`.
 
 The session cookie is `__Secure-pplx.session.<account id>` (with several accounts the one of `__Host-pplx-last-active-account`), sent with that account id in the header `x-pplx-account`; the older `__Secure-next-auth.session-token` works as well. `login` opens perplexity.ai in Chrome and waits until the session cookie shows up in the profile (Chrome writes its cookies to disk with a delay of some seconds). The login of perplexity.ai lasts about a month.
 
-**Usage:** `perplexity-invoices [--profile PROFILE] [--user-data-dir DIR] [list|download|login] [OPTIONS]`
+`send` mails all invoices that were not sent yet in one mail, e.g. to the accounting: their PDFs attached, a list of them, oldest first, with their Stripe links and the total in the text. It remembers the invoices sent in `~/.local/state/perplexity-invoices/sent.json` (`$XDG_STATE_HOME`), only after the mail went out, so a failed run sends them again next time; an invoice whose PDF cannot be downloaded is left out (exit code 1) and sent with the next run. `--mark-sent` marks the invoices as sent without mailing them, e.g. the old ones already handed in. The SMTP server comes from `setup-email`, a wizard like `probonio-setup-email` of bahn-probonio-bot: provider presets (Gmail, Outlook, Microsoft 365, iCloud, GMX, WEB.DE, T-Online, mailbox.org, Posteo) or any server, the login, the sender, the recipients and the subject prefix, then a test mail. Without settings of its own it takes the server, login and addresses of bahn-probonio-bot as defaults. The settings are kept in `~/.config/perplexity-invoices/email.json` (`$XDG_CONFIG_HOME`, mode 0600), the SMTP password in the keyring (`service=perplexity-invoices key=smtp-password`; `$SMTP_PASSWORD` overrides it; without a keyring, on request, in `email.json`):
+
+```json
+{
+  "host": "smtp.gmail.com", "port": 587, "security": "starttls",
+  "username": "me@gmail.com",
+  "from": "me@gmail.com", "fromName": "perplexity-invoices",
+  "to": ["me@gmail.com", "accounting@example.com"],
+  "subjectPrefix": "[perplexity-invoices]"
+}
+```
+
+`security` is `starttls`, `tls` (implicit TLS, port 465), `opportunistic` (STARTTLS when the server offers it) or `none`.
+
+**Usage:** `perplexity-invoices [--profile PROFILE] [--user-data-dir DIR] [list|download|send|setup-email|login] [OPTIONS]`
 
 | Argument / Flag | Description |
 |---|---|
 | `list` | Print date, invoice id, amount and status of each invoice, tab-separated, newest first (the default command). `--json` prints the invoices as JSON, with their Stripe links. |
 | `download` | Download the PDFs as `perplexity-<date>-<invoice id>.pdf` and print the path of each new one; a PDF that is already there is skipped (`-f, --force` downloads it again). |
+| `send` | Mail all invoices not sent yet in one mail with their PDFs and print for each `Sent: <date> <invoice id> <amount>`; `-n, --dry-run` only prints the invoices it would send, `--mark-sent` marks them as sent without mailing. |
+| `setup-email` | Wizard for the SMTP settings of `send`; `--test` sends a test mail, `--show` prints the settings (without the password), `--remove` deletes them and the stored password. |
 | `login` | Open perplexity.ai in Chrome and wait for the login (`-t, --timeout SECONDS`, default 300; `-f, --force` also when already logged in). |
-| `--since YYYY-MM-DD` | `list`, `download`: only the invoices from this date on. |
+| `--since YYYY-MM-DD` | `list`, `download`, `send`: only the invoices from this date on. |
 | `-o, --output DIR` | `download`: folder for the PDFs (default: the Downloads folder, `xdg-user-dir DOWNLOAD`), created when missing. |
 | `--profile PROFILE` | Chrome profile folder (default: `Default`). |
 | `--user-data-dir DIR` | Chrome user data folder (default: `~/.config/google-chrome`). |
@@ -1879,6 +1895,10 @@ perplexity-invoices login
 perplexity-invoices
 perplexity-invoices download -o ~/Documents/Rechnungen/perplexity
 perplexity-invoices download --since 2026-01-01
+perplexity-invoices setup-email
+perplexity-invoices send --mark-sent   # all invoices so far count as sent
+perplexity-invoices send -n
+perplexity-invoices send
 ```
 
 ## Interactive Input Prompts

@@ -7,14 +7,27 @@ Google Chrome: its cookies of perplexity.ai are read from the profile and
 decrypted with the key Chrome keeps in the keyring (Chrome Safe Storage).
 Cloudflare only lets requests through with Chrome's cf_clearance cookie and
 the user agent of the same Chrome, so both are sent along.
+
+`send` mails each invoice not sent yet, with its PDF attached, through the SMTP
+server of `setup-email`. The settings are kept in
+$XDG_CONFIG_HOME/perplexity-invoices/email.json (mode 0600), the SMTP password
+in the keyring (service=perplexity-invoices key=smtp-password, $SMTP_PASSWORD
+overrides it), the invoices sent in $XDG_STATE_HOME/perplexity-invoices/sent.json.
 """
 import argparse
 import datetime
+import email.message
+import email.utils
+import getpass
 import glob
 import json
 import os
+import re
 import shutil
+import smtplib
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -36,6 +49,34 @@ DEFAULT_USER_DATA_DIR = os.path.expanduser("~/.config/google-chrome")
 DEFAULT_PROFILE = "Default"
 DEFAULT_LOGIN_TIMEOUT = 300
 LOGIN_POLL_SECONDS = 3
+
+TOOL = "perplexity-invoices"
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+EMAIL_CONFIG = os.path.join(CONFIG_HOME, TOOL, "email.json")
+SENT_STATE = os.path.join(STATE_HOME, TOOL, "sent.json")
+# the settings of bahn-probonio-bot are offered as defaults of a first setup
+OTHER_EMAIL_CONFIGS = [os.path.join(CONFIG_HOME, "bahn-probonio-bot", "email.json")]
+KEYRING_SERVICE = TOOL
+PASSWORD_KEY = "smtp-password"
+SECURITY_MODES = ["starttls", "tls", "opportunistic", "none"]
+DEFAULT_PREFIX = f"[{TOOL}]"
+DEFAULT_FROM_NAME = TOOL
+SMTP_TIMEOUT = 60
+ADDRESS_RE = re.compile(r'^[^\s@<>()",;:]+@[^\s@<>()",;:]+\.[^\s@<>()",;:]+$')
+# common providers, the same presets as bahn-probonio-bot
+PRESETS = [
+    ("Gmail", "smtp.gmail.com", 587, "starttls",
+     "Needs an app password (Google account > Security > App passwords)."),
+    ("Outlook.com / Hotmail", "smtp-mail.outlook.com", 587, "starttls", ""),
+    ("Microsoft 365", "smtp.office365.com", 587, "starttls", "SMTP AUTH must be enabled for the mailbox."),
+    ("iCloud", "smtp.mail.me.com", 587, "starttls", "Needs an app-specific password."),
+    ("GMX", "mail.gmx.net", 587, "starttls", "Enable POP3/IMAP/SMTP access in the GMX settings."),
+    ("WEB.DE", "smtp.web.de", 587, "starttls", "Enable POP3/IMAP/SMTP access in the WEB.DE settings."),
+    ("T-Online", "securesmtp.t-online.de", 465, "tls", "Uses the separate e-mail password."),
+    ("mailbox.org", "smtp.mailbox.org", 465, "tls", ""),
+    ("Posteo", "posteo.de", 587, "starttls", ""),
+]
 
 
 def log(message):
@@ -237,21 +278,31 @@ def command_list(args):
                          invoice["status"]]))
 
 
-def download(url, target):
-    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}"})
-    partial = target + ".part"
+def fetch_pdf(url):
+    request = urllib.request.Request(url, headers={"User-Agent": TOOL})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, open(partial, "wb") as file:
-            shutil.copyfileobj(response, file)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read()
     except (urllib.error.URLError, OSError) as error:
-        if os.path.exists(partial):
-            os.remove(partial)
         raise RuntimeError(str(getattr(error, "reason", error)))
-    with open(partial, "rb") as file:
-        if file.read(5) != b"%PDF-":
-            os.remove(partial)
-            raise RuntimeError("the response is not a PDF")
-    os.replace(partial, target)
+    if not data.startswith(b"%PDF-"):
+        raise RuntimeError("the response is not a PDF")
+    return data
+
+
+def write_file(path, data, mode=0o644):
+    """Write atomically, so an abort leaves no half file behind."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    partial = path + ".part"
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as file:
+        file.write(data)
+    os.chmod(partial, mode)
+    os.replace(partial, path)
+
+
+def download(url, target):
+    write_file(target, fetch_pdf(url))
 
 
 def command_download(args):
@@ -276,6 +327,421 @@ def command_download(args):
             failed += 1
             continue
         print(target)
+    if failed:
+        sys.exit(1)
+
+
+# ---------- e-mail settings ----------
+
+def valid_address(value):
+    return bool(ADDRESS_RE.match(value.strip()))
+
+
+def split_addresses(value):
+    return [address for address in re.split(r"[\s,;]+", value) if address]
+
+
+def default_port(security):
+    return {"tls": 465, "none": 25}.get(security, 587)
+
+
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        fail(f"Cannot read {path}: {error}")
+
+
+def save_json(path, data, mode):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    write_file(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"), mode)
+
+
+def validate_config(config):
+    problems = []
+    if not config.get("host"):
+        problems.append("host missing")
+    if not valid_address(config.get("from") or ""):
+        problems.append(f"invalid from address \"{config.get('from') or ''}\"")
+    if not config.get("to"):
+        problems.append("to (recipients) missing")
+    problems += [f"invalid recipient \"{address}\"" for address in config.get("to") or []
+                 if not valid_address(address)]
+    if config.get("security", "starttls") not in SECURITY_MODES:
+        problems.append(f"invalid security \"{config['security']}\" ({', '.join(SECURITY_MODES)})")
+    port = config.get("port")
+    if port is not None and not (isinstance(port, int) and 0 < port < 65536):
+        problems.append(f"invalid port \"{port}\"")
+    if problems:
+        fail(f"E-mail settings in {EMAIL_CONFIG} incomplete: {'; '.join(problems)}. "
+             f"Run: {APP_NAME} setup-email")
+
+
+def load_config():
+    config = load_json(EMAIL_CONFIG)
+    if config is None:
+        fail(f"No e-mail settings yet ({EMAIL_CONFIG}), run: {APP_NAME} setup-email")
+    validate_config(config)
+    return config
+
+
+def keyring_password():
+    try:
+        result = subprocess.run(["secret-tool", "lookup", "service", KEYRING_SERVICE, "key", PASSWORD_KEY],
+                                capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return ""
+    return result.stdout
+
+
+def keyring_available():
+    try:
+        # exits 0 even without matches, non-zero when no Secret Service is reachable
+        return subprocess.run(["secret-tool", "search", "service", KEYRING_SERVICE],
+                              capture_output=True, check=False).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def store_keyring_password(password):
+    result = subprocess.run(["secret-tool", "store", f"--label={TOOL}: SMTP password",
+                             "service", KEYRING_SERVICE, "key", PASSWORD_KEY],
+                            input=password, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        fail(f"Cannot store the SMTP password in the keyring: {result.stderr.strip()}")
+
+
+def clear_keyring_password():
+    subprocess.run(["secret-tool", "clear", "service", KEYRING_SERVICE, "key", PASSWORD_KEY],
+                   capture_output=True, check=False)
+
+
+def password_source(config):
+    if os.environ.get("SMTP_PASSWORD"):
+        return "environment ($SMTP_PASSWORD)"
+    if keyring_password():
+        return "keyring"
+    if config.get("password"):
+        return EMAIL_CONFIG
+    return None
+
+
+def smtp_password(config):
+    return os.environ.get("SMTP_PASSWORD") or keyring_password() or config.get("password")
+
+
+def describe_config(config):
+    security = config.get("security", "starttls")
+    if config.get("username"):
+        password = password_source(config) or "missing"
+    else:
+        password = "not needed"
+    rows = [
+        ("server", f"{config['host']}:{config.get('port') or default_port(security)} ({security})"),
+        ("login", config.get("username") or "none"),
+        ("password", password),
+        ("from", f"{config.get('fromName') or DEFAULT_FROM_NAME} <{config['from']}>"),
+        ("to", ", ".join(config.get("to") or [])),
+        ("subject", f"{config.get('subjectPrefix', DEFAULT_PREFIX)} Perplexity invoice ..."),
+    ]
+    return "\n".join(f"  {name:<10} {value}" for name, value in rows)
+
+
+def send_mail(config, message):
+    security = config.get("security", "starttls")
+    port = config.get("port") or default_port(security)
+    message["From"] = email.utils.formataddr((config.get("fromName") or DEFAULT_FROM_NAME, config["from"]))
+    message["To"] = ", ".join(config["to"])
+    message["Date"] = email.utils.formatdate(localtime=True)
+    message["Message-ID"] = email.utils.make_msgid(domain=config["from"].split("@")[1])
+    message["X-Mailer"] = TOOL
+    password = None
+    if config.get("username"):
+        password = smtp_password(config)
+        if not password:
+            raise RuntimeError(f"No SMTP password for {config['username']}: store it with "
+                               f"{APP_NAME} setup-email or set $SMTP_PASSWORD")
+    context = ssl.create_default_context()
+    try:
+        if security == "tls":
+            smtp = smtplib.SMTP_SSL(config["host"], port, timeout=SMTP_TIMEOUT, context=context)
+        else:
+            smtp = smtplib.SMTP(config["host"], port, timeout=SMTP_TIMEOUT)
+        with smtp:
+            if security in ("starttls", "opportunistic"):
+                smtp.ehlo()
+                if smtp.has_extn("starttls"):
+                    smtp.starttls(context=context)
+                    smtp.ehlo()
+                elif security == "starttls":
+                    raise RuntimeError("the server offers no STARTTLS")
+            if password:
+                smtp.login(config["username"], password)
+            smtp.send_message(message)
+    except (smtplib.SMTPException, OSError) as error:
+        raise RuntimeError(f"SMTP {config['host']}:{port}: {error}")
+
+
+def invoices_total(invoices):
+    """Sum per currency, e.g. "47.60 USD"."""
+    totals = {}
+    for invoice in invoices:
+        currency = invoice["currency"].upper()
+        totals[currency] = totals.get(currency, 0) + invoice["amount_cents"]
+    return " + ".join(f"{cents / 100:.2f} {currency}" for currency, cents in totals.items())
+
+
+def invoices_mail(config, invoices, pdfs):
+    """One mail with all invoices, oldest first, each PDF attached."""
+    prefix = config.get("subjectPrefix", DEFAULT_PREFIX)
+    first, last = invoice_date(invoices[0]), invoice_date(invoices[-1])
+    message = email.message.EmailMessage()
+    if len(invoices) == 1:
+        message["Subject"] = f"{prefix} Perplexity invoice {first}: {invoice_amount(invoices[0])}".strip()
+        lines = [f"Perplexity invoice of {first}", ""]
+    else:
+        message["Subject"] = (f"{prefix} Perplexity invoices {first} to {last}: {len(invoices)} invoices, "
+                              f"{invoices_total(invoices)}").strip()
+        lines = [f"{len(invoices)} Perplexity invoices from {first} to {last}, "
+                 f"total {invoices_total(invoices)}", ""]
+    for invoice in invoices:
+        lines.append(f"{invoice_date(invoice)}  {invoice['invoice_id']}  {invoice_amount(invoice):>12}  "
+                     f"{invoice['status']}")
+        if invoice.get("hosted_invoice_url"):
+            lines.append(f"  {invoice['hosted_invoice_url']}")
+    lines += ["", "The invoice PDFs are attached." if len(invoices) > 1 else "The invoice PDF is attached.",
+              "", "-- ", f"sent by {TOOL} on {socket.gethostname()}"]
+    message.set_content("\n".join(lines) + "\n")
+    for invoice, pdf in zip(invoices, pdfs):
+        message.add_attachment(pdf, maintype="application", subtype="pdf", filename=invoice_filename(invoice))
+    return message
+
+
+def test_mail(config):
+    message = email.message.EmailMessage()
+    message["Subject"] = f"{config.get('subjectPrefix', DEFAULT_PREFIX)} test mail".strip()
+    message.set_content(f"Test mail of {TOOL} on {socket.gethostname()}.\n\n"
+                        f"With these settings, {APP_NAME} send mails the Perplexity invoices "
+                        f"to {', '.join(config['to'])}.\n")
+    return message
+
+
+def send_test_mail(config):
+    log(f"Sending a test mail to {', '.join(config['to'])} ...")
+    try:
+        send_mail(config, test_mail(config))
+    except RuntimeError as error:
+        fail(str(error))
+    log("Test mail sent")
+
+
+# ---------- setup-email ----------
+
+def abort_input():
+    log("")
+    log("Abort.")
+    sys.exit(1)
+
+
+def ask(question, default=""):
+    hint = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{question}{hint}: ").strip()
+    except EOFError:
+        abort_input()
+    return answer or default
+
+
+def ask_valid(question, default, check):
+    while True:
+        answer = ask(question, default)
+        problem = check(answer)
+        if not problem:
+            return answer
+        log(f"ERROR: {problem}")
+
+
+def confirm(question, default):
+    while True:
+        answer = ask(f"{question} {'[Y/n]' if default else '[y/N]'}").lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+
+
+def choose(question, items, default_index):
+    for number, item in enumerate(items, 1):
+        print(f"  {number:>2}  {item}")
+
+    def check(answer):
+        if answer.isdigit() and 1 <= int(answer) <= len(items):
+            return None
+        return f"enter a number from 1 to {len(items)}"
+    return int(ask_valid(question, str(default_index + 1), check)) - 1
+
+
+def setup_wizard():
+    current = load_json(EMAIL_CONFIG)
+    if current:
+        print(f"Current settings ({EMAIL_CONFIG}):\n{describe_config(current)}\n")
+    else:
+        for path in OTHER_EMAIL_CONFIGS:
+            current = load_json(path)
+            if current:
+                print(f"Defaults taken from {path}\n")
+                current = {key: value for key, value in current.items()
+                           if key in ("host", "port", "security", "username", "from", "to")}
+                break
+        current = current or {}
+
+    hosts = [preset[1] for preset in PRESETS]
+    custom = len(PRESETS)
+    if current.get("host") in hosts:
+        default_choice = hosts.index(current["host"])
+    else:
+        default_choice = custom if current.get("host") else 0
+    choice = choose("E-mail provider", [f"{name} ({host})" for name, host, *_ in PRESETS] + ["other server ..."],
+                    default_choice)
+    if choice < custom:
+        _name, host, port, security, hint = PRESETS[choice]
+        if hint:
+            print(f"  {hint}")
+    else:
+        host = ask_valid("SMTP server", current.get("host", ""), lambda a: None if a else "server is required")
+        modes = ["STARTTLS (port 587)", "TLS/SSL (port 465)", "STARTTLS when available",
+                 "none (port 25, local relay only!)"]
+        current_mode = current.get("security", "starttls")
+        security = SECURITY_MODES[choose("Encryption", modes, SECURITY_MODES.index(current_mode)
+                                         if current_mode in SECURITY_MODES else 0)]
+        keep_port = current.get("port") if current.get("port") != default_port(security) else None
+        answer = ask_valid(f"Port (empty: {default_port(security)})", str(keep_port or ""),
+                           lambda a: None if not a or (a.isdigit() and 0 < int(a) < 65536) else "invalid port")
+        port = int(answer) if answer else default_port(security)
+
+    username = ask('Username (usually the e-mail address, "-" for no login)', current.get("username", ""))
+    username = "" if username == "-" else username
+    password = ""
+    store_in_file = False
+    if username:
+        stored = password_source({**current, "username": username})
+        if not keyring_available():
+            print("  No keyring (Secret Service) reachable on this machine")
+            store_in_file = confirm(f"Store the password in {EMAIL_CONFIG} (mode 0600)?",
+                                    bool(current.get("password")))
+            if not store_in_file:
+                print(f"  Then set $SMTP_PASSWORD for {APP_NAME} send")
+        if keyring_available() or store_in_file:
+            prompt = f"Password (empty: keep the one of the {stored})" if stored else "Password"
+            try:
+                password = getpass.getpass(f"{prompt}: ")
+            except EOFError:
+                abort_input()
+            if not password and not stored:
+                print("  No password entered, set $SMTP_PASSWORD for the send")
+
+    sender = ask_valid("Sender address", current.get("from") or (username if "@" in username else ""),
+                       lambda a: None if valid_address(a) else f"invalid e-mail address \"{a}\"")
+
+    def check_recipients(answer):
+        addresses = split_addresses(answer)
+        if not addresses:
+            return "at least one recipient"
+        bad = [address for address in addresses if not valid_address(address)]
+        return f"invalid e-mail address \"{bad[0]}\"" if bad else None
+    recipients = ask_valid("Recipients (separate with commas)", ", ".join(current.get("to") or [sender]),
+                           check_recipients)
+    prefix = ask("Subject prefix", current.get("subjectPrefix", DEFAULT_PREFIX))
+
+    config = {
+        "host": host,
+        "port": port,
+        "security": security,
+        "username": username,
+        "from": sender,
+        "fromName": current.get("fromName") or DEFAULT_FROM_NAME,
+        "to": split_addresses(recipients),
+        "subjectPrefix": prefix,
+    }
+    if not username:
+        clear_keyring_password()
+    elif store_in_file:
+        config["password"] = password or current.get("password", "")
+    elif password:
+        store_keyring_password(password)
+    validate_config(config)
+    save_json(EMAIL_CONFIG, config, 0o600)
+    print(f"\nE-mail settings saved to {EMAIL_CONFIG}:\n{describe_config(config)}\n")
+    if confirm("Send a test mail now?", True):
+        send_test_mail(config)
+
+
+def command_setup_email(args):
+    if args.remove:
+        if os.path.exists(EMAIL_CONFIG):
+            os.remove(EMAIL_CONFIG)
+        clear_keyring_password()
+        log("E-mail settings and stored SMTP password removed")
+    elif args.show:
+        print(f"E-mail settings ({EMAIL_CONFIG}):\n{describe_config(load_config())}")
+    elif args.test:
+        send_test_mail(load_config())
+    else:
+        setup_wizard()
+
+
+# ---------- send ----------
+
+def command_send(args):
+    config = None if args.mark_sent or args.dry_run else load_config()
+    sent = load_json(SENT_STATE) or {}
+    invoices = Client(args.user_data_dir, args.profile).invoices(args.since)
+    pending = [invoice for invoice in reversed(invoices) if invoice["invoice_id"] not in sent]
+    if not pending:
+        log("No invoices to send")
+        return
+    def label(invoice):
+        return f"{invoice_date(invoice)} {invoice['invoice_id']} {invoice_amount(invoice)}"
+
+    if args.dry_run:
+        for invoice in pending:
+            print(f"Would send: {label(invoice)}")
+        return
+    failed = 0
+    attached, pdfs = [], []
+    if not args.mark_sent:
+        for invoice in pending:
+            if not invoice.get("invoice_pdf"):
+                warning(f"No PDF for the invoice {invoice['invoice_id']} ({invoice['status']}), skipped")
+                continue
+            try:
+                pdfs.append(fetch_pdf(invoice["invoice_pdf"]))
+            except RuntimeError as error:
+                log(f"ERROR: Download of {invoice['invoice_id']} failed, not sent: {error}")
+                failed += 1
+                continue
+            attached.append(invoice)
+        if not attached:
+            sys.exit(1)
+        try:
+            send_mail(config, invoices_mail(config, attached, pdfs))
+        except RuntimeError as error:
+            fail(f"Sending failed: {error}")
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    for invoice in pending if args.mark_sent else attached:
+        record = {"date": invoice_date(invoice), "at": now}
+        if args.mark_sent:
+            record["marked"] = True
+        else:
+            record["to"] = config["to"]
+        sent[invoice["invoice_id"]] = record
+        print(f"{'Marked as sent' if args.mark_sent else 'Sent'}: {label(invoice)}")
+    save_json(SENT_STATE, sent, 0o600)
     if failed:
         sys.exit(1)
 
@@ -308,10 +774,12 @@ def command_login(args):
 def main():
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="List and download the invoices (Rechnungen) of a perplexity.ai subscription, "
-                    "with the login of Google Chrome.",
+        description="List, download and mail the invoices (Rechnungen) of a perplexity.ai "
+                    "subscription, with the login of Google Chrome.",
         epilog=f"examples:\n  {APP_NAME} login\n  {APP_NAME} list\n"
-               f"  {APP_NAME} download -o ~/Documents/Rechnungen --since 2026-01-01",
+               f"  {APP_NAME} download -o ~/Documents/Rechnungen --since 2026-01-01\n"
+               f"  {APP_NAME} setup-email\n  {APP_NAME} send\n\n"
+               f"files:\n  {EMAIL_CONFIG}  e-mail settings\n  {SENT_STATE}  invoices sent",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", default=DEFAULT_PROFILE,
                         help=f"Chrome profile folder (default {DEFAULT_PROFILE})")
@@ -334,6 +802,26 @@ def main():
     download_parser.add_argument("-f", "--force", action="store_true",
                                  help="download again PDFs that are already there")
     download_parser.set_defaults(func=command_download)
+
+    send_parser = commands.add_parser(
+        "send", help="mail all invoices not sent yet in one mail, with their PDFs (see setup-email)")
+    send_parser.add_argument("--since", type=parse_since, metavar="YYYY-MM-DD",
+                             help="only invoices from this date on")
+    send_mode = send_parser.add_mutually_exclusive_group()
+    send_mode.add_argument("-n", "--dry-run", action="store_true",
+                           help="only print the invoices that would be sent")
+    send_mode.add_argument("--mark-sent", action="store_true",
+                           help="mark the invoices as sent without mailing them")
+    send_parser.set_defaults(func=command_send)
+
+    setup_parser = commands.add_parser(
+        "setup-email", help="set up the SMTP server, sender and recipients of send (wizard)")
+    setup_mode = setup_parser.add_mutually_exclusive_group()
+    setup_mode.add_argument("--test", action="store_true", help="send a test mail with the saved settings")
+    setup_mode.add_argument("--show", action="store_true", help="print the saved settings (without password)")
+    setup_mode.add_argument("--remove", action="store_true",
+                            help="delete the settings and the stored SMTP password")
+    setup_parser.set_defaults(func=command_setup_email)
 
     login_parser = commands.add_parser(
         "login", help="open perplexity.ai in Chrome and wait until you logged in")
