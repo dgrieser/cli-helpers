@@ -55,7 +55,7 @@ CONFIGFILES := (cd $(SHAREDDIR) && find $(CONFIGDIRS) -type f -not -path '*/__py
 # commands that are also importable Python modules: they get installed a second
 # time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
 # piping through them
-MODULES := toage
+MODULES := toage prompt
 # setup.sh sets up a new machine from the repo, it is no command
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -not -name setup.sh -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)

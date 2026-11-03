@@ -267,23 +267,47 @@ def display_state(last_action, output, r, g, b, display_name=None):
         sys.stdout.write("\r" + " " * 100 + "\n")
     sys.stdout.flush()
 
+def load_prompt():
+    """The prompt module of cli-helpers: prompt.py on sys.path when installed,
+    else the prompt next to this script (a checkout before make install)."""
+    try:
+        import prompt
+        return prompt
+    except ImportError:
+        pass
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "prompt")
+    if not os.path.isfile(path):
+        return None
+    loader = importlib.machinery.SourceFileLoader("prompt", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("prompt", loader))
+    loader.exec_module(module)
+    sys.modules["prompt"] = module
+    return module
+
+
 def ask_for_preset(presets, label, mode):
     """Ask for a preset name through the prompt helper.
 
     mode "select" only offers existing presets, mode "complete" also accepts a
-    new name. The helper draws on stderr and reads the keyboard from /dev/tty,
-    so only its stdout is captured here. Returns (name, lines_written).
+    new name. The prompt module of cli-helpers draws on the terminal; without
+    it a plain input() asks. Esc and Ctrl-C give no name. Returns
+    (name, lines_written).
     """
-    command = ["prompt-select" if mode == "select" else "prompt-complete", "-p", label]
-    try:
-        result = subprocess.run(command, input="\n".join(presets), text=True, stdout=subprocess.PIPE)
-    except OSError:
+    prompt = load_prompt()
+    if prompt is None:
         sys.stdout.write(f"{label} ")
         sys.stdout.flush()
         return input().strip(), 1
-    if result.returncode != 0:
-        return "", 1
-    return result.stdout.strip(), 1
+    try:
+        if mode == "select":
+            name = prompt.select(label, presets)
+        else:
+            name = prompt.complete(label, presets)
+    except KeyboardInterrupt:
+        name = None
+    return (name or "").strip(), 1
 
 # Function to handle key inputs
 def get_key():

@@ -65,7 +65,7 @@ their logins, caches and installed programs, and what only the git repos of `~/w
 `/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
 config and the API key of Codeium (of `~/.codeium/config.json` of its Vim plugin, else of `~/.codeium/sublime/codeium-api-key.txt` of its Sublime Text plugin) in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
 
-The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
+The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`, `prompt`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
 ```bash
 make list                     # show targets and the full command list
@@ -1861,7 +1861,7 @@ Lists, downloads and mails the invoices (Rechnungen) of a perplexity.ai subscrip
 
 The session cookie is `__Secure-pplx.session.<account id>` (with several accounts the one of `__Host-pplx-last-active-account`), sent with that account id in the header `x-pplx-account`; the older `__Secure-next-auth.session-token` works as well. `login` opens perplexity.ai in Chrome and waits until the session cookie shows up in the profile (Chrome writes its cookies to disk with a delay of some seconds). The login of perplexity.ai lasts about a month.
 
-`send` mails all invoices that were not sent yet in one mail, e.g. to the accounting: their PDFs attached, a list of them, oldest first, with their Stripe links and the total in the text. It remembers the invoices sent in `~/.local/state/perplexity-invoices/sent.json` (`$XDG_STATE_HOME`), only after the mail went out, so a failed run sends them again next time; an invoice whose PDF cannot be downloaded is left out (exit code 1) and sent with the next run. `--mark-sent` marks the invoices as sent without mailing them, e.g. the old ones already handed in. The SMTP server comes from `setup-email`, a wizard like `probonio-setup-email` of bahn-probonio-bot: provider presets (Gmail, Outlook, Microsoft 365, iCloud, GMX, WEB.DE, T-Online, mailbox.org, Posteo) or any server, the login, the sender, the recipients and the subject prefix, then a test mail. Without settings of its own it takes the server, login and addresses of bahn-probonio-bot as defaults. The settings are kept in `~/.config/perplexity-invoices/email.json` (`$XDG_CONFIG_HOME`, mode 0600), the SMTP password in the keyring (`service=perplexity-invoices key=smtp-password`; `$SMTP_PASSWORD` overrides it; without a keyring, on request, in `email.json`):
+`send` mails all invoices that were not sent yet in one mail, e.g. to the accounting: their PDFs attached, a list of them, oldest first, with their Stripe links and the total in the text. It remembers the invoices sent in `~/.local/state/perplexity-invoices/sent.json` (`$XDG_STATE_HOME`), only after the mail went out, so a failed run sends them again next time; an invoice whose PDF cannot be downloaded is left out (exit code 1) and sent with the next run. `--mark-sent` marks the invoices as sent without mailing them, e.g. the old ones already handed in. The SMTP server comes from `setup-email`, a wizard like `probonio-setup-email` of bahn-probonio-bot, with the prompts of cli-helpers ([prompt-select](#prompt) lists filtered by typing, [prompt-input](#prompt) pre-filled with the current values; Esc or Ctrl-D aborts): provider presets (Gmail, Outlook, Microsoft 365, iCloud, GMX, WEB.DE, T-Online, mailbox.org, Posteo) or any server, the login, the sender, the recipients and the subject prefix (`-` for none), then a test mail. Without settings of its own it takes the server, login and addresses of bahn-probonio-bot as defaults. The settings are kept in `~/.config/perplexity-invoices/email.json` (`$XDG_CONFIG_HOME`, mode 0600), the SMTP password in the keyring (`service=perplexity-invoices key=smtp-password`; `$SMTP_PASSWORD` overrides it; without a keyring, on request, in `email.json`):
 
 ```json
 {
@@ -1872,6 +1872,8 @@ The session cookie is `__Secure-pplx.session.<account id>` (with several account
   "subjectPrefix": "[perplexity-invoices]"
 }
 ```
+
+An empty `subjectPrefix` sends the subjects without a prefix.
 
 `security` is `starttls`, `tls` (implicit TLS, port 465), `opportunistic` (STARTTLS when the server offers it) or `none`.
 
@@ -1955,6 +1957,8 @@ Spans wrapped in `"`, `'` or `` ` `` are drawn as inline code snippets: the quot
 
 Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
 
+It is also the importable `prompt` Python module (`prompt.py`, see [Installation](#installation)), so Python tools ask in-process instead of running the command: `input_line(question, default)`, `multiline(question, default)`, `password(question)`, `confirm(question, default)`, `select(question, items, default, filter, returns, header_lines)` (items as `(key, title)` pairs or plain strings) and `complete(question, candidates, default, ignore_case, substring)` return the answer (`confirm` `True` or `False`, it takes `y`/`yes` and `n`/`no` and asks again on anything else), or `None` when it was aborted (Esc, Ctrl-D), and Ctrl-C raises `KeyboardInterrupt`; `run(arguments, name)` takes any option, as if called under the name `name`, and returns the exit status and the answer. `brutto-netto`, `perplexity-invoices` and `screen-color` ask with it, and load it from next to themselves in a checkout that is not installed yet.
+
 #### Single-line mode keys (`--single-line` / `prompt-input` and the confirmation aliases)
 On a terminal the line is edited in place, so a pre-filled `-d`/`--prefill` value can be changed instead of only accepted or retyped. Piped input and `--protected` use a plain read instead.
 
@@ -1965,7 +1969,7 @@ On a terminal the line is edited in place, so a pre-filled `-d`/`--prefill` valu
 | Ctrl-U / Ctrl-K / Ctrl-W | Kill to start of line / to end of line / the previous word. |
 | Enter | Submit; an empty line returns `-d` when one was given. |
 | `↑` / `↓`, Tab, Esc | Ignored. |
-| Ctrl-D | Abort on an empty line (exit 1). |
+| Ctrl-D | Abort on an empty line (exit 1); with `--protected` also on piped input that ended. |
 | Ctrl-C | Abort (exit 130). |
 
 #### Multi-line mode keys (`prompt` / `prompt-multiline`)

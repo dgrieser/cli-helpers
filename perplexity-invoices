@@ -18,7 +18,6 @@ import argparse
 import datetime
 import email.message
 import email.utils
-import getpass
 import glob
 import json
 import os
@@ -445,7 +444,7 @@ def describe_config(config):
         ("password", password),
         ("from", f"{config.get('fromName') or DEFAULT_FROM_NAME} <{config['from']}>"),
         ("to", ", ".join(config.get("to") or [])),
-        ("subject", f"{config.get('subjectPrefix', DEFAULT_PREFIX)} Perplexity invoice ..."),
+        ("subject", subject(config, "Perplexity invoice ...")),
     ]
     return "\n".join(f"  {name:<10} {value}" for name, value in rows)
 
@@ -485,6 +484,12 @@ def send_mail(config, message):
         raise RuntimeError(f"SMTP {config['host']}:{port}: {error}")
 
 
+def subject(config, text):
+    """The subject with the prefix of the settings, none when it is empty."""
+    prefix = config.get("subjectPrefix", DEFAULT_PREFIX).strip()
+    return f"{prefix} {text}" if prefix else text
+
+
 def invoices_total(invoices):
     """Sum per currency, e.g. "47.60 USD"."""
     totals = {}
@@ -496,15 +501,14 @@ def invoices_total(invoices):
 
 def invoices_mail(config, invoices, pdfs):
     """One mail with all invoices, oldest first, each PDF attached."""
-    prefix = config.get("subjectPrefix", DEFAULT_PREFIX)
     first, last = invoice_date(invoices[0]), invoice_date(invoices[-1])
     message = email.message.EmailMessage()
     if len(invoices) == 1:
-        message["Subject"] = f"{prefix} Perplexity invoice {first}: {invoice_amount(invoices[0])}".strip()
+        message["Subject"] = subject(config, f"Perplexity invoice {first}: {invoice_amount(invoices[0])}")
         lines = [f"Perplexity invoice of {first}", ""]
     else:
-        message["Subject"] = (f"{prefix} Perplexity invoices {first} to {last}: {len(invoices)} invoices, "
-                              f"{invoices_total(invoices)}").strip()
+        message["Subject"] = subject(config, f"Perplexity invoices {first} to {last}: {len(invoices)} "
+                                             f"invoices, {invoices_total(invoices)}")
         lines = [f"{len(invoices)} Perplexity invoices from {first} to {last}, "
                  f"total {invoices_total(invoices)}", ""]
     for invoice in invoices:
@@ -522,7 +526,7 @@ def invoices_mail(config, invoices, pdfs):
 
 def test_mail(config):
     message = email.message.EmailMessage()
-    message["Subject"] = f"{config.get('subjectPrefix', DEFAULT_PREFIX)} test mail".strip()
+    message["Subject"] = subject(config, "Perplexity invoices: test mail")
     message.set_content(f"Test mail of {TOOL} on {socket.gethostname()}.\n\n"
                         f"With these settings, {APP_NAME} send mails the Perplexity invoices "
                         f"to {', '.join(config['to'])}.\n")
@@ -540,19 +544,47 @@ def send_test_mail(config):
 
 # ---------- setup-email ----------
 
-def abort_input():
-    log("")
-    log("Abort.")
-    sys.exit(1)
+def load_prompt():
+    """The prompt module of cli-helpers: prompt.py on sys.path when installed,
+    else the prompt next to this script (a checkout before make install)."""
+    try:
+        import prompt
+        return prompt
+    except ImportError:
+        pass
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "prompt")
+    if not os.path.isfile(path):
+        return None
+    loader = importlib.machinery.SourceFileLoader("prompt", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("prompt", loader))
+    loader.exec_module(module)
+    sys.modules["prompt"] = module
+    return module
+
+
+def prompt(function, *arguments, **options):
+    """Ask with the prompt module of cli-helpers. Ctrl-C exits with 130."""
+    prompts = load_prompt()
+    if prompts is None:
+        fail("prompt of cli-helpers not found")
+    try:
+        return getattr(prompts, function)(*arguments, **options)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def aborted(answer):
+    """Esc and Ctrl-D abort the wizard (the prompt says so)."""
+    if answer is None:
+        sys.exit(1)
+    return answer
 
 
 def ask(question, default=""):
-    hint = f" [{default}]" if default else ""
-    try:
-        answer = input(f"{question}{hint}: ").strip()
-    except EOFError:
-        abort_input()
-    return answer or default
+    """A line of input, pre-filled with default."""
+    return aborted(prompt("input_line", f"{question}:", default)).strip()
 
 
 def ask_valid(question, default, check):
@@ -564,26 +596,17 @@ def ask_valid(question, default, check):
         log(f"ERROR: {problem}")
 
 
+def ask_password(question):
+    return aborted(prompt("password", f"{question}:"))
+
+
 def confirm(question, default):
-    while True:
-        answer = ask(f"{question} {'[Y/n]' if default else '[y/N]'}").lower()
-        if not answer:
-            return default
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("n", "no"):
-            return False
+    return aborted(prompt("confirm", question, default))
 
 
-def choose(question, items, default_index):
-    for number, item in enumerate(items, 1):
-        print(f"  {number:>2}  {item}")
-
-    def check(answer):
-        if answer.isdigit() and 1 <= int(answer) <= len(items):
-            return None
-        return f"enter a number from 1 to {len(items)}"
-    return int(ask_valid(question, str(default_index + 1), check)) - 1
+def choose(question, items, default):
+    """items: (key, title) pairs; the key selected, from a list filtered by typing."""
+    return aborted(prompt("select", f"{question}:", items, default, filter=True))
 
 
 def setup_wizard():
@@ -600,29 +623,29 @@ def setup_wizard():
                 break
         current = current or {}
 
-    hosts = [preset[1] for preset in PRESETS]
-    custom = len(PRESETS)
-    if current.get("host") in hosts:
-        default_choice = hosts.index(current["host"])
+    presets = {preset[1]: preset for preset in PRESETS}
+    if current.get("host") in presets:
+        default_choice = current["host"]
     else:
-        default_choice = custom if current.get("host") else 0
-    choice = choose("E-mail provider", [f"{name} ({host})" for name, host, *_ in PRESETS] + ["other server ..."],
-                    default_choice)
-    if choice < custom:
-        _name, host, port, security, hint = PRESETS[choice]
+        default_choice = "other" if current.get("host") else PRESETS[0][1]
+    choice = choose("E-mail provider", [(host, f"{name} ({host})") for name, host, *_ in PRESETS]
+                    + [("other", "other server ...")], default_choice)
+    if choice in presets:
+        _name, host, port, security, hint = presets[choice]
         if hint:
             print(f"  {hint}")
     else:
         host = ask_valid("SMTP server", current.get("host", ""), lambda a: None if a else "server is required")
-        modes = ["STARTTLS (port 587)", "TLS/SSL (port 465)", "STARTTLS when available",
-                 "none (port 25, local relay only!)"]
+        modes = [("starttls", "STARTTLS (port 587)"), ("tls", "TLS/SSL (port 465)"),
+                 ("opportunistic", "STARTTLS when available"), ("none", "none (port 25, local relay only!)")]
         current_mode = current.get("security", "starttls")
-        security = SECURITY_MODES[choose("Encryption", modes, SECURITY_MODES.index(current_mode)
-                                         if current_mode in SECURITY_MODES else 0)]
-        keep_port = current.get("port") if current.get("port") != default_port(security) else None
-        answer = ask_valid(f"Port (empty: {default_port(security)})", str(keep_port or ""),
-                           lambda a: None if not a or (a.isdigit() and 0 < int(a) < 65536) else "invalid port")
-        port = int(answer) if answer else default_port(security)
+        security = choose("Encryption", modes, current_mode if current_mode in SECURITY_MODES else "starttls")
+        if current.get("security") == security and current.get("port"):
+            port = current["port"]
+        else:
+            port = default_port(security)
+        port = int(ask_valid("Port", str(port),
+                             lambda a: None if a.isdigit() and 0 < int(a) < 65536 else "invalid port"))
 
     username = ask('Username (usually the e-mail address, "-" for no login)', current.get("username", ""))
     username = "" if username == "-" else username
@@ -637,11 +660,7 @@ def setup_wizard():
             if not store_in_file:
                 print(f"  Then set $SMTP_PASSWORD for {APP_NAME} send")
         if keyring_available() or store_in_file:
-            prompt = f"Password (empty: keep the one of the {stored})" if stored else "Password"
-            try:
-                password = getpass.getpass(f"{prompt}: ")
-            except EOFError:
-                abort_input()
+            password = ask_password(f"Password (empty: keep the one of the {stored})" if stored else "Password")
             if not password and not stored:
                 print("  No password entered, set $SMTP_PASSWORD for the send")
 
@@ -656,7 +675,8 @@ def setup_wizard():
         return f"invalid e-mail address \"{bad[0]}\"" if bad else None
     recipients = ask_valid("Recipients (separate with commas)", ", ".join(current.get("to") or [sender]),
                            check_recipients)
-    prefix = ask("Subject prefix", current.get("subjectPrefix", DEFAULT_PREFIX))
+    prefix = ask('Subject prefix ("-" for none)', current.get("subjectPrefix", DEFAULT_PREFIX) or "-")
+    prefix = "" if prefix == "-" else prefix
 
     config = {
         "host": host,
@@ -692,6 +712,9 @@ def command_setup_email(args):
     elif args.test:
         send_test_mail(load_config())
     else:
+        # piped input would answer every question with its default at its end
+        if not sys.stdin.isatty():
+            fail(f"{APP_NAME} setup-email asks on a terminal, stdin is none")
         setup_wizard()
 
 

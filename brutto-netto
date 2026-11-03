@@ -17,8 +17,6 @@ import datetime
 import html
 import os
 import re
-import shutil
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -49,8 +47,6 @@ TAX_CLASSES = {
 }
 # the tax details --interactive asks for; the rarer ones stay options
 ASKED = ["tax-class", "state", "church", "age", "children"]
-# the prompts of cli-helpers, next to this script (installed or in the repo)
-PROMPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # the options a config file may set, with their defaults
 DEFAULTS = {
@@ -102,30 +98,49 @@ def save_config(args, given):
     print(f"Saved {', '.join(sorted(given))} to {CONFIG_FILE}", file=sys.stderr)
 
 
-def prompt(tool, *arguments):
-    """Run a prompt of cli-helpers: its answer, None for "no" or an empty
-    answer; Esc aborts, Ctrl-C (exit 130) too, with its status."""
-    path = os.path.join(PROMPT_DIR, tool)
-    if not os.access(path, os.X_OK):
-        path = shutil.which(tool)
-        if not path:
-            fail(f"{tool} of cli-helpers not found")
-    result = subprocess.run([path, *arguments], stdout=subprocess.PIPE, text=True)
-    if result.returncode == 130:
-        sys.exit(130)
-    if result.returncode != 0:
+def load_prompt():
+    """The prompt module of cli-helpers: prompt.py on sys.path when installed,
+    else the prompt next to this script (a checkout before make install)."""
+    try:
+        import prompt
+        return prompt
+    except ImportError:
+        pass
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "prompt")
+    if not os.path.isfile(path):
         return None
-    return result.stdout.rstrip("\n")
+    loader = importlib.machinery.SourceFileLoader("prompt", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("prompt", loader))
+    loader.exec_module(module)
+    sys.modules["prompt"] = module
+    return module
+
+
+def prompt(function, *arguments, **options):
+    """Ask with the prompt module of cli-helpers. Ctrl-C exits with 130."""
+    prompts = load_prompt()
+    if prompts is None:
+        fail("prompt of cli-helpers not found")
+    try:
+        return getattr(prompts, function)(*arguments, **options)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 def ask_yes(question, default):
-    return prompt("prompt-yes-no" if default else "prompt-no-yes", question) is not None
+    """Ctrl-D aborts (the prompt says so)."""
+    answer = prompt("confirm", question, default)
+    if answer is None:
+        sys.exit(1)
+    return answer
 
 
 def ask_value(question, default, convert):
     """Ask until the answer converts; Ctrl-D aborts (the prompt says so)."""
     while True:
-        answer = prompt("prompt-input", "--prompt", question, "--default", default)
+        answer = prompt("input_line", question, default)
         if answer is None:
             sys.exit(1)
         if answer == "":
@@ -138,8 +153,7 @@ def ask_value(question, default, convert):
 
 def ask_select(question, items, default):
     """items: (key, title) pairs; Esc aborts (the prompt says so)."""
-    answer = prompt("prompt-select", "--prompt", question, "--default", str(default), "--filter",
-                    *[f"{key}={title}" for key, title in items])
+    answer = prompt("select", question, items, default, filter=True)
     if answer is None:
         sys.exit(1)
     return answer

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+"""Read input from the terminal: lines, a secret, a confirmation or a choice of a list.
 
+This file is installed twice: as the `prompt` command (with its aliases such as
+`prompt-input` and `prompt-select`) and, under the name `prompt.py`, into a
+directory on sys.path (see MODULES in the Makefile). Python tools can therefore
+ask in-process with `input_line()`, `multiline()`, `password()`, `confirm()`,
+`select()` and `complete()`, or with `run()` for any other option, instead of
+running the command.
+"""
+
+import io
 import os
 import sys
 import re
@@ -598,7 +608,7 @@ def compile_pattern(pattern, option):
         return re.compile(pattern)
     except re.error as error:
         print('ERROR: ' + option + ' is not a valid regular expression: ' + str(error), file=sys.stderr)
-        exit(1)
+        sys.exit(1)
 
 
 def unique(values):
@@ -1176,9 +1186,14 @@ def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, pre
             cursor = position + 1
 
 
+# run() turns this off for the module functions, which hand in their items
+# themselves: the stdin of the calling tool is not theirs to read
+READ_STDIN_ITEMS = True
+
+
 def read_entries(arguments):
     entries = list(arguments)
-    if sys.stdin is not None and not sys.stdin.isatty():
+    if READ_STDIN_ITEMS and sys.stdin is not None and not sys.stdin.isatty():
         try:
             entries.extend(sys.stdin.read().splitlines())
         except (OSError, UnicodeDecodeError):
@@ -1210,14 +1225,14 @@ def cycle_rows(items, specs):
             position = default_index(items, name)
             if position is None:
                 print('ERROR: --cycle "' + spec + '" names no item: ' + name, file=sys.stderr)
-                exit(1)
+                sys.exit(1)
             if position in grouped or position in members:
                 print('ERROR: --cycle "' + spec + '" uses the item "' + name + '" twice.', file=sys.stderr)
-                exit(1)
+                sys.exit(1)
             members.append(position)
         if len(members) < 2:
             print('ERROR: --cycle "' + spec + '" needs at least two items.', file=sys.stderr)
-            exit(1)
+            sys.exit(1)
         for position in members:
             grouped[position] = members
     rows = []
@@ -1269,7 +1284,7 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
 
     if interrupted:
         term.close()
-        exit(130)
+        sys.exit(130)
 
     head, _ = build_head(theme, prompt, prompt_display, prompt_char)
     if line is None:
@@ -1278,7 +1293,7 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
             term.write(theme.paint('hint', 'Abort.') + '\r\n')
             term.flush()
         term.close()
-        exit(1)
+        sys.exit(1)
     if not line:
         line = default
     # the line notes that nobody answered, the answer was the default
@@ -1286,9 +1301,9 @@ def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_c
     term.flush()
     term.close()
     if exit_code_pattern:
-        exit(0 if re.match(exit_code_pattern, line) else 1)
+        sys.exit(0 if re.match(exit_code_pattern, line) else 1)
     print(line, end='')
-    exit(0)
+    sys.exit(0)
 
 
 def run_multiline_mode(args, prompt, prompt_char):
@@ -1311,7 +1326,7 @@ def run_multiline_mode(args, prompt, prompt_char):
 
     if interrupted:
         term.close()
-        exit(130)
+        sys.exit(130)
 
     # the empty line the cursor sits on after the last Enter is an artifact
     if len(lines) > 1 and not lines[-1]:
@@ -1327,7 +1342,7 @@ def run_multiline_mode(args, prompt, prompt_char):
     term.flush()
     term.close()
     print('\n'.join(lines))
-    exit(0)
+    sys.exit(0)
 
 
 # what select mode prints for the item at position chosen
@@ -1346,7 +1361,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
     term = Terminal()
     if not term.open():
         print('ERROR: No terminal available for interactive input.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     theme = Theme(term.supports_color() and not args.no_color)
     height = args.height if args.height else 0
 
@@ -1357,7 +1372,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
         header_lines = args.header_lines
         if header_lines and len(entries) <= header_lines:
             print('ERROR: --header-lines ' + str(header_lines) + ' leaves no items to select from.', file=sys.stderr)
-            exit(1)
+            sys.exit(1)
         # the header goes through the same parsing, so its columns keep lining
         # up with the titles below it
         header = [title for _, title in parse_items(entries[:header_lines], delimiter, split_pattern, key_pattern)]
@@ -1366,7 +1381,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
         items = parse_items(entries[header_lines:], delimiter, split_pattern, key_pattern)
         if not items:
             print('ERROR: No items to select from.', file=sys.stderr)
-            exit(1)
+            sys.exit(1)
         rows = cycle_rows(items, args.cycle)
         selection = [0] * len(rows)
         index = 0
@@ -1377,13 +1392,13 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
                 position = default_index(items, name)
                 if position is None:
                     print('ERROR: --checked "' + name + '" matches no item.', file=sys.stderr)
-                    exit(1)
+                    sys.exit(1)
                 checked.add(position)
         if args.default:
             position = default_index(items, args.default)
             if position is None:
                 print('ERROR: --default "' + args.default + '" matches no item.', file=sys.stderr)
-                exit(1)
+                sys.exit(1)
             # the row of the default starts on it, a cycling one included
             index = next(row for row, members in enumerate(rows) if position in members)
             selection[index] = rows[index].index(position)
@@ -1407,7 +1422,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
                 if not args.no_abort_message:
                     term.write(theme.paint('hint', 'Abort.') + '\r\n')
                     term.flush()
-                exit(1)
+                sys.exit(1)
         if select_mode and checked is not None:
             if prompt:
                 term.write(paint_prompt(theme, prompt) + ' ')
@@ -1431,7 +1446,7 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
                 if not args.no_abort_message:
                     term.write(theme.paint('hint', 'Abort.') + '\r\n')
                     term.flush()
-                exit(1)
+                sys.exit(1)
             if not line:
                 line = args.default
             head, _ = build_head(theme, prompt, prompt_display, prompt_char)
@@ -1447,9 +1462,9 @@ def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, en
 
     term.close()
     if interrupted:
-        exit(130)
+        sys.exit(130)
     print(result, end='')
-    exit(0)
+    sys.exit(0)
 
 def main():
     bin_name = os.path.basename(sys.argv[0])
@@ -1605,48 +1620,48 @@ def main():
 
     if prompt_select and prompt_complete:
         print('ERROR: --select and --complete are mutually exclusive.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if (prompt_select or prompt_complete) and (prompt_protected or args.single_line):
         print('ERROR: --select and --complete cannot be combined with --protected or --single-line.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines or args.no_header_uppercase or args.cycle):
         print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return, --header-lines, --no-header-uppercase and --cycle can only be used in select mode.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if (args.multi or args.checked) and not prompt_select:
         print('ERROR: --multi and --checked can only be used in select mode.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.checked and not args.multi:
         print('ERROR: --checked needs --multi.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.multi and (args.filter or args.cycle):
         print('ERROR: --multi cannot be combined with --filter or --cycle.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if len([option for option in (args.delimiter, args.delimiter_regex, args.key_regex) if option is not None]) > 1:
         print('ERROR: --delimiter, --delimiter-regex and --key-regex are mutually exclusive.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.timeout is not None:
         if args.timeout < 1:
             print('ERROR: --timeout must be a positive number.', file=sys.stderr)
-            exit(1)
+            sys.exit(1)
         if not prompt_single_line or prompt_protected or prompt_select or prompt_complete:
             print('ERROR: --timeout can only be used in single-line mode, not with --protected.', file=sys.stderr)
-            exit(1)
+            sys.exit(1)
     if args.header_lines < 0:
         print('ERROR: --header-lines must not be negative.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     multiline_mode = not (prompt_single_line or prompt_select or prompt_complete or prompt_protected)
     if not prompt_complete and (args.ignore_case or args.substring or args.files or args.dirs):
         print('ERROR: --ignore-case, --substring, --files and --dirs can only be used in completion mode.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.prefill and prompt_protected:
         print('ERROR: --prefill cannot be used with --protected.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.prefill and prompt_select:
         print('ERROR: --prefill cannot be used in select mode.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if args.files and args.dirs:
         print('ERROR: --files and --dirs are mutually exclusive.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if (args.files or args.dirs) and not args.prefill:
         # a default path doubles as the starting point, so Enter accepts it and
         # editing it stays possible; without one, start in the current directory
@@ -1654,10 +1669,10 @@ def main():
         args.prefill = args.default if args.default else os.getcwd().rstrip('/') + '/'
     if args.height is not None and args.height < 1:
         print('ERROR: --height must be a positive number.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if prompt_default and prompt_protected:
         print('ERROR: --default cannot be used with --protected.', file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     if (multiline_mode or prompt_single_line) and prompt_default and not args.prefill and not prompt_protected:
         # the default text is edited in place, so Enter (or Ctrl-D) accepts it
         args.prefill = prompt_default
@@ -1721,15 +1736,19 @@ def main():
                 line = input_with_default(prompt_default)
         except KeyboardInterrupt:
             print('')
-            exit(130)
+            sys.exit(130)
         except EOFError:
+            if prompt_protected:
+                # Ctrl-D at a secret aborts, it has no default to fall back to
+                print('', file=sys.stderr)
+                sys.exit(1)
             # nothing on stdin at all still honors the default
             line = prompt_default
         if prompt_exit_code_pattern:
             if not line:
                 line = ''
-            if re.match(prompt_exit_code_pattern, line): exit(0)
-            else: exit(1)
+            if re.match(prompt_exit_code_pattern, line): sys.exit(0)
+            else: sys.exit(1)
         print(line, end='')
     else:
         lines = []
@@ -1746,7 +1765,7 @@ def main():
                     prompt_default = ''
             except KeyboardInterrupt:
                 print('')
-                exit(130)
+                sys.exit(130)
             except EOFError:
                 break
             lines.append(line)
@@ -1758,6 +1777,102 @@ def main():
 
         print('\r' + ' ' * visible_length(prompt_char) + '\r', end='', file=sys.stderr)
         print('\n'.join(lines))
+
+# ---------- use as a module ----------
+
+def run(arguments, name='prompt', stdin_items=True):
+    """Run prompt as if called as NAME ARGUMENTS, e.g. run(['Delete?'],
+    'prompt-yes-no'): the exit status and what it printed (the answer). The
+    prompt itself is drawn on the terminal as usual. Ctrl-C (status 130) raises
+    KeyboardInterrupt. stdin_items=False keeps a piped stdin from adding list
+    items or completion candidates."""
+    global READ_STDIN_ITEMS
+    saved_argv, saved_stdout, saved_read = sys.argv, sys.stdout, READ_STDIN_ITEMS
+    sys.argv = [name, *arguments]
+    sys.stdout = io.StringIO()
+    READ_STDIN_ITEMS = stdin_items
+    status = 0
+    try:
+        main()
+    except SystemExit as stop:
+        status = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+    finally:
+        output = sys.stdout.getvalue()
+        sys.stdout, sys.argv, READ_STDIN_ITEMS = saved_stdout, saved_argv, saved_read
+    if status == 130:
+        raise KeyboardInterrupt
+    return status, output
+
+
+def input_line(question, default=''):
+    """A line of input, pre-filled with default; None when aborted (Ctrl-D)."""
+    status, output = run(['--single-line', '--prompt', question, '--default', default])
+    return output if status == 0 else None
+
+
+def multiline(question=None, default=''):
+    """Lines of input until Ctrl-D, pre-filled with default; None when aborted."""
+    arguments = ['--default', default]
+    if question is not None:
+        arguments += ['--prompt', question]
+    status, output = run(arguments)
+    return output.rstrip('\n') if status == 0 else None
+
+
+def password(question='Password:'):
+    """A secret, typed without echo; None when aborted (Ctrl-D)."""
+    status, output = run(['--single-line', '--protected', '--prompt', question])
+    return output if status == 0 else None
+
+
+def confirm(question, default=False):
+    """True for "yes", False for "no", None when aborted (Ctrl-D): question gets
+    " [Y/n]:" (default True) or " [y/N]:" appended. y/yes and n/no in any case,
+    an empty answer is the default; anything else asks again."""
+    while True:
+        status, output = run(['--single-line', '--prompt', question + (' [Y/n]:' if default else ' [y/N]:')])
+        if status != 0:
+            return None
+        answer = output.strip().lower()
+        if not answer:
+            return default
+        if answer in ('y', 'yes'):
+            return True
+        if answer in ('n', 'no'):
+            return False
+
+
+def select(question, items, default=None, filter=False, returns='key', header_lines=0):
+    """The item chosen, None when aborted (Esc). items are (key, title) pairs or
+    plain strings (key and title in one, e.g. table rows after header_lines
+    header rows); default names the item the cursor starts on by key, title or
+    number; filter lets typing filter the list; returns is 'key', 'title',
+    'index' (an int, 0-based) or 'number' (an int, 1-based)."""
+    entries = [item if isinstance(item, str) else f'{item[0]}\t{item[1]}' for item in items]
+    arguments = ['--prompt', question, '--delimiter', '\\t', '--return', returns]
+    if default is not None:
+        arguments += ['--default', str(default)]
+    if filter:
+        arguments.append('--filter')
+    if header_lines:
+        arguments += ['--header-lines', str(header_lines)]
+    # after "--", an item that starts with "-" stays an item
+    status, output = run(arguments + ['--'] + entries, 'prompt-select', stdin_items=False)
+    if status != 0:
+        return None
+    return int(output) if returns in ('index', 'number') else output
+
+
+def complete(question, candidates, default='', ignore_case=False, substring=False):
+    """A line of input with Tab completion against the candidates; None when aborted (Esc)."""
+    arguments = ['--prompt', question, '--default', default]
+    if ignore_case:
+        arguments.append('--ignore-case')
+    if substring:
+        arguments.append('--substring')
+    status, output = run(arguments + ['--'] + list(candidates), 'prompt-complete', stdin_items=False)
+    return output if status == 0 else None
+
 
 if __name__ == '__main__':
     main()
