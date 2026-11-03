@@ -77,6 +77,7 @@ completion() {
 mode=""
 target=""
 print=0
+copy=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -84,6 +85,14 @@ while [ "${#}" -gt 0 ]; do
             shift
             completion "${@}"
             exit 0
+            ;;
+        # Internal: run /copy in the private tmux session (see bind-key below).
+        --copy-review)
+            [ "${#}" -eq 3 ] || fail "Usage: --copy-review SOCKET SESSION"
+            copy=1
+            socket="${2}"
+            session="${3}"
+            break
             ;;
         -h|--help) usage ;;
         -p|--print) print=1 ;;
@@ -100,6 +109,37 @@ while [ "${#}" -gt 0 ]; do
     esac
     shift
 done
+
+tmux_review() {
+    tmux -L "${socket}" "${@}"
+}
+
+wait_for_screen() {
+    local needle="${1}"
+    local timeout="${2}"
+    local deadline=$((SECONDS + timeout))
+    local screen=""
+    while [ "${SECONDS}" -le "${deadline}" ]; do
+        screen="$(tmux_review capture-pane -p -t "${session}" 2>/dev/null)" || return 1
+        [[ "${screen}" == *"${needle}"* ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+if [ "${copy}" -eq 1 ]; then
+    tmux_review send-keys -t "${session}" -l /copy
+    # Codex treats an Enter that follows typed text too quickly as part of a
+    # paste, so wait before submitting; retry once if the picker stays closed.
+    sleep 0.5
+    tmux_review send-keys -t "${session}" Enter
+    if ! wait_for_screen "Copy whole response" 3; then
+        tmux_review send-keys -t "${session}" Enter
+        wait_for_screen "Copy whole response" 5 || exit 1
+    fi
+    tmux_review send-keys -t "${session}" Enter
+    exit 0
+fi
 
 command -v codex >/dev/null 2>&1 || fail "codex not found"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
@@ -143,23 +183,7 @@ tput clear >/dev/null 2>&1 || fail "Terminal lacks screen controls; set TERM to 
 
 socket="codex-review-$$"
 session="review"
-
-tmux_review() {
-    tmux -L "${socket}" "${@}"
-}
-
-wait_for_screen() {
-    local needle="${1}"
-    local timeout="${2}"
-    local deadline=$((SECONDS + timeout))
-    local screen=""
-    while [ "${SECONDS}" -le "${deadline}" ]; do
-        screen="$(tmux_review capture-pane -p -t "${session}" 2>/dev/null)" || return 1
-        [[ "${screen}" == *"${needle}"* ]] && return 0
-        sleep 0.1
-    done
-    return 1
-}
+self="$(readlink -f "${BASH_SOURCE[0]}")" || fail "Could not resolve script path"
 
 tmux_review new-session -d -s "${session}" codex || fail "Could not start Codex in tmux"
 # Detaching also ends this wrapper; always stop its private server on exit.
@@ -198,7 +222,7 @@ fi
 
 if [ -n "${mode}" ]; then
     # One Enter after the review runs /copy, then restores normal Enter behavior.
-    tmux_review bind-key -n Enter run-shell "tmux -L ${socket} unbind-key -n Enter; tmux -L ${socket} send-keys -t ${session} -l /copy; tmux -L ${socket} send-keys -t ${session} Enter"
+    tmux_review bind-key -n Enter run-shell -b "tmux -L ${socket} unbind-key -n Enter; $(printf '%q' "${self}") --copy-review ${socket} ${session}"
 fi
 
 env -u TMUX tmux -L "${socket}" attach-session -t "${session}"
