@@ -1856,6 +1856,31 @@ brutto-netto 4500 --hours 40 --new-hours 32
 brutto-netto --tax-class 3 --children 2 --state bayern --save
 ```
 
+### `perplexity-invoices`
+Lists and downloads the invoices (Rechnungen) of a perplexity.ai subscription, from the API the settings page of perplexity.ai uses (`/rest/stripe/customer-invoices`, paged until the last one), as PDFs from Stripe. It logs in with the cookies of perplexity.ai of Google Chrome, read from the profile and decrypted with the key Chrome keeps in the keyring (`Chrome Safe Storage`, through `secret-tool`). Cloudflare only lets the requests through with the `cf_clearance` cookie of Chrome and the user agent of the same Chrome version, so both are sent along; when Cloudflare still refuses, opening perplexity.ai in Chrome once renews its check. Needs `python3-cryptography` and `libsecret-tools`.
+
+The session cookie is `__Secure-pplx.session.<account id>` (with several accounts the one of `__Host-pplx-last-active-account`), sent with that account id in the header `x-pplx-account`; the older `__Secure-next-auth.session-token` works as well. `login` opens perplexity.ai in Chrome and waits until the session cookie shows up in the profile (Chrome writes its cookies to disk with a delay of some seconds). The login of perplexity.ai lasts about a month.
+
+**Usage:** `perplexity-invoices [--profile PROFILE] [--user-data-dir DIR] [list|download|login] [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `list` | Print date, invoice id, amount and status of each invoice, tab-separated, newest first (the default command). `--json` prints the invoices as JSON, with their Stripe links. |
+| `download` | Download the PDFs as `perplexity-<date>-<invoice id>.pdf` and print the path of each new one; a PDF that is already there is skipped (`-f, --force` downloads it again). |
+| `login` | Open perplexity.ai in Chrome and wait for the login (`-t, --timeout SECONDS`, default 300; `-f, --force` also when already logged in). |
+| `--since YYYY-MM-DD` | `list`, `download`: only the invoices from this date on. |
+| `-o, --output DIR` | `download`: folder for the PDFs (default: the Downloads folder, `xdg-user-dir DOWNLOAD`), created when missing. |
+| `--profile PROFILE` | Chrome profile folder (default: `Default`). |
+| `--user-data-dir DIR` | Chrome user data folder (default: `~/.config/google-chrome`). |
+
+**Examples:**
+```bash
+perplexity-invoices login
+perplexity-invoices
+perplexity-invoices download -o ~/Documents/Rechnungen/perplexity
+perplexity-invoices download --since 2026-01-01
+```
+
 ## Interactive Input Prompts
 
 ### `prompt`
