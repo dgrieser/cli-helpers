@@ -1681,12 +1681,15 @@ Generates a random password of a given length using `openssl` for randomness, op
 | `-U, --upper COUNT` | Require at least COUNT uppercase letters. |
 | `-d, --digits COUNT` | Require at least COUNT digits. |
 | `-s, --special COUNT` | Require at least COUNT special characters. |
+| `-x, --exclude CHARS` | Never use any character contained in CHARS. |
 
 **Examples:**
 ```bash
 generate-password
 generate-password --length 20
 generate-password -l 16 -d 2 -s 2
+generate-password -x '0O1lI'
+generate-password -l 20 -x '0O1lI[]{}()<>'
 ```
 
 ### `retry`
