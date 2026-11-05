@@ -2719,7 +2719,10 @@ software-335-teamviewer@desktop@gui() {
     config_update teamviewer "${CURRENT_USER_HOME}/.config/teamviewer"
 }
 
-software-340-glab@dev() { install_git_release "https://gitlab.com/gitlab-org/cli"; }
+software-340-glab@dev() {
+    install_git_release "https://gitlab.com/gitlab-org/cli" || return $?
+    completion_update glab glab completion -s bash
+}
 software-350-gh@dev() { apt_add_with_repo "gh" "https://cli.github.com/packages" "stable" "main" "https://cli.github.com/packages/githubcli-archive-keyring.gpg"; }
 
 software-360-helm@dev@k8s() {
