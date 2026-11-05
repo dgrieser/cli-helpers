@@ -2222,16 +2222,17 @@ software-120-nickpit@dev@agents() {
     completion_update nickpit nickpit completion bash
 }
 software-121-mittwald-outlook-bridge@mw@gui() {
-    local env_file="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge/env"
+    local config_dir="${CURRENT_USER_HOME}/.config/mittwald-outlook-bridge"
     local package_unit="/usr/lib/systemd/user/mittwald-outlook-bridge.service"
     # the WebKitGTK runtime of the webview build's sign-in window; its deb depends
     # on them, the tarball does not
     apt_upgrade libwebkit2gtk-4.1-0 libgtk-3-0 || return 1
     # the deb of the release, which brings the systemd user unit
     install_git_release "https://gitlab.mittwald.it/mittwald/tools/mittwald-outlook-bridge" --pattern "*{arch}*webview*" || return $?
-    # the service needs the MWOB_* settings, at least MWOB_FEED_TOKEN
-    if [ ! -f "${env_file}" ]; then
-        warning "${env_file} is missing, create it with the MWOB_* settings (at least MWOB_FEED_TOKEN), then run: ${APP_NAME} mittwald-outlook-bridge"
+    # the service needs its tokens: either the token files that set-token writes
+    # and serve reads on its own, or MWOB_*_TOKEN lines in the optional env file
+    if [ ! -f "${config_dir}/feed-token" ] && [ ! -f "${config_dir}/imap-token" ] && [ ! -f "${config_dir}/env" ]; then
+        warning "mittwald-outlook-bridge has no tokens, create them with: mittwald-outlook-bridge set-token, then run: ${APP_NAME} mittwald-outlook-bridge"
         return 0
     fi
     if [ ! -f "${package_unit}" ] && [ "${dry_run}" -eq 0 ]; then
