@@ -172,7 +172,7 @@ if [ "${print}" -eq 1 ]; then
         commit) review_args=(--commit "${target}") ;;
     esac
 
-    codex exec review "${review_args[@]}" --output-last-message "${answer_file}" >/dev/null || exit $?
+    codex exec --profile review review "${review_args[@]}" --output-last-message "${answer_file}" >/dev/null || exit $?
     cat "${answer_file}"
     exit
 fi
@@ -185,7 +185,7 @@ socket="codex-review-$$"
 session="review"
 self="$(readlink -f "${BASH_SOURCE[0]}")" || fail "Could not resolve script path"
 
-tmux_review new-session -d -s "${session}" codex || fail "Could not start Codex in tmux"
+tmux_review new-session -d -s "${session}" codex --profile review || fail "Could not start Codex in tmux"
 # Detaching also ends this wrapper; always stop its private server on exit.
 trap 'tmux_review kill-server >/dev/null 2>&1' EXIT
 tmux_review set-option -g status off
