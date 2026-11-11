@@ -185,49 +185,79 @@ socket="codex-review-$$"
 session="review"
 self="$(readlink -f "${BASH_SOURCE[0]}")" || fail "Could not resolve script path"
 
-tmux_review new-session -d -s "${session}" codex || fail "Could not start Codex in tmux"
+error_file="$(mktemp)" || fail "Could not create temporary file"
+tmux_review new-session -d -s "${session}" codex || { rm -f "${error_file}"; fail "Could not start Codex in tmux"; }
 # Detaching also ends this wrapper; always stop its private server on exit.
-trap 'tmux_review kill-server >/dev/null 2>&1' EXIT
+trap 'tmux_review kill-server >/dev/null 2>&1; rm -f "${error_file}"' EXIT
 tmux_review set-option -g status off
 
-wait_for_screen "Ask Codex to do anything" 60 || fail "Codex did not become ready"
-# --profile would force Codex out of the shared background server, so select
-# the first profile (review settings) from the TUI instead: Ctrl+X, p, 1.
-# The chord only registers when all keys arrive in one send-keys call.
-tmux_review send-keys -t "${session}" C-x p 1
-wait_for_screen "Model changed to" 10 || fail "Codex did not switch to the review profile"
-tmux_review send-keys -t "${session}" -l /review
-tmux_review send-keys -t "${session}" Enter
-# Codex may use the first Enter to accept the slash-command suggestion.
-if ! wait_for_screen "Select a review preset" 5; then
+# Types the review commands into Codex. Runs in the background so the user sees
+# Codex's screen, including any startup dialog, from the start.
+drive_review() {
+    wait_for_screen "Ask Codex to do anything" 30 || fail "Codex did not become ready"
+    # --profile would force Codex out of the shared background server, so
+    # select the first preset (review settings) from the TUI instead:
+    # Ctrl+X, p, 1. Before the status line (model · directory · ...) appears,
+    # Codex drops Ctrl+X and types "p" into the prompt. After that, it answers
+    # with a notice until startup completes, so retry until the picker opens.
+    wait_for_screen " · " 10 || fail "Codex status line did not appear"
+    local deadline=$((SECONDS + 10))
+    until tmux_review send-keys -t "${session}" C-x p && wait_for_screen "from settings" 1; do
+        [ "${SECONDS}" -lt "${deadline}" ] || fail "Codex preset picker did not open"
+    done
+    tmux_review send-keys -t "${session}" 1
+    wait_for_screen "Model changed to" 10 || fail "Codex did not switch to the review preset"
+    tmux_review send-keys -t "${session}" -l /review
     tmux_review send-keys -t "${session}" Enter
-    wait_for_screen "Select a review preset" 60 || fail "Codex review picker did not open"
-fi
-
-case "${mode}" in
-    base)
+    # Codex may use the first Enter to accept the slash-command suggestion.
+    if ! wait_for_screen "Select a review preset" 5; then
         tmux_review send-keys -t "${session}" Enter
-        wait_for_screen "Select a base branch" 60 || fail "Codex branch picker did not open"
-        ;;
-    uncommitted)
-        tmux_review send-keys -t "${session}" Down Enter
-        ;;
-    commit)
-        tmux_review send-keys -t "${session}" Down Down Enter
-        wait_for_screen "Select a commit to review" 60 || fail "Codex commit picker did not open"
-        ;;
-esac
+        wait_for_screen "Select a review preset" 60 || fail "Codex review picker did not open"
+    fi
 
-if [ -n "${target}" ]; then
-    tmux_review send-keys -t "${session}" -l "${target}"
-    tmux_review send-keys -t "${session}" Enter
-elif [ "${mode}" = base ] || [ "${mode}" = commit ]; then
-    tmux_review send-keys -t "${session}" Enter
-fi
+    case "${mode}" in
+        base)
+            tmux_review send-keys -t "${session}" Enter
+            wait_for_screen "Select a base branch" 60 || fail "Codex branch picker did not open"
+            ;;
+        uncommitted)
+            tmux_review send-keys -t "${session}" Down Enter
+            ;;
+        commit)
+            tmux_review send-keys -t "${session}" Down Down Enter
+            wait_for_screen "Select a commit to review" 60 || fail "Codex commit picker did not open"
+            ;;
+    esac
 
-if [ -n "${mode}" ]; then
-    # One Enter after the review runs /copy, then restores normal Enter behavior.
-    tmux_review bind-key -n Enter run-shell -b "tmux -L ${socket} unbind-key -n Enter; $(printf '%q' "${self}") --copy-review ${socket} ${session}"
-fi
+    if [ -n "${target}" ]; then
+        tmux_review send-keys -t "${session}" -l "${target}"
+        tmux_review send-keys -t "${session}" Enter
+    elif [ "${mode}" = base ] || [ "${mode}" = commit ]; then
+        tmux_review send-keys -t "${session}" Enter
+    fi
+
+    if [ -n "${mode}" ]; then
+        # One Enter after the review runs /copy, then restores normal Enter
+        # behavior.
+        tmux_review bind-key -n Enter run-shell -b "tmux -L ${socket} unbind-key -n Enter; $(printf '%q' "${self}") --copy-review ${socket} ${session}"
+    fi
+}
+
+# On failure, the driver records its error and stops the tmux server, which
+# ends the attach below; the error is shown once the terminal is restored.
+(
+    trap '[ "${?}" -eq 0 ] || tmux_review kill-server >/dev/null 2>&1' EXIT
+    drive_review
+) 2>"${error_file}" &
+driver=$!
 
 env -u TMUX tmux -L "${socket}" attach-session -t "${session}"
+status=$?
+
+kill "${driver}" 2>/dev/null
+wait "${driver}" 2>/dev/null
+if [ -s "${error_file}" ]; then
+    cat "${error_file}" 1>&2
+    exit 1
+fi
+exit "${status}"
