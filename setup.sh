@@ -14,7 +14,8 @@
 # Claude Code, Codex and opencode from a backup, the git repos of the workspace
 # with what only they held (changes, stashes, local branches, worktrees), the categories of updater
 # the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
-# NetBox cluster when the kubectl-helpers are installed, browser-router as the default browser and, on GNOME, the
+# NetBox cluster when the kubectl-helpers are installed, TLS 1.0/1.1 in Firefox with certificate exceptions for
+# the old servers of LEGACY_TLS_HOSTS in the keyring, browser-router as the default browser and, on GNOME, the
 # settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
 # setup.sh --list lists its steps, setup.sh STEP... runs only those. On a headless
 # system (see headless) it leaves out what only a desktop needs: the steps of
@@ -89,11 +90,26 @@ STEPS=(
     "agent-logins  login_agents          -      the logins of Claude Code and Codex"
     "k-ctx         setup_k_ctx_shell     -      the shell shorthands of k-ctx"
     "kubeconfigs   setup_kubeconfigs     -      netbox-cli and a kubeconfig per NetBox cluster"
+    # after gh-glab, which dials the VPN that the legacy TLS hosts are behind
+    "firefox       setup_firefox_legacy  -      TLS 1.0/1.1 in Firefox and certificate exceptions for the legacy TLS hosts (from the keyring)"
     "browser       set_default_browser   -      browser-router as the default browser"
     "gnome         gnome_settings        -      the GNOME settings and app shortcuts"
 )
 # the steps only a desktop needs, left out of a full run on a headless system
-GUI_STEPS=(sublime chrome chrome-apps browser gnome)
+GUI_STEPS=(sublime chrome chrome-apps firefox browser gnome)
+# the old servers Firefox has to reach with TLS 1.0/1.1 (e.g. an old FreeIPA), as
+# HOST or HOST:PORT separated by spaces; internal names, so they are in the
+# keyring as type=dotfile-secret name=LEGACY_TLS_HOSTS, not in this public repo
+LEGACY_TLS_SECRET="LEGACY_TLS_HOSTS"
+# the preferences that let Firefox speak TLS 1.0/1.1 with the RSA key exchange
+# ciphers of such a server; they apply to every site, but a server that
+# supports TLS 1.2 or 1.3 still gets it
+FIREFOX_LEGACY_TLS_PREFS=(
+    'security.tls.version.enable-deprecated true'
+    'security.tls.version.min 1'
+    'security.ssl3.rsa_aes_128_sha true'
+    'security.ssl3.rsa_aes_256_sha true'
+)
 
 failed=()
 
@@ -1297,6 +1313,103 @@ setup_kubeconfigs() {
     for cluster in "${clusters[@]}"; do
         run k-ctx add --yes "${cluster}" || failed+=("k-ctx add ${cluster}")
     done
+}
+
+# the profile folder of the default Firefox profile, of the snap or of the deb,
+# from its profiles.ini; empty when Firefox never ran here
+firefox_profile_dir() {
+    local base ini
+    for base in "${HOME}/snap/firefox/common/.mozilla/firefox" "${HOME}/.mozilla/firefox"; do
+        ini="${base}/profiles.ini"
+        [ -f "${ini}" ] || continue
+        # the profile of [Install...] Default= is the one Firefox opens, else the
+        # one marked Default=1
+        awk -F= -v base="${base}" '
+            /^\[/ { install = ($0 ~ /^\[Install/); path = ""; rel = 1; def = 0; next }
+            install && $1 == "Default" { print base "/" $2; found = 1; exit }
+            $1 == "Path" { path = $2 }
+            $1 == "IsRelative" { rel = $2 }
+            $1 == "Default" && $2 == "1" { def = 1 }
+            path != "" && def && !candidate { candidate = (rel == 1 ? base "/" path : path) }
+            END { if (!found && candidate) print candidate }
+        ' "${ini}" | head -n 1
+        return 0
+    done
+}
+
+# TLS 1.0/1.1 in Firefox for the old servers of LEGACY_TLS_HOSTS in the keyring:
+# the preferences of FIREFOX_LEGACY_TLS_PREFS in user.js of the default profile,
+# which Firefox reads at every start, and for every host a certificate exception
+# in cert_override.txt for the certificate it presents now (fetched with
+# openssl, so the VPN has to be up), as these servers have a self-signed CA;
+# a renewed certificate needs this step again
+setup_firefox_legacy() {
+    local hosts profile user_js overrides pref name value target host port fingerprint tmp
+    local -a fingerprints=()
+    command -v firefox > /dev/null 2>&1 || { echo "Firefox is not installed, no legacy TLS for it" 1>&2; return 0; }
+    hosts="$(secret-tool lookup type dotfile-secret name "${LEGACY_TLS_SECRET}" 2>/dev/null)"
+    if [ -z "${hosts}" ]; then
+        echo "No ${LEGACY_TLS_SECRET} in the keyring, no legacy TLS for Firefox (store it: secret-tool store --label=\"dotfile ${LEGACY_TLS_SECRET}\" type dotfile-secret name ${LEGACY_TLS_SECRET})" 1>&2
+        return 0
+    fi
+    info "Firefox: TLS 1.0/1.1 and certificate exceptions for ${hosts}"
+    profile="$(firefox_profile_dir)"
+    if [ -z "${profile}" ] || [ ! -d "${profile}" ]; then
+        warning "Firefox has no profile yet: start it once, close it, then run ${APP_NAME} firefox"
+        failed+=("firefox, no profile yet")
+        return 0
+    fi
+    # Firefox writes cert_override.txt over the new one when its exceptions change
+    while pgrep -x firefox > /dev/null 2>&1; do
+        if ! ask "Close Firefox now, then continue (no: skip its legacy TLS)?"; then
+            failed+=("firefox, it was running")
+            return 0
+        fi
+    done
+
+    user_js="${profile}/user.js"
+    touch "${user_js}"
+    for pref in "${FIREFOX_LEGACY_TLS_PREFS[@]}"; do
+        read -r name value <<< "${pref}"
+        grep -qF "user_pref(\"${name}\", ${value});" "${user_js}" && continue
+        # a line of the same preference with another value is replaced
+        sed -i "/^user_pref(\"${name//./\\.}\",/d" "${user_js}"
+        echo "user_pref(\"${name}\", ${value});" >> "${user_js}"
+        echo "${user_js}: ${name} = ${value}" 1>&2
+    done
+
+    overrides="${profile}/cert_override.txt"
+    tmp="$(mktemp)"
+    if [ -f "${overrides}" ]; then
+        cp "${overrides}" "${tmp}"
+    else
+        printf '# PRIVATE FILE\n# This is a generated file!  Do not edit.\n' > "${tmp}"
+    fi
+    for target in ${hosts}; do
+        host="${target%%:*}"
+        port="${target#"${host}"}"
+        port="${port#:}"
+        port="${port:-443}"
+        # SECLEVEL=0, as the TLS of OpenSSL refuses these old servers otherwise
+        mapfile -t fingerprints < <(timeout 10 openssl s_client -connect "${host}:${port}" -servername "${host}" \
+                -cipher 'ALL:@SECLEVEL=0' < /dev/null 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')
+        fingerprint="${fingerprints[0]:-}"
+        if [ -z "${fingerprint}" ]; then
+            warning "No certificate from ${host}:${port}, is the VPN up?"
+            failed+=("firefox certificate exception for ${host}:${port}, unreachable")
+            continue
+        fi
+        if grep -qF "${host}:${port}:	OID.2.16.840.1.101.3.4.2.1	${fingerprint}	" "${tmp}"; then
+            echo "Firefox trusts the certificate of ${host}:${port} already" 1>&2
+            continue
+        fi
+        sed -i "/^${host//./\\.}:${port}:	/d" "${tmp}"
+        printf '%s:%s:\tOID.2.16.840.1.101.3.4.2.1\t%s\t\n' "${host}" "${port}" "${fingerprint}" >> "${tmp}"
+        echo "Firefox trusts the certificate of ${host}:${port} (SHA-256 ${fingerprint})" 1>&2
+    done
+    cmp -s "${tmp}" "${overrides}" || install -m 600 "${tmp}" "${overrides}" || failed+=("firefox: write ${overrides}")
+    rm -f "${tmp}"
 }
 
 set_default_browser() {
