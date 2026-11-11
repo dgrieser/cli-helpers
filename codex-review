@@ -185,12 +185,17 @@ socket="codex-review-$$"
 session="review"
 self="$(readlink -f "${BASH_SOURCE[0]}")" || fail "Could not resolve script path"
 
-tmux_review new-session -d -s "${session}" codex --profile review || fail "Could not start Codex in tmux"
+tmux_review new-session -d -s "${session}" codex || fail "Could not start Codex in tmux"
 # Detaching also ends this wrapper; always stop its private server on exit.
 trap 'tmux_review kill-server >/dev/null 2>&1' EXIT
 tmux_review set-option -g status off
 
 wait_for_screen "Ask Codex to do anything" 60 || fail "Codex did not become ready"
+# --profile would force Codex out of the shared background server, so select
+# the first profile (review settings) from the TUI instead: Ctrl+X, p, 1.
+# The chord only registers when all keys arrive in one send-keys call.
+tmux_review send-keys -t "${session}" C-x p 1
+wait_for_screen "Model changed to" 10 || fail "Codex did not switch to the review profile"
 tmux_review send-keys -t "${session}" -l /review
 tmux_review send-keys -t "${session}" Enter
 # Codex may use the first Enter to accept the slash-command suggestion.
