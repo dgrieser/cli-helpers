@@ -2251,10 +2251,15 @@ software-121-mittwald-outlook-bridge@mw@gui() {
 # --non-interactive: every step of the installer takes its default answer; the
 # installer takes the API key from MITTWALD_AI_API_KEY and does not ask for it, so
 # a shell without the key leaves cmai without one
+# --repos: the installer replaces copies of its hook in the repos of the workspace
+# with links to the hook, so that every update of the hook reaches them
 software-122-git-commit-ai@dev@agents() {
     local config_dir="${CURRENT_USER_HOME}/.config/git-commit-ai"
+    local workspace_dir="${CURRENT_USER_HOME}/workspace"
+    local -a installer_args=( "--non-interactive" )
+    [ -d "${workspace_dir}" ] && installer_args+=( "--repos" "${workspace_dir}" )
     # --session: the installer keeps the key in the keyring of the user
-    curl_update --session "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" --non-interactive || return 1
+    curl_update --session "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" "${installer_args[@]}" || return 1
     # the installer keeps the key in the file config, or in the system keychain
     # and then writes the name of the keychain entry to the file keychain
     if [ "${dry_run}" -eq 0 ] && [ ! -s "${config_dir}/config" ] && [ ! -s "${config_dir}/keychain" ]; then
