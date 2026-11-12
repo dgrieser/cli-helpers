@@ -1415,9 +1415,16 @@ flatpak_update() {
     fi
 }
 
-# curl_update PKG URL [ARG...]: pipe the install script at URL into bash, with ARGs
-# for the script
+# curl_update [--session] PKG URL [ARG...]: pipe the install script at URL into bash,
+# with ARGs for the script
+# --session: a script that runs as the other user gets the session bus of that user,
+#            which sudo removes from the environment (e.g. to reach the keyring)
 curl_update() {
+    local shell=( "bash" )
+    if [ "${1}" = "--session" ]; then
+        shift
+        [ -n "${SUDO_USER}" ] && shell=( "env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus" "bash" )
+    fi
     local pkg="${1}"; shift
     local url="${1}"; shift
     [ -z "${url}" ] && echo "ERROR: curl_update requires a URL" 1>&2 && return 1
@@ -1428,10 +1435,10 @@ curl_update() {
     [ "${verbose}" -eq 0 ] && curl_args+=( "--silent" "--show-error" )
     curl_args+=( "${url}" )
     if [ "${dry_run}" -eq 0 ]; then
-        [ "${verbose}" -eq 1 ] && echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash -s -- ${*}" 1>&2
-        curl "${curl_args[@]}" | ${SUDO_USER} bash -s -- "${@}"
+        [ "${verbose}" -eq 1 ] && echo "+ curl ${curl_args[*]} | ${SUDO_USER} ${shell[*]} -s -- ${*}" 1>&2
+        curl "${curl_args[@]}" | ${SUDO_USER} "${shell[@]}" -s -- "${@}"
     else
-        echo "+ curl ${curl_args[*]} | ${SUDO_USER} bash -s -- ${*}"
+        echo "+ curl ${curl_args[*]} | ${SUDO_USER} ${shell[*]} -s -- ${*}"
     fi
 }
 
@@ -2245,10 +2252,13 @@ software-121-mittwald-outlook-bridge@mw@gui() {
 # installer takes the API key from MITTWALD_AI_API_KEY and does not ask for it, so
 # a shell without the key leaves cmai without one
 software-122-git-commit-ai@dev@agents() {
-    local key_file="${CURRENT_USER_HOME}/.config/git-commit-ai/config"
-    curl_update "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" --non-interactive || return 1
-    if [ "${dry_run}" -eq 0 ] && [ ! -s "${key_file}" ]; then
-        warning "cmai has no API key, set it with: cmai --api-key \"\${MITTWALD_AI_API_KEY}\" (from a shell that has it)"
+    local config_dir="${CURRENT_USER_HOME}/.config/git-commit-ai"
+    # --session: the installer keeps the key in the keyring of the user
+    curl_update --session "git-commit-ai" "https://github.com/mittwald/ai-developer-tools/raw/refs/heads/main/install-git-commit-ai.sh" --non-interactive || return 1
+    # the installer keeps the key in the file config, or in the system keychain
+    # and then writes the name of the keychain entry to the file keychain
+    if [ "${dry_run}" -eq 0 ] && [ ! -s "${config_dir}/config" ] && [ ! -s "${config_dir}/keychain" ]; then
+        warning "cmai has no API key, export MITTWALD_AI_API_KEY and run: ${APP_NAME} git-commit-ai"
     fi
 }
 software-130-slack@comms@gui() {
