@@ -2966,7 +2966,58 @@ software-450-aws@dev() {
     ${SUDO} "${aws_folder_path}/aws/install" "${install_args[@]}" || return 1
     "${aws_target_parent_folder}/bin/${aws_name}" --version || return 1
     # the completion is a program of the AWS CLI, bash only has to call it
-    completion_update aws printf 'complete -C aws_completer aws\n'
+    completion_update aws printf 'complete -C aws_completer aws\n' || return 1
+    aws_config_update
+}
+
+# aws_config_update: the S3 access keys stored in the GNOME keyring (one item per
+# profile: service=aws profile=NAME endpoint=URL, the secret is the JSON that
+# credential_process prints: {"Version":1,"AccessKeyId":"...","SecretAccessKey":"..."})
+# become profiles of ~/.aws/config that read their keys from the keyring on each
+# call, so no key lands in a file; other profiles and settings there are kept
+aws_config_update() {
+    # secret-tool talks to the keyring of the user's session
+    local session_env=("env" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local file="${CURRENT_USER_HOME}/.aws/config"
+    local items
+    local profile
+    local endpoint
+    local key
+    local value
+    local wanted
+    local -A settings
+
+    needs secret-tool || return $(( $? == 3 ? 0 : 1 ))
+    # the attributes of the found items are printed on stderr, the secrets on
+    # stdout; each item starts with its [/org/freedesktop/secrets/...] line
+    items="$(${SUDO_USER} "${session_env[@]}" secret-tool search --all service aws 2>&1 >/dev/null \
+        | awk '/^\[/ { if (p != "") print p "\t" e; p = ""; e = "" }
+               /^attribute\.profile = / { p = substr($0, 21) }
+               /^attribute\.endpoint = / { e = substr($0, 22) }
+               END { if (p != "") print p "\t" e }' | sort -u)"
+    if [ -z "${items}" ]; then
+        echo "${APP_NAME}: no AWS access keys in the keyring yet, store each profile once with:" 1>&2
+        echo "  jq -nc '{Version: 1, AccessKeyId: env.AWS_ACCESS_KEY_ID, SecretAccessKey: env.AWS_SECRET_ACCESS_KEY}' \\" 1>&2
+        echo "    | secret-tool store --label=\"aws PROFILE\" service aws profile PROFILE endpoint URL" 1>&2
+        return 0
+    fi
+    while IFS=$'\t' read -r profile endpoint; do
+        settings=([credential_process]="secret-tool lookup service aws profile ${profile}")
+        [ -n "${endpoint}" ] && settings[endpoint_url]="${endpoint}"
+        for key in "${!settings[@]}"; do
+            wanted="${settings[${key}]}"
+            value="$(${SUDO_USER} env AWS_CONFIG_FILE="${file}" aws configure get --profile "${profile}" "${key}" 2>/dev/null)"
+            [ "${value}" = "${wanted}" ] && continue
+            if [ "${dry_run}" -eq 1 ]; then
+                echo "Would set ${key} of the AWS profile ${profile} in ${file}" 1>&2
+                continue
+            fi
+            verbose "aws configure set --profile ${profile} ${key} ${wanted}"
+            ${SUDO_USER} env AWS_CONFIG_FILE="${file}" aws configure set --profile "${profile}" "${key}" "${wanted}" \
+                || return 1
+        done
+    done <<< "${items}"
+    echo "${APP_NAME}: AWS profiles from the keyring: ${items//$'\n'/ }" 1>&2
 }
 
 software-460-aws-v1@dev() {
