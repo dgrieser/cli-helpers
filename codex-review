@@ -2,45 +2,61 @@
 
 APP_NAME="$(basename "${0}")"
 
+FULL_REVIEW_PROMPT="Review the whole repository"
+
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} [OPTIONS] [base [BRANCH] | uncommitted | commit [SHA]]
+usage: ${APP_NAME} [OPTIONS] [full | base [BRANCH] | uncommitted | commit [SHA]]
 
-Runs a Codex review of the current Git repository. Interactive mode opens Codex
-in a private tmux session; after a selected review finishes, press Enter once
-to run /copy. With --print, only the final review response goes to stdout.
+Runs a Codex review of the current Git repository with codex exec review.
 
-Interactive:
-    ${APP_NAME}                       Open Codex's /review picker
-    ${APP_NAME} base                  Open Codex's base branch picker
-    ${APP_NAME} base BRANCH           Review changes against local BRANCH
-    ${APP_NAME} base default          Review changes against the default
-                                       branch, as detected by git-default
-    ${APP_NAME} uncommitted           Review staged, unstaged, and untracked
-                                       changes
-    ${APP_NAME} commit                Open Codex's commit picker
-    ${APP_NAME} commit SHA            Review commit SHA (any commit ref, among
-                                       the last 100 commits)
+Without a target, the review is chosen from the repository state:
+  - uncommitted changes (staged, unstaged, untracked): those changes
+  - on the default branch (as detected by git-default): the whole repository
+  - on any other branch: the changes against the default branch
 
-Non-interactive:
-    ${APP_NAME} --print base BRANCH   Review changes against BRANCH
-    ${APP_NAME} --print base default  Review changes against the default branch
-    ${APP_NAME} --print uncommitted   Review staged, unstaged, and untracked
-                                       changes
-    ${APP_NAME} --print commit SHA    Review commit SHA (any commit ref)
+In a terminal, the response is shown and a menu then offers to copy it, send
+a follow-up prompt to the same Codex session, or run the review again.
+Otherwise, or with --print, only the response goes to stdout.
+
+Targets:
+    full                Review the whole repository
+    base [BRANCH]       Review changes against BRANCH (default: the default
+                        branch; "default" also stands for it)
+    uncommitted         Review staged, unstaged, and untracked changes
+    commit [SHA]        Review commit SHA, any commit ref (default: HEAD)
 
 Options:
-    -p, --print         Run non-interactively and print the review response
+    -p, --print         Print only the response, even in a terminal
     -h, --help          Display this help
 
     --bash-completion   Print completion candidates and exit
+
+Environment:
+    CODEX_REVIEW_PROFILE  Codex profile for the review (default: review)
 EOF
     exit 1
 }
 
-fail() {
+error() {
     echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
     exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+# Local and remote branches, newest first, without symbolic refs like origin/HEAD.
+list_branches() {
+    git for-each-ref --sort=-committerdate \
+        --format='%(if)%(symref)%(then)%(else)%(refname:short)%(end)' \
+        refs/heads refs/remotes 2>/dev/null | grep -v '^$'
 }
 
 # Arguments: the word before the cursor, then the command line words after the
@@ -51,10 +67,9 @@ completion() {
     shift
 
     case "${prev}" in
-        # Codex's branch picker only lists local branches.
         base)
             echo default
-            git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+            list_branches
             return
             ;;
         commit)
@@ -68,16 +83,152 @@ completion() {
     [ "${#}" -gt 0 ] && set -- "${@:1:$(( ${#} - 1 ))}"
     for word in "${@}"; do
         case "${word}" in
-            base|uncommitted|commit) return ;;
+            full|base|uncommitted|commit) return ;;
         esac
     done
-    echo "base uncommitted commit"
+    echo "full base uncommitted commit"
+}
+
+# Shows what Codex does while it works: commands it runs and errors.
+show_progress() {
+    local width="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+    jq --unbuffered -r --argjson width "$(( width - 4 ))" '
+        def short: gsub("\\s+"; " ") | if length > $width then .[0:$width - 1] + "…" else . end;
+        if .type == "item.started" and .item.type == "command_execution" then
+            "  $ " + (.item.command | sub("^/bin/(ba)?sh -lc "; "") | short)
+        elif .type == "item.completed" and .item.type == "reasoning" and (.item.text // "") != "" then
+            "  " + (.item.text | short)
+        elif .type == "error" then
+            "ERROR: " + .message
+        elif .type == "turn.failed" then
+            "ERROR: " + (.error.message // "turn failed")
+        else empty end
+    ' 2>/dev/null | if [ -t 2 ]; then
+        sed -u "s/^/$(tput dim 2>/dev/null)/; s/\$/$(tput sgr0 2>/dev/null)/"
+    else
+        cat
+    fi 1>&2
+}
+
+# Runs codex exec with the given arguments and standard input, records the
+# session id and replaces ${answer_file} with the final response. On failure,
+# the previous response stays.
+run_codex() {
+    local events_file="${work_dir}/events.jsonl"
+    local new_answer_file="${work_dir}/answer.new.md"
+    local status
+    local id
+
+    rm -f "${new_answer_file}"
+    codex exec --profile "${profile}" "${@}" --json --output-last-message "${new_answer_file}" \
+        | tee "${events_file}" | show_progress
+    status="${PIPESTATUS[0]}"
+    [ "${status}" -eq 0 ] || return "${status}"
+
+    id="$(jq -r 'select(.type == "thread.started") | .thread_id' "${events_file}" | head -n 1)"
+    [ -n "${id}" ] && session_id="${id}"
+    [ -s "${new_answer_file}" ] || { error "Codex returned no response"; return 1; }
+    mv -f "${new_answer_file}" "${answer_file}"
+}
+
+run_review() {
+    run_codex review "${review_args[@]}" </dev/null
+}
+
+# The prompt goes through stdin, so text starting with "-" is no option.
+run_followup() {
+    [ -n "${session_id}" ] || { error "No Codex session to continue"; return 1; }
+    printf '%s\n' "${1}" | run_codex resume "${session_id}" -
+}
+
+# Codex leaves out the final newline of the response.
+print_answer() {
+    cat "${answer_file}"
+    [ -z "$(tail -c 1 "${answer_file}")" ] || echo
+}
+
+show_answer() {
+    if [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+        glow --style "${GLOW_STYLE:-auto}" "${answer_file}"
+    else
+        print_answer
+    fi
+}
+
+ask_next() {
+    prompt-select --prompt "Next:" --no-abort-message \
+        "copy=Copy response" \
+        "followup=Send follow-up prompt" \
+        "review=Run review again" \
+        "quit=Quit" \
+        </dev/tty
+}
+
+ask_followup() {
+    prompt --prompt "Follow-up prompt (Ctrl-D sends):" --no-abort-message </dev/tty
+}
+
+interactive_loop() {
+    local action
+    local text
+
+    while true; do
+        echo 1>&2
+        action="$(ask_next)" || return 0
+        case "${action}" in
+            copy)
+                clip "${answer_file}" && echo "Copied to clipboard." 1>&2
+                ;;
+            followup)
+                text="$(ask_followup)" || continue
+                [ -n "${text//[[:space:]]/}" ] || continue
+                if run_followup "${text}"; then
+                    show_answer
+                else
+                    error "Follow-up failed"
+                fi
+                ;;
+            review)
+                if run_review; then
+                    show_answer
+                else
+                    error "Review failed"
+                fi
+                ;;
+            quit)
+                return 0
+                ;;
+        esac
+    done
+}
+
+# The default branch, as detected by git-default (which reports its own error).
+default_branch() {
+    command -v git-default >/dev/null 2>&1 || fail "git-default not found (from dev-helpers)"
+    git-default || exit 1
+}
+
+# Uncommitted changes win; otherwise a branch is reviewed against the default
+# branch, and the default branch itself gets a review of the whole repository.
+detect_mode() {
+    local branch
+
+    if [ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+        echo uncommitted
+        return
+    fi
+    branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)"
+    if [ "${branch}" = "$(default_branch)" ]; then
+        echo full
+    else
+        echo base
+    fi
 }
 
 mode=""
 target=""
 print=0
-copy=0
+profile="${CODEX_REVIEW_PROFILE:-review}"
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -86,21 +237,16 @@ while [ "${#}" -gt 0 ]; do
             completion "${@}"
             exit 0
             ;;
-        # Internal: run /copy in the private tmux session (see bind-key below).
-        --copy-review)
-            [ "${#}" -eq 3 ] || fail "Usage: --copy-review SOCKET SESSION"
-            copy=1
-            socket="${2}"
-            session="${3}"
-            break
-            ;;
         -h|--help) usage ;;
         -p|--print) print=1 ;;
-        base|uncommitted|commit)
+        full|base|uncommitted|commit)
             [ -z "${mode}" ] || fail "Choose one review target"
             mode="${1}"
             ;;
-        -*) fail "Unknown option: ${1}" ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
         *)
             [ "${mode}" = base ] || [ "${mode}" = commit ] || fail "Unexpected argument: ${1}"
             [ -z "${target}" ] || fail "Too many arguments"
@@ -110,154 +256,58 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
-tmux_review() {
-    tmux -L "${socket}" "${@}"
-}
+command -v codex >/dev/null 2>&1 || fail "codex not found"
+command -v jq >/dev/null 2>&1 || fail "jq not found"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
 
-wait_for_screen() {
-    local needle="${1}"
-    local timeout="${2}"
-    local deadline=$((SECONDS + timeout))
-    local screen=""
-    while [ "${SECONDS}" -le "${deadline}" ]; do
-        screen="$(tmux_review capture-pane -p -t "${session}" 2>/dev/null)" || return 1
-        [[ "${screen}" == *"${needle}"* ]] && return 0
-        sleep 0.1
-    done
-    return 1
-}
+# Without a terminal on both ends, there is nobody to answer the menu.
+if [ "${print}" -eq 0 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    print=1
+fi
+if [ "${print}" -eq 0 ]; then
+    command -v prompt-select >/dev/null 2>&1 || fail "prompt-select not found"
+    command -v prompt >/dev/null 2>&1 || fail "prompt not found"
+    command -v clip >/dev/null 2>&1 || fail "clip not found"
+fi
 
-if [ "${copy}" -eq 1 ]; then
-    tmux_review send-keys -t "${session}" -l /copy
-    # Codex treats an Enter that follows typed text too quickly as part of a
-    # paste, so wait before submitting; retry once if the picker stays closed.
-    sleep 0.5
-    tmux_review send-keys -t "${session}" Enter
-    if ! wait_for_screen "Copy whole response" 3; then
-        tmux_review send-keys -t "${session}" Enter
-        wait_for_screen "Copy whole response" 5 || exit 1
-    fi
-    tmux_review send-keys -t "${session}" Enter
+[ -n "${mode}" ] || mode="$(detect_mode)" || exit 1
+
+case "${mode}" in
+    full)
+        review_args=("${FULL_REVIEW_PROMPT}")
+        description="whole repository"
+        ;;
+    base)
+        if [ -z "${target}" ] || [ "${target}" = default ]; then
+            target="$(default_branch)" || exit 1
+        fi
+        git rev-parse --verify --quiet "${target}^{commit}" >/dev/null || fail "Unknown branch: ${target}"
+        review_args=(--base "${target}")
+        description="changes against ${target}"
+        ;;
+    uncommitted)
+        review_args=(--uncommitted)
+        description="uncommitted changes"
+        ;;
+    commit)
+        sha="$(git rev-parse --verify --quiet "${target:-HEAD}^{commit}")" || fail "Unknown commit: ${target}"
+        review_args=(--commit "${sha}")
+        description="commit $(git rev-parse --short "${sha}")"
+        ;;
+esac
+
+work_dir="$(mktemp -d)" || fail "Could not create temporary directory"
+trap 'rm -rf "${work_dir}"' EXIT
+answer_file="${work_dir}/answer.md"
+session_id=""
+
+echo "Reviewing ${description}" 1>&2
+run_review || exit $?
+
+if [ "${print}" -eq 1 ]; then
+    print_answer
     exit 0
 fi
 
-command -v codex >/dev/null 2>&1 || fail "codex not found"
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Not in a Git repository"
-
-if [ "${mode}" = base ] && [ "${target}" = default ]; then
-    command -v git-default >/dev/null 2>&1 || fail "git-default not found (from dev-helpers)"
-    # git-default reports its own error.
-    target="$(git-default)" || exit 1
-fi
-
-if [ "${mode}" = commit ] && [ -n "${target}" ]; then
-    # Codex's commit picker matches typed text against commit subjects too, so
-    # a ref like HEAD would select a commit titled "...headless...".
-    sha="$(git rev-parse --verify --quiet "${target}^{commit}")" || fail "Unknown commit: ${target}"
-    target="${sha}"
-fi
-
-if [ "${print}" -eq 1 ]; then
-    [ -n "${mode}" ] || usage
-    case "${mode}" in
-        base|commit) [ -n "${target}" ] || usage ;;
-    esac
-
-    answer_file="$(mktemp)" || fail "Could not create temporary file"
-    trap 'rm -f "${answer_file}"' EXIT
-
-    case "${mode}" in
-        base) review_args=(--base "${target}") ;;
-        uncommitted) review_args=(--uncommitted) ;;
-        commit) review_args=(--commit "${target}") ;;
-    esac
-
-    codex exec --profile review review "${review_args[@]}" --output-last-message "${answer_file}" >/dev/null || exit $?
-    cat "${answer_file}"
-    exit
-fi
-
-command -v tmux >/dev/null 2>&1 || fail "tmux not found (required for interactive mode)"
-[ -t 0 ] && [ -t 1 ] || fail "Interactive mode needs a terminal"
-tput clear >/dev/null 2>&1 || fail "Terminal lacks screen controls; set TERM to your terminal type"
-
-socket="codex-review-$$"
-session="review"
-self="$(readlink -f "${BASH_SOURCE[0]}")" || fail "Could not resolve script path"
-
-error_file="$(mktemp)" || fail "Could not create temporary file"
-tmux_review new-session -d -s "${session}" codex || { rm -f "${error_file}"; fail "Could not start Codex in tmux"; }
-# Detaching also ends this wrapper; always stop its private server on exit.
-trap 'tmux_review kill-server >/dev/null 2>&1; rm -f "${error_file}"' EXIT
-tmux_review set-option -g status off
-
-# Types the review commands into Codex. Runs in the background so the user sees
-# Codex's screen, including any startup dialog, from the start.
-drive_review() {
-    wait_for_screen "Ask Codex to do anything" 30 || fail "Codex did not become ready"
-    # --profile would force Codex out of the shared background server, so
-    # select the first preset (review settings) from the TUI instead:
-    # Ctrl+X, p, 1. Before the status line (model · directory · ...) appears,
-    # Codex drops Ctrl+X and types "p" into the prompt. After that, it answers
-    # with a notice until startup completes, so retry until the picker opens.
-    wait_for_screen " · " 10 || fail "Codex status line did not appear"
-    local deadline=$((SECONDS + 10))
-    until tmux_review send-keys -t "${session}" C-x p && wait_for_screen "from settings" 1; do
-        [ "${SECONDS}" -lt "${deadline}" ] || fail "Codex preset picker did not open"
-    done
-    tmux_review send-keys -t "${session}" 1
-    wait_for_screen "Model changed to" 10 || fail "Codex did not switch to the review preset"
-    tmux_review send-keys -t "${session}" -l /review
-    tmux_review send-keys -t "${session}" Enter
-    # Codex may use the first Enter to accept the slash-command suggestion.
-    if ! wait_for_screen "Select a review preset" 5; then
-        tmux_review send-keys -t "${session}" Enter
-        wait_for_screen "Select a review preset" 60 || fail "Codex review picker did not open"
-    fi
-
-    case "${mode}" in
-        base)
-            tmux_review send-keys -t "${session}" Enter
-            wait_for_screen "Select a base branch" 60 || fail "Codex branch picker did not open"
-            ;;
-        uncommitted)
-            tmux_review send-keys -t "${session}" Down Enter
-            ;;
-        commit)
-            tmux_review send-keys -t "${session}" Down Down Enter
-            wait_for_screen "Select a commit to review" 60 || fail "Codex commit picker did not open"
-            ;;
-    esac
-
-    if [ -n "${target}" ]; then
-        tmux_review send-keys -t "${session}" -l "${target}"
-        tmux_review send-keys -t "${session}" Enter
-    elif [ "${mode}" = base ] || [ "${mode}" = commit ]; then
-        tmux_review send-keys -t "${session}" Enter
-    fi
-
-    if [ -n "${mode}" ]; then
-        # One Enter after the review runs /copy, then restores normal Enter
-        # behavior.
-        tmux_review bind-key -n Enter run-shell -b "tmux -L ${socket} unbind-key -n Enter; $(printf '%q' "${self}") --copy-review ${socket} ${session}"
-    fi
-}
-
-# On failure, the driver records its error and stops the tmux server, which
-# ends the attach below; the error is shown once the terminal is restored.
-(
-    trap '[ "${?}" -eq 0 ] || tmux_review kill-server >/dev/null 2>&1' EXIT
-    drive_review
-) 2>"${error_file}" &
-driver=$!
-
-env -u TMUX tmux -L "${socket}" attach-session -t "${session}"
-status=$?
-
-kill "${driver}" 2>/dev/null
-wait "${driver}" 2>/dev/null
-if [ -s "${error_file}" ]; then
-    cat "${error_file}" 1>&2
-    exit 1
-fi
-exit "${status}"
+show_answer
+interactive_loop

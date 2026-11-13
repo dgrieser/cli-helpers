@@ -641,69 +641,72 @@ serve-clip
 ## AI Helpers
 
 ### `agent-session`
-Browses and prints conversation sessions of the Claude CLI (`~/.claude/projects`) and the Codex CLI (`~/.codex/sessions`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, age, generated title, and directory by last activity. Titles come from Claude's generated `ai-title` records and Codex's thread database, falling back to the first prompt for sessions without one, so the prompt gets no column of its own by default; it stays a hidden searchable field of the picker and its width goes to the title, which is displayed in a 50-character column. `--prompt-column` shows the prompt as a column as well, which shortens the title column to 30 characters; `--print` uses 50/60-character columns. The complete title and prompt are kept in hidden fields, so a search matches them in full. The newest 20 sessions load first; once the picker opens, the rest of the selected range loads in the background. Claude and Codex use distinct agent colors, with a fallback color for additional agents. Ages under 60 minutes are green and italic; older ages are faded. Seconds are omitted after 60 seconds, minutes from two hours onward, and hours from two days onward; all ages of a listing are rendered and colored by one `toage` call against the same reference point, which gets the two colors of the column handed over. Session IDs stay hidden. The preview renders the selected conversation through `glow` with color forced on and opens scrolled to its end, so the last message is what is shown first.
+Browses, searches, resumes and forks the conversation sessions of the Claude CLI (`~/.claude/projects`), the Codex CLI (`~/.codex/sessions` and its `state_*.sqlite` thread database) and opencode (`~/.local/share/opencode/opencode.db`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, live state, age, generated title and directory by last activity. Titles come from Claude's `custom-title`/`ai-title` records, the names and titles of Codex's thread database and opencode's session titles, falling back to the first prompt; the prompt gets no column of its own by default but stays searchable, and `--prompt-column` shows it (shortening the title column from 50 to 30 characters; `--print` uses 50/60-character columns). Ages under 60 minutes are green and italic, older ones faded, with the precision of `toage` shrinking as a session gets older. Codex subagent threads (reviews, spawned agents) and opencode child sessions are left out, as are archived Codex threads.
+
+The tool is written in Python and keeps an index of every session it has read in an SQLite database under `~/.cache/agent-session`: the title, first prompt, directory, last messages and every user and agent message, the messages also in a trigram full-text table. A session file is only read again where it changed, and then only from the byte the last read stopped at, since Claude and Codex only ever append; a line still being written is left for the next look. Lines are told apart by their bytes before one is decoded, so API requests, tool calls and tool output - nearly all of the gigabytes these files hold - are never parsed. Codex sessions are read in all three shapes Codex has written over time (`item_completed` events of `UserMessage`/`AgentMessage` items, the older `user_message`/`agent_message` events, and the plain response items of the first versions); opencode sessions are read from its database whenever their update time changes, an answer once it is complete, so their messages only grow at the end as well. Reading the last 7 days takes a few seconds once, then a listing takes about a tenth of a second; the whole history (several gigabytes) takes about half a minute once and gives an index of about 200 MB. Removing the folder costs the next listing its speed and nothing else.
 
 **Usage:** `agent-session [OPTIONS] [SESSION]`
 
 | Argument / Flag | Description |
 |---|---|
-| `SESSION` | The ID of the session to print; omit to browse sessions interactively. |
+| `SESSION` | The ID of the session to print (a part of one is enough when it is unique); omit to browse sessions interactively. |
 | `-h, --help` | Show the help message and exit. |
-| `-a, --agent AGENT` | Only use sessions of `claude` or `codex` (default: both). |
+| `-a, --agent AGENT` | Only use sessions of `claude`, `codex` or `opencode` (default: all of them). |
 | `-l, --last` | Print the latest session. |
 | `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
-| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 60); cannot be combined with `--limit`. |
+| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 7); cannot be combined with `--limit`. |
 | `-c, --current-directory` | Only list sessions recorded in the current directory, for the picker, `--print`, `--last` and a `SESSION` lookup. The picker then starts with all sessions of the current directory, open or not; `ctrl-d` widens it to every folder. |
 | `-A, --all-directories` | List sessions from all recorded working directories; the default. |
 | `-o, --open` | Only list the sessions open in a running agent, however long ago they were last active. The picker starts with these anyway, except with `--current-directory`, where `--open` keeps it to the open sessions of the current directory; `tab` shows all of them. |
 | `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
 | `-P, --prompt-column` | Show the first prompt as a column of its own; without it the prompt stays searchable in the picker. |
-| `-g, --grep GREP` | Filter listed sessions to those whose user or agent messages match the given regex. |
+| `-g, --grep GREP` | Filter listed sessions to those with a user or agent message the given (Python) regex matches. |
 | `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
 | `-r, --raw` | Print raw output instead of rendering it through `glow`. |
 | `--resume SESSION` | Resume the session with the given ID right away, in the directory it was recorded in; a directory that is gone is created again when confirmed. |
 | `--fork SESSION` | Fork the session with the given ID right away, asking for the working root and the agent; a working root that does not exist is created when confirmed. |
+| `--index` | Bring the index up to date for the selected agents and age window (`--days`) and exit; it also forgets sessions whose files are gone. The picker starts this in the background for its window. |
 | `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
 | `--verbose` | Print verbose diagnostic output to stderr. |
 
-By default, listings include sessions from every recorded working directory active within the last 60 days. `--current-directory` narrows them down to the current directory. `--days` changes the age window; `--limit` instead lists the newest requested number without an age cutoff. Filtering matches the messages only, so hits in tool calls, tool output or file contents do not list a session. The session files are grepped first to narrow down the candidates, which are then confirmed against their decoded messages, newest session first. Non-ASCII characters are stored escaped in some session files and are not found by the pre-filter.
+Filtering with `--grep`, `--igrep` and the picker's `/` matches the messages only, so hits in tool calls, tool output or file contents do not list a session. A pattern without regex syntax whose words have three characters or more is looked up in the full-text index and confirmed against the messages; any other pattern is matched against every indexed message of the listed sessions. Either way a message is matched with its whitespace collapsed, so a phrase across a line break counts. Searching the sessions of all time takes well under a second once they are indexed.
 
-`--resume` and `--fork` take a session ID and go straight to what `enter` would reach in the picker, without listing anything: `--resume` continues the session in the folder it was recorded in, `--fork` asks for the working root and the agent the way the picker does and then forks. Both look the session up in every recorded working directory, because they enter its folder themselves, and both take a part of an ID as well, as long as it matches one session only. Neither combines with `SESSION`, `--last`, `--grep`, `--igrep` or `--print`, and they do not combine with each other.
+`--resume` and `--fork` take a session ID and go straight to what `enter` would reach in the picker, without listing anything: `--resume` continues the session in the folder it was recorded in, `--fork` asks for the working root and the agent the way the picker does and then forks. Both look the session up in every recorded working directory, because they enter its folder themselves. Neither combines with `SESSION`, `--last`, `--grep`, `--igrep` or `--print`, and they do not combine with each other.
 
-Called as `claude-session` or `codex-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
+Called as `claude-session`, `codex-session` or `opencode-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
 
-The picker binds `/` to prompt for a case-insensitive message search, `enter` to use the selected session, `tab` to toggle between the open sessions and all of them, `ctrl-space` to pick the folder of the scope, `ctrl-d` to toggle between the sessions of the current directory and those of every folder, `ctrl-s` to make the folder of the selected session that scope, `ctrl-a` to walk the agent filter, `ctrl-f` to focus the terminal a running session is open in, `ctrl-r` to refresh the session list and preview, `esc` to clear an active search and to exit without one, and `ctrl-c` to exit.
+A session open in a running agent carries a marker next to its agent: `▶` working, `⌨︎` (blinking) waiting for the user - a question, a permission, a plan to confirm - and `✔` open at the prompt with nothing to do. Claude publishes a file per process in `~/.claude/sessions` naming its session and state; a file is only trusted while the start time of its process still agrees. Codex publishes nothing, but its process holds the session file open, the last `task_started`/`task_complete`/`turn_aborted` event (read from the end of the file) says whether a turn runs, and a last call that asks to run outside the sandbox or asks the user a question, with no output after it and no command process below Codex, counts as waiting. Opencode is found by its processes: the session named by `--session`, or else the session of its working directory written to since the process started; an assistant message without an end means working, a `question` tool still running means waiting. The state is searchable in the picker as `'@working`, `'@waiting` or `'@open`.
 
-The open picker keeps its list current by itself, shown as `↻ 5s` in the key list. Every 5 seconds it lists again from what it listed last: only the session files written since the previous look are read again - new sessions, sessions resumed just now and sessions that are working - and moved to where their time puts them, while every other row is taken over as it was and only gets its age and its live marker worked out anew, so a session that is merely open, finished or waiting at a prompt shows its current state. Which files were written is answered by a single `find -newer` against a marker file touched before each look, so nothing written while a list is put together is missed. Once a minute the list is made from scratch instead, for whatever the quick one leaves out: a file that is gone, a title a session got elsewhere. The open sessions only are few, so while `tab` shows them the list is simply made anew every 5 seconds, which also finds a session opened without anything written to it yet and drops one that was closed. The cursor stays on its session when the rows move under it, as long as nothing is searched for - a query orders the rows by itself.
+The picker binds `/` to prompt for a full-text message search, `enter` to use the selected session, `tab` to toggle between the open sessions and all of them, `ctrl-o` to widen the age window (7, 30, 90, 365 days, then back to 7), `ctrl-space` to pick the folder of the scope, `ctrl-d` to toggle between the sessions of the current directory and those of every folder, `ctrl-s` to make the folder of the selected session that scope, `ctrl-a` to walk the agent filter (all, `claude`, `codex`, `opencode`), `ctrl-f` to focus the terminal a running session is open in, `ctrl-r` to refresh the list, `esc` to clear an active search and to exit without one, and `ctrl-c` to exit.
 
-`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were, so a wrong turn costs one key and not a restart. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print` - a session that is open in a running agent is resumed already, so `Focus terminal` takes the place of `Resume` for it; `Copy` and `Print` share their row with `Copy last message` and `Print last message`: `tab` (`shift-tab` backwards) walks over the two variants of a row, so the question stays four lines long and every answer keeps its place. The last message variants act on the last message of the conversation instead of the whole transcript. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` - both of them, also where they are the same folder, so the keys of the question stay put - and `...`, which asks for one with directory completion under the prompt `Folder:`; then for the agent, with completion over `claude` and `codex` and the session's own as the default. `Print` and `Print last message` ask for `Markdown` or `Raw`. Every answered question stays on screen, so the way through them reads back as `Continue session: Fork` / `Fork in: ~/workspace/tool (session)` / `Fork with: codex`.
+The fuzzy search of fzf matches more than the visible columns: every row carries the full title, the first prompt, the state, the last user message and the last message as hidden fields, so typing a word from the end of a conversation finds it without a separate search. `/` searches every message of the listed sessions through the index instead.
 
-`Focus terminal` and `ctrl-f` bring the terminal window the session runs in to the front and leave the picker open, for coming back to. Which window that is, is found by `window-focus-by-process` from the agent process the live marker was found through, without knowing the terminal emulator; between several windows of one terminal the title the agent gives it decides, then the working directory a shell names there. `ctrl-f` does nothing for a session that is not running.
+The picker starts with the sessions open in a running agent, over every folder - the agents name them, so nothing is searched for them and the picker is there right away - while the sessions of the last 7 days are read into the index in the background, so `tab` shows all of them a moment later without waiting for files to be read. After a change of the filter, the scope or the search the newest 20 sessions are shown first and the rest is loaded behind them. The list refreshes itself every 5 seconds (`↻ 5s` in the key list); since the index only reads what was written since, a refresh costs a look at the modification times and the live state. The cursor stays on its session when the rows move under it, as long as nothing is searched for.
 
-The questions are asked while the picker is still running: `enter` hands the terminal over for them and leaves their answers in a file, and the picker turns that file into what it does next - the action once there are answers, nothing at all while there are none. That is what lets `esc` fall back into a picker that was never closed.
+The preview shows the end of the conversation: as many of the last messages as fit into 40000 characters, rendered through `glow` and scrolled to the bottom, messages of one role that follow each other - an answer around its tool calls - under one heading. It then follows the session: new messages are rendered and appended while the agent writes them, for as long as the cursor stays on the session. fzf starts the preview again on every reload of the list, so what a preview rendered is kept in the cache and printed at once by the next one - fzf keeps the old content until new output arrives, so the refresh of the list does not disturb the preview - and only the messages that came since are rendered.
 
-The picker starts with the sessions that are open in a running agent only, over every folder - the agents name them, so nothing is searched for them and the picker is there right away - and `tab` toggles between those and all sessions of the age window. `ctrl-space` turns the list into the folders the listed sessions were recorded in, open ones only or all of them as `tab` has it, over every folder and each of them once, sorted alphabetically and led by `<all>`, with the preview put away and the cursor on the other way the scope can go: on the folder the picker was started in while every folder is listed, on `<all>` while one folder is. `enter` makes the folder under the cursor the scope - `<all>` the listing of every folder - and shows the sessions again; `esc` and `ctrl-space` go back to them without changing it.
+`ctrl-space` turns the list into the folders the listed sessions were recorded in, open ones only or all of them as `tab` has it, each once, sorted alphabetically and led by `<all>`, with the preview put away and the cursor on the other way the scope can go: on the folder the picker was started in while every folder is listed, on `<all>` while one folder is. `enter` makes the folder under the cursor the scope and shows the sessions again; `esc` and `ctrl-space` go back to them without changing it. `ctrl-d` is the short way to the folder the picker was started in: it lists all sessions of that folder, open or not; pressed again, it goes back to every folder. `ctrl-s` takes the scope from the selected session. Searching, the scope, the age window and the agent filter live in a state file the list command reads, so a key only changes that file and reloads the list. The prompt names what is shown: `open` while only the open sessions are listed, the agent while one is selected, the folder, `all` or `folders`, the age window, and `~ PATTERN` while a search is active.
 
-`ctrl-d` is the short way to the folder the picker was started in: it lists all sessions of that folder, open or not, since the open sessions of a single folder are seldom the ones looked for there. Pressed again, it goes back to every folder and leaves the `tab` filter as it is. Pressed while the folders are shown, it toggles the same way and shows the sessions again. `agent-session --current-directory` starts the picker where `ctrl-d` leads, and `--open` next to it keeps that to the open sessions of the folder.
+`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print`; a session open in a running agent is resumed already, so `Focus terminal` takes the place of `Resume` for it. `Copy` and `Print` share their row with `Copy last message` and `Print last message`, `tab` (`shift-tab` backwards) walking over the two. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` and `...` for any other one (`Folder:` with directory completion); then for the agent, with completion over `claude`, `codex` and `opencode` and the session's own as the default. `Print` asks for `Markdown` or `Raw`. The questions are asked while the picker is still running and their answers are left in a file the picker turns into what it does next. `Focus terminal` and `ctrl-f` bring the terminal window the session runs in to the front through `window-focus-by-process` and leave the picker open.
 
-Searching, switching the folder scope and filtering by agent happen inside the running picker instead of it being closed and opened again: all three live in a state file the list command reads, so a key only changes that file and reloads the list - showing the newest 20 sessions again and loading the rest in the background, the way the picker started. They combine, so a search stays in place while the agent filter walks over it and the other way round. `ctrl-a` walks that filter over both agents, `claude` only and `codex` only, starting from whatever the invocation selected, so `claude-session` reaches the codex sessions as well. The folder the scope filters by is part of that state as well, so it does not have to stay the directory the picker was started in: `ctrl-s` takes it from the selected session, which is what turns a session found over all folders into the listing of its own folder; a session whose directory is not recorded anywhere leaves the scope as it is. The prompt names what is shown: `open` in the color of the open marker while only the open sessions are listed, then the agent in its own color while one is selected, then the folder of the current directory, `all`, or `folders` while those are shown, in the color of the directory column, followed by `~ PATTERN` in the color of the title column while a search is active, and then the arrow of the picker in its own color; so the filter, the scope and the search stay visible, while the fzf filter and the cursor are kept as they are. The search prompt is pre-filled with the active pattern, so it can be edited or emptied to clear the search; an aborted prompt keeps it. `esc` clears the search as well, but only while there is one - without a search it leaves the picker. It decides that from the same state file: the key hands the actions of a cleared search to a command that either clears and answers with them, or answers with the exit. The clipboard confirmation and the exact resume or fork command are printed in a muted color. Resume starts `codex resume ID` or `claude --resume ID` from the session's recorded working directory with standard input, output, and error reattached to the terminal. A recorded working directory that no longer exists is asked for first - `Folder '~/path' is missing. Create it?` - and created again on yes, since neither CLI needs more than the folder to be there; no steps back to `Continue session:` in the picker, while `--resume` stops with `Session directory not found`.
-
-A fork takes the shortest route to the chosen folder that the CLIs allow. With the same agent the native fork support is used where it reaches: `codex fork -C DIR ID` forks in any directory because codex takes the working root as an argument, `claude --resume ID --fork-session` only in the folder the session was recorded in, because claude looks a session up in the project of its working directory. Everything else - the other agent, or a claude session forked into another folder - starts a fresh session with the complete rendered conversation handed over as its first prompt, `claude PROMPT` or `codex -C DIR PROMPT`. A transcript over 100000 bytes stays in its temporary file and the prompt tells the agent to read it, so no command line grows too large. A chosen working root that does not exist - the recorded folder of the session that is gone since, or one typed under `Folder:` - is asked for right after it is picked with `Folder '~/path' is missing. Create it?`; yes creates it, no asks for the folder again.
+Resume starts `claude --resume ID`, `codex resume -C DIR ID` or `opencode --session ID` from the session's recorded working directory with standard input, output and error reattached to the terminal; a directory that no longer exists is asked for first - `Folder '~/path' is missing. Create it?`. A fork takes the shortest route the CLIs allow: `codex fork -C DIR ID` forks into any directory, `claude --resume ID --fork-session` and `opencode --session ID --fork` only in the folder the session was recorded in, because both look a session up by the folder they run in. Everything else - another agent, or a Claude or opencode session forked into another folder - starts a fresh session with the rendered conversation as its first prompt (`claude PROMPT`, `codex -C DIR PROMPT`, `opencode --prompt PROMPT`); a transcript over 100000 bytes stays in its temporary file and the prompt tells the agent to read it. The clipboard confirmation and the exact resume or fork command are printed in a muted color.
 
 **Examples:**
 ```bash
 agent-session
 agent-session --print
 agent-session --last
-agent-session --days 7
+agent-session --days 30
 agent-session --current-directory
 agent-session --prompt-column
 agent-session --agent codex -n 10 --grep "TODO"
 agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
 agent-session --resume 3f9a1c2b-abcd-1234-ef56-7890abcdef12
 agent-session --fork 3f9a1c2b
+agent-session --index --days 365
 claude-session -n 20 --igrep "docker compose"
 codex-session --last
+opencode-session --print
 ```
 
 ### `aish`
@@ -757,34 +760,45 @@ codex-chat --print-history
 Symlink to [`agent-session`](#agent-session) that only uses sessions of the Codex CLI.
 
 ### `codex-review`
-Starts Codex's `/review` picker, or runs a selected review. Interactive mode needs `tmux` and a terminal. After a selected review finishes, press Enter once to run `/copy`; the Codex session then remains interactive. Detaching stops the private tmux session and Codex process.
+Runs a Codex review of the current Git repository with `codex exec review`, using the Codex profile `review` (`CODEX_REVIEW_PROFILE` selects another one).
 
-**Usage:** `codex-review [--print] [base [BRANCH] | uncommitted | commit [SHA]]`
+Without a target, the review is chosen from the state of the repository:
+
+1. Uncommitted changes (staged, unstaged, or untracked): review those changes.
+2. On the default branch, as detected by `git-default` from dev-helpers: review the whole repository.
+3. On any other branch: review the changes against the default branch.
+
+When stdin and stdout are a terminal, the commands Codex runs are shown as progress on stderr, and the response is rendered with `glow` when it is installed. Afterwards, a menu offers:
+
+- **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
+- **Send follow-up prompt**: sends a prompt to the same Codex session (`codex exec resume`), for example to ask about a finding or to have it checked again after fixes.
+- **Run review again**: runs the same review in a new Codex session; follow-up prompts then go to that session.
+- **Quit** (or Esc).
+
+Otherwise, for example in a pipe, or with `--print`, only the response goes to stdout; the progress stays on stderr.
+
+**Usage:** `codex-review [--print] [full | base [BRANCH] | uncommitted | commit [SHA]]`
 
 | Argument / Flag | Description |
 |---|---|
-| `base [BRANCH]` | Review changes against a base branch. `BRANCH` is typed into Codex's branch picker, which lists local branches only. `default` stands for the repository's default branch, as detected by `git-default` from dev-helpers; a branch that is really named `default` cannot be selected this way. |
+| `full` | Review the whole repository. |
+| `base [BRANCH]` | Review changes against a base branch, local or remote. Without `BRANCH`, or with `default`, the default branch as detected by `git-default`. |
 | `uncommitted` | Review staged, unstaged, and untracked changes. |
-| `commit [SHA]` | Review the changes of one commit. `SHA` can be any commit ref; it is resolved to the full SHA first, because Codex's commit picker also matches the typed text against commit subjects. The picker only lists the last 100 commits; `--print` takes any commit. |
-| `-p, --print` | Run non-interactively with `codex exec review` and print the review response. |
+| `commit [SHA]` | Review the changes of one commit; `SHA` can be any commit ref (default: `HEAD`). |
+| `-p, --print` | Print only the response, even in a terminal. |
 | `-h, --help` | Show the help message and exit. |
-| `--bash-completion` | Output shell-completion candidates (flags and review targets, `default` and local branches after `base`, `HEAD`, local branches and tags after `commit`). |
+| `--bash-completion` | Output shell-completion candidates (flags and review targets, `default` and branches after `base`, `HEAD`, local branches and tags after `commit`). |
 
 **Examples:**
 ```bash
-codex-review                  # Open /review picker
-codex-review base             # Select base branch review in Codex
-codex-review base main        # Select main in Codex's branch picker
-codex-review base default     # Select the default branch in Codex's branch picker
-codex-review uncommitted      # Review working tree in Codex
-codex-review commit HEAD      # Select the HEAD commit in Codex's commit picker
-codex-review --print base main
-codex-review --print base default
-codex-review --print uncommitted
-codex-review --print commit HEAD
+codex-review                  # Review what the repository state suggests
+codex-review base             # Review changes against the default branch
+codex-review base main        # Review changes against main
+codex-review commit           # Review the HEAD commit
+codex-review full             # Review the whole repository
+codex-review > review.md      # Print only the response
+codex-review --print commit HEAD~1
 ```
-
-`--print` uses `codex exec review`. Only the final review response goes to stdout; Codex diagnostics remain on stderr. Branch or commit argument is required in this mode.
 
 ### `opencode-run`
 Starts an interactive OpenCode session that immediately runs a slash command or submits a prompt, so a command like `lintfix` can be kicked off from the shell and then be watched and worked with in the TUI.
