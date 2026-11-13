@@ -1,0 +1,11 @@
+[Unit]
+Description=Index the sessions of claude, codex and opencode for agent-session
+
+[Service]
+Type=oneshot
+# only what was written since the last run is read, so a run takes a fraction
+# of a second; it stays out of the way of everything else anyway
+ExecStart=/usr/local/bin/agent-session --index --days 7
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle

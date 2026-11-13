@@ -87,6 +87,14 @@ The GNOME extension steps (packaging, installing, enabling) are skipped automati
 detected, so the install works unchanged on non-GNOME systems; set `ENABLE_GNOME_EXTENSION=0` to skip them on a
 GNOME system too, or `ENABLE_GNOME_EXTENSION=1` to force them.
 
+`make install` and `make install-links` also install the systemd user timer that keeps the index of
+[`agent-session`](#agent-session) current (`make install-agent-session-timer` on its own): the units
+`agent-session-index.service` and `agent-session-index.timer` are copied to `~/.config/systemd/user` of the user who
+runs make - under `sudo` the one in `SUDO_USER` - with `ExecStart` pointing into `BINDIR`, and the timer is enabled in
+that user's session. Without a running session the units are installed and the command that enables them is printed.
+A staged install (`DESTDIR=...`) and `INSTALL_USER_ASSETS=0` skip it; `make uninstall` (or
+`make uninstall-agent-session-timer`) disables and removes it.
+
 ## Contents
 
 - [Audio Media](#audio-media)
@@ -644,6 +652,8 @@ serve-clip
 Browses, searches, resumes and forks the conversation sessions of the Claude CLI (`~/.claude/projects`), the Codex CLI (`~/.codex/sessions` and its `state_*.sqlite` thread database) and opencode (`~/.local/share/opencode/opencode.db`), showing user and agent messages and rendering them as Markdown (via `glow`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, live state, age, generated title and directory by last activity. Titles come from Claude's `custom-title`/`ai-title` records, the names and titles of Codex's thread database and opencode's session titles, falling back to the first prompt; the prompt gets no column of its own by default but stays searchable, and `--prompt-column` shows it (shortening the title column from 50 to 30 characters; `--print` uses 50/60-character columns). Ages under 60 minutes are green and italic, older ones faded, with the precision of `toage` shrinking as a session gets older. Codex subagent threads (reviews, spawned agents) and opencode child sessions are left out, as are archived Codex threads.
 
 The tool is written in Python and keeps an index of every session it has read in an SQLite database under `~/.cache/agent-session`: the title, first prompt, directory, last messages and every user and agent message, the messages also in a trigram full-text table. A session file is only read again where it changed, and then only from the byte the last read stopped at, since Claude and Codex only ever append; a line still being written is left for the next look. Lines are told apart by their bytes before one is decoded, so API requests, tool calls and tool output - nearly all of the gigabytes these files hold - are never parsed. Codex sessions are read in all three shapes Codex has written over time (`item_completed` events of `UserMessage`/`AgentMessage` items, the older `user_message`/`agent_message` events, and the plain response items of the first versions); opencode sessions are read from its database whenever their update time changes, an answer once it is complete, so their messages only grow at the end as well. Reading the last 7 days takes a few seconds once, then a listing takes about a tenth of a second; the whole history (several gigabytes) takes about half a minute once and gives an index of about 200 MB. Removing the folder costs the next listing its speed and nothing else.
+
+`make install` and `make install-links` install a systemd user timer (`agent-session-index.timer`) that runs `agent-session --index --days 7` a minute after login and then 30 minutes after each run, at the lowest CPU and I/O priority. A run that finds nothing new takes less than a tenth of a second of CPU, and the picker always opens on an index that is at most half an hour behind, so `tab` and `/` only read what was written since.
 
 **Usage:** `agent-session [OPTIONS] [SESSION]`
 

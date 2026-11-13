@@ -59,10 +59,14 @@ MODULES := toage prompt
 # setup.sh sets up a new machine from the repo, it is no command
 SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -not -name setup.sh -printf '%f\n' | sort)
 LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
+# the systemd user timer that keeps the index of agent-session current, installed
+# for the user running make (also under sudo) by install and install-links
+AGENT_SESSION_UNITS := agent-session-index.service agent-session-index.timer
+AGENT_SESSION_TIMER := agent-session-index.timer
 
 REPO_DIR := $(CURDIR)
 
-.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links bind-shortcuts gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
+.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links install-agent-session-timer uninstall-agent-session-timer bind-shortcuts gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
 
 list:
 	@printf 'Available targets:\n'
@@ -78,6 +82,7 @@ list:
 	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
 	@printf '  make bind-shortcuts           Bind every app-shortcut binding as a GNOME custom shortcut (as your user)\n'
 	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
+	@printf '  make install-agent-session-timer  Keep the agent-session index current (part of install/install-links)\n'
 	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
 	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
 	@printf '  sudo make uninstall           Remove installed files\n'
@@ -139,6 +144,7 @@ install: check-dirs
 	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
 	$(MAKE) install-completions
 	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop)
+	$(MAKE) --no-print-directory install-agent-session-timer
 	for link in $(LINKS); do \
 		target="$$(readlink "$$link")"; \
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
@@ -181,6 +187,7 @@ install-links: check-dirs
 	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
 	$(MAKE) install-completions-links
 	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop-links)
+	$(MAKE) --no-print-directory install-agent-session-timer
 	for link in $(LINKS); do \
 		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
@@ -253,6 +260,53 @@ install-desktop-links:
 		update-desktop-database "$(DESKTOPDIR)" || true; \
 	fi
 
+# The timer is the user's, not root's: under sudo the units go to the home of
+# SUDO_USER and systemctl --user talks to that user's session, as in updater.
+# Its ExecStart names $(BINDIR), so the units are copied, also by install-links.
+# Without a session bus (no login) the units are installed and enabled at the
+# next login by hand; a staged install (DESTDIR) or INSTALL_USER_ASSETS=0 skips it.
+install-agent-session-timer:
+	@if [ -n "$(DESTDIR)" ] || [ "$(INSTALL_USER_ASSETS)" = "0" ]; then \
+		echo "Skipping the agent-session index timer."; exit 0; \
+	fi; \
+	if ! command -v systemctl >/dev/null 2>&1; then \
+		echo "Skipping the agent-session index timer (no systemctl)."; exit 0; \
+	fi; \
+	user="$${SUDO_USER:-$$(id -un)}"; uid="$$(id -u "$$user")"; \
+	if [ "$$uid" -eq 0 ]; then \
+		echo "Skipping the agent-session index timer (no user to install it for)."; exit 0; \
+	fi; \
+	home="$$(getent passwd "$$user" | cut -d: -f6)"; dir="$$home/.config/systemd/user"; \
+	as_user=""; [ "$$(id -u)" -eq 0 ] && as_user="sudo -u $$user"; \
+	$$as_user mkdir -p "$$dir" || exit 1; \
+	for unit in $(AGENT_SESSION_UNITS); do \
+		sed 's#/usr/local/bin#$(BINDIR)#g' "$(SHAREDDIR)/systemd-user/$$unit" \
+			| $$as_user tee "$$dir/$$unit" >/dev/null || exit 1; \
+	done; \
+	bus="/run/user/$$uid/bus"; \
+	if [ ! -S "$$bus" ]; then \
+		echo "WARNING: no session of $$user to enable the timer in; run as $$user: systemctl --user enable --now $(AGENT_SESSION_TIMER)" 1>&2; \
+		exit 0; \
+	fi; \
+	session="env XDG_RUNTIME_DIR=/run/user/$$uid DBUS_SESSION_BUS_ADDRESS=unix:path=$$bus"; \
+	$$as_user $$session systemctl --user daemon-reload \
+		&& $$as_user $$session systemctl --user enable --now $(AGENT_SESSION_TIMER) \
+		&& echo "Enabled $(AGENT_SESSION_TIMER) for $$user" \
+		|| echo "WARNING: could not enable $(AGENT_SESSION_TIMER); run as $$user: systemctl --user enable --now $(AGENT_SESSION_TIMER)" 1>&2
+
+uninstall-agent-session-timer:
+	@[ -z "$(DESTDIR)" ] || exit 0; \
+	command -v systemctl >/dev/null 2>&1 || exit 0; \
+	user="$${SUDO_USER:-$$(id -un)}"; uid="$$(id -u "$$user")"; \
+	home="$$(getent passwd "$$user" | cut -d: -f6)"; dir="$$home/.config/systemd/user"; \
+	as_user=""; [ "$$(id -u)" -eq 0 ] && as_user="sudo -u $$user"; \
+	bus="/run/user/$$uid/bus"; \
+	session="env XDG_RUNTIME_DIR=/run/user/$$uid DBUS_SESSION_BUS_ADDRESS=unix:path=$$bus"; \
+	[ -S "$$bus" ] && $$as_user $$session systemctl --user disable --now $(AGENT_SESSION_TIMER) 2>/dev/null; \
+	for unit in $(AGENT_SESSION_UNITS); do $$as_user rm -f "$$dir/$$unit"; done; \
+	[ -S "$$bus" ] && $$as_user $$session systemctl --user daemon-reload; \
+	true
+
 # the default browser is a per-user setting (~/.config/mimeapps.list), so it is
 # never changed by install, which usually runs as root
 # GNOME custom shortcuts for every app-shortcut binding (replaces only its own ones)
@@ -295,7 +349,7 @@ install-pth:
 		echo "WARNING: cannot write $$pth, so $(PYTHONDIR) is not on sys.path; run: sudo make install-pth" 1>&2; \
 	fi
 
-uninstall:
+uninstall: uninstall-agent-session-timer
 	for script in $(SCRIPTS) $(LINKS); do \
 		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
 	done
@@ -350,5 +404,7 @@ else
 endif
 	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
 	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"
+	@printf 'agent-session index timer -> ~/.config/systemd/user of the installing user\n'
+	@printf '%s\n' $(AGENT_SESSION_UNITS) | sed 's#^#  $(SHAREDDIR)/systemd-user/#'
 	@printf 'Desktop entries -> %s\n' "$(DESTDIR)$(DESKTOPDIR)"
 	@printf '%s\n' $(DESKTOPS) | sed 's#^#  $(DESKTOPSRCDIR)/#'
