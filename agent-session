@@ -69,10 +69,21 @@ TITLE_MAX_CHARS = 500
 # The preview renders the end of a conversation: as many of the last messages
 # as fit into this many characters, the last one always.
 PREVIEW_MAX_CHARS = 40000
-PREVIEW_POLL_SECONDS = 0.5
-# a preview is a process of its own that keeps following its session; fzf ends
-# it when the cursor moves on, this ends one that was forgotten
-PREVIEW_MAX_SECONDS = 4 * 3600
+# A line as wide as the preview is wrapped by fzf into an empty one after it,
+# so the preview is rendered a column narrower than it is.
+PREVIEW_WIDTH_MARGIN = 1
+# what the preview cache holds is rendered by this version of the preview; a
+# render of another one is made again
+PREVIEW_RENDER_VERSION = 3
+# The watcher of an open picker waits for the files of the sessions to change;
+# where it cannot be told of that (no inotify) it looks this often instead.
+WATCH_POLL_SECONDS = 2
+# what it does at most this often, while sessions are written: read the session
+# under the cursor, and make the list again
+WATCH_PREVIEW_SECONDS = 0.5
+# the ages of the list change by the minute, and a process that ends writes
+# nothing, so the list is made again this often anyway
+WATCH_LIST_SECONDS = 60
 SCHEMA_VERSION = 1
 
 C_AGENTS = {
@@ -189,8 +200,9 @@ Interactive keys:
     esc                 Clear an active search, exit without one
     ctrl-c              Exit
 
-The preview shows the end of the conversation and follows it while the agent
-writes; the list refreshes itself every {REFRESH_SECONDS} seconds.
+The preview shows the end of the conversation and is shown again as soon as the
+session under the cursor gets a new message; the list is made again once
+sessions changed, at most every {REFRESH_SECONDS} seconds, and loaded only where it changed.
 
 Asked for the selected session, esc stepping back one question and out of
 the first one into the picker again:
@@ -289,15 +301,21 @@ def pad(text, width):
 
 
 def shorten(text, max_width):
-    if text_width(text) <= max_width:
-        return text
+    # titles are mostly plain ASCII, where a character is a column
+    if text.isascii():
+        return text if len(text) <= max_width else text[:max_width - 3] + '...'
     kept = []
     width = 0
-    for char in text:
+    for position, char in enumerate(text):
         width += char_width(char)
-        if width > max_width - 3:
+        if width > max_width:
             break
         kept.append(char)
+    else:
+        return text
+    # the cut text and its dots have to fit, so the last characters go again
+    while kept and text_width(''.join(kept)) > max_width - 3:
+        kept.pop()
     return ''.join(kept) + '...'
 
 
@@ -471,7 +489,7 @@ def codex_thread_rows(where='', parameters=()):
         rows = connection.execute(
             f'SELECT id, rollout_path, cwd, substr(COALESCE(NULLIF({name}, \'\'), title), 1, ?),'
             f' substr({prompt}, 1, ?), source, {thread_source}, archived'
-            f' FROM threads {where}', (TITLE_MAX_CHARS, PROMPT_SCAN_CHARS) + tuple(parameters)
+            f' FROM threads {where}', (TITLE_MAX_CHARS, SNIPPET_CHARS * 2) + tuple(parameters)
         ).fetchall()
         connection.close()
         return rows
@@ -1490,6 +1508,11 @@ def format_rows(rows, live, options):
     else:
         title_max = FZF_TITLE_MAX_WIDTH
         prompt_max = FZF_TEXT_MAX_WIDTH
+    # The picker counts ages in minutes: its list is only loaded again when a
+    # row changed, and an age in seconds would change every row every second.
+    age_options = dict(AGE_OPTIONS)
+    if not options.print:
+        age_options['minimum'] = 60
     cells = []
     directories = {}
     for row in rows:
@@ -1498,7 +1521,7 @@ def format_rows(rows, live, options):
             directories[row['cwd']] = format_cwd(row['cwd']) if row['cwd'] else '-'
         cells.append((
             row['agent'], marker, words,
-            toage.format_span(now - row['mtime'], **AGE_OPTIONS),
+            toage.format_span(now - row['mtime'], **age_options),
             shorten(row['display_title'], title_max),
             shorten(row['prompt'] or '-', prompt_max) if options.prompt_column else '',
             directories[row['cwd']],
@@ -1522,11 +1545,13 @@ def format_rows(rows, live, options):
     return lines, states
 
 
-def picker_rows(rows, live, options, track_key=None, track_file=None):
+def picker_rows(rows, live, options, track_key=None):
     """The rows of the picker: the display line and, hidden behind it, the
     agent, the key, the full title and prompt, the state and the end of the
-    conversation, which the fuzzy search of fzf matches as well."""
+    conversation, which the fuzzy search of fzf matches as well. Returns them
+    with the position of the row of track_key, None where there is none."""
     lines, states = format_rows(rows, live, options)
+    found = None
     output = [lines[0] + '\tAGENT\tKEY\tFULL_TITLE\tFULL_PROMPT\tSTATE\tCONTENT']
     for position, (row, line, words) in enumerate(zip(rows, lines[1:], states), start=1):
         snippet = row['last_user'][:SNIPPET_CHARS]
@@ -1535,13 +1560,12 @@ def picker_rows(rows, live, options, track_key=None, track_file=None):
         output.append('\t'.join((
             line, row['agent'], row['key'], single_line(row['display_title']),
             single_line(row['prompt'][:SNIPPET_CHARS]), words, single_line(snippet))))
-        if track_file and row['key'] == track_key:
-            with open(track_file, 'w') as handle:
-                handle.write(f'pos({position})')
-    return output
+        if found is None and row['key'] == track_key:
+            found = position
+    return output, found
 
 
-def folder_rows(rows, options, track_key=None, track_file=None):
+def folder_rows(rows, options, track_key=None):
     """The folders view: the folders the listed sessions were recorded in,
     each once and in order, led by the one that stands for all of them. The
     cursor starts on the other way the scope can go."""
@@ -1558,10 +1582,7 @@ def folder_rows(rows, options, track_key=None, track_file=None):
         if found == 1 and wanted != FOLDERS_ALL \
                 and resolve_directory(folder) == resolve_directory(wanted):
             found = position
-    if track_file:
-        with open(track_file, 'w') as handle:
-            handle.write(f'pos({found})')
-    return output
+    return output, found
 
 
 # --- rendering ---------------------------------------------------------------------
@@ -1583,18 +1604,55 @@ def markdown(messages, previous_role=None):
     return '\n\n'.join(parts)
 
 
-def glow(text, width=None, style=None, color=False):
-    command = [require('glow')]
-    if style:
-        command += ['--style', style]
-    if width:
-        command += ['--width', str(width)]
-    environment = dict(os.environ)
-    if color:
-        environment.update(COLORTERM='truecolor', CLICOLOR_FORCE='1')
-    result = subprocess.run(command, input=text, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, env=environment)
-    return result.stdout
+# the color of the heading of a turn: the user's in the color of the prompt
+# column, the agent's in the color of its agent
+ROLE_COLORS = {'user': 110}
+AGENT_COLOR_NUMBERS = {'claude': 141, 'codex': 40, 'opencode': 178}
+BLANK_LINE = re.compile(r'^(?:\s|\033\[[0-9;]*m)*$')
+
+
+def render(messages, width=None, agent=None, previous_role=None, color=True):
+    """Messages rendered for the terminal by rich, in this process: a rule
+    with the role at the start of every turn, the messages of a turn - an
+    answer around its tool calls - as Markdown under it. rich is loaded only
+    here, where something is rendered, as loading it costs more than the rest
+    of a preview. Without rich the Markdown is shown as it is."""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.rule import Rule
+        from rich.text import Text
+    except ImportError:
+        return markdown(messages, previous_role) + '\n'
+    import io
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=width or None, force_terminal=color,
+                      no_color=not color, color_system='truecolor' if color else None,
+                      highlight=False, emoji=False, soft_wrap=False)
+    for _, role, text in messages:
+        if role != previous_role:
+            color_number = ROLE_COLORS.get(role) or AGENT_COLOR_NUMBERS.get(agent, 208)
+            label = Text(f' {ROLE_LABELS.get(role, role)} ', style=f'bold color({color_number})')
+            console.print()
+            console.print(Rule(label, align='left', style='color(240)'))
+        console.print(Markdown(text, code_theme='monokai', hyperlinks=False))
+        console.print()
+        previous_role = role
+    return tidy_render(buffer.getvalue())
+
+
+def tidy_render(text):
+    """Runs of empty lines - rich puts one around every block, and a turn adds
+    its own - become one, and the empty lines at either end go."""
+    lines = []
+    for line in text.split('\n'):
+        if not BLANK_LINE.match(line):
+            lines.append(line)
+        elif lines and lines[-1]:
+            lines.append('')
+    while lines and not lines[-1]:
+        lines.pop()
+    return '\n'.join(lines) + '\n' if lines else ''
 
 
 def ensured_session(agent, key):
@@ -1617,16 +1675,15 @@ def session_markdown(agent, key, last_only=False):
 
 
 class PreviewCache:
-    """What the preview of a session rendered last, so the preview that fzf
-    starts again on every reload of the list prints it at once - fzf keeps the
-    old content until the new one arrives, so nothing flickers - and only
-    renders the messages that came since."""
+    """What the preview of a session rendered last, so a preview started again
+    - for new messages, or by a reload of the list - prints it at once and
+    renders only the messages that came since. fzf keeps the old content until
+    the new one arrives, so nothing flickers."""
 
-    def __init__(self, key, width, style):
+    def __init__(self, key, width):
         os.makedirs(RENDER_FOLDER, exist_ok=True)
         self.path = os.path.join(RENDER_FOLDER, hashlib.sha1(key.encode()).hexdigest() + '.json')
-        self.width = width
-        self.style = style
+        self.signature = [PREVIEW_RENDER_VERSION, width]
 
     def load(self, generation):
         try:
@@ -1634,76 +1691,56 @@ class PreviewCache:
                 cached = json.load(handle)
         except (OSError, ValueError):
             return None
-        if (cached.get('width'), cached.get('style'), cached.get('generation')) \
-                != (self.width, self.style, generation):
+        if cached.get('signature') != self.signature or cached.get('generation') != generation:
             return None
         return cached
 
     def save(self, generation, last_seq, last_role, text):
-        temporary = self.path + f'.{os.getpid()}'
-        try:
-            with open(temporary, 'w') as handle:
-                json.dump({'width': self.width, 'style': self.style, 'generation': generation,
-                           'last_seq': last_seq, 'last_role': last_role, 'text': text}, handle)
-            os.replace(temporary, self.path)
-        except OSError:
-            pass
+        write_json(self.path, {'signature': self.signature, 'generation': generation,
+                               'last_seq': last_seq, 'last_role': last_role, 'text': text})
 
 
-def preview(agent, key):
-    """The end of the conversation, and then whatever the agent writes next,
-    for as long as the cursor stays on the session: fzf keeps the preview
-    scrolled to its end."""
-    width = int(os.environ.get('FZF_PREVIEW_COLUMNS') or 80)
-    style = os.environ.get('GLOW_STYLE') or 'dark'
-    index, candidate, view = ensured_session(agent, key)
-    cache = PreviewCache(view['key'], width, style)
+def write_json(path, value):
+    temporary = path + f'.{os.getpid()}'
+    try:
+        with open(temporary, 'w') as handle:
+            json.dump(value, handle)
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
+def preview(agent, key, state_file=None):
+    """The end of the conversation, scrolled to its last message by fzf. The
+    preview prints and ends - fzf shows a spinner for as long as a preview
+    runs - and the watcher of the picker starts it again once the session got
+    new messages. What it showed is left next to the state of the picker, for
+    the watcher to tell new messages from those."""
+    width = max(int(os.environ.get('FZF_PREVIEW_COLUMNS') or 80) - PREVIEW_WIDTH_MARGIN, 20)
+    index, _, view = ensured_session(agent, key)
+    cache = PreviewCache(view['key'], width)
     cached = cache.load(view['generation'])
     if cached and cached['last_seq'] <= view['last_seq'] \
             and len(cached['text']) < PREVIEW_MAX_CHARS * 6:
         text = cached['text']
         last_seq = cached['last_seq']
-        last_role = cached['last_role']
         new = index.messages(view['key'], last_seq)
         if new:
-            text += glow(markdown(new, last_role), width, style, color=True)
-            last_seq, last_role = new[-1][0], new[-1][1]
-            cache.save(view['generation'], last_seq, last_role, text)
+            chunk = render(new, width, agent, cached['last_role'])
+            text = text + '\n' + chunk if text and chunk else text + chunk
+            last_seq = new[-1][0]
+            cache.save(view['generation'], last_seq, new[-1][1], text)
     else:
         messages = index.tail_messages(view['key'], PREVIEW_MAX_CHARS)
-        if not messages:
-            print(f'{C_MUTED}No messages{C_RESET}', flush=True)
-            last_seq, last_role, text = 0, None, ''
-        else:
-            text = glow(markdown(messages), width, style, color=True)
-            last_seq, last_role = messages[-1][0], messages[-1][1]
-        cache.save(view['generation'], last_seq, last_role, text)
-    generation = view['generation']
+        text = render(messages, width, agent) if messages else ''
+        last_seq = messages[-1][0] if messages else 0
+        cache.save(view['generation'], last_seq, messages[-1][1] if messages else None, text)
+    if state_file:
+        write_json(state_file + '.preview', {'key': view['key'], 'last_seq': last_seq,
+                                             'generation': view['generation']})
     try:
-        sys.stdout.write(text)
+        sys.stdout.write(text or f'{C_MUTED}No messages{C_RESET}\n')
         sys.stdout.flush()
-        started = time.time()
-        while time.time() - started < PREVIEW_MAX_SECONDS:
-            time.sleep(PREVIEW_POLL_SECONDS)
-            fresh = candidate_for(agent, key)
-            if fresh is None or (fresh.mtime == candidate.mtime and fresh.size == candidate.size):
-                continue
-            candidate = fresh
-            row = index.ensure(candidate)
-            if row is None:
-                continue
-            if row['generation'] != generation:
-                # the session was read anew: what is shown no longer matches it
-                return
-            new = index.messages(row['key'], last_seq)
-            if not new:
-                continue
-            chunk = glow(markdown(new, last_role), width, style, color=True)
-            last_seq, last_role = new[-1][0], new[-1][1]
-            text += chunk
-            cache.save(generation, last_seq, last_role, text)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
     except BrokenPipeError:
         pass
 
@@ -2001,7 +2038,7 @@ def session_run(agent, key, answer_file):
         fail(f'Unknown session action: {action}')
 
 
-def session_action(action, agent, key, answer_file=None, current_directory=None):
+def session_action(action, agent, key, answer_file=None, current_directory=None, state_file=None):
     last_only = action.endswith('-last')
     action = action[:-len('-last')] if last_only else action
     if agent not in ALL_AGENTS:
@@ -2016,9 +2053,9 @@ def session_action(action, agent, key, answer_file=None, current_directory=None)
     elif action == 'run':
         session_run(agent, key, answer_file)
     elif action == 'preview':
-        preview(agent, key)
+        preview(agent, key, state_file)
     elif action == 'markdown':
-        sys.stdout.write(glow(session_markdown(agent, key, last_only)))
+        print_rendered(agent, key, last_only)
     elif action == 'raw':
         print(session_markdown(agent, key, last_only))
     elif action == 'clipboard':
@@ -2099,14 +2136,24 @@ def spawn_indexer(options):
         pass
 
 
+def free_port():
+    import socket
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
 def browse(options, query):
     fzf_with_header = require('fzf-with-header')
-    require('glow')
     require('clip')
-    state_file = tempfile.NamedTemporaryFile(prefix=f'{APP_NAME}.state.', delete=False).name
+    # the files of the picker lie in a folder of their own, which its watcher
+    # is told about changes in - and nothing else of the temporary folder
+    folder = tempfile.mkdtemp(prefix=f'{APP_NAME}.')
+    state_file = os.path.join(folder, 'state')
     # the questions of a selected session are asked while the picker is open,
     # so their answers are left here for the action that follows them
-    answer_file = tempfile.NamedTemporaryFile(prefix=f'{APP_NAME}.answers.', delete=False).name
+    answer_file = os.path.join(folder, 'answers')
+    open(answer_file, 'w').close()
     track_file = state_file + '.track'
     # the open sessions are few and run anywhere, so the picker starts with all
     # of them wherever they were started; held to the current directory by -c
@@ -2116,7 +2163,18 @@ def browse(options, query):
         options.open_only = True
     options.write_state(state_file)
     spawn_indexer(options)
+    port = free_port()
+    watcher = None
     try:
+        # the watcher keeps the list and the preview current through the port
+        # fzf listens on; it ends with the state file, or once fzf is gone
+        watcher_command = [SCRIPT_PATH, '--fzf-state', state_file, '--fzf-watch', str(port)]
+        if options.limit:
+            watcher_command += ['--limit', str(options.limit)]
+        if options.prompt_column:
+            watcher_command.append('--prompt-column')
+        watcher = subprocess.Popen(watcher_command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, start_new_session=True)
         initial = list_command(options, state_file, batch=True)
         full = list_command(options, state_file)
         state_command = quoted(SCRIPT_PATH, '--fzf-state', state_file)
@@ -2127,10 +2185,9 @@ def browse(options, query):
         reload_actions = (f'rebind(load)+reload-sync({initial})'
                           f'+transform-prompt({state_command} --fzf-prompt)')
         reload_quoted = shlex.quote(reload_actions)
-        refresh = f'{full} --fzf-track {{3}}'
         track = shlex.quote(track_file)
         track_command = f'[ -z {{q}} ] && cat -- {track} 2>/dev/null; rm -f -- {track}'
-        preview_command = f'{script} --fzf-action preview {{2}} {{3}}'
+        preview_command = f'{state_command} --fzf-action preview {{2}} {{3}}'
         answers = shlex.quote(answer_file)
         enter_command = (f'{state_command} --fzf-answers {answers} --fzf-enter {reload_quoted}'
                          ' {2} {3}')
@@ -2144,9 +2201,8 @@ def browse(options, query):
             '--filter-columns', '1,4,5,6,7',
             '--delimiter', '\t',
             '--key-descriptions', keys,
-            '--watch', str(REFRESH_SECONDS),
-            '--watch-command', refresh,
             '--',
+            f'--listen=127.0.0.1:{port}',
             '--no-multi',
             '--prompt', fzf_prompt(options),
             '--preview', preview_command,
@@ -2174,11 +2230,10 @@ def browse(options, query):
         result = subprocess.run(command)
         return result.returncode
     finally:
-        for path in (state_file, state_file + '.tmp', answer_file, track_file):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        if watcher:
+            watcher.terminate()
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def picker_state_action(options, state_file, action, arguments):
@@ -2271,23 +2326,235 @@ def picker_state_action(options, state_file, action, arguments):
                          f'+transform:{quoted(*base, "become")} {{2}} {{3}}')
 
 
-def list_for_picker(options, state_file, batch, track_key):
-    track_file = state_file + '.track' if state_file and track_key is not None else None
+def picker_output(options, batch=None, track_key=None):
+    """The list of the picker as fzf reads it, with the position of the row
+    the cursor is to be put on."""
     index = Index()
     if options.view == 'folders':
         live = Live(options.agents) if options.open_only else None
         rows = collect(options, live, index, all_directories=True)
-        if track_file is None and state_file:
-            track_file = state_file + '.track'
-        output = folder_rows(rows, options, track_key, track_file)
+        lines, found = folder_rows(rows, options, track_key)
     else:
         live = Live(options.agents)
         limit = options.limit
         if batch and (not limit or batch < limit):
             limit = batch
         rows = collect(options, live, index, limit=limit)
-        output = picker_rows(rows, live, options, track_key, track_file)
-    sys.stdout.write('\n'.join(output) + '\n')
+        lines, found = picker_rows(rows, live, options, track_key)
+    return '\n'.join(lines) + '\n', found
+
+
+def write_track(state_file, position):
+    """Leaves the position the cursor is to go to for the result binding of
+    the picker, which moves it there once the list is in."""
+    if state_file and position:
+        with open(state_file + '.track', 'w') as handle:
+            handle.write(f'pos({position})')
+
+
+def list_signature(text):
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def list_for_picker(options, state_file, batch, track_key):
+    text, found = picker_output(options, batch, track_key)
+    # the folders view starts with its cursor on the other way the scope can go
+    if track_key is not None or options.view == 'folders':
+        write_track(state_file, found)
+    # what the picker shows, for the watcher to tell a changed list from it
+    if state_file and not batch:
+        with open(state_file + '.signature', 'w') as handle:
+            handle.write(list_signature(text))
+    sys.stdout.write(text)
+
+
+def fzf_request(port, action=None):
+    """Asks the picker for its state, or has it perform an action."""
+    import urllib.request
+    url = f'http://127.0.0.1:{port}'
+    if action is None:
+        with urllib.request.urlopen(url + '?limit=0', timeout=2) as response:
+            return json.load(response)
+    request = urllib.request.Request(url, data=action.encode(), method='POST')
+    with urllib.request.urlopen(request, timeout=2):
+        return None
+
+
+def read_file(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+class Inotify:
+    """The changes of files, from the kernel: inotify through libc, as the
+    standard library of Python has no module for it. None where there is none."""
+
+    MODIFY, ATTRIB, CLOSE_WRITE, MOVED_TO, CREATE, DELETE = 0x2, 0x4, 0x8, 0x80, 0x100, 0x200
+    CHANGES = MODIFY | CLOSE_WRITE | MOVED_TO | CREATE | DELETE
+
+    @classmethod
+    def open(cls):
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            descriptor = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        except (OSError, AttributeError):
+            return None
+        return cls(libc, descriptor) if descriptor >= 0 else None
+
+    def __init__(self, libc, descriptor):
+        self.libc = libc
+        self.descriptor = descriptor
+        self.paths = {}
+        self.watches = {}
+
+    def watch(self, folders):
+        """Watches these folders - every change of a file in them - and no
+        others."""
+        folders = {folder for folder in folders if folder and os.path.isdir(folder)}
+        for folder in set(self.watches) - folders:
+            self.libc.inotify_rm_watch(self.descriptor, self.watches.pop(folder))
+        for folder in folders - set(self.watches):
+            watch = self.libc.inotify_add_watch(self.descriptor, os.fsencode(folder), self.CHANGES)
+            if watch >= 0:
+                self.watches[folder] = watch
+                self.paths[watch] = folder
+
+    def wait(self, timeout):
+        """The files that changed within timeout seconds, as paths."""
+        import select
+        import struct
+        changed = set()
+        if not select.select([self.descriptor], [], [], max(timeout, 0))[0]:
+            return changed
+        while True:
+            try:
+                data = os.read(self.descriptor, 65536)
+            except BlockingIOError:
+                return changed
+            position = 0
+            while position + 16 <= len(data):
+                watch, _, _, length = struct.unpack_from('iIII', data, position)
+                name = data[position + 16:position + 16 + length].rstrip(b'\0')
+                position += 16 + length
+                folder = self.paths.get(watch)
+                if folder:
+                    changed.add(os.path.join(folder, os.fsdecode(name)))
+
+
+def watched_folders(state_file, text):
+    """The folders whose changes can change the picker: its own folder, where
+    the preview names the session under the cursor; every project of claude
+    and the folder of its running sessions; the folders of the codex sessions
+    listed and of today; the folder of the database of opencode."""
+    folders = {os.path.dirname(state_file), CLAUDE_PEERS, CLAUDE_PROJECTS,
+               os.path.dirname(OPENCODE_DB),
+               os.path.join(CODEX_SESSIONS, time.strftime('%Y/%m/%d'))}
+    try:
+        folders.update(entry.path for entry in os.scandir(CLAUDE_PROJECTS) if entry.is_dir())
+    except OSError:
+        pass
+    for line in text.split('\n')[1:]:
+        fields = line.split('\t')
+        if len(fields) > 2 and fields[1] == 'codex':
+            folders.add(os.path.dirname(fields[2]))
+    return folders
+
+
+def watch_picker(options, state_file, port):
+    """Keeps the open picker current. It is told by the kernel which files
+    changed and does nothing while none did: once the session under the
+    cursor - the one the preview names in the folder of the picker - got a
+    message the preview does not show yet, it has fzf start the preview again;
+    once any session changed, it makes the list and has fzf load it where it
+    differs from what fzf shows. Without inotify it looks every few seconds."""
+    index = Index()
+    inotify = Inotify.open()
+    picker = os.getppid()
+    preview_file = state_file + '.preview'
+    own_files = {state_file + suffix for suffix in ('.list', '.list.tmp', '.signature', '.track')}
+    # fzf has just loaded the list
+    listed = time.time()
+    previewed = 0.0
+    list_due = True
+    preview_due = True
+    asked = {}
+    text = read_file(state_file + '.list') or ''
+    while os.path.exists(state_file) and os.getppid() == picker:
+        now = time.time()
+        if inotify:
+            inotify.watch(watched_folders(state_file, text))
+            # what is due waits for its interval, everything else for a change;
+            # the picker going away is looked for every few seconds
+            waits = [10.0, listed + WATCH_LIST_SECONDS - now]
+            if list_due:
+                waits.append(listed + REFRESH_SECONDS - now)
+            if preview_due:
+                waits.append(previewed + WATCH_PREVIEW_SECONDS - now)
+            changed = inotify.wait(min(waits)) - own_files
+        else:
+            time.sleep(WATCH_POLL_SECONDS)
+            changed = {None}
+        try:
+            shown = json.loads(read_file(preview_file) or '{}')
+        except ValueError:
+            shown = {}
+        key = shown.get('key')
+        if changed:
+            list_due = True
+            # a write of the session under the cursor, or any write to the
+            # database of opencode, where all of its sessions are
+            if None in changed or preview_file in changed or key in changed or (
+                    key and key.startswith('opencode:')
+                    and any(path and path.startswith(OPENCODE_DB) for path in changed)):
+                preview_due = True
+        now = time.time()
+        if preview_due and key and now - previewed >= WATCH_PREVIEW_SECONDS:
+            preview_due = False
+            previewed = now
+            agent = 'opencode' if key.startswith('opencode:') else (
+                'codex' if key.startswith(CODEX_SESSIONS) else 'claude')
+            candidate = candidate_for(agent, key)
+            row = index.ensure(candidate) if candidate else None
+            if row:
+                current = (row['last_seq'], row['generation'])
+                if current != (shown.get('last_seq'), shown.get('generation')) \
+                        and asked.get(key) != current:
+                    asked[key] = current
+                    try:
+                        fzf_request(port, 'refresh-preview')
+                    except OSError:
+                        pass
+        if not (list_due and now - listed >= REFRESH_SECONDS) and now - listed < WATCH_LIST_SECONDS:
+            continue
+        list_due = False
+        listed = now
+        fresh = Options()
+        fresh.limit = options.limit
+        fresh.prompt_column = options.prompt_column
+        fresh.read_state(state_file)
+        if fresh.limit:
+            fresh.days = None
+        # in the folders view the preview is away and names no row
+        text, found = picker_output(fresh, None, key if fresh.view != 'folders' else None)
+        signature = list_signature(text)
+        if signature == read_file(state_file + '.signature'):
+            continue
+        list_file = state_file + '.list'
+        with open(list_file + '.tmp', 'w') as handle:
+            handle.write(text)
+        os.replace(list_file + '.tmp', list_file)
+        with open(state_file + '.signature', 'w') as handle:
+            handle.write(signature)
+        if fresh.view != 'folders':
+            write_track(state_file, found)
+        try:
+            fzf_request(port, f'reload(cat -- {shlex.quote(list_file)})')
+        except OSError:
+            pass
 
 
 def print_table(options):
@@ -2323,12 +2590,19 @@ def find_session(options, wanted, all_directories):
     return matches[0]
 
 
+def print_rendered(agent, key, last_only=False):
+    index, _, view = ensured_session(agent, key)
+    messages = index.messages(view['key'])
+    if last_only:
+        messages = messages[-1:]
+    sys.stdout.write(render(messages, agent=agent, color=sys.stdout.isatty()))
+
+
 def print_session(options, candidate):
-    content = session_markdown(candidate.agent, candidate.key)
     if options.raw:
-        print(content)
+        print(session_markdown(candidate.agent, candidate.key))
     else:
-        sys.stdout.write(glow(content))
+        print_rendered(candidate.agent, candidate.key)
 
 
 def run_index(options):
@@ -2390,6 +2664,7 @@ def main(argv):
     picker_action = None
     picker_arguments = []
     fzf_list = False
+    watch_port = None
     fzf_batch = None
     track_key = None
     query = ''
@@ -2430,6 +2705,8 @@ def main(argv):
             state_file = value(argument)
         elif argument == '--fzf-answers':
             answer_file = value(argument)
+        elif argument == '--fzf-watch':
+            watch_port = number(argument, value(argument))
         elif argument == '--fzf-query':
             query = value(argument)
         elif argument in ('--fzf-prompt', '--fzf-search', '--fzf-toggle-open',
@@ -2497,7 +2774,7 @@ def main(argv):
         if state_file:
             options.read_state(state_file)
             current_directory = options.launch_directory
-        session_action(name, agent, key, answer_file, current_directory)
+        session_action(name, agent, key, answer_file, current_directory, state_file)
         return 0
 
     if limit_explicit and days_explicit:
@@ -2564,6 +2841,10 @@ def main(argv):
         print_session(options, candidate_for(rows[0]['agent'], rows[0]['key']))
     elif session_id:
         print_session(options, find_session(options, session_id, not options.current_directory_only))
+    elif watch_port:
+        if not state_file:
+            fail('The picker watcher requires --fzf-state')
+        watch_picker(options, state_file, watch_port)
     elif fzf_list:
         list_for_picker(options, state_file, fzf_batch, track_key)
     elif options.print:
