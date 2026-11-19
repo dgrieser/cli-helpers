@@ -1,0 +1,7 @@
+# GIMP shortcutsrc
+#
+# The shortcuts of cli-helpers, merged into the user's shortcutsrc by updater gimp.
+
+(file-version 1)
+
+(action "file-print-gtk" "<Primary>p")

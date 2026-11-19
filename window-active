@@ -1,0 +1,22 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    id="$(cli_helpers_gnome_window_bridge active)"
+    [ -n "${id}" ] && echo "${id}" || exit 1
+else
+    id=$(xdotool getwindowfocus)
+    if [ -n "${id}" ]; then
+        printf "0x%08x\n" ${id}
+    else
+        exit 1
+    fi
+fi

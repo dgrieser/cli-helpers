@@ -1,0 +1,106 @@
+// Zed keymap
+//
+// For information on binding keys, see the Zed
+// documentation: https://zed.dev/docs/key-bindings
+//
+// To see the default key bindings run `zed: open default keymap`
+// from the command palette.
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-r": null,
+      "ctrl-shift-r": "file_finder::Toggle",
+      "ctrl-shift-f": "project_search::ToggleFocus",
+      "ctrl-h": "buffer_search::DeployReplace",
+      "ctrl-+": "zed::IncreaseBufferFontSize",
+      "ctrl-alt-+": "zed::IncreaseUiFontSize",
+      "ctrl--": "zed::DecreaseBufferFontSize",
+      "ctrl-alt--": "zed::DecreaseUiFontSize",
+      "ctrl-0": "zed::ResetBufferFontSize",
+      "ctrl-alt-0": "zed::ResetUiFontSize"
+    }
+  },
+  {
+    "context": "Editor",
+    "bindings": {
+      "ctrl-+": "zed::IncreaseBufferFontSize",
+      "ctrl-alt-+": "zed::IncreaseUiFontSize",
+      "ctrl--": "zed::DecreaseBufferFontSize",
+      "ctrl-alt--": "zed::DecreaseUiFontSize",
+      "ctrl-0": "zed::ResetBufferFontSize",
+      "ctrl-alt-0": "zed::ResetUiFontSize",
+      "alt-left": "pane::GoBack",
+      "alt-right": "pane::GoForward",
+      "ctrl-o": "outline::Toggle",
+      "f2": "editor::Rename",
+      "f3": "editor::GoToDefinition",
+      "f12": "editor::FindAllReferences",
+      "ctrl-1": "editor::ToggleCodeActions",
+      "ctrl-f": "buffer_search::Dismiss",
+      "ctrl-h": [
+        "buffer_search::Dismiss",
+        "buffer_search::DeployReplace"
+      ],
+      "ctrl-shift-c": "editor::ToggleComments",
+      "ctrl-alt-down": "editor::AddSelectionBelow",
+      "ctrl-alt-up": "editor::AddSelectionAbove",
+      "alt-u": "editor::Undo",
+      "ctrl-alt-f": "editor::Format"
+    }
+  },
+  {
+    "context": "ProjectPanel && not_editing",
+    "bindings": {
+      "f2": "project_panel::Rename"
+    }
+  },
+  {
+    "bindings": {
+      "ctrl-alt-v": "workspace::ToggleVimMode"
+    }
+  },
+  {
+    "context": "Editor",
+    "unbind": {
+      "undo": "editor::Undo",
+      "ctrl-shift-i": "editor::Format"
+    }
+  },
+  {
+    "context": "KeymapEditor",
+    "unbind": {
+      "ctrl-alt-f": "keymap_editor::ToggleKeystrokeSearch"
+    }
+  },
+  {
+    "context": "ProjectSearchBar",
+    "unbind": {
+      "ctrl-alt-f": "project_search::OpenTextFinder"
+    }
+  },
+  {
+    "context": "ProjectSearchView",
+    "unbind": {
+      "ctrl-alt-f": "project_search::OpenTextFinder"
+    }
+  },
+  {
+    "context": "Pane",
+    "unbind": {
+      "ctrl-alt-f": "project_search::ToggleFilters"
+    }
+  },
+  {
+    "context": "TextFinder || TextFinder > Picker > Editor || TextFinder > Picker > menu",
+    "unbind": {
+      "ctrl-alt-f": "text_finder::ToProjectSearch"
+    }
+  },
+  {
+    "context": "TextFinder || TextFinder > Picker > Editor || TextFinder > Picker > menu",
+    "bindings": {
+      "ctrl-alt-f": "text_finder::ToProjectSearch"
+    }
+  }
+]

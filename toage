@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Render time spans the way a human reads them: "5d", "2h13m", "47s".
+
+This file is installed twice: as the `toage` command and, under the name
+`toage.py`, into a directory on PYTHONPATH (see the Makefile). Tools can
+therefore either pipe text through it or import `toage()` / `format_span()`
+and stay in one process.
+"""
+
+import argparse
+import datetime
+import re
+import sys
+
+__all__ = [
+    'DEFAULT_DROP_SECONDS',
+    'DEFAULT_MAX_UNITS',
+    'DEFAULT_UNITS',
+    'RESET',
+    'UNITS',
+    'format_span',
+    'parse_color',
+    'parse_color_rule',
+    'parse_span',
+    'parse_time',
+    'parse_units',
+    'toage',
+]
+
+# largest unit first: a span is rendered from its most significant unit down
+UNITS = (('w', 604800), ('d', 86400), ('h', 3600), ('m', 60), ('s', 1))
+UNIT_SIZES = dict(UNITS)
+
+# weeks are opt-in: "41d3h" is easier to place than "5w6d", and a unit that is
+# left out rolls into the next smaller one
+DEFAULT_UNITS = 'dhms'
+
+# two units are enough to place a span ("2h13m"); more only adds noise
+DEFAULT_MAX_UNITS = 2
+
+# seconds stop being interesting once an hour has passed, which is the same
+# rule as dropping them as soon as a larger unit is present
+DEFAULT_DROP_SECONDS = 3600
+
+TIMESTAMP_PATTERN = re.compile(
+    r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?')
+EPOCH_PATTERN = re.compile(r'\d+(?:\.\d+)?')
+SPAN_PATTERN = re.compile(r'(\d+)([wdhms])')
+
+RESET = '\033[0m'
+UTC = datetime.timezone.utc
+
+
+def parse_span(text):
+    """Turn "90", "90s", "2h" or "1d12h" into seconds, "never" into None."""
+    text = str(text).strip().lower()
+    if text in ('', 'never', 'none', 'off'):
+        return None
+    if EPOCH_PATTERN.fullmatch(text):
+        return int(float(text))
+
+    total = 0
+    position = 0
+    for match in SPAN_PATTERN.finditer(text):
+        # the matches have to cover the whole text without gaps, otherwise
+        # something like "2hours" would silently be read as "2h"
+        if match.start() != position:
+            break
+        total += int(match.group(1)) * UNIT_SIZES[match.group(2)]
+        position = match.end()
+    if position == 0 or position != len(text):
+        raise ValueError(f'invalid time span: {text}')
+    return total
+
+
+def parse_units(text):
+    """Read "wdhms" (also "w,d,h" or "w d h") as a set of units to print."""
+    units = re.sub(r'[\s,]', '', str(text).strip().lower())
+    unknown = set(units) - set(UNIT_SIZES)
+    if unknown or not units:
+        raise ValueError(f'invalid units: {text}')
+    return units
+
+
+def parse_color(text):
+    """Read a color as an escape sequence, as "\\033[...m" text or as SGR codes.
+
+    The palette stays with the caller - every tool has its own - so only the
+    codes it hands over are used, never a built-in color.
+    """
+    color = str(text)
+    # a shell can pass the escape byte itself, a Makefile or a config file
+    # usually cannot, so the written forms are understood as well
+    for written in ('\\033', '\\e', '\\x1b'):
+        color = color.replace(written, '\033')
+    if '\033' in color:
+        return color
+    if re.fullmatch(r'[0-9;]+', color):
+        return f'\033[{color}m'
+    raise ValueError(f'invalid color: {text}')
+
+
+def parse_color_rule(text):
+    """Read "SPAN=COLOR" as a rule, a bare "COLOR" as the one for every span."""
+    span, separator, color = str(text).partition('=')
+    if not separator:
+        return (None, parse_color(span))
+    return (parse_span(span), parse_color(color))
+
+
+def colorize(span, total, colors):
+    """Wrap a formatted span in the color of the first rule that matches it."""
+    if not span or not colors:
+        return span
+    for threshold, color in colors:
+        if threshold is None or total < threshold:
+            return f'{color}{span}{RESET}'
+    return span
+
+
+def parse_time(text, has_timezone=True):
+    """Parse an ISO 8601 timestamp or epoch seconds into an aware UTC datetime.
+
+    `has_timezone` is kept for callers that pass it positionally; the offset is
+    detected from the text itself. Timestamps without one are read as local
+    time, which is what dropping the offset used to mean here.
+    """
+    text = str(text).strip()
+    if EPOCH_PATTERN.fullmatch(text):
+        return datetime.datetime.fromtimestamp(float(text), UTC)
+    # fromisoformat only learned to read a trailing "Z" in Python 3.11
+    date = datetime.datetime.fromisoformat(re.sub(r'[Zz]$', '+00:00', text))
+    return date.astimezone(UTC)
+
+
+def format_span(seconds, units=DEFAULT_UNITS, max_units=DEFAULT_MAX_UNITS,
+                drop_seconds=DEFAULT_DROP_SECONDS, drop_minutes=None,
+                drop_hours=None, minimum=0, colors=None):
+    """Format a number of seconds as a compact span.
+
+    `units` selects which units may appear at all; a unit left out of it rolls
+    into the next smaller one, so the default "dhms" prints "41d3h" and not
+    "5w6d". `drop_seconds`, `drop_minutes` and `drop_hours` name the span from
+    which on that unit is left out, so the precision can shrink as the span
+    grows: with `drop_minutes=7200` something two hours old reads "2h" instead
+    of "2h13m". None keeps the unit at any size. `max_units` caps how many
+    units are printed, `minimum` raises spans that would otherwise round to
+    nothing - a span of zero prints as the empty string.
+
+    `colors` is a list of (span, color) rules, the first matching one wins and a
+    span of None matches everything, so a caller can fade a span out as it grows
+    without knowing how it is going to be formatted. An empty span stays
+    uncolored, since escape codes around nothing are only noise.
+    """
+    # a timestamp in the future has no age, and neither has one that is younger
+    # than the requested minimum
+    total = max(int(seconds), 0, int(minimum or 0))
+    drops = {'s': drop_seconds, 'm': drop_minutes, 'h': drop_hours}
+
+    remainder = total
+    parts = []
+    for unit, size in UNITS:
+        if unit not in units:
+            continue
+        value, remainder = divmod(remainder, size)
+        threshold = drops.get(unit)
+        if not value or (threshold is not None and total >= threshold):
+            continue
+        parts.append(f'{value}{unit}')
+        if max_units and len(parts) >= max_units:
+            break
+    return colorize(''.join(parts), total, colors)
+
+
+def toage(date_str, has_timezone=True, now=None, **options):
+    """Age of a timestamp as a compact span, e.g. "14d" or "12h".
+
+    `now` overrides the reference point, so a batch of timestamps can be
+    rendered against the same moment. Remaining options go to `format_span()`.
+    """
+    date = parse_time(date_str, has_timezone)
+    if now is None:
+        now = datetime.datetime.now(UTC)
+    elif not isinstance(now, datetime.datetime):
+        now = parse_time(now)
+    return format_span((now - date).total_seconds(), **options)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Print time spans as compact, human readable ages.',
+        epilog='Without TIME arguments and without --lines, every ISO 8601 '
+               'timestamp read on stdin is replaced by its age.')
+    parser.add_argument('time', nargs='*', metavar='TIME',
+                        help='ISO 8601 timestamp or epoch seconds to print the '
+                             'age of, one age per line')
+    parser.add_argument('-n', '--now', metavar='TIME',
+                        help='reference point instead of the current time, so '
+                             'a batch of ages stays consistent')
+    parser.add_argument('-U', '--units', type=parse_units, metavar='UNITS',
+                        default=DEFAULT_UNITS,
+                        help='units that may appear, largest first; a unit left '
+                             'out rolls into the next smaller one, so "wdhms" '
+                             'prints "5w6d" where the default prints "41d3h" '
+                             f'(default: {DEFAULT_UNITS})')
+    parser.add_argument('-u', '--max-units', type=int, metavar='N',
+                        default=DEFAULT_MAX_UNITS,
+                        help='print at most N units, 0 for all '
+                             f'(default: {DEFAULT_MAX_UNITS})')
+    parser.add_argument('--drop-seconds', type=parse_span, metavar='SPAN',
+                        default=DEFAULT_DROP_SECONDS,
+                        help='leave out seconds from SPAN on, "never" to always '
+                             'keep them (default: 1h)')
+    parser.add_argument('--drop-minutes', type=parse_span, metavar='SPAN',
+                        default=None,
+                        help='leave out minutes from SPAN on (default: never)')
+    parser.add_argument('--drop-hours', type=parse_span, metavar='SPAN',
+                        default=None,
+                        help='leave out hours from SPAN on (default: never)')
+    parser.add_argument('-m', '--min', type=parse_span, metavar='SPAN',
+                        default=0,
+                        help='shortest span to report, so anything younger is '
+                             'still printed as SPAN instead of as nothing '
+                             '(default: 0, which prints nothing)')
+    parser.add_argument('-c', '--color', type=parse_color_rule, metavar='RULE',
+                        action='append', dest='colors',
+                        help='color spans below SPAN, as "SPAN=COLOR" or as a '
+                             'plain "COLOR" for every span; repeatable, the '
+                             'first matching rule wins, so name the smallest '
+                             'span first. COLOR is an escape sequence, its '
+                             'written "\\033[36m" form or bare SGR codes '
+                             'like "38;5;6"')
+    parser.add_argument('-l', '--lines', action='store_true',
+                        help='read one timestamp or epoch per line from stdin '
+                             'instead of scanning lines for timestamps')
+
+    args = parser.parse_args(argv)
+    options = {
+        'units': args.units,
+        'max_units': args.max_units,
+        'drop_seconds': args.drop_seconds,
+        'drop_minutes': args.drop_minutes,
+        'drop_hours': args.drop_hours,
+        'minimum': args.min,
+        'colors': args.colors,
+    }
+
+    try:
+        now = parse_time(args.now) if args.now else datetime.datetime.now(UTC)
+    except ValueError as error:
+        parser.error(f'invalid --now value: {error}')
+
+    if args.time or args.lines:
+        values = args.time or [line.strip() for line in sys.stdin]
+        for value in values:
+            if not value:
+                print()
+                continue
+            try:
+                print(toage(value, now=now, **options))
+            except ValueError as error:
+                sys.stderr.write(f'{parser.prog}: {error}\n')
+                return 1
+        return 0
+
+    def replace(match):
+        # a filter must not damage lines it cannot make sense of, so an
+        # unparseable timestamp is left as it is
+        try:
+            return toage(match.group(0), now=now, **options)
+        except ValueError:
+            return match.group(0)
+
+    for line in sys.stdin:
+        sys.stdout.write(TIMESTAMP_PATTERN.sub(replace, line))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

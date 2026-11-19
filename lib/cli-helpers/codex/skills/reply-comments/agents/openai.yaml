@@ -1,0 +1,4 @@
+interface:
+  display_name: "Short German Thread Replies"
+  short_description: "German replies to open PR and MR discussions"
+  default_prompt: "Use $reply-comments to draft short German replies to open PR or MR discussions based on the changes made and preview them for approval."

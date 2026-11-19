@@ -1,0 +1,12 @@
+#!/bin/bash
+
+if [ "${XDG_SESSION_TYPE}" == "x11" ] || [[ "${DESKTOP_SESSION}" == *"xorg" ]] || [ -z "${WAYLAND_DISPLAY}" ]; then
+    echo "x"
+    exit 0
+elif [ "${XDG_SESSION_TYPE}" == "wayland" ] || [ "${DESKTOP_SESSION}" == *"wayland" ] || [ -n "${WAYLAND_DISPLAY}" ]; then
+    echo "wayland"
+    exit 0
+fi
+
+echo "ERROR: Unknown"
+exit 1

@@ -1,0 +1,21 @@
+[mgr]
+prepend_keymap = [
+  { on = "<Enter>", run = "plugin smart-enter", desc = "Enter the child directory, or open the file" },
+  { on = "<Backspace>", run = "leave", desc = "Go up to parent directory" },
+  { on = "<Esc>", run = "plugin smart-esc", desc = "Cancel visual/selection/filter/find, or quit" },
+  { on = "<F2>", run = "rename", desc = "Rename the directory or file" },
+  { on = "<F3>", run = "plugin toggle-sort", desc = "Toggle natural/name and newest-first sort" },
+  { on = "d", run = "plugin trash-delete", desc = "Trash selected files" },
+  { on = "D", run = "plugin trash-delete", desc = "Trash selected files" },
+  { on = "<Delete>", run = "plugin trash-delete", desc = "Trash selected files" },
+  { on = "<S-Delete>", run = "plugin trash-delete", desc = "Trash selected files" },
+  { on = "<PageUp>",   run = "arrow -5", desc = "Move up 5 lines" },
+  { on = "<PageDown>", run = "arrow 5",  desc = "Move down 5 lines" },
+  { on = "<S-Up>",   run = "seek -5", desc = "Scroll preview up" },
+  { on = "<S-Down>", run = "seek 5",  desc = "Scroll preview down" },
+  { on = "K",        run = "seek -5", desc = "Scroll preview up" },
+  { on = "J",        run = "seek 5",  desc = "Scroll preview down" },
+  { on = ["c", "C"], run = ["plugin copy-file-contents"], desc = "Copy file contents" },
+  { on = "<S-c>", run = ["plugin copy-file-contents"], desc = "Copy contents of file" },
+  { on = "z", run = "shell --block vim-fzf", desc = "Fuzzy find a file" },
+]

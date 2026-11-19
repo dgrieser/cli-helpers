@@ -1,0 +1,6 @@
+description: Chrome
+bindings: ['<Shift><Control>b']
+focus:
+  class: [google-chrome]
+launch:
+  desktop: google-chrome

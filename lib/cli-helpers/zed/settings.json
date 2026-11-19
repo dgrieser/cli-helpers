@@ -1,0 +1,96 @@
+// Zed settings
+//
+// For information on how to configure Zed, see the Zed
+// documentation: https://zed.dev/docs/configuring-zed
+//
+// To see all of Zed's default settings without changing your
+// custom settings, run `zed: open default settings` from the
+// command palette (cmd-shift-p / ctrl-shift-p)
+{
+  "vim_mode": false,
+  "diff_view_style": "split",
+  "cli_default_open_behavior": "new_window",
+  "minimap": {
+    "current_line_highlight": "none",
+    "thumb_border": "left_open",
+    "thumb": "always",
+    "display_in": "active_editor",
+    "show": "always",
+  },
+  "scrollbar": {
+    "diagnostics": "warning",
+    "selected_text": false,
+    "git_diff": false,
+  },
+  "relative_line_numbers": "disabled",
+  "sticky_scroll": {
+    "enabled": true,
+  },
+  "excerpt_context_lines": 5,
+  "which_key": {
+    "enabled": true,
+  },
+  "autosave": {
+    "after_delay": {
+      "milliseconds": 1000,
+    },
+  },
+  "icon_theme": {
+    "mode": "system",
+    "light": "Zed (Default)",
+    "dark": "Zed (Default)",
+  },
+  "project_panel": {
+    "dock": "left",
+  },
+  "outline_panel": {
+    "dock": "left",
+  },
+  "collaboration_panel": {
+    "dock": "left",
+  },
+  "agent": {
+    "default_profile": "write",
+    "default_model": {
+      "effort": "medium",
+      "provider": "zed.dev",
+      "model": "gpt-5.5",
+      "enable_thinking": true,
+    },
+    "dock": "right",
+    "favorite_models": [],
+    "model_parameters": [],
+  },
+  "git_panel": {
+    "dock": "left",
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+  },
+  "restore_on_startup": "empty_tab",
+  "cursor_shape": "bar",
+  "buffer_line_height": "comfortable",
+  "buffer_font_family": ".ZedMono",
+  "redact_private_values": true,
+  "text_rendering_mode": "platform_default",
+  "ui_font_size": 16.0,
+  "buffer_font_size": 16.0,
+  "agent_ui_font_size": 16.0,
+  "agent_buffer_font_size": 16.0,
+  "theme": {
+    "mode": "system",
+    "light": "One Light",
+    "dark": "One Dark",
+  },
+  "profiles": {
+    "LargeFonts": {
+      "settings": {
+        "buffer_font_size": 20.0,
+        "ui_font_size": 20.0,
+        "agent_ui_font_size": 20.0,
+        "agent_buffer_font_size": 20.0,
+      },
+    },
+  },
+}

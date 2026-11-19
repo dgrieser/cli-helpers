@@ -1,0 +1,59 @@
+#!/bin/bash
+
+delay=1
+retries=-1
+
+usage() {
+    echo "usage: $(basename "${0}") [-r retries] [-d delay] '<command>'" 1>&2
+    exit 1
+}
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+while [[ "${1}" == "-"* ]]; do
+    if [ "${1}" == "-r" ]; then
+        shift
+        if ! [[ "${1}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: -r [retries] must be numeric"
+            usage
+            exit 1
+        fi
+        retries=${1}
+        shift
+    elif [ "${1}" == "-d" ]; then
+        shift
+        if ! [[ "${1}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: -d [delay] must be numeric"
+            usage
+            exit 1
+        fi
+        delay=${1}
+        shift
+    else
+        usage
+        exit 1
+    fi
+done
+
+cmd="$@"
+
+n=${retries}
+first=0
+exitcode=1
+until [ ${n} -eq 0 ]; do
+    if [ ${first} -eq 0 ]; then
+        first=1
+    else
+        sleep ${delay}
+    fi
+    bash -c "${cmd}"
+    exitcode=$?
+    [ ${exitcode} -eq 0 ] && break
+    [ ${exitcode} -eq 130 ] && break
+    [ ${n} -gt 0 ] && n=$((n-1))
+done
+
+exit ${exitcode}

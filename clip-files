@@ -1,0 +1,52 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    echo "usage: ${APP_NAME} [-m|--markdown] <files ...>" 1>&2
+    echo
+    echo "${APP_NAME} copies the file name and content of the specified files into the clipboard." 1>&2
+    echo "Optionally, it can also wrap the content in markdown code blocks." 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+NL=$'\n'
+markdown=0
+files=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -m|--markdown)
+            markdown=1
+            ;;
+        *)
+            files+=("${1}")
+            ;;
+    esac
+    shift
+done
+
+[ "${#files[@]}" -eq 0 ] && usage
+
+content=""
+for file in "${files[@]}"; do
+    [ ! -f "${file}" ] && fail "${file} is not a file"
+    [ -n "${content}" ] && content="${content}${NL}${NL}"
+    content="${content}${file}${NL}"
+    [ ${markdown} -eq 1 ] && content="${content}\`\`\`${NL}"
+    content="${content}$(cat "${file}" 2>/dev/null)${NL}"
+    [ ${markdown} -eq 1 ] && content="${content}\`\`\`${NL}"
+done
+
+echo -n "${content}" | clip

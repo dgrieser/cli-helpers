@@ -1,0 +1,4 @@
+description: Toggle microphone
+bindings: ['<Shift><Control>a']
+launch:
+  command: [amixer-mic-toggle]

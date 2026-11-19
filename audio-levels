@@ -1,0 +1,57 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename $0) [-h|--help|--list-devices] <pulseaudio-device>" 1>&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "${pid}" ]; then
+        kill -9 "${pid}" 2>/dev/null
+        wait "${pid}" 2>/dev/null
+    fi
+    echo
+    exit 0
+}
+
+list_devices() {
+    pactl -f json list sources short | jq -r '.[].name'
+}
+
+device=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "--list-devices --h --help $(list_devices | tr '\n' ' ')"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --list-devices)
+            pactl -f json list sources short | jq -r '.[].name'
+            exit 0
+            ;;
+        *)
+            [ -z "${device}" ] && device="${1}" || usage
+            ;;
+    esac
+    shift
+done
+
+[ -z "${device}" ] && device="default"
+
+trap cleanup INT
+sox -t pulseaudio "${device}" -n stats &
+pid=$!
+
+
+while true; do
+    IFS= read -rsn1 key
+    if [[ $key == $'\e' ]] || [[ $key == 'q' ]] || [[ $key == '' ]]; then
+        break
+    fi
+done
+
+cleanup

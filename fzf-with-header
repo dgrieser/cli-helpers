@@ -1,0 +1,1742 @@
+#!/bin/bash
+
+function usage() {
+    echo "usage: $(basename "${0}") [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--ask-keep-keys <key>,...] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--watch-command <command>] [--columns <comma separated columns>] [--filter-columns <comma separated columns>] [--delimiter <delimiter>] [--hscroll] [<query ...>] -- [fzf args]" 1>&2
+    exit 1
+}
+
+color_settings='bg+:'"${COLOR_SELECTION_BACKGROUND:-238}"',header:'"${COLOR_TABLE_HEADER:-238}"':italic'
+color_style="${COLOR_MODE}"
+
+C_HELP=$'\033[90m'      # grey descriptions (matches reminder's help text)
+C_KEY=$'\033[38;5;250m' # lighter grey keys
+C_RESET=$'\033[0m'
+
+cmd=""
+key_cmd=""
+fzf_rc=0
+# keys handled inside the running fzf instead of ending it: silently or with the
+# terminal handed over, each of them with or without a reload of the list
+reload_keys=""
+exec_reload_keys=""
+silent_keys=""
+exec_keys=""
+msg_file=""
+# a command whose output leads the footer, in front of the watch indicator: for
+# a caller that has a state of its own to name there
+footer_prefix_cmd=""
+# keys that ask the user something before their command runs, answered on the
+# query line of the running fzf instead of on a prompt of its own
+declare -A ask_question
+declare -A ask_kind
+declare -A ask_prefill
+declare -A ask_pick_cmd
+declare -A ask_question_cmd
+declare -A ask_submit_actions
+declare -A ask_close_submit
+declare -A ask_close_cancel
+declare -A ask_restore_extra
+declare -A ask_reload
+ask_keys=()
+# the keys of the caller that keep working while a question is open: every other
+# one of them is dead for as long as it is asked, because a key that relists or
+# changes what is listed would take the candidates away from the question. A key
+# that knows about the question itself - one that walks its candidates - says so
+# with this
+ask_keep_keys=""
+# a command naming the prompt, asked again after every key handled inside fzf:
+# for a caller whose prompt names a state its keys change
+prompt_cmd=""
+declare -A key_desc
+key_desc_order=()
+args=""
+query=""
+delimiter='  +'
+hscroll_arg=--no-hscroll
+watch_seconds=0
+# the wait before the first reload: unset means the one of --watch, so the first
+# reload comes no sooner than every one after it. A caller wanting the first list
+# earlier or later than the interval names --watch-delay itself
+watch_delay=""
+watch_while_cmd=""
+# a command naming the seconds between two reloads, asked again while watching:
+# for a caller whose view changes into one that is worth watching less often
+watch_interval_cmd=""
+# the command a watched list is reloaded with, where that is not the one it was
+# listed with first: for a caller that can refresh a list it has already cheaper
+# than it can make one
+watch_cmd=""
+watcher_pid=""
+watch_reset_file=""
+refresh_key="ctrl-r"
+reverse=1
+print_query=0
+preview_toggle_key="ctrl-p"
+preview_width_key="ctrl-g"
+# the widths ctrl-g offers on top of the one the caller asked for, which the
+# cycle ends on again
+preview_widths="70 85 40"
+fzf_bindings='shift-left:change-preview-window(wrap),shift-right:change-preview-window(nowrap)'
+
+# text handed to a shell that fzf starts, e.g. a question of a caller
+shell_quote() {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+# fzf ends an action argument on the character that closes it, so an argument
+# carrying text of a caller is wrapped in a pair the text does not use itself;
+# the last form takes the rest of the argument and needs no closing character,
+# which only works for the last action of a binding
+action_arg() {
+    local action="${1}"
+    local body="${2}"
+    local pair open close
+
+    for pair in '()' '[]' '{}' '<>' '~~' '!!' '@@' '%%' '^^' '&&' '**' ';;' '//' '||'; do
+        open="${pair:0:1}"
+        close="${pair:1:1}"
+        [[ "${body}" == *"${open}"* ]] && continue
+        [[ "${body}" == *"${close}"* ]] && continue
+        printf '%s%s%s%s' "${action}" "${open}" "${body}" "${close}"
+        return 0
+    done
+    printf '%s:%s' "${action}" "${body}"
+}
+
+# Emit a shell printf command whose placeholder arguments are expanded by fzf.
+# Keeping them outside the quoted literal segments preserves spaces and quotes.
+question_printf() {
+    local text="${1}" field
+    printf "printf '%%s'"
+    while [[ "${text}" =~ \{[+fsqn0-9.,-]*\} ]]; do
+        field="${BASH_REMATCH[0]}"
+        printf ' %s %s' "$(shell_quote "${text%%"${field}"*}")" "${field}"
+        text="${text#*"${field}"}"
+    done
+    printf ' %s' "$(shell_quote "${text}")"
+}
+
+ask_outside() {
+    local key="${1}" question prefill picked rest pick_status
+    question="$(cat "${ask_question_file}")"
+    prefill="$(cat "${ask_prefill_file}")"
+
+    if [ "${ask_kind[${key}]}" = "pick" ]; then
+        picked="$(FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --ansi --no-multi \
+            --header-lines=1 --print-query --expect=enter --cycle \
+            --bind 'tab:down,shift-tab:up' --prompt "${question} " --query "${prefill}" \
+            < <("${SHELL:-/bin/sh}" -c "${ask_pick_cmd[${key}]}"))"
+        pick_status=$?
+        [ "${pick_status}" -le 1 ] && [[ "${picked}" == *$'\n'* ]] || return 1
+        rest="${picked#*$'\n'}"
+        [ "${rest%%$'\n'*}" = "enter" ] || return 1
+        outside_answer="${picked%%$'\n'*}"
+        [[ "${rest}" == *$'\n'* ]] && outside_answer="${rest#*$'\n'}"
+        return 0
+    fi
+
+    [ "${ask_kind[${key}]}" = "confirm" ] && question="${question} [y/N]"
+    outside_answer="$(prompt --complete --prompt="${question}" --prefill="${prefill}" --no-abort-message </dev/null)" || return 1
+    [ "${ask_kind[${key}]}" != "confirm" ] || [[ "${outside_answer}" =~ ^[yY]([eE][sS])?$ ]]
+}
+
+# The question of an asking key is answered on the query line, so enter and esc
+# mean something else while one is open. Both are bound to this router, which is
+# called by fzf with the query as its answer: it prints the actions fzf is to
+# perform - the ones the caller had on those keys while nothing is being asked,
+# and otherwise the ones that submit the answer or drop it.
+#
+# Everything it needs to know is written to a configuration file before fzf
+# starts, so the bindings stay plain text and no state has to be passed through
+# them.
+ask_route() {
+    local mode="${1}"
+    local answer="${2}"
+    local line="${3}"
+    local config="${FZF_WITH_HEADER_ASK_CONFIG}"
+    local key kind actions search submit pending
+
+    { [ -z "${config}" ] || [ ! -s "${config}" ]; } && return 0
+    # shellcheck source=/dev/null
+    . "${config}"
+
+    # A list was emptied and the one that takes its place is named in this file.
+    # Loading it here instead of in the binding that emptied it is what lets fzf
+    # draw the empty list first: a load already on its way keeps the rows that were
+    # there before on the screen until it is through, and a picked answer must not
+    # be looked for among them.
+    if [ "${mode}" == "load" ]; then
+        if [ -s "${ask_pending}" ]; then
+            pending="$(cat "${ask_pending}")"
+            rm -f "${ask_pending}"
+            printf '%s' "reload(${pending})+first"
+            return 0
+        fi
+        # a question is open, and what a caller draws from this event would take
+        # the hint that names the keys answering it off the footer
+        [ -e "${ask_state}" ] && return 0
+        printf '%s' "${ask_load_actions}"
+        return 0
+    fi
+
+    # nothing is being asked: the keys do what they do for the caller
+    if [ ! -e "${ask_state}" ]; then
+        [ "${mode}" == "submit" ] && printf '%s' "${ask_enter_actions}"
+        [ "${mode}" == "cancel" ] && printf '%s' "${ask_esc_actions}"
+        return 0
+    fi
+
+    key="$(cat "${ask_state}" 2>/dev/null)"
+    rm -f "${ask_state}"
+    kind="${ask_kinds[${key}]}"
+    # the candidates are on the screen, so the list that comes back is the caller's
+    # own one again: whichever action below empties the list picks it up from here
+    [ "${kind}" == "pick" ] && printf '%s' "${ask_list_cmd}" > "${ask_pending}"
+    # a candidate list is answered with the row the cursor is on; a query that
+    # matches nothing is taken as it was typed, so a value the list does not
+    # offer can be given as well
+    [ "${kind}" == "pick" ] && [ -n "${line}" ] && answer="${line}"
+    printf '%s' "${answer}" > "${ask_answer}"
+
+    actions="${ask_restore}"
+    # the search was switched off while the answer was typed, so the query line
+    # would not filter anything; it only comes back if the caller had it, and an
+    # input line the caller does not show at all is hidden again
+    search="$(cat "${ask_search}" 2>/dev/null)"
+    [ "${search}" == "enabled" ] && actions="enable-search+${actions}"
+    [ "${search}" == "hidden" ] && actions="${actions}+hide-input"
+    # whatever else the question took away, e.g. the preview command of the caller
+    [ -n "${ask_restores[${key}]}" ] && actions="${actions}+${ask_restores[${key}]}"
+
+    submit=0
+    if [ "${mode}" == "submit" ] && [ -n "${ask_submits[${key}]}" ]; then
+        # a confirmation runs the command on a yes and on nothing else, so
+        # anything else typed there is a no, as is an empty answer
+        if [ "${kind}" != "confirm" ] || [[ "${answer}" =~ ^[yY]([eE][sS])?$ ]]; then
+            submit=1
+        fi
+    fi
+    # the list of a candidate question is the caller's again; whatever the key
+    # command does with the answer follows it, and its own actions come last
+    # because the message they end with takes the rest of the binding
+    if [ ${submit} -eq 1 ]; then
+        [ -n "${ask_closes_submit[${key}]}" ] && actions="${actions}+${ask_closes_submit[${key}]}"
+        actions="${actions}+${ask_submits[${key}]}"
+    else
+        [ -n "${ask_closes_cancel[${key}]}" ] && actions="${actions}+${ask_closes_cancel[${key}]}"
+    fi
+    printf '%s' "${actions}"
+    return 0
+}
+
+# every footer line is a line the list does not get, so on a short terminal the
+# keys are packed into fewer lines and the ones that no longer fit are dropped
+# behind a "…"
+pack_keys_header() {
+    local max_lines="${1}"
+    local i lines=1 line_width=${lead_width} entry_width limit
+    keys_header=""
+    footer_ind_sep=""
+    for (( i = 0; i < ${#entry_texts[@]}; i++ )); do
+        entry_width="${entry_widths[i]}"
+        # the last line still has to fit the "…" marker
+        limit=${max_line_width}
+        [ ${lines} -ge ${max_lines} ] && limit=$(( max_line_width - 2 ))
+        if [ -z "${keys_header}" ] && [ ${lead_width} -eq 0 ]; then
+            keys_header="${entry_texts[i]}"
+            line_width=${entry_width}
+        elif [ $((line_width + 3 + entry_width)) -le ${limit} ]; then
+            if [ -z "${keys_header}" ]; then
+                # the prefix or the indicator holds the first slot of the line
+                footer_ind_sep=" · "
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header} · ${entry_texts[i]}"
+            fi
+            line_width=$((line_width + 3 + entry_width))
+        elif [ ${lines} -lt ${max_lines} ]; then
+            if [ -z "${keys_header}" ]; then
+                footer_ind_sep=$'\n'
+                keys_header="${entry_texts[i]}"
+            else
+                keys_header="${keys_header}"$'\n'"${entry_texts[i]}"
+            fi
+            line_width=${entry_width}
+            lines=$((lines + 1))
+        else
+            [ -z "${keys_header}" ] && [ ${lead_width} -gt 0 ] && footer_ind_sep=" "
+            keys_header="${keys_header}${C_HELP}…"
+            break
+        fi
+    done
+}
+
+# everything of the footer but the prefix, which is asked for separately because
+# it is the one part that changes without the footer being rebuilt here
+build_footer_rest() {
+    local indicator="${1}"
+    local lead=""
+
+    if [ ${watch_indicator} -eq 1 ] && [ -n "${indicator}" ]; then
+        # the prefix took the first slot, so the indicator follows it
+        [ -n "${footer_prefix_cmd}" ] && lead="${C_HELP} · "
+        lead="${lead}${C_HELP}↻ ${indicator}"
+    fi
+    if [ -z "${lead}" ] && [ -z "${footer_prefix_cmd}" ]; then
+        printf '%s' "${keys_header}${C_RESET}"
+    else
+        # the separator carries the color of the descriptions, so a prefix that
+        # ends its own colors does not leave it in whatever comes next
+        printf '%s' "${lead}${C_HELP}${footer_ind_sep}${keys_header}${C_RESET}"
+    fi
+}
+
+build_footer() {
+    local indicator="${1}"
+
+    [ -n "${footer_prefix_cmd}" ] && printf '%s' "$(${footer_prefix_cmd} 2>/dev/null)"
+    build_footer_rest "${indicator}"
+}
+
+# The footer as the running fzf has room for it right now, called by fzf whenever
+# that room may have changed: the terminal was resized, the preview was toggled or
+# changed its width, or the footer is put together again anyway. fzf names its own
+# size and the one of a visible preview, so the keys are packed into what is left
+# of them instead of into what the terminal looked like when the picker started.
+#
+# The keys, and whatever else leads them, are written to a configuration file
+# before fzf starts, the way the router of the asking keys gets its own.
+footer_route() {
+    local config="${1}"
+    local cols lines list_cols avail_lines max_footer_lines
+    local indicator="" prefix="" prefix_text prefix_width=0
+
+    { [ -z "${config}" ] || [ ! -s "${config}" ]; } && return 0
+    # shellcheck source=/dev/null
+    . "${config}"
+
+    # a question is open, and the footer names the keys that answer it
+    if [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ]; then
+        cat "${ask_hint_file}" 2>/dev/null
+        return 0
+    fi
+
+    cols="${FZF_COLUMNS:-80}"
+    lines="${FZF_LINES:-24}"
+    list_cols="${cols}"
+    # fzf spends three lines on the header, its separator and the prompt, and one
+    # more on the border above the footer
+    avail_lines=$(( lines - 4 ))
+    # a hidden preview names no size at all; a visible one next to the list takes
+    # its columns and border away from the footer, one above or below it the lines
+    if [ -n "${FZF_PREVIEW_COLUMNS}" ]; then
+        if [ $(( cols - FZF_PREVIEW_COLUMNS )) -gt 6 ]; then
+            list_cols=$(( cols - FZF_PREVIEW_COLUMNS - 4 ))
+        else
+            avail_lines=$(( avail_lines - ${FZF_PREVIEW_LINES:-0} - 2 ))
+        fi
+    fi
+    # fzf indents the footer by 2 columns
+    max_line_width=$(( list_cols - 4 ))
+    [ "${max_line_width}" -lt 10 ] && max_line_width=10
+    # not even one line to spare: the list needs every row it can get
+    max_footer_lines=$(( avail_lines - min_list_lines ))
+    [ ${max_footer_lines} -lt 1 ] && return 0
+
+    [ ${watch_indicator} -eq 1 ] && indicator="$(cat "${footer_indicator_file}" 2>/dev/null)"
+    if [ -n "${footer_prefix_cmd}" ]; then
+        prefix="$(${footer_prefix_cmd} 2>/dev/null)"
+        prefix_text="$(printf '%s' "${prefix}" | sed 's/\x1b\[[0-9;]*m//g')"
+        [ -n "${prefix_text}" ] && prefix_width=$(( ${#prefix_text} + 3 ))
+    fi
+    lead_width=$(( ind_width + prefix_width ))
+    pack_keys_header ${max_footer_lines}
+    printf '%s' "${prefix}"
+    build_footer_rest "${indicator}"
+    return 0
+}
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --columns)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${args}" ] && args="${args} "
+            args="${args}--with-nth=${1}"
+            ;;
+        --filter-columns)
+            shift
+            [ -z "${1}" ] && usage
+            [ -n "${args}" ] && args="${args} "
+            args="${args}--nth=${1}"
+            ;;
+        --command)
+            shift
+            [ -z "${1}" ] && usage
+            cmd="${1}"
+            print_query=1
+            ;;
+        --key-command)
+            shift
+            [ -z "${1}" ] && usage
+            key_cmd="${1}"
+            print_query=1
+            ;;
+        --key-descriptions)
+            shift
+            [ -z "${1}" ] && usage
+            IFS=',' read -ra desc_pairs <<< "${1}"
+            for desc_pair in "${desc_pairs[@]}"; do
+                [[ "${desc_pair}" != *:* ]] && usage
+                key_desc["${desc_pair%%:*}"]="${desc_pair#*:}"
+                key_desc_order+=("${desc_pair%%:*}")
+            done
+            ;;
+        --reload-keys)
+            shift
+            [ -z "${1}" ] && usage
+            reload_keys="${1}"
+            ;;
+        --ask-keep-keys)
+            shift
+            [ -z "${1}" ] && usage
+            ask_keep_keys="${1}"
+            ;;
+        --exec-reload-keys)
+            shift
+            [ -z "${1}" ] && usage
+            exec_reload_keys="${1}"
+            ;;
+        --silent-keys)
+            shift
+            [ -z "${1}" ] && usage
+            silent_keys="${1}"
+            ;;
+        --exec-keys)
+            shift
+            [ -z "${1}" ] && usage
+            exec_keys="${1}"
+            ;;
+        --ask|--confirm|--pick)
+            ask_option="${1}"
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" != *:* ]] && usage
+            ask_key="${1%%:*}"
+            ask_text="${1#*:}"
+            { [ -z "${ask_key}" ] || [ -z "${ask_text}" ]; } && usage
+            [ -z "${ask_question[${ask_key}]+x}" ] && ask_keys+=("${ask_key}")
+            ask_question["${ask_key}"]="${ask_text}"
+            case "${ask_option}" in
+                --confirm)
+                    ask_kind["${ask_key}"]="confirm"
+                    ;;
+                --pick)
+                    ask_kind["${ask_key}"]="pick"
+                    ;;
+                *)
+                    ask_kind["${ask_key}"]="ask"
+                    ;;
+            esac
+            ;;
+        --ask-prefill)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" != *:* ]] && usage
+            ask_key="${1%%:*}"
+            ask_text="${1#*:}"
+            { [ -z "${ask_key}" ] || [ -z "${ask_text}" ]; } && usage
+            ask_prefill["${ask_key}"]="${ask_text}"
+            ;;
+        --pick-command)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" != *:* ]] && usage
+            ask_key="${1%%:*}"
+            ask_text="${1#*:}"
+            { [ -z "${ask_key}" ] || [ -z "${ask_text}" ]; } && usage
+            ask_pick_cmd["${ask_key}"]="${ask_text}"
+            ;;
+        --question-command)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" != *:* ]] && usage
+            ask_key="${1%%:*}"
+            ask_text="${1#*:}"
+            { [ -z "${ask_key}" ] || [ -z "${ask_text}" ]; } && usage
+            ask_question_cmd["${ask_key}"]="${ask_text}"
+            ;;
+        --prompt-command)
+            shift
+            [ -z "${1}" ] && usage
+            prompt_cmd="${1}"
+            ;;
+        --ask-route)
+            # the router of the asking keys, called by the running fzf
+            shift
+            ask_route "${@}"
+            exit 0
+            ;;
+        --footer-route)
+            # the footer packed into the room the running fzf has for it
+            shift
+            footer_route "${@}"
+            exit 0
+            ;;
+        --footer-prefix)
+            shift
+            [ -z "${1}" ] && usage
+            footer_prefix_cmd="${1}"
+            ;;
+        --watch)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            watch_seconds="${1}"
+            ;;
+        --watch-delay)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            watch_delay="${1}"
+            ;;
+        --watch-while)
+            shift
+            [ -z "${1}" ] && usage
+            watch_while_cmd="${1}"
+            ;;
+        --watch-interval-command)
+            shift
+            [ -z "${1}" ] && usage
+            watch_interval_cmd="${1}"
+            ;;
+        --watch-command)
+            shift
+            [ -z "${1}" ] && usage
+            watch_cmd="${1}"
+            ;;
+        --delimiter)
+            shift
+            [ -z "${1}" ] && usage
+            delimiter="${1}"
+            ;;
+        --hscroll)
+            hscroll_arg=--hscroll
+            ;;
+        --help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            if [[ "${1}" == -* ]]; then
+                break
+            else
+                [ -n "${query}" ] && query="${query} "
+                query="${query}${1}"
+            fi
+            ;;
+    esac
+    shift
+done
+
+args="${hscroll_arg}${args:+ ${args}}"
+
+if [ ${print_query} -eq 1 ]; then
+    [ -n "${args}" ] && args="${args} "
+    args="${args}--print-query"
+fi
+
+[ ${watch_seconds} -gt 0 ] && [ -z "${cmd}" ] && echo "ERROR: --watch requires --command" 1>&2 && usage
+[ -n "${watch_while_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-while requires --watch" 1>&2 && usage
+[ -n "${watch_interval_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-interval-command requires --watch" 1>&2 && usage
+[ -n "${watch_cmd}" ] && [ ${watch_seconds} -eq 0 ] && echo "ERROR: --watch-command requires --watch" 1>&2 && usage
+# no delay was named, so the first reload waits what every one after it waits
+[ -z "${watch_delay}" ] && watch_delay="${watch_seconds}"
+inline_keys="${reload_keys}${exec_reload_keys}${silent_keys}${exec_keys}"
+[ -n "${inline_keys}" ] && [ -z "${key_cmd}" ] && echo "ERROR: keys handled inside fzf require --key-command" 1>&2 && usage
+[ -n "${reload_keys}${exec_reload_keys}" ] && [ -z "${cmd}" ] && echo "ERROR: reloading keys require --command" 1>&2 && usage
+for ask_key in "${ask_keys[@]}"; do
+    case "${ask_key}" in
+        enter|return|esc|escape)
+            echo "ERROR: '${ask_key}' answers a question and cannot ask one itself" 1>&2
+            usage
+            ;;
+    esac
+done
+for ask_key in "${!ask_prefill[@]}"; do
+    [ -z "${ask_question[${ask_key}]+x}" ] &&
+        echo "ERROR: --ask-prefill for key '${ask_key}' requires a question for it" 1>&2 && usage
+done
+for ask_key in "${!ask_question_cmd[@]}"; do
+    [ -z "${ask_question[${ask_key}]+x}" ] &&
+        echo "ERROR: --question-command for key '${ask_key}' requires a question for it" 1>&2 && usage
+done
+for ask_key in "${!ask_pick_cmd[@]}"; do
+    [ "${ask_kind[${ask_key}]}" == "pick" ] ||
+        { echo "ERROR: --pick-command for key '${ask_key}' requires --pick for it" 1>&2; usage; }
+done
+for ask_key in "${ask_keys[@]}"; do
+    [ "${ask_kind[${ask_key}]}" == "pick" ] || continue
+    [ -z "${ask_pick_cmd[${ask_key}]+x}" ] &&
+        echo "ERROR: --pick for key '${ask_key}' requires --pick-command for it" 1>&2 && usage
+    # the candidates take the place of the list, so it has to be listable again
+    [ -z "${cmd}" ] && echo "ERROR: --pick requires --command" 1>&2 && usage
+done
+
+# Old fzf builds vary in which options and bindings they accept. Probes run
+# without user defaults, perform a noninteractive match and have no side effects.
+fzf_supports() {
+    FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf "$@" --filter='' <<< probe &>/dev/null
+}
+
+legacy_fzf=0
+supports_start=1
+supports_preview_width=1
+supports_inline_header=1
+supports_questions=1
+info_style=inline-right
+inline_reload_action=reload-sync
+fzf_version="$(FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --version 2>/dev/null)"
+if [[ "${fzf_version}" =~ ^0\.([0-9]+)([.[:space:]]|$) ]] && [ "${BASH_REMATCH[1]}" -lt 63 ]; then
+    legacy_fzf=1
+    footer_prefix_cmd=""
+    fzf_supports --info=inline-right || info_style=inline
+    fzf_supports --bind 'start:reload(true)' || supports_start=0
+    fzf_supports --bind 'ctrl-g:change-preview-window(right,40%|)' || supports_preview_width=0
+    [ -z "${inline_keys}" ] || fzf_supports --bind 'ctrl-x:transform-header(true)' || supports_inline_header=0
+    [ -z "${reload_keys}${exec_reload_keys}" ] || fzf_supports --bind 'ctrl-x:reload-sync(true)' || inline_reload_action=reload
+    [ "${watch_seconds}" -eq 0 ] || fzf_supports --listen=127.0.0.1:39000 || watch_seconds=0
+    if [ "${#ask_keys[@]}" -gt 0 ] && ! fzf_supports --bind 'ctrl-x:show-input+change-ghost()+transform(true)+print(x)+reload-sync(true)'; then
+        supports_questions=0
+    fi
+fi
+
+# a manual refresh signals the watcher through this file to restart its timer
+[ ${watch_seconds} -gt 0 ] && watch_reset_file="${TMPDIR:-/tmp}/fzf-with-header-refresh.$$"
+# the same file put into the environment of everything started from inside fzf:
+# a key command that ended whatever --watch-while waits for can touch it to put
+# the watching back on its interval, instead of the user having to press ctrl-r
+[ -n "${watch_reset_file}" ] && export FZF_WITH_HEADER_WATCH_RESET="${watch_reset_file}"
+
+# a silent key runs its command inside fzf, so whatever it writes to stderr is
+# collected here instead of the screen and shown as a message above the header
+[ -n "${inline_keys}" ] && msg_file="${TMPDIR:-/tmp}/fzf-with-header-message.$$"
+
+# the script itself, called back by the running fzf for what only it knows
+self_path="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)"
+[ -z "${self_path}" ] && self_path="${BASH_SOURCE[0]}"
+printf -v self_arg '%q' "${self_path}"
+
+# The footer is packed again by the running fzf whenever the room for it may have
+# changed, from what this file says about the keys and the rest of it; the watch
+# indicator lives in a file of its own, because the watcher changes it later.
+footer_config_file=""
+footer_route_action=""
+if [ "${legacy_fzf}" -eq 0 ]; then
+    footer_config_file="${TMPDIR:-/tmp}/fzf-with-header-footer.$$"
+    footer_indicator_file="${footer_config_file}.indicator"
+    footer_route_action="$(action_arg transform-footer "${self_arg} --footer-route '${footer_config_file}'")"
+fi
+
+# The files an open question lives in. The one naming the key is the question
+# itself: as long as it is there, the query line holds an answer instead of a
+# search, and the router below decides what enter and esc do. The others keep
+# what the picker looked like before the question, so it can be put back.
+ask_prefix=""
+ask_dir=""
+ask_state_file=""
+ask_pending_file=""
+route_questions=0
+if [ "${#ask_keys[@]}" -gt 0 ]; then
+    if [ "${supports_questions}" -eq 1 ]; then
+        route_questions=1
+        ask_prefix="${TMPDIR:-/tmp}/fzf-with-header-ask.$$"
+    else
+        ask_dir="$(mktemp -d "${TMPDIR:-/tmp}/fzf-with-header-ask.XXXXXXXX")" || exit 1
+        trap 'rmdir "${ask_dir}"' EXIT
+        ask_prefix="${ask_dir}/ask"
+    fi
+    ask_state_file="${ask_prefix}.state"
+    ask_line_file="${ask_prefix}.line"
+    ask_answer_file="${ask_prefix}.answer"
+    ask_question_file="${ask_prefix}.question"
+    ask_prefill_file="${ask_prefix}.prefill"
+    ask_query_file="${ask_prefix}.query"
+    ask_prompt_file="${ask_prefix}.prompt"
+    ask_ghost_file="${ask_prefix}.ghost"
+    ask_search_file="${ask_prefix}.search"
+    ask_pending_file="${ask_prefix}.pending"
+    ask_hint_file="${ask_prefix}.hint"
+    ask_config_file="${ask_prefix}.config"
+fi
+
+if [ ${reverse} -eq 1 ]; then
+    [ -n "${args}" ] && args="${args} "    
+    args="${args}--layout=default"
+fi
+
+if [ "${supports_preview_width}" -eq 0 ]; then
+    fzf_bindings='shift-left:toggle-preview-wrap,shift-right:toggle-preview-wrap'
+fi
+args="${args} --bind=${fzf_bindings}"
+
+split_key_spec() {
+    # split a bind/expect spec on commas outside parentheses
+    echo "${1}" | awk '{
+        depth = 0; buf = ""
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "(") depth++
+            else if (c == ")") depth--
+            if (c == "," && depth == 0) { if (buf != "") print buf; buf = "" } else buf = buf c
+        }
+        if (buf != "") print buf
+    }'
+}
+
+format_key_entry() {
+    local entry="${1}"
+    local key="${entry%%:*}"
+    if [ -n "${key_desc[${key}]+x}" ]; then
+        printf '%s\t%s\n' "${key}" "${key_desc[${key}]}"
+    elif [[ "${entry}" != *:* ]]; then
+        printf '%s\t\n' "${entry}"
+    else
+        local action="${entry#*:}"
+        case "${action}" in
+            execute\(*|execute-silent\(*|become\(*)
+                local body="${action#*\(}"
+                body="${body%)}"
+                printf '%s\t%s\n' "${key}" "${body%% *}"
+                ;;
+            *)
+                printf '%s\t%s\n' "${key}" "$(echo "${action}" | sed 's/([^)]*)//g')"
+                ;;
+        esac
+    fi
+}
+
+collect_keys() {
+    local entry
+    while read -r entry; do
+        format_key_entry "${entry}"
+    done < <(split_key_spec "${1}")
+}
+
+# extract position and size from a --preview-window spec (other tokens ignored)
+preview_pos="right"
+preview_size="50"
+preview_size_pct=1
+parse_preview_window() {
+    local toks tok
+    IFS=',:' read -ra toks <<< "${1}"
+    for tok in "${toks[@]}"; do
+        case "${tok}" in
+            up|down|left|right)
+                preview_pos="${tok}"
+                ;;
+            [0-9]*%)
+                preview_size="${tok%\%}"
+                preview_size_pct=1
+                ;;
+            [0-9]*)
+                preview_size="${tok}"
+                preview_size_pct=0
+                ;;
+        esac
+    done
+}
+
+# with --height the footer has to fit into that window instead of the terminal
+height_spec=""
+parse_height() {
+    local spec="${1#\~}"
+    [[ "${spec}" =~ ^[0-9]+%?$ ]] && height_spec="${spec}"
+}
+
+# The list is loaded by fzf itself (see the start binding further down), so the
+# caller's own start actions have to join that one binding instead of replacing
+# it: they are taken out of their --bind arguments here and put back together
+# with the reload below. Everything else is passed on untouched.
+#
+# With a key that asks something, enter and esc are routed as well, because they
+# answer the question while one is open: what the caller had on them is taken
+# over by the router instead of being passed on, and the keys that were to end
+# fzf are turned into bindings of their own - a key that only waits in --expect
+# cannot be unbound while a question is open, and would end the picker in the
+# middle of an answer.
+caller_args=("$@")
+passthrough_args=()
+caller_start_actions=""
+caller_enter_actions=""
+caller_esc_actions=""
+caller_load_actions=""
+ask_expect_keys=""
+ask_taken_spec=""
+arg_index=0
+while [ ${arg_index} -lt ${#caller_args[@]} ]; do
+    bind_arg="${caller_args[arg_index]}"
+    if [ "${legacy_fzf}" -eq 1 ]; then
+        case "${bind_arg}" in
+            --preview-window|--preview-window=*)
+                if [ "${bind_arg}" = "--preview-window" ] && [ $((arg_index + 1)) -lt "${#caller_args[@]}" ]; then
+                    arg_index=$((arg_index + 1))
+                    bind_arg="--preview-window=${caller_args[arg_index]}"
+                fi
+                if [[ "${bind_arg}" == *,* ]] && ! fzf_supports "${bind_arg}"; then
+                    bind_arg="${bind_arg//,/:}"
+                fi
+                ;;
+            --ellipsis=*)
+                if ! fzf_supports "${bind_arg}"; then
+                    arg_index=$((arg_index + 1))
+                    continue
+                fi
+                ;;
+        esac
+    fi
+    bind_spec=""
+    bind_style=""
+    expect_spec=""
+    expect_style=""
+    case "${bind_arg}" in
+        --bind=*)
+            bind_spec="${bind_arg#--bind=}"
+            bind_style="inline"
+            ;;
+        --bind)
+            bind_spec="${caller_args[arg_index + 1]}"
+            bind_style="pair"
+            ;;
+        --expect=*)
+            if [ "${route_questions}" -eq 1 ]; then
+                expect_spec="${bind_arg#--expect=}"
+                expect_style="inline"
+            fi
+            ;;
+        --expect)
+            if [ "${route_questions}" -eq 1 ]; then
+                expect_spec="${caller_args[arg_index + 1]}"
+                expect_style="pair"
+            fi
+            ;;
+    esac
+    if [ -n "${bind_spec}" ]; then
+        kept_spec=""
+        while read -r bind_entry; do
+            [ -z "${bind_entry}" ] && continue
+            if [[ "${bind_entry}" == start:* ]]; then
+                caller_start_actions="${caller_start_actions:+${caller_start_actions}+}${bind_entry#start:}"
+            elif [ "${route_questions}" -eq 1 ] && [[ "${bind_entry}" == enter:* || "${bind_entry}" == return:* ]]; then
+                caller_enter_actions="${caller_enter_actions:+${caller_enter_actions}+}${bind_entry#*:}"
+                ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
+            elif [ "${route_questions}" -eq 1 ] && [[ "${bind_entry}" == esc:* || "${bind_entry}" == escape:* ]]; then
+                caller_esc_actions="${caller_esc_actions:+${caller_esc_actions}+}${bind_entry#*:}"
+                ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
+            elif [ "${route_questions}" -eq 1 ] && [[ "${bind_entry}" == load:* ]]; then
+                caller_load_actions="${caller_load_actions:+${caller_load_actions}+}${bind_entry#load:}"
+                ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${bind_entry}"
+            else
+                kept_spec="${kept_spec:+${kept_spec},}${bind_entry}"
+            fi
+        done < <(split_key_spec "${bind_spec}")
+        if [ -n "${kept_spec}" ]; then
+            if [ "${bind_style}" == "inline" ]; then
+                passthrough_args+=("--bind=${kept_spec}")
+            else
+                passthrough_args+=(--bind "${kept_spec}")
+            fi
+        fi
+        [ "${bind_style}" == "pair" ] && arg_index=$(( arg_index + 1 ))
+    elif [ -n "${expect_spec}" ]; then
+        while read -r expect_key; do
+            [ -z "${expect_key}" ] && continue
+            ask_expect_keys="${ask_expect_keys:+${ask_expect_keys},}${expect_key}"
+            ask_taken_spec="${ask_taken_spec:+${ask_taken_spec},}${expect_key}"
+        done < <(split_key_spec "${expect_spec}")
+        [ "${expect_style}" == "pair" ] && arg_index=$(( arg_index + 1 ))
+    else
+        passthrough_args+=("${bind_arg}")
+    fi
+    arg_index=$(( arg_index + 1 ))
+done
+set -- "${passthrough_args[@]}"
+
+# what enter and esc are to do while nothing is being asked: the actions of the
+# caller, or the exit an --expect key stood for - the key it printed included,
+# because that first line of the output is what a key command reads its key from.
+# An --expect list also made fzf write an empty line for every other exit, so
+# enter keeps writing one when it was not part of that list itself.
+ask_enter_print=""
+ask_esc_print=""
+expect_bind_args=()
+while read -r expect_key; do
+    [ -z "${expect_key}" ] && continue
+    case "${expect_key}" in
+        enter|return)
+            ask_enter_print="${expect_key}"
+            ;;
+        esc|escape)
+            ask_esc_print="${expect_key}"
+            ;;
+        *)
+            expect_bind_args+=(--bind "${expect_key}:print(${expect_key})+accept")
+            ;;
+    esac
+done < <(split_key_spec "${ask_expect_keys}")
+
+ask_enter_actions="accept"
+[ -n "${ask_expect_keys}" ] && ask_enter_actions="print()+accept"
+[ -n "${ask_enter_print}" ] && ask_enter_actions="print(${ask_enter_print})+accept"
+if [ -n "${caller_enter_actions}" ]; then
+    ask_enter_actions="${caller_enter_actions}"
+    [ -n "${ask_enter_print}" ] && ask_enter_actions="print(${ask_enter_print})+${ask_enter_actions}"
+fi
+ask_esc_actions="abort"
+[ -n "${ask_esc_print}" ] && ask_esc_actions="print(${ask_esc_print})+accept"
+if [ -n "${caller_esc_actions}" ]; then
+    ask_esc_actions="${caller_esc_actions}"
+    [ -n "${ask_esc_print}" ] && ask_esc_actions="print(${ask_esc_print})+${ask_esc_actions}"
+fi
+
+mapped_keys=""
+used_keys=""
+has_preview=0
+# the preview command of the caller, kept because the candidates of a picking key
+# are none of its business: it is taken away while they are shown and given back
+# afterwards, which leaves a hidden preview hidden
+caller_preview_cmd=""
+prev=""
+for arg in "$@"; do
+    spec=""
+    case "${arg}" in
+        --preview|--preview=*)
+            has_preview=1
+            [ "${arg}" != "--preview" ] && caller_preview_cmd="${arg#--preview=}"
+            ;;
+        --preview-window=*)
+            parse_preview_window "${arg#--preview-window=}"
+            ;;
+        --height=*)
+            parse_height "${arg#--height=}"
+            ;;
+        --bind=*)
+            spec="${arg#--bind=}"
+            ;;
+        --expect=*)
+            spec="${arg#--expect=}"
+            ;;
+        *)
+            case "${prev}" in
+                --bind|--expect)
+                    spec="${arg}"
+                    ;;
+                --preview)
+                    caller_preview_cmd="${arg}"
+                    ;;
+                --preview-window)
+                    parse_preview_window "${arg}"
+                    ;;
+                --height)
+                    parse_height "${arg}"
+                    ;;
+            esac
+            ;;
+    esac
+    if [ -n "${spec}" ]; then
+        mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${spec}")"
+        used_keys="${used_keys}"$'\n'"$(split_key_spec "${spec}" | sed 's/:.*//')"
+    fi
+    prev="${arg}"
+done
+
+# the keys the routing above took out of the caller's arguments are still keys of
+# the picker, so they belong in the footer and count as used
+if [ -n "${ask_taken_spec}" ]; then
+    mapped_keys="${mapped_keys}"$'\n'"$(collect_keys "${ask_taken_spec}")"
+    used_keys="${used_keys}"$'\n'"$(split_key_spec "${ask_taken_spec}" | sed 's/:.*//')"
+fi
+
+# explicit --key-descriptions: show exactly those keys, in the given order
+if [ "${#key_desc_order[@]}" -gt 0 ]; then
+    mapped_keys=""
+    for desc_key in "${key_desc_order[@]}"; do
+        mapped_keys="${mapped_keys}${desc_key}"$'\t'"${key_desc[${desc_key}]}"$'\n'
+    done
+fi
+
+# keys handled inside the running fzf instead of letting it exit on them and
+# starting it again below. The bindings are built further down, once the width a
+# message may use is known.
+inline_specs=()
+collect_inline_keys() {
+    local keys="${1}"
+    local mode="${2}"
+    local do_reload="${3}"
+    local key
+
+    [ -z "${keys}" ] && return 0
+    while read -r key; do
+        [ -z "${key}" ] && continue
+        if [ "${legacy_fzf}" -eq 1 ] && ! fzf_supports --bind "${key}:ignore"; then
+            continue
+        fi
+        if printf '%s\n' "${used_keys}" | grep -qxF -- "${key}"; then
+            echo "ERROR: key '${key}' is handled inside fzf and bound as well (--bind/--expect)" 1>&2
+            exit 1
+        fi
+        used_keys="${used_keys}"$'\n'"${key}"
+        inline_specs+=("${key}"$'\t'"${mode}"$'\t'"${do_reload}")
+        # a caller without --key-descriptions still gets the key into the footer
+        [ "${#key_desc_order[@]}" -eq 0 ] && mapped_keys="${mapped_keys}"$'\n'"${key}"$'\t'
+    done < <(split_key_spec "${keys}")
+}
+
+collect_inline_keys "${reload_keys}" silent 1
+collect_inline_keys "${exec_reload_keys}" exec 1
+collect_inline_keys "${silent_keys}" silent 0
+collect_inline_keys "${exec_keys}" exec 0
+
+# a question is asked inside the picker, so the key it belongs to has to be one
+# that is handled there as well
+for ask_key in "${ask_keys[@]}"; do
+    if ! printf '%s\n' "${inline_specs[@]}" | cut -f1 | grep -qxF -- "${ask_key}"; then
+        if [ "${legacy_fzf}" -eq 1 ] && ! fzf_supports --bind "${ask_key}:ignore"; then
+            continue
+        fi
+        echo "ERROR: key '${ask_key}' asks for input and must be handled inside fzf (--reload-keys, --exec-reload-keys, --silent-keys or --exec-keys)" 1>&2
+        exit 1
+    fi
+done
+
+# the preview-wrap bindings are always added, so they belong in the footer
+# whenever there is a preview window - including the --key-descriptions case,
+# which rebuilds the list from the caller's keys alone. The preview is toggled
+# on top of that, unless the caller uses that key for something else. Toggling
+# and resizing the preview give the list another width, so both pack the footer
+# again for it.
+preview_toggle_bind_args=()
+preview_width_bind_args=()
+if [ "${has_preview}" -eq 1 ]; then
+    # the width is cycled by one binding: fzf walks through the specs of a
+    # change-preview-window separated by "|", and the empty one at the end is the
+    # window the caller asked for, with whatever else it had in it
+    if [ "${supports_preview_width}" -eq 1 ] && ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_width_key}"; then
+        width_spec=""
+        for preview_width in ${preview_widths}; do
+            [ "${preview_size_pct}" -eq 1 ] && [ "${preview_width}" == "${preview_size}" ] && continue
+            width_spec="${width_spec}${width_spec:+|}${preview_pos},${preview_width}%"
+        done
+        if [ -n "${width_spec}" ]; then
+            preview_width_bind_args=(--bind "${preview_width_key}:change-preview-window(${width_spec}|)${footer_route_action:++${footer_route_action}}")
+            used_keys="${used_keys}"$'\n'"${preview_width_key}"
+            mapped_keys="${preview_width_key}"$'\t'"width"$'\n'"${mapped_keys}"
+        fi
+    fi
+    if ! printf '%s\n' "${used_keys}" | grep -qxF -- "${preview_toggle_key}"; then
+        preview_toggle_bind_args=(--bind "${preview_toggle_key}:toggle-preview${footer_route_action:++${footer_route_action}}")
+        used_keys="${used_keys}"$'\n'"${preview_toggle_key}"
+        mapped_keys="${preview_toggle_key}"$'\t'"preview"$'\n'"${mapped_keys}"
+    fi
+    mapped_keys="shift ←/→"$'\t'"wrap"$'\n'"${mapped_keys}"
+fi
+
+# any --command view can be reloaded on demand; leave the key alone if the
+# caller already uses it for something else
+refresh_bind_args=()
+if [ -n "${cmd}" ] && [ -z "${key_desc[${refresh_key}]+x}" ] &&
+   ! printf '%s\n' "${used_keys}" | grep -qxF -- "${refresh_key}"; then
+    refresh_action="reload(${cmd})"
+    # the manual reload already happened, the watcher only restarts its timer
+    [ -n "${watch_reset_file}" ] && refresh_action="${refresh_action}+execute-silent(touch '${watch_reset_file}')"
+    refresh_bind_args=(--bind "${refresh_key}:${refresh_action}")
+    mapped_keys="${mapped_keys}"$'\n'"${refresh_key}"$'\t'"↻"
+fi
+
+# merge keys sharing a description: "alt-+ stage" + "insert stage" -> "alt-+/insert stage"
+mapped_keys="$(echo "${mapped_keys}" | awk 'BEGIN { FS = OFS = "\t" }
+    $1 == "" { next }
+    seen[$0]++ { next }
+    $2 != "" && ($2 in slot) { keys[slot[$2]] = keys[slot[$2]] "/" $1; next }
+    { n++; keys[n] = $1; descs[n] = $2; if ($2 != "") slot[$2] = n }
+    END { for (i = 1; i <= n; i++) print keys[i], descs[i] }')"
+# wrap the key list to the terminal width (footer lines never soft-wrap);
+# widths are measured on the entry with its ANSI colors stripped, and fzf
+# indents the footer by 2 columns
+term_cols="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
+[ -z "${term_cols}" ] && term_cols="$(tput cols 2>/dev/null)"
+[ -z "${term_cols}" ] && term_cols="${COLUMNS:-80}"
+max_line_width=$((term_cols - 4))
+# a left/right preview window shrinks the footer to the list pane; up/down
+# previews leave the full width
+if [ "${has_preview}" -eq 1 ]; then
+    case "${preview_pos}" in
+        left|right)
+            if [ "${preview_size_pct}" -eq 1 ]; then
+                list_cols=$(( term_cols * (100 - preview_size) / 100 ))
+            else
+                list_cols=$(( term_cols - preview_size ))
+            fi
+            max_line_width=$(( list_cols - 4 ))
+            ;;
+    esac
+fi
+[ "${max_line_width}" -lt 10 ] && max_line_width=10
+
+# the bindings for the keys handled inside fzf: run the key command with the same
+# payload an --expect exit would have produced (the key on the first line, the
+# selected line on the second), then reload the list if the key changed anything.
+#
+# A silent key keeps the screen, so its stderr is collected and shown above the
+# header until the next key wipes it; an exec key gets the terminal handed over
+# and shows whatever it wants itself. fzf's stdout is the command substitution
+# around it, so a silent key command must not write there.
+#
+# fzf keeps the cursor on its index across a reload and fires the load event
+# again, so the cursor is put back on the first entry unless the caller positions
+# it on load itself.
+inline_bind_args=()
+outside_ask_bind_args=()
+declare -A outside_ask_modes
+cursor_action="+first"
+printf '%s\n' "${used_keys}" | grep -qxF -- "load" && cursor_action=""
+[ "${inline_reload_action}" = "reload" ] && cursor_action=""
+show_message="transform-header:m=\$(tail -n 3 '${msg_file}' 2>/dev/null); [ -n \"\${m}\" ] && printf '%s\n' \"\${m}\" | fold -s -w ${max_line_width} | awk '{printf \"\033[31m%s\033[0m\n\", \$0}'"
+for spec in "${inline_specs[@]}"; do
+    IFS=$'\t' read -r inline_key inline_mode inline_reload <<< "${spec}"
+    if [ "${supports_questions}" -eq 0 ] && [ -n "${ask_question[${inline_key}]+x}" ]; then
+        # Let fzf expand its own placeholders before exiting. The first action
+        # records the key even if there is no row and the later actions skip.
+        outside_ask_modes["${inline_key}"]="${inline_mode}"
+        question="${ask_question[${inline_key}]}"
+        fallback_question="$(sed -E 's/\{[+fsqn0-9.,-]*\}//g' <<< "${question}")"
+        prepare_ask="printf '%s' $(shell_quote "${inline_key}") > '${ask_state_file}'; : > '${ask_line_file}'; : > '${ask_prefill_file}'"
+        prepare_ask="${prepare_ask}; printf '%s' $(shell_quote "${fallback_question}") > '${ask_question_file}'"
+        outside_binding="$(action_arg execute-silent "${prepare_ask}")"
+        outside_binding="${outside_binding}+$(action_arg execute-silent "printf '%s' {} > '${ask_line_file}'")"
+        question_command="${ask_question_cmd[${inline_key}]:-$(question_printf "${question}")}"
+        outside_binding="${outside_binding}+$(action_arg execute-silent "{ ${question_command}; } > '${ask_question_file}'")"
+        if [ -n "${ask_prefill[${inline_key}]+x}" ]; then
+            outside_binding="${outside_binding}+$(action_arg execute-silent "{ ${ask_prefill[${inline_key}]}; } > '${ask_prefill_file}'")"
+        fi
+        outside_ask_bind_args+=(--bind "${inline_key}:${outside_binding}+accept")
+        continue
+    fi
+    if [ -n "${ask_question[${inline_key}]+x}" ]; then
+        # an asking key runs its command once the question was answered, and the
+        # answer alone is what the round trip through fzf added: the line the
+        # question was asked on is the one that was under the cursor back then,
+        # not the one that is there now
+        payload="\"\$(printf '%s\n%s' '${inline_key}' \"\$(cat '${ask_line_file}')\")\""
+        answer_env="FZF_WITH_HEADER_ANSWER=\"\$(cat '${ask_answer_file}')\" "
+    else
+        payload="\"\$(printf '%s\n%s' '${inline_key}' {})\""
+        answer_env=""
+    fi
+    if [ "${inline_mode}" == "exec" ]; then
+        # the terminal is handed over, so stdout goes to it as well: fzf would
+        # pass on its own, which is the command substitution around it, and a
+        # command that pages only when it talks to a terminal would not page
+        # (the message of a previous key is gone once the screen was handed over)
+        action="execute(${answer_env}${key_cmd} ${payload} >/dev/tty; : > '${msg_file}')"
+    else
+        action="execute-silent(${answer_env}${key_cmd} ${payload} >/dev/null 2>'${msg_file}')"
+    fi
+    if [ "${inline_reload}" -eq 1 ]; then
+        # A picking key had the candidates in the place of the list, so the list
+        # coming back is not a newer version of what is on the screen but something
+        # else entirely: the list is emptied here and loaded by the load event that
+        # empties it, instead of replacing the rows only once they are all there - a
+        # row of the candidates must not be taken for one of the list in between.
+        if [ "${ask_kind[${inline_key}]}" == "pick" ]; then
+            action="${action}+reload-sync(true)${cursor_action}"
+        else
+            action="${action}+${inline_reload_action}(${cmd})${cursor_action}"
+        fi
+        # the list is up to date now, so the watcher restarts its interval
+        [ -n "${watch_reset_file}" ] && action="${action}+execute-silent(touch '${watch_reset_file}')"
+        # the row under the cursor may be another one, or say something else
+        [ "${has_preview}" -eq 1 ] && action="${action}+refresh-preview"
+    fi
+    # a prompt naming what the picker shows has to name it again once a key
+    # changed it
+    if [ "${supports_inline_header}" -eq 1 ]; then
+        [ -n "${prompt_cmd}" ] && action="${action}+transform-prompt(${prompt_cmd})"
+        action="${action}+${show_message}"
+    fi
+    if [ -n "${ask_question[${inline_key}]+x}" ]; then
+        # the key opens the question instead, and the router below performs these
+        # actions once it was answered
+        ask_submit_actions["${inline_key}"]="${action}"
+        ask_reload["${inline_key}"]="${inline_reload}"
+    else
+        inline_bind_args+=(--bind "${inline_key}:${action}")
+    fi
+done
+
+# with --watch the key list is led by a "↻ <n>s" indicator naming the reload
+# interval; reserve its widest form so the wrapping stays put when it changes
+footer_ind_sep=""
+watch_indicator=0
+ind_width=0
+if [ ${watch_seconds} -gt 0 ]; then
+    watch_indicator=1
+    ind_text="${watch_seconds}s"
+    [ ${watch_delay} -gt ${watch_seconds} ] && ind_text="${watch_delay}s"
+    # an interval command may name a wider one right away; a later change simply
+    # rewraps the footer
+    if [ -n "${watch_interval_cmd}" ]; then
+        watch_interval_start="$(${watch_interval_cmd} 2>/dev/null)"
+        [[ "${watch_interval_start}" =~ ^[0-9]+$ ]] &&
+            [ ${#watch_interval_start} -gt $(( ${#ind_text} - 1 )) ] && ind_text="${watch_interval_start}s"
+    fi
+    ind_width=$(( 2 + ${#ind_text} ))
+    # "↻ off" is shown once watching stopped
+    [ ${ind_width} -lt 5 ] && ind_width=5
+fi
+
+# a footer prefix leads the indicator, so both take their room out of the first
+# footer line; the width is measured on what the command prints right now, with
+# its colors stripped, and a later prefix of another width simply wraps as it
+# comes out
+prefix_width=0
+if [ -n "${footer_prefix_cmd}" ]; then
+    footer_prefix_text="$(${footer_prefix_cmd} 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+    [ -n "${footer_prefix_text}" ] && prefix_width=$(( ${#footer_prefix_text} + 3 ))
+fi
+# what leads the keys of the footer: the prefix, the indicator, or both
+lead_width=$(( ind_width + prefix_width ))
+
+# how many footer lines the terminal can spare
+term_lines="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)"
+[ -z "${term_lines}" ] && term_lines="$(tput lines 2>/dev/null)"
+[ -z "${term_lines}" ] && term_lines="${LINES:-24}"
+window_lines="${term_lines}"
+if [ -n "${height_spec}" ]; then
+    if [ "${height_spec}" != "${height_spec%\%}" ]; then
+        window_lines=$(( term_lines * ${height_spec%\%} / 100 ))
+        # a percentage never shrinks the window below fzf's --min-height
+        [ "${window_lines}" -lt 10 ] && window_lines=10
+    else
+        window_lines="${height_spec}"
+    fi
+    [ "${window_lines}" -gt "${term_lines}" ] && window_lines="${term_lines}"
+fi
+# fzf spends three lines on the header, its separator and the prompt, and one
+# more on the border above the footer
+avail_lines=$(( window_lines - 4 ))
+# an up/down preview eats list lines as well; a left/right one does not
+if [ "${has_preview}" -eq 1 ]; then
+    case "${preview_pos}" in
+        up|down)
+            if [ "${preview_size_pct}" -eq 1 ]; then
+                avail_lines=$(( avail_lines - window_lines * preview_size / 100 ))
+            else
+                # plus the two lines of the preview border
+                avail_lines=$(( avail_lines - preview_size - 2 ))
+            fi
+            ;;
+    esac
+fi
+# whatever the footer would like, the list keeps at least this many rows
+min_list_lines=3
+max_footer_lines=$(( avail_lines - min_list_lines ))
+
+entry_texts=()
+entry_widths=()
+while IFS=$'\t' read -r entry_key entry_desc; do
+    [ -z "${entry_key}" ] && continue
+    if [ -n "${entry_desc}" ]; then
+        entry_texts+=("${C_KEY}${entry_key}${C_HELP} ${entry_desc}")
+        entry_widths+=($(( ${#entry_key} + 1 + ${#entry_desc} )))
+    else
+        entry_texts+=("${C_KEY}${entry_key}")
+        entry_widths+=("${#entry_key}")
+    fi
+done <<< "${mapped_keys}"
+
+footer_enabled=1
+if [ ${max_footer_lines} -lt 1 ]; then
+    # not even one line to spare: the list needs every row it can get
+    footer_enabled=0
+    keys_header=""
+else
+    pack_keys_header ${max_footer_lines}
+fi
+
+# until the first reload the wait is the delay, afterwards the interval
+if [ ${watch_delay} -gt 0 ]; then
+    initial_indicator="${watch_delay}s"
+else
+    initial_indicator="${watch_seconds}s"
+fi
+
+# fzf is started with nothing to show and fetches the list on its start event, so
+# the picker is on the screen while the command is still running instead of after
+# it. Whatever the caller wanted to do on start follows the reload.
+[ ${watch_indicator} -eq 0 ] && initial_indicator=""
+
+# The footer given to fzf is packed for the terminal as it is now, and packed
+# again by fzf itself from the configuration written here once the room for it
+# changes: on a resize, on the preview keys above, and wherever else the footer
+# is put together again anyway. A footer that did not fit at first may still get
+# its room that way.
+footer_args=()
+footer_route_bind_args=()
+if [ -n "${footer_route_action}" ] &&
+   { [ "${#entry_texts[@]}" -gt 0 ] || [ "${watch_indicator}" -eq 1 ] || [ -n "${footer_prefix_cmd}" ]; }; then
+    [ ${footer_enabled} -eq 1 ] && footer_args=(--footer "$(build_footer "${initial_indicator}")")
+    {
+        declare -p entry_texts entry_widths
+        printf 'watch_indicator=%q\n' "${watch_indicator}"
+        printf 'ind_width=%q\n' "${ind_width}"
+        printf 'footer_prefix_cmd=%q\n' "${footer_prefix_cmd}"
+        printf 'footer_indicator_file=%q\n' "${footer_indicator_file}"
+        printf 'min_list_lines=%q\n' "${min_list_lines}"
+        printf 'ask_state_file=%q\n' "${ask_state_file}"
+        printf 'ask_hint_file=%q\n' "${ask_hint_file}"
+    } > "${footer_config_file}"
+    printf '%s' "${initial_indicator}" > "${footer_indicator_file}"
+    footer_route_bind_args=(--bind "resize:${footer_route_action}")
+    # the same action put into the environment of everything started from inside
+    # fzf: a caller that shows or hides the preview from actions it prints itself,
+    # e.g. through a transform, adds it to them to have the footer follow
+    export FZF_WITH_HEADER_FOOTER_ACTION="${footer_route_action}"
+else
+    footer_config_file=""
+    footer_route_action=""
+fi
+
+# fzf is started with nothing to show and fetches the list on its start event, so
+# the picker is on the screen while the command is still running instead of after
+# it. Whatever the caller wanted to do on start follows the reload; the footer
+# goes first, packed for the size fzf really came up with.
+start_action="${footer_route_action}"
+[ -n "${cmd}" ] && start_action="${start_action:+${start_action}+}reload(${cmd})"
+[ -n "${caller_start_actions}" ] && start_action="${start_action:+${start_action}+}${caller_start_actions}"
+start_bind_args=()
+[ "${supports_start}" -eq 1 ] && [ -n "${start_action}" ] && start_bind_args=(--bind "start:${start_action}")
+
+# A prefix names something the caller changes while the picker runs, so waiting
+# for the next watch interval to show it would be too late. Every reload fires
+# the load event, and every key that changes the prefix reloads, so the footer is
+# put together again there, with the prefix asked for anew.
+footer_refresh_bind_args=()
+if [ -n "${footer_prefix_cmd}" ] && [ -n "${footer_route_action}" ] && [ -n "${cmd}" ] &&
+   ! printf '%s\n' "${used_keys}" | grep -qxF -- "load"; then
+    footer_refresh_bind_args=(--bind "load:${footer_route_action}")
+fi
+
+# The bindings of the keys that ask something. Pressing one hands the query line
+# over to the answer: the question leads the input line instead of the prompt and
+# every other key is unbound until it is answered, so nothing ends the picker in
+# the middle of one. A typed answer switches the search off, so the list stays the
+# one the question was asked on; a picked one puts the candidates in its place and
+# keeps the search, because that is what finds them. What the picker looked like
+# before is written away by the same key and put back by the router once the
+# answer is in.
+ask_bind_args=()
+ask_router_bind_args=()
+if [ "${route_questions}" -eq 1 ]; then
+    # without a footer there is nothing to show a hint in, and nothing to restore
+    [ -n "${footer_route_action}" ] &&
+        printf '%s' "${C_HELP}enter submit · esc cancel${C_RESET}" > "${ask_hint_file}"
+
+    # Every key of the picker is dead while a question is open, apart from the two
+    # that answer it. A binding on the query changing goes with them, because what
+    # is typed there is an answer and not a search, and so does the one on a list
+    # being loaded: the candidates of a picking key fire that event, and whatever
+    # the caller draws from it would take the hint of the question off the footer.
+    # The other events fzf fires around the list are left alone.
+    ask_unbind_keys=""
+    while read -r ask_used_key; do
+        [ -z "${ask_used_key}" ] && continue
+        case "${ask_used_key}" in
+            enter|return|esc|escape|load|start|focus|zero|one|multi|jump*|click*|scroll*)
+                continue
+                ;;
+        esac
+        # a key the caller named as one of the question's own
+        [[ ",${ask_keep_keys}," == *",${ask_used_key},"* ]] && continue
+        [[ ",${ask_unbind_keys}," == *",${ask_used_key},"* ]] && continue
+        ask_unbind_keys="${ask_unbind_keys:+${ask_unbind_keys},}${ask_used_key}"
+    done <<< "${used_keys}"
+    ask_restore_actions="transform-prompt(cat '${ask_prompt_file}')+transform-ghost(cat '${ask_ghost_file}')+transform-query(cat '${ask_query_file}')"
+    [ -n "${footer_route_action}" ] && ask_restore_actions="${ask_restore_actions}+${footer_route_action}"
+    [ -n "${ask_unbind_keys}" ] && ask_restore_actions="${ask_restore_actions}+rebind(${ask_unbind_keys})"
+
+    for ask_key in "${ask_keys[@]}"; do
+        # a confirmation names its answers, so the prompt says what enter on an
+        # empty line means
+        ask_prompt_text="${ask_question[${ask_key}]}"
+        [ "${ask_kind[${ask_key}]}" == "confirm" ] && ask_prompt_text="${ask_prompt_text} [y/N]"
+        ask_prompt_text="${ask_prompt_text} "
+        # What the question is asked on is written away in two steps, because fzf
+        # skips a command carrying a placeholder while nothing is matched: with an
+        # empty list the first of them still runs, so the question is asked there as
+        # well, on nothing instead of on a row.
+        ask_open_body="printf '%s' $(shell_quote "${ask_key}") > '${ask_state_file}'"
+        ask_open_body="${ask_open_body}; : > '${ask_line_file}'"
+        ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_QUERY}\" > '${ask_query_file}'"
+        ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_PROMPT}\" > '${ask_prompt_file}'"
+        ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_GHOST}\" > '${ask_ghost_file}'"
+        ask_open_body="${ask_open_body}; printf '%s' \"\${FZF_INPUT_STATE}\" > '${ask_search_file}'"
+        # the candidates are picked up by the load event of the emptied list below
+        [ "${ask_kind[${ask_key}]}" == "pick" ] &&
+            ask_open_body="${ask_open_body}; printf '%s' $(shell_quote "${ask_pick_cmd[${ask_key}]}") > '${ask_pending_file}'"
+        # the question and the text the input starts with may name what is under the
+        # cursor with the placeholders of a binding, e.g. "Delete {1}?", which is
+        # what puts them into the second step
+        ask_open_row_body=""
+        ask_question_text=""
+        if [ -n "${ask_question_cmd[${ask_key}]+x}" ]; then
+            # a question naming a state the keys change has to be asked for anew
+            # every time it is put on the screen; what it prints is the question as
+            # it is, colors and trailing space included
+            ask_question_text="printf '%s' \"\$(${ask_question_cmd[${ask_key}]})\" > '${ask_question_file}'"
+            [ "${ask_kind[${ask_key}]}" == "confirm" ] &&
+                ask_question_text="${ask_question_text}; printf '%s' ' [y/N] ' >> '${ask_question_file}'"
+        else
+            ask_question_text="printf '%s' $(shell_quote "${ask_prompt_text}") > '${ask_question_file}'"
+        fi
+        if [[ "${ask_question_text}" == *'{'*'}'* ]]; then
+            # a question about a row has nothing to say about one that is not there,
+            # so what is left of it without the placeholders is asked instead
+            ask_open_body="${ask_open_body}; printf '%s' $(shell_quote "$(sed 's/{[^}]*}//g' <<< "${ask_prompt_text}")") > '${ask_question_file}'"
+            ask_open_row_body="${ask_question_text}"
+        else
+            ask_open_body="${ask_open_body}; ${ask_question_text}"
+        fi
+        if [ -n "${ask_prefill[${ask_key}]+x}" ]; then
+            ask_open_body="${ask_open_body}; : > '${ask_prefill_file}'"
+            ask_open_row_body="${ask_open_row_body:+${ask_open_row_body}; }{ ${ask_prefill[${ask_key}]}; } > '${ask_prefill_file}' 2>/dev/null"
+        else
+            ask_open_body="${ask_open_body}; : > '${ask_prefill_file}'"
+        fi
+        ask_open_action="$(action_arg execute-silent "${ask_open_body}")"
+        # the row the question is asked about: no row, nothing to write, and the
+        # files above hold what the first step left for that case
+        ask_open_row_body="printf '%s' {} > '${ask_line_file}'${ask_open_row_body:+; ${ask_open_row_body}}"
+        ask_open_action="${ask_open_action}+$(action_arg execute-silent "${ask_open_row_body}")"
+        # the keys go first, so nothing the rest of this binding sets off, e.g. the
+        # load event of the candidates below, runs anything of the caller
+        [ -n "${ask_unbind_keys}" ] && ask_open_action="${ask_open_action}+unbind(${ask_unbind_keys})"
+        # a picker that shows no input line at all still has to show the question
+        ask_open_action="${ask_open_action}+show-input+transform-prompt(cat '${ask_question_file}')"
+        if [ "${ask_kind[${ask_key}]}" == "pick" ]; then
+            # The candidates take the place of the list and are searched the way
+            # the list is, so the answer is fuzzy-found instead of typed out. A
+            # preview of the caller belongs to the rows of the list and not to
+            # these, so it is taken away while they are shown - an empty preview
+            # command closes the window without unhiding a hidden one, so the
+            # caller's own command puts it back the way it was.
+            ask_open_action="${ask_open_action}+enable-search+transform-query(cat '${ask_prefill_file}')+change-ghost()"
+            [ -n "${caller_preview_cmd}" ] && ask_open_action="${ask_open_action}+change-preview()"
+            # The list is emptied right here and the candidates are loaded by the
+            # load event that empties it: the rows of the list are off the screen the
+            # moment the question is there, and an answer given before the candidates
+            # arrived is the text that was typed and never a row of what the picker
+            # showed before.
+            ask_open_action="${ask_open_action}+reload-sync(true)+first"
+            [ -n "${caller_preview_cmd}" ] &&
+                ask_restore_extra["${ask_key}"]="$(action_arg change-preview "${caller_preview_cmd}")"
+            # coming back means the caller's list again, emptied and loaded the same
+            # way, and a preview built from the row of it the cursor ends up on
+            ask_close_actions="reload-sync(true)+first"
+            [ "${has_preview}" -eq 1 ] && ask_close_actions="${ask_close_actions}+refresh-preview"
+            ask_close_cancel["${ask_key}"]="${ask_close_actions}"
+            # a key that reloads empties the list itself, after its command ran
+            [ "${ask_reload[${ask_key}]}" == "1" ] || ask_close_submit["${ask_key}"]="${ask_close_actions}"
+        else
+            # the answer replaces the query, so the search is switched off: the
+            # list stays what it was while the answer is typed
+            ask_open_action="${ask_open_action}+disable-search+transform-query(cat '${ask_prefill_file}')+change-ghost()"
+        fi
+        [ -n "${footer_route_action}" ] && ask_open_action="${ask_open_action}+transform-footer(cat '${ask_hint_file}')"
+        ask_bind_args+=(--bind "${ask_key}:${ask_open_action}")
+    done
+
+    ask_router_bind_args=(
+        --bind "enter:transform:${self_arg} --ask-route submit {q} {}"
+        --bind "esc:transform:${self_arg} --ask-route cancel"
+        --bind "load:transform:${self_arg} --ask-route load"
+    )
+    # what the load event does while no question is open: the footer of a caller
+    # with a prefix, which the router prints instead of the binding built above,
+    # and whatever the caller had on that event
+    ask_load_actions=""
+    if [ "${#footer_refresh_bind_args[@]}" -gt 0 ]; then
+        ask_load_actions="${footer_refresh_bind_args[1]#load:}"
+        footer_refresh_bind_args=()
+    fi
+    [ -n "${caller_load_actions}" ] &&
+        ask_load_actions="${ask_load_actions:+${ask_load_actions}+}${caller_load_actions}"
+
+    # everything the router has to know, so the bindings above stay plain text
+    {
+        printf 'ask_state=%q\n' "${ask_state_file}"
+        printf 'ask_answer=%q\n' "${ask_answer_file}"
+        printf 'ask_search=%q\n' "${ask_search_file}"
+        printf 'ask_pending=%q\n' "${ask_pending_file}"
+        printf 'ask_list_cmd=%q\n' "${cmd}"
+        printf 'ask_load_actions=%q\n' "${ask_load_actions}"
+        printf 'ask_restore=%q\n' "${ask_restore_actions}"
+        printf 'ask_enter_actions=%q\n' "${ask_enter_actions}"
+        printf 'ask_esc_actions=%q\n' "${ask_esc_actions}"
+        printf 'declare -A ask_kinds=('
+        for ask_key in "${ask_keys[@]}"; do
+            printf '[%q]=%q ' "${ask_key}" "${ask_kind[${ask_key}]}"
+        done
+        printf ')\n'
+        printf 'declare -A ask_submits=('
+        for ask_key in "${ask_keys[@]}"; do
+            printf '[%q]=%q ' "${ask_key}" "${ask_submit_actions[${ask_key}]}"
+        done
+        printf ')\n'
+        printf 'declare -A ask_restores=('
+        for ask_key in "${ask_keys[@]}"; do
+            printf '[%q]=%q ' "${ask_key}" "${ask_restore_extra[${ask_key}]}"
+        done
+        printf ')\n'
+        printf 'declare -A ask_closes_submit=('
+        for ask_key in "${ask_keys[@]}"; do
+            printf '[%q]=%q ' "${ask_key}" "${ask_close_submit[${ask_key}]}"
+        done
+        printf ')\n'
+        printf 'declare -A ask_closes_cancel=('
+        for ask_key in "${ask_keys[@]}"; do
+            printf '[%q]=%q ' "${ask_key}" "${ask_close_cancel[${ask_key}]}"
+        done
+        printf ')\n'
+    } > "${ask_config_file}"
+    export FZF_WITH_HEADER_ASK_CONFIG="${ask_config_file}"
+fi
+
+update_fzf() {
+    local cmd="${1}"
+    local port="${2}"
+    local seconds="${3}"
+    local remaining="${watch_delay}"
+    local first=1
+    local idle=0
+    rm -f "${watch_reset_file}"
+    # fzf is started after this watcher, so give it a moment to open its port
+    [ ${remaining} -eq 0 ] && sleep 1
+    while true; do
+        # reloading stopped, but a manual refresh may bring the watched state
+        # back: wait for one and put the watching back on its interval - the
+        # condition is checked at the end of that interval, by which time the
+        # reload of the refresh has updated whatever it looks at
+        if [ ${idle} -eq 1 ]; then
+            while [ ! -e "${watch_reset_file}" ]; do
+                sleep 1
+            done
+            rm -f "${watch_reset_file}"
+            idle=0
+            remaining="${seconds}"
+            post_footer "${port}" "${seconds}s"
+            continue
+        fi
+        # counted down in steps instead of one sleep, so a manual refresh can
+        # restart the wait; the indicator only names the interval, so no redraw
+        while [ ${remaining} -gt 0 ]; do
+            sleep 1
+            remaining=$(( remaining - 1 ))
+            # a manual refresh reloaded already, so only the timer restarts
+            if [ -e "${watch_reset_file}" ]; then
+                rm -f "${watch_reset_file}"
+                remaining="${seconds}"
+            fi
+            # an interval named while the wait is running counts from here, so a
+            # view that just became a slow one is not reloaded once more first
+            if [ -n "${watch_interval_cmd}" ]; then
+                new_seconds="$(${watch_interval_cmd} 2>/dev/null)"
+                if [[ "${new_seconds}" =~ ^[0-9]+$ ]] && [ "${new_seconds}" -gt 0 ] &&
+                   [ "${new_seconds}" -ne "${seconds}" ]; then
+                    seconds="${new_seconds}"
+                    remaining="${seconds}"
+                    post_footer "${port}" "${seconds}s"
+                fi
+            fi
+        done
+        # the first reload always happens; the condition only decides whether
+        # to keep going, so a state the command reports after that reload counts
+        if [ ${first} -eq 0 ] && [ -n "${watch_while_cmd}" ] && ! ${watch_while_cmd} >/dev/null 2>&1; then
+            post_footer "${port}" "off"
+            idle=1
+            continue
+        fi
+        # a question is being answered on the query line: relisting under it
+        # would move the list away from what was asked about, and the footer
+        # holding the hint of the question would be overwritten
+        while [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ]; do
+            sleep 1
+        done
+        reload_fzf "${cmd}" "${port}" || break
+        # the delay only applies before the first reload; a footer prefix is
+        # posted after every reload instead, because only the command behind it
+        # knows whether it still says the same
+        if [ ${first} -eq 1 ] && [ "${initial_indicator}" != "${seconds}s" ]; then
+            post_footer "${port}" "${seconds}s"
+        elif [ -n "${footer_prefix_cmd}" ]; then
+            post_footer "${port}" "${seconds}s"
+        fi
+        first=0
+        remaining="${seconds}"
+    done
+}
+
+post_footer() {
+    local port="${1}"
+    local indicator="${2}"
+    # there is no footer to show the indicator in
+    [ -z "${footer_route_action}" ] && return 0
+    # every footer fzf packs from now on names the indicator the watcher is showing
+    printf '%s' "${indicator}" > "${footer_indicator_file}"
+    # the footer of an open question names the keys that answer it, and the one
+    # put back once it is answered reads the indicator from the file above
+    [ -n "${ask_state_file}" ] && [ -e "${ask_state_file}" ] && return 0
+    # fzf packs it itself, because only fzf knows the room it has for it
+    curl -XPOST 127.0.0.1:${port} --data-binary "${footer_route_action}" &> /dev/null
+    return 0
+}
+
+reload_fzf() {
+    local cmd="${1}"
+    local port="${2}"
+    local payload="reload(${cmd})"
+
+    # A question may be opened while this reload is on its way, and taking the
+    # candidates of a picking key away under it would answer it with a row of the
+    # list instead. Whether one is open is therefore decided by fzf itself, after
+    # everything the key that opened it did, so there is no moment in between.
+    [ -n "${ask_state_file}" ] &&
+        payload="transform:[ -e '${ask_state_file}' ] || printf '%s' $(shell_quote "${payload}")"
+    curl -XPOST 127.0.0.1:${port} --data-binary "${payload}" &> /dev/null
+    return ${?}
+}
+
+stop_watcher() {
+    [ -n "${watch_reset_file}" ] && rm -f "${watch_reset_file}"
+    [ -z "${watcher_pid}" ] && return 0
+    kill "${watcher_pid}" &> /dev/null
+    watcher_pid=""
+}
+
+cleanup() {
+    stop_watcher
+    [ -n "${msg_file}" ] && rm -f "${msg_file}"
+    [ -n "${footer_config_file}" ] && rm -f "${footer_config_file}" "${footer_indicator_file}"
+    [ -n "${ask_prefix}" ] && rm -f "${ask_prefix}".*
+    [ -n "${ask_dir}" ] && rmdir "${ask_dir}"
+    return 0
+}
+
+trap cleanup EXIT
+
+buffered_input=""
+if [ "${#outside_ask_bind_args[@]}" -gt 0 ] && [ -z "${cmd}" ] && [ ! -t 0 ]; then
+    buffered_input="${ask_prefix}.input"
+    cat > "${buffered_input}" || exit 1
+fi
+resume_query_args=()
+resume_prompt_args=()
+
+while true; do
+    # a message left over from the previous round must not reappear
+    [ -n "${msg_file}" ] && : > "${msg_file}"
+    # so does the indicator the watcher of the previous round was showing
+    [ -n "${footer_config_file}" ] && printf '%s' "${initial_indicator}" > "${footer_indicator_file}"
+    # a question of the previous round was answered by ending fzf, so the round
+    # after it starts on the list again instead of on that question
+    [ -n "${ask_state_file}" ] && rm -f "${ask_state_file}" "${ask_pending_file}"
+    if [ -n "${cmd}" ]; then
+        # a fresh listen port per round, so restarts after a key command do not
+        # reuse the port of an fzf that is already gone
+        listen_arg=""
+        if [ ${watch_seconds} -gt 0 ]; then
+            port=$((39000+RANDOM%1000))
+            while lsof -nP -i:${port} &> /dev/null; do
+                port=$((port+1))
+            done
+            listen_arg="--listen=127.0.0.1:${port}"
+            update_fzf "${watch_cmd:-${cmd}}" "${port}" "${watch_seconds}" &
+            watcher_pid=$!
+        fi
+        result="$(
+            if [ "${supports_start}" -eq 0 ]; then
+                exec < <("${SHELL:-/bin/sh}" -c "${cmd}")
+            else
+                exec < /dev/null
+            fi
+            fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_refresh_bind_args[@]}" "${footer_route_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${refresh_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info "${info_style}" --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} ${listen_arg} "$@" "${outside_ask_bind_args[@]}" "${resume_query_args[@]}" "${resume_prompt_args[@]}"
+        )"
+        fzf_rc=$?
+        stop_watcher
+    else
+        result="$(
+            if [ -n "${buffered_input}" ]; then
+                exec < "${buffered_input}"
+            fi
+            fzf --delimiter "${delimiter}" --ansi --header-lines 1 "${footer_args[@]}" "${start_bind_args[@]}" "${footer_route_bind_args[@]}" "${preview_toggle_bind_args[@]}" "${preview_width_bind_args[@]}" "${inline_bind_args[@]}" "${ask_bind_args[@]}" "${ask_router_bind_args[@]}" "${expect_bind_args[@]}" --tabstop 2 --info "${info_style}" --color "${color_style}" --color="${color_settings}" --query="${query}" ${args} "$@" "${outside_ask_bind_args[@]}" "${resume_query_args[@]}" "${resume_prompt_args[@]}"
+        )"
+        fzf_rc=$?
+    fi
+
+    if [ "${fzf_rc}" -eq 2 ]; then
+        exit "${fzf_rc}"
+    fi
+
+    if [ "${print_query}" -eq 1 ] && { [ -n "${cmd}" ] || [ "${#outside_ask_bind_args[@]}" -gt 0 ]; }; then
+        query="${result%%$'\n'*}"
+        if [[ "${result}" == *$'\n'* ]]; then
+            result="${result#*$'\n'}"
+        else
+            result=""
+        fi
+    fi
+
+    if [ "${supports_questions}" -eq 0 ] && [ -s "${ask_state_file}" ] && [ "${fzf_rc}" -lt 130 ]; then
+        ask_key="$(cat "${ask_state_file}")"
+        resume_query_args=(--query "${query}")
+        if ask_outside "${ask_key}"; then
+            payload="$(printf '%s\n%s' "${ask_key}" "$(cat "${ask_line_file}")")"
+            if [ "${outside_ask_modes[${ask_key}]}" = "exec" ]; then
+                FZF_WITH_HEADER_QUERY="${query}" FZF_WITH_HEADER_ANSWER="${outside_answer}" ${key_cmd} "${payload}" </dev/tty >/dev/tty
+            else
+                FZF_WITH_HEADER_QUERY="${query}" FZF_WITH_HEADER_ANSWER="${outside_answer}" ${key_cmd} "${payload}" </dev/null >/dev/null
+            fi
+            [ -n "${prompt_cmd}" ] && resume_prompt_args=(--prompt "$(${prompt_cmd})")
+        fi
+        continue
+    fi
+
+    # ctrl-c, and anything else that kills fzf, leaves neither a key nor a row:
+    # the picker is gone, so the run ends here instead of handing that emptiness
+    # to the key command, which has no key to act on
+    if [ "${fzf_rc}" -ge 130 ] || { [ -n "${key_cmd}" ] && [ -z "${result}" ]; }; then
+        exit 130
+    fi
+
+    if [ -n "${key_cmd}" ]; then
+        # TODO actually store last command exec and pipe back into fzf
+        # TODO OR at least add saved header as argument, maybe split key, result and header as individual arguments
+        # the query is what the list was narrowed down to when the key was
+        # pressed, so a key command that wants to show what was on the screen
+        # can filter by it the same way
+        FZF_WITH_HEADER_QUERY="${query}" ${key_cmd} "${result}"
+        exit_code=$?
+        case "${exit_code}" in
+            1)
+                exit 0
+                ;;
+           255)
+                exit 1
+                ;;
+        esac
+    else
+        echo "${result}"
+        exit 0
+    fi
+done

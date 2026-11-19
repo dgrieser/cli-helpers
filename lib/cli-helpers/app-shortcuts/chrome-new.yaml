@@ -1,0 +1,5 @@
+# always a new window, never focuses an existing one
+description: Chrome (new window)
+bindings: ['<Control><Alt>b']
+launch:
+  desktop: google-chrome

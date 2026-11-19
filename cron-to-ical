@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import argparse
+from croniter import croniter
+from datetime import datetime, timedelta, time as datetime_time
+from dateutil.relativedelta import relativedelta
+from icalendar import Calendar, Event
+import uuid
+from tzlocal import get_localzone
+import sys
+from zoneinfo import ZoneInfo
+
+def parse_duration(duration_str):
+    total_seconds = 0
+    parts = duration_str.split()
+    for part in parts:
+        if part and not part[-1].isdigit():
+            unit = part[-1]
+            value = int(part[:-1])
+            if unit == 'd':
+                total_seconds += value * 86400
+            elif unit == 'h':
+                total_seconds += value * 3600
+            elif unit == 'm':
+                total_seconds += value * 60
+            elif unit == 's':
+                total_seconds += value
+            else:
+                raise ValueError(f"Invalid duration unit: {unit}")
+        else:
+            total_seconds += int(part)
+    return total_seconds
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate iCal file from cron expression.')
+    parser.add_argument('cron', type=str, help='Cron expression')
+    parser.add_argument('--duration', type=str, help='Duration in format like "1d 2h 3m 4s" or "50" seconds, default: 1 day', default='1d')
+    parser.add_argument('--end_date', type=str, help='End date in YYYY-MM-DD format (default: 50 years from start_date)', default=(datetime.today() + relativedelta(years=50)).strftime('%Y-%m-%d'))
+    parser.add_argument('--start_date', type=str, default=datetime.today().strftime('%Y-%m-%d'),
+                        help='Start date in YYYY-MM-DD format (default: today)')
+
+    args = parser.parse_args()
+
+    try:
+        start_date = datetime.strptime(args.start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(args.end_date, '%Y-%m-%d').date()
+    except ValueError as e:
+        sys.stderr.write(f"Error parsing date: {e}\n")
+        return
+
+    try:
+        duration_seconds = parse_duration(args.duration)
+    except ValueError as e:
+        sys.stderr.write(f"Error parsing duration: {e}\n")
+        return
+
+    start_datetime = datetime.combine(start_date, datetime_time.min)
+    adjusted_start = start_datetime - timedelta(seconds=1)
+    end_datetime = datetime.combine(end_date, datetime_time(23, 59, 59, 999999))
+
+    try:
+        cron = croniter(args.cron, adjusted_start)
+    except Exception as e:
+        sys.stderr.write(f"Invalid cron expression: {e}\n")
+        return
+
+    local_tz = get_localzone()
+    utc_tz = ZoneInfo('UTC')
+    occurrences = []
+
+    while True:
+        try:
+            next_dt = cron.get_next(datetime)
+        except StopIteration:
+            break
+        except Exception as e:
+            sys.stderr.write(f"Error generating cron occurrences: {e}\n")
+            break
+
+        if next_dt > end_datetime:
+            break
+        occurrences.append(next_dt)
+
+    cal = Calendar()
+    cal.add('prodid', f'-//Cron to iCal//Generated from "{args.cron}"//')
+    cal.add('version', '2.0')
+
+    duration_td = timedelta(seconds=duration_seconds)
+
+    for dt_naive in occurrences:
+        try:
+            # Convert naive datetime to local timezone
+            dt_local = dt_naive.replace(tzinfo=local_tz)
+        except ValueError as e:
+            if 'is ambiguous' in str(e):
+                # Handle ambiguous times by choosing the first occurrence (fold=0)
+                dt_local = dt_naive.replace(tzinfo=local_tz, fold=0)
+            elif 'does not exist' in str(e):
+                sys.stderr.write(f"Skipping non-existent time: {dt_naive}\n")
+                continue
+            else:
+                sys.stderr.write(f"Unexpected error: {e}\n")
+                continue
+
+        dt_utc = dt_local.astimezone(utc_tz)
+        end_utc = dt_utc + duration_td
+
+        event = Event()
+        event.add('summary', 'Cron Execution')
+        event.add('dtstart', dt_utc)
+        event.add('dtend', end_utc)
+        event.add('dtstamp', datetime.now(utc_tz))
+        event['uid'] = f"{uuid.uuid4()}"
+        cal.add_component(event)
+
+    print(cal.to_ical().decode('utf-8').replace('\r\n', '\n'))
+
+if __name__ == '__main__':
+    main()

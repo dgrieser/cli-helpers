@@ -1,0 +1,12 @@
+{
+  "dns": [
+    "172.17.0.1"
+  ],
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "defaultMaxUsedSpace": "30GB",
+      "defaultMinFreeSpace": "50GB"
+    }
+  }
+}

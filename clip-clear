@@ -1,0 +1,114 @@
+#!/bin/bash
+APP_NAME="$(basename "${0}")"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-clipboard"
+elif [ -f "${SCRIPT_DIR}/lib-clipboard" ]; then
+    . "${SCRIPT_DIR}/lib-clipboard"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-clipboard"
+fi
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [-c|--clipboard|-p|--primary] [--after SECONDS] [--secret ID]
+
+Clears the clipboard or the primary selection.
+
+Options:
+  -c, --clipboard      Clear the clipboard (default)
+  -p, --primary        Clear the primary selection
+  --after SECONDS      Wait SECONDS before clearing
+  --secret ID          Clear the secret clip --secret marked as ID, in the
+                       clipboard and the primary selection, but only where it
+                       still is; what the clipboard held before the secret
+                       comes back, if the history holds it too, unless
+                       CLIP_SECRET_RESTORE=0
+  -h, --help           Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# takes the secret marked as ID out of every selection that still holds it
+clear_secret() {
+    local id="${1}"
+    local secret_hash
+    local selection
+    local restore_file=""
+
+    # gone already: another clear-up took care of it
+    secret_hash="$(cli_helpers_clip_secret_hash "${id}")" || return 0
+    # what the clipboard held before, but only text the history holds as well:
+    # what the history leaves out, such as a password copied by a password
+    # manager right before the secret, does not come back either
+    if [ "${CLIP_SECRET_RESTORE:-1}" != "0" ]; then
+        restore_file="$(cli_helpers_clip_secret_previous "${id}")" || restore_file=""
+        if [ -n "${restore_file}" ] && { [ ! -s "${restore_file}" ] ||
+            ! cli_helpers_clip_history_has "$(cli_helpers_clip_hash "${restore_file}")"; }; then
+            restore_file=""
+        fi
+    fi
+    for selection in clipboard primary; do
+        [ "$(cli_helpers_clipboard_read "${selection}" | cli_helpers_clip_hash)" = "${secret_hash}" ] || continue
+        if [ "${selection}" = "clipboard" ] && [ -n "${restore_file}" ]; then
+            cli_helpers_clipboard_write clipboard "${restore_file}"
+        else
+            cli_helpers_clipboard_clear "${selection}"
+        fi
+    done
+    cli_helpers_clip_secret_unmark "${id}"
+}
+
+clipboard="clipboard"
+after=0
+secret_id=""
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--primary)
+            clipboard="primary"
+            ;;
+        -c|--clipboard)
+            clipboard="clipboard"
+            ;;
+        --after)
+            shift
+            [ -z "${1}" ] && usage
+            after="${1}"
+            ;;
+        --secret)
+            shift
+            [ -z "${1}" ] && usage
+            secret_id="${1}"
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+
+[[ "${after}" =~ ^[0-9]+$ ]] || fail "'${after}' is no number of seconds"
+
+[ "${after}" -gt 0 ] && sleep "${after}"
+if [ -n "${secret_id}" ]; then
+    clear_secret "${secret_id}"
+else
+    cli_helpers_clipboard_clear "${clipboard}"
+fi

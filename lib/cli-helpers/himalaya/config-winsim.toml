@@ -1,0 +1,37 @@
+# himalaya 2 config, converted from the 1.x one of the old system; no password in here,
+# it comes from the GNOME keyring, stored there once with:
+#   secret-tool store --label="himalaya mail@david-grieser.de" service himalaya account mail@david-grieser.de
+
+# no table borders
+table.preset = "                   "
+
+[accounts."mail@david-grieser.de"]
+default = true
+email = "winsim@david-grieser.de"
+display-name = "winsim@david-grieser.de"
+downloads-dir = "~/Downloads"
+
+imap.server = "imaps://webmail.your-server.de:993"
+imap.sasl.plain.username = "mail@david-grieser.de"
+imap.sasl.plain.password.command = "secret-tool lookup service himalaya account mail@david-grieser.de"
+
+smtp.server = "smtps://webmail.your-server.de:465"
+smtp.sasl.plain.username = "mail@david-grieser.de"
+smtp.sasl.plain.password.command = "secret-tool lookup service himalaya account mail@david-grieser.de"
+
+envelope.list.page-size = 100
+envelope.list.datetime-local-tz = true
+envelope.list.datetime-fmt = "%+"
+envelope.list.table.unseen-char = "*"
+envelope.list.table.replied-char = "⮌"
+envelope.list.table.attachment-char = "📎"
+envelope.list.table.id-color = "ansi_(38)"
+envelope.list.table.flags-color = "ansi_(66)"
+envelope.list.table.subject-color = "ansi_(0)"
+envelope.list.table.from-color = "ansi_(129)"
+envelope.list.table.date-color = "ansi_(40)"
+
+mailbox.alias.inbox = "INBOX"
+mailbox.alias.sent = "INBOX.Sent"
+mailbox.alias.drafts = "INBOX.Drafts"
+mailbox.alias.trash = "INBOX.Trash"

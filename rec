@@ -1,0 +1,24 @@
+#!/bin/bash
+
+function cleanup() {
+    [ -n "${pid}" ] && kill "${pid}"
+    [ -n "${1}" ] && rm -f "${tmpfile}" && echo 1>&2 && echo "Aborted recording" 1>&2 && exit 1
+}
+
+function setup_traps() {
+    for sig in SIGINT SIGTERM SIGHUP; do
+        trap "cleanup ${sig}" "${sig}"
+    done
+}
+
+tmpfile="$(tmpfile /tmp/rec.XXXXXX.mp3)"
+ffmpeg -y -v quiet -f alsa -i default -c:a libmp3lame -q:a 2 "${tmpfile}" &
+pid=$!
+setup_traps
+
+echo -n "Press enter to stop recording..." 1>&2
+read -p "" key
+echo "${tmpfile}"
+cleanup
+echo "Stopped recording" 1>&2
+exit 0

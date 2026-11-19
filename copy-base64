@@ -1,0 +1,22 @@
+#!/bin/bash
+
+function usage() {
+    echo "usage: $(basename "${0}") <file>"
+    exit 1
+}
+
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+file="${1}"
+
+if [ ! -f "${file}" ]; then
+    echo "ERROR: ${file} not found"
+    usage
+fi
+
+name="$(basename "${file}")"
+encoded="$(cat "${file}" | base64 -w 0)"
+cmd='echo -n "'"${encoded}"'" | base64 -d > "'"${name}"'"'
+echo -n "${cmd}" | clip && echo "Copied to clipboard"

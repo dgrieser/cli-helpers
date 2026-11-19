@@ -1,0 +1,2893 @@
+#!/usr/bin/env python3
+"""Browse, search, resume and fork the sessions of the claude, codex and
+opencode CLIs.
+
+Everything a listing shows - title, first prompt, directory, the first and the
+last message - and every message of a session are kept in an SQLite index in
+the cache folder. A session file is only read where it grew since it was last
+looked at, and then only from the byte where the last look stopped, so a
+session of a hundred megabytes that got one more message costs that message.
+The messages are in a full-text table as well, which is what makes a search
+over all of them answer at once instead of grepping gigabytes of tool output.
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+
+APP_NAME = os.path.basename(sys.argv[0])
+SCRIPT_PATH = os.path.realpath(__file__)
+SCRIPT_FOLDER = os.path.dirname(SCRIPT_PATH)
+HOME = os.path.expanduser('~')
+
+CLAUDE_HOME = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(HOME, '.claude')
+CLAUDE_PROJECTS = os.path.join(CLAUDE_HOME, 'projects')
+# claude writes a file per running process here, naming the session it has
+# open and what that session is doing
+CLAUDE_PEERS = os.path.join(CLAUDE_HOME, 'sessions')
+CODEX_HOME = os.environ.get('CODEX_HOME') or os.path.join(HOME, '.codex')
+CODEX_SESSIONS = os.path.join(CODEX_HOME, 'sessions')
+DATA_HOME = os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local', 'share')
+OPENCODE_DB = os.path.join(DATA_HOME, 'opencode', 'opencode.db')
+CACHE_FOLDER = os.path.join(
+    os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'), 'agent-session')
+INDEX_FILE = os.path.join(CACHE_FOLDER, 'index.sqlite')
+RENDER_FOLDER = os.path.join(CACHE_FOLDER, 'render')
+
+ALL_AGENTS = ('claude', 'codex', 'opencode')
+DEFAULT_DAYS = 7
+# what ctrl-o walks through, starting over after the last one
+DAYS_STEPS = (7, 30, 90, 365)
+INITIAL_BATCH = 20
+REFRESH_SECONDS = 5
+DIRECTORY_MAX_WIDTH = 35
+FZF_TEXT_MAX_WIDTH = 30
+# without the prompt column the title gets the width the prompt would have used
+FZF_TITLE_MAX_WIDTH = 50
+PRINT_TITLE_MAX_WIDTH = 50
+PRINT_PROMPT_MAX_WIDTH = 60
+FORK_PROMPT_MAX_BYTES = 100000
+# Only the beginning of a prompt is ever shown or searched, and a pasted log can
+# make a prompt megabytes long.
+PROMPT_SCAN_CHARS = 8192
+# what the picker carries of a session for its fuzzy search, next to the title
+# and the prompt: the last user message and the last message
+SNIPPET_CHARS = 400
+# Codex keeps its first message as the title where it has no name for a session,
+# which runs to megabytes; fifty columns of it are ever shown.
+TITLE_MAX_CHARS = 500
+# The preview renders the end of a conversation: as many of the last messages
+# as fit into this many characters, the last one always.
+PREVIEW_MAX_CHARS = 40000
+# A line as wide as the preview is wrapped by fzf into an empty one after it,
+# so the preview is rendered a column narrower than it is.
+PREVIEW_WIDTH_MARGIN = 1
+# what the preview cache holds is rendered by this version of the preview; a
+# render of another one is made again
+PREVIEW_RENDER_VERSION = 3
+# The watcher of an open picker waits for the files of the sessions to change;
+# where it cannot be told of that (no inotify) it looks this often instead.
+WATCH_POLL_SECONDS = 2
+# what it does at most this often, while sessions are written: read the session
+# under the cursor, and make the list again
+WATCH_PREVIEW_SECONDS = 0.5
+# the ages of the list change by the minute, and a process that ends writes
+# nothing, so the list is made again this often anyway
+WATCH_LIST_SECONDS = 60
+SCHEMA_VERSION = 1
+
+C_AGENTS = {
+    'claude': '\033[38;5;141m',
+    'codex': '\033[38;5;40m',
+    'opencode': '\033[38;5;178m',
+}
+C_AGENT_OTHER = '\033[38;5;208m'
+C_AGE_SHORT = '\033[38;5;40;3m'
+C_AGE_LONG = '\033[38;5;245m'
+C_DIRECTORY = '\033[38;5;33m'
+C_TITLE = '\033[38;5;250m'
+C_PROMPT = '\033[38;5;110m'
+C_MUTED = '\033[90m'
+C_RESET = '\033[0m'
+C_LIVE_WORKING = '\033[38;5;45m'
+# the one marker that wants to be seen from across the room, so it blinks
+C_LIVE_WAITING = '\033[38;5;208;5m'
+C_LIVE_OPEN = '\033[38;5;40m'
+# The marker of a session that is open in a running agent: what it is doing
+# decides its symbol and its color. The glyphs are drawn at different widths,
+# the keyboard two columns wide, so the narrow ones are led by a space and all
+# of them take two columns.
+LIVE_MARKERS = {
+    'working': ' ' + C_LIVE_WORKING + '▶' + C_RESET,
+    'waiting': C_LIVE_WAITING + '⌨︎' + C_RESET,
+    'open': ' ' + C_LIVE_OPEN + '✔' + C_RESET,
+}
+LIVE_EMPTY = '  '
+AGE_OPTIONS = {
+    'units': 'wdhms', 'minimum': 1, 'drop_seconds': 60, 'drop_minutes': 7200,
+    'drop_hours': 172800, 'colors': [(3600, C_AGE_SHORT), (None, C_AGE_LONG)],
+}
+FOLDERS_ALL = '<all>'
+
+CLAUDE_SKIP_USER = ('<command-name>', '<local-command-', '<tool_result>')
+CODEX_SKIP_USER = ('<environment_context>', '<user_instructions>', '<user_shell>')
+OPENCODE_PLACEHOLDER_TITLE = re.compile(r'^(New|Child) session - \d{4}-')
+ANSI_PATTERN = re.compile(r'\033\[[0-9;]*m')
+CWD_PATTERN = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
+CODEX_FILE_PATTERN = re.compile(
+    r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)\.jsonl$')
+REGEX_SPECIALS = set('.^$*+?{}[]\\|()')
+
+USAGE = f"""\
+usage: {APP_NAME} [OPTIONS] [SESSION]
+
+Browses sessions of the claude, codex and opencode CLIs, user and agent messages
+
+SESSION   the ID of the session to print; omit to browse sessions
+
+Options:
+    -h, --help          Show this message
+    -a, --agent AGENT   Only use sessions of AGENT (claude, codex or opencode;
+                        default: all of them)
+    -l, --last          Print the latest session
+    -n, --limit LIMIT   Limit sessions by count instead of age
+    -d, --days DAYS     Only list sessions active within DAYS (default: {DEFAULT_DAYS})
+    -c, --current-directory
+                        Only list sessions from the current directory; the
+                        picker starts with all sessions of it, open or not
+    -A, --all-directories
+                        List sessions from all directories (the default)
+    -o, --open          Only list the sessions open in a running agent; the
+                        picker starts with them, without -c over every folder
+    -p, --print         Print the session table instead of opening the picker
+    -P, --prompt-column Show the first prompt as a column of its own; without it
+                        the prompt stays searchable in the picker
+    -g, --grep GREP     Filter listed sessions by a regex match in their messages
+    -i, --igrep GREP    Filter listed sessions by a case-insensitive regex match
+    -r, --raw           Raw output
+    --resume SESSION    Resume the session with SESSION in its directory,
+                        asking to create the directory when it is missing
+    --fork SESSION      Fork the session with SESSION, asking for the folder
+                        and the agent, and to create the folder when it is
+                        missing
+    --index             Bring the index up to date for the selected sessions
+                        and exit; the picker does this in the background
+    --bash-completion   Print completion candidates and exit
+    --verbose           Verbose output
+
+Called as claude-session, codex-session or opencode-session the matching agent
+is preselected.
+
+A session that is open in a running agent carries a marker next to its agent:
+    ▶   working on something right now
+    ⌨︎   waiting for you: a question, a permission, a plan to confirm
+    ✔   open, with nothing to do
+The state is searchable in the picker, as '@working, '@waiting or '@open.
+
+The picker searches fuzzily over the title, the first prompt, the directory,
+the state, the last user message and the last message of every session; / runs
+a full-text search over every message instead.
+
+The index of all sessions is kept in
+    {CACHE_FOLDER}
+and only the part of a session file written since it was last read is read
+again. Removing the folder costs the next listing its speed and nothing else.
+
+Interactive keys:
+    /                   Search all messages, case-insensitively
+    enter               Use the session: asks what is to happen with it
+    tab                 Toggle the open sessions only (the start) and all of
+                        them, of the last {DEFAULT_DAYS} days by default
+    ctrl-o              Widen the age window: {', '.join(f'{d}d' for d in DAYS_STEPS)}, then back
+    ctrl-space          Show the folders of the listed sessions to pick the scope
+                        from, <all> first; enter picks, esc and ctrl-space go back
+    ctrl-d              Toggle the folder the picker was started in, with all
+                        of its sessions, open or not, and every folder
+    ctrl-s              Take that folder from the selected session
+    ctrl-a              Walk the agent filter: all, claude, codex, opencode
+    ctrl-f              Focus the terminal of a running session, selecting its tab in Ptyxis
+    ctrl-r              Refresh sessions
+    esc                 Clear an active search, exit without one
+    ctrl-c              Exit
+
+The preview shows the end of the conversation and is shown again as soon as the
+session under the cursor gets a new message; the list is made again once
+sessions changed, at most every {REFRESH_SECONDS} seconds, and loaded only where it changed.
+
+Asked for the selected session, esc stepping back one question and out of
+the first one into the picker again:
+    Resume              Resume the session in its original directory,
+                        asking to create it when it is missing
+    Focus terminal      In place of Resume for a running session: bring the
+                        terminal it runs in to the front, the picker stays open
+    Fork                Continue it, asking for the folder and the agent, and
+                        to create the folder when it is missing
+    Copy                Copy raw Markdown to the clipboard
+    Print               Print it, asking for rendered Markdown or raw; both
+                        start with the session ID
+
+Copy shares its row with a last message and a session ID variant, Print with
+a last message variant, tab (shift-tab backwards) walking over them."""
+
+verbose_enabled = False
+
+
+def usage():
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+
+
+def error(message):
+    print(f'ERROR: {message}', file=sys.stderr)
+
+
+def fail(message):
+    error(message)
+    sys.exit(1)
+
+
+def verbose(message):
+    if verbose_enabled:
+        print('+ ' + str(message).replace('\n', '\n+ '), file=sys.stderr)
+
+
+def muted(message):
+    print(f'{C_MUTED}{message}{C_RESET}', file=sys.stderr)
+
+
+def which(command):
+    for folder in [SCRIPT_FOLDER] + os.environ.get('PATH', '').split(os.pathsep):
+        path = os.path.join(folder, command)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def require(command):
+    path = which(command)
+    if not path:
+        fail(f'{command} not found')
+    return path
+
+
+def load_toage():
+    """The toage module of cli-helpers: toage.py on sys.path when installed,
+    else the toage next to this script (a checkout before make install)."""
+    try:
+        import toage
+        return toage
+    except ImportError:
+        pass
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(SCRIPT_FOLDER, 'toage')
+    if not os.path.isfile(path):
+        fail('toage not found')
+    loader = importlib.machinery.SourceFileLoader('toage', path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader('toage', loader))
+    loader.exec_module(module)
+    return module
+
+
+# --- text ------------------------------------------------------------------
+
+def char_width(char):
+    if unicodedata.combining(char) or char in '︎️‍':
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in 'WF' else 1
+
+
+def text_width(text):
+    if text.isascii():
+        return len(text)
+    return sum(char_width(char) for char in text)
+
+
+def visible_width(text):
+    return text_width(ANSI_PATTERN.sub('', text))
+
+
+def pad(text, width):
+    return text + ' ' * max(width - visible_width(text), 0)
+
+
+def shorten(text, max_width):
+    # titles are mostly plain ASCII, where a character is a column
+    if text.isascii():
+        return text if len(text) <= max_width else text[:max_width - 3] + '...'
+    kept = []
+    width = 0
+    for position, char in enumerate(text):
+        width += char_width(char)
+        if width > max_width:
+            break
+        kept.append(char)
+    else:
+        return text
+    # the cut text and its dots have to fit, so the last characters go again
+    while kept and text_width(''.join(kept)) > max_width - 3:
+        kept.pop()
+    return ''.join(kept) + '...'
+
+
+def collapse(text):
+    return ' '.join(text.split())
+
+
+def truncate_middle(value, max_length):
+    if len(value) <= max_length:
+        return value
+    start = (max_length - 3) // 2
+    end = max_length - 3 - start
+    return value[:start] + '...' + value[-end:]
+
+
+def shorten_path(path, max_length):
+    if len(path) <= max_length:
+        return path
+    parts = path.split('/')
+    if len(parts) <= 3:
+        return truncate_middle(path, max_length)
+    prefix = '/' + parts[1] if path.startswith('/') else parts[0] + '/' + parts[1]
+    shortened = path
+    for collapse_end in range(2, len(parts) - 1):
+        shortened = prefix + '/...' + ''.join('/' + part for part in parts[collapse_end + 1:])
+        if len(shortened) <= max_length:
+            return shortened
+    return truncate_middle(shortened, max_length)
+
+
+def display_path(path):
+    if path == HOME:
+        return '~'
+    if path.startswith(HOME + '/'):
+        return '~/' + path[len(HOME) + 1:]
+    return path
+
+
+def format_cwd(cwd):
+    return shorten_path(display_path(cwd), DIRECTORY_MAX_WIDTH)
+
+
+def clean_prompt(text):
+    """The first prompt as one line: a slash command by its message, tags and
+    runs of whitespace gone."""
+    text = text[:PROMPT_SCAN_CHARS]
+    match = re.search(r'<command-message>(.*?)</command-message>', text, re.S)
+    if match:
+        text = match.group(1)
+    return collapse(re.sub(r'<[^>]+>', '', text))
+
+
+def single_line(text):
+    return text.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+
+_resolved = {}
+
+
+def resolve_directory(path):
+    if path not in _resolved:
+        _resolved[path] = os.path.realpath(path)
+    return _resolved[path]
+
+
+def open_readonly(path):
+    uri = 'file:' + urllib.parse.quote(path) + '?mode=ro'
+    return sqlite3.connect(uri, uri=True, timeout=5)
+
+
+def codex_state_db():
+    """The newest state database of codex: its name carries the version of its
+    schema, which codex counts up now and then."""
+    best = None
+    best_version = -1
+    try:
+        names = os.listdir(CODEX_HOME)
+    except OSError:
+        return None
+    for name in names:
+        match = re.fullmatch(r'state_(\d+)\.sqlite', name)
+        if match and int(match.group(1)) > best_version:
+            best_version = int(match.group(1))
+            best = os.path.join(CODEX_HOME, name)
+    return best
+
+
+def codex_id_from_path(path):
+    name = os.path.basename(path)
+    match = CODEX_FILE_PATTERN.match(name)
+    if match:
+        return match.group(1)
+    name = name[:-len('.jsonl')] if name.endswith('.jsonl') else name
+    return name[len('rollout-'):] if name.startswith('rollout-') else name
+
+
+def codex_is_subagent(source, thread_source=None):
+    if thread_source == 'subagent':
+        return True
+    if isinstance(source, dict):
+        return 'subagent' in source
+    return isinstance(source, str) and 'subagent' in source
+
+
+# --- sessions as they are found ---------------------------------------------
+
+class Candidate:
+    """A session as its agent keeps it, before it is read: where it is and
+    when it was last written. `extra` holds what the agent's own database says
+    about it, which wins over what the index read from the file."""
+
+    __slots__ = ('key', 'agent', 'id', 'path', 'mtime', 'size', 'extra')
+
+    def __init__(self, key, agent, session_id, path, mtime, size, extra=None):
+        self.key = key
+        self.agent = agent
+        self.id = session_id
+        self.path = path
+        self.mtime = mtime
+        self.size = size
+        self.extra = extra or {}
+
+
+def file_candidate(agent, path, extra=None):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    if agent == 'claude':
+        session_id = os.path.basename(path)[:-len('.jsonl')]
+    else:
+        session_id = codex_id_from_path(path)
+    return Candidate(path, agent, session_id, path, stat.st_mtime, stat.st_size, extra)
+
+
+def claude_candidates(cutoff):
+    try:
+        projects = list(os.scandir(CLAUDE_PROJECTS))
+    except OSError:
+        return
+    for project in projects:
+        if not project.is_dir():
+            continue
+        try:
+            entries = list(os.scandir(project.path))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.name.endswith('.jsonl'):
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < cutoff:
+                continue
+            yield Candidate(entry.path, 'claude', entry.name[:-len('.jsonl')], entry.path,
+                            stat.st_mtime, stat.st_size)
+
+
+def codex_thread_rows(where='', parameters=()):
+    database = codex_state_db()
+    if not database:
+        return []
+    try:
+        connection = open_readonly(database)
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+        thread_source = 'thread_source' if 'thread_source' in columns else 'NULL'
+        name = 'name' if 'name' in columns else 'NULL'
+        prompt = 'first_user_message' if 'first_user_message' in columns else "''"
+        rows = connection.execute(
+            f'SELECT id, rollout_path, cwd, substr(COALESCE(NULLIF({name}, \'\'), title), 1, ?),'
+            f' substr({prompt}, 1, ?), source, {thread_source}, archived'
+            f' FROM threads {where}', (TITLE_MAX_CHARS, SNIPPET_CHARS * 2) + tuple(parameters)
+        ).fetchall()
+        connection.close()
+        return rows
+    except sqlite3.Error as exception:
+        verbose(f'codex state database: {exception}')
+        return []
+
+
+def codex_extra(cwd, title, prompt, source, thread_source):
+    return {
+        'cwd': cwd or '',
+        'title': collapse(title or '')[:TITLE_MAX_CHARS],
+        'prompt': clean_prompt(prompt or ''),
+        'hidden': 1 if codex_is_subagent(source, thread_source) else 0,
+    }
+
+
+def codex_candidates(cutoff):
+    seen = set()
+    has_database = codex_state_db() is not None
+    rows = codex_thread_rows('WHERE updated_at >= ?', (int(cutoff),))
+    for session_id, path, cwd, title, prompt, source, thread_source, archived in rows:
+        seen.add(path)
+        if archived:
+            continue
+        candidate = file_candidate('codex', path, codex_extra(cwd, title, prompt, source, thread_source))
+        if candidate and candidate.mtime >= cutoff:
+            candidate.id = session_id
+            yield candidate
+    # Files the database does not know - a codex without one, or one that has
+    # not caught up yet - are found in the folders of the days of the window.
+    # A file lies in the folder of the day its session started, so a session
+    # started before the window and written to within it is only found by the
+    # database, or by a walk over every folder where there is no window.
+    if cutoff > 0 and has_database:
+        folders = set()
+        day = time.time()
+        while day >= cutoff - 86400:
+            folders.add(os.path.join(CODEX_SESSIONS, time.strftime('%Y/%m/%d', time.localtime(day))))
+            day -= 86400
+        paths = []
+        for folder in folders:
+            try:
+                paths.extend(entry.path for entry in os.scandir(folder))
+            except OSError:
+                continue
+    else:
+        paths = []
+        for folder, _, names in os.walk(CODEX_SESSIONS):
+            paths.extend(os.path.join(folder, name) for name in names)
+    scanned = []
+    for path in paths:
+        name = os.path.basename(path)
+        if path in seen or not name.startswith('rollout-') or not name.endswith('.jsonl'):
+            continue
+        candidate = file_candidate('codex', path)
+        if candidate and candidate.mtime >= cutoff:
+            scanned.append(candidate)
+    # a session the database last saw before the window, written to within it,
+    # still has its name and its archive flag there
+    known = {}
+    for start in range(0, len(scanned) if has_database else 0, 500):
+        chunk = [candidate.path for candidate in scanned[start:start + 500]]
+        for row in codex_thread_rows(
+                f"WHERE rollout_path IN ({','.join('?' * len(chunk))})", chunk):
+            known[row[1]] = row
+    for candidate in scanned:
+        row = known.get(candidate.path)
+        if row:
+            if row[7]:
+                continue
+            candidate.id = row[0]
+            candidate.extra = codex_extra(*row[2:7])
+        yield candidate
+
+
+def opencode_extra(directory, title):
+    if OPENCODE_PLACEHOLDER_TITLE.match(title or ''):
+        title = ''
+    return {'cwd': directory or '', 'title': collapse(title or '')[:TITLE_MAX_CHARS]}
+
+
+def opencode_rows(where='', parameters=()):
+    if not os.path.isfile(OPENCODE_DB):
+        return []
+    try:
+        connection = open_readonly(OPENCODE_DB)
+        rows = connection.execute(
+            'SELECT id, directory, title, time_updated FROM session'
+            ' WHERE parent_id IS NULL AND time_archived IS NULL ' + where,
+            tuple(parameters)).fetchall()
+        connection.close()
+        return rows
+    except sqlite3.Error as exception:
+        verbose(f'opencode database: {exception}')
+        return []
+
+
+def opencode_candidate(row):
+    session_id, directory, title, updated = row
+    # the database is the session, so the time of its last change stands in
+    # for the modification time and for the size a file would have
+    return Candidate('opencode:' + session_id, 'opencode', session_id, OPENCODE_DB,
+                     updated / 1000, updated, opencode_extra(directory, title))
+
+
+def opencode_candidates(cutoff):
+    for row in opencode_rows('AND time_updated >= ?', (int(cutoff * 1000),)):
+        yield opencode_candidate(row)
+
+
+def discover(agents, cutoff):
+    candidates = []
+    if 'claude' in agents:
+        candidates.extend(claude_candidates(cutoff))
+    if 'codex' in agents:
+        candidates.extend(codex_candidates(cutoff))
+    if 'opencode' in agents:
+        candidates.extend(opencode_candidates(cutoff))
+    candidates.sort(key=lambda candidate: candidate.mtime, reverse=True)
+    return candidates
+
+
+def candidate_for(agent, key):
+    """The session a row of the picker names: the file for claude and codex,
+    the row of the database for opencode."""
+    if agent == 'opencode':
+        session_id = key.split(':', 1)[1] if key.startswith('opencode:') else key
+        rows = opencode_rows('AND id = ?', (session_id,))
+        if not rows:
+            rows = []
+            if os.path.isfile(OPENCODE_DB):
+                connection = open_readonly(OPENCODE_DB)
+                rows = connection.execute(
+                    'SELECT id, directory, title, time_updated FROM session WHERE id = ?',
+                    (session_id,)).fetchall()
+                connection.close()
+        return opencode_candidate(rows[0]) if rows else None
+    if agent in ('claude', 'codex'):
+        return file_candidate(agent, key)
+    return None
+
+
+# --- parsing -----------------------------------------------------------------
+
+class Parsed:
+    """What reading a session added to what the index knew of it: the values
+    of its row, the messages that came on top, and whether the messages known
+    so far are void (`reset`) or those of one kind are (`drop_kind`)."""
+
+    def __init__(self, values, state, offset, reset):
+        self.values = values
+        self.state = state
+        self.offset = offset
+        self.reset = reset
+        self.drop_kind = None
+        self.restart = False
+        self.messages = []
+
+    def add(self, kind, role, text, prompt=True):
+        text = text.strip()
+        if not text:
+            return
+        self.messages.append((kind, role, text))
+        if role == 'user':
+            if prompt and not self.values['prompt']:
+                self.values['prompt'] = clean_prompt(text)
+            self.values['last_user'] = single_line(text[:SNIPPET_CHARS * 2])
+        self.values['last_text'] = single_line(text[:SNIPPET_CHARS * 2])
+        self.values['last_role'] = role
+
+
+def read_lines(path, offset):
+    """The complete lines of a file from offset on, with the offset after the
+    last of them: a line still being written is left for the next look."""
+    with open(path, 'rb') as handle:
+        handle.seek(offset)
+        for line in handle:
+            if not line.endswith(b'\n'):
+                return
+            offset += len(line)
+            yield offset, line
+
+
+def claude_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(part.get('text') or '' for part in content
+                         if isinstance(part, dict) and part.get('type') == 'text')
+    return ''
+
+
+def parse_claude(candidate, parsed):
+    """Claude writes a line per event. The few that matter are told apart by
+    their bytes before one of them is decoded: requests, tool calls and tool
+    output make up nearly all of a file and are never parsed."""
+    state = parsed.state
+    for offset, line in read_lines(candidate.path, parsed.offset):
+        parsed.offset = offset
+        if line.startswith(b'{"type":"api-'):
+            continue
+        if b'"type":"ai-title"' in line or b'"type":"custom-title"' in line \
+                or b'"type":"summary"' in line:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            kind = record.get('type')
+            if kind == 'ai-title' and record.get('aiTitle'):
+                state['ai'] = record['aiTitle']
+            elif kind == 'custom-title' and (record.get('customTitle') or record.get('title')):
+                state['custom'] = record.get('customTitle') or record.get('title')
+            elif kind == 'summary' and record.get('summary'):
+                state['summary'] = record['summary']
+            continue
+        if not parsed.values['cwd'] and b'"cwd":"' in line:
+            match = CWD_PATTERN.search(line)
+            if match:
+                try:
+                    parsed.values['cwd'] = json.loads(b'"' + match.group(1) + b'"')
+                except ValueError:
+                    pass
+        if b'"type":"user"' in line:
+            if b'"content":"' not in line and b'"type":"text"' not in line:
+                continue
+        elif b'"type":"assistant"' in line:
+            if b'"type":"text"' not in line:
+                continue
+        else:
+            continue
+        if b'"isMeta":true' in line or b'"isSidechain":true' in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        role = record.get('type')
+        message = record.get('message')
+        if role not in ('user', 'assistant') or not isinstance(message, dict):
+            continue
+        text = claude_text(message.get('content')).strip()
+        if role == 'user' and text.startswith(CLAUDE_SKIP_USER):
+            continue
+        parsed.add('m', role, text, prompt=not record.get('isCompactSummary'))
+    title = state.get('custom') or state.get('ai') or state.get('summary') or ''
+    parsed.values['title'] = collapse(title)[:TITLE_MAX_CHARS]
+
+
+def codex_item_text(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    return '\n'.join(part.get('text') or '' for part in content
+                     if isinstance(part, dict) and part.get('type') in ('text', 'Text',
+                                                                         'input_text', 'output_text'))
+
+
+def parse_codex(candidate, parsed):
+    """Codex recorded its messages in three shapes over time: as item events
+    (now), as user and agent message events (before), and only as the items
+    sent to the model (at first). The events are what was shown, so they win:
+    the items count only for a file without a single event, and the first
+    event drops the items read before it."""
+    state = parsed.state
+    mode = state.get('mode', 'r')
+    for offset, line in read_lines(candidate.path, parsed.offset):
+        parsed.offset = offset
+        if not state.get('meta') and b'"type":"session_meta"' in line:
+            state['meta'] = 1
+            try:
+                payload = json.loads(line).get('payload') or {}
+            except ValueError:
+                continue
+            if not parsed.values['cwd']:
+                parsed.values['cwd'] = payload.get('cwd') or ''
+            if codex_is_subagent(payload.get('source'), payload.get('thread_source')):
+                parsed.values['hidden'] = 1
+            continue
+        role = None
+        if b'"type":"event_msg"' in line:
+            if b'"type":"item_completed"' in line:
+                if b'"type":"UserMessage"' not in line and b'"type":"AgentMessage"' not in line:
+                    continue
+                try:
+                    item = json.loads(line)['payload']['item']
+                except (ValueError, KeyError, TypeError):
+                    continue
+                role = {'UserMessage': 'user', 'AgentMessage': 'assistant'}.get(item.get('type'))
+                text = codex_item_text(item.get('content'))
+            elif b'"type":"user_message"' in line or b'"type":"agent_message"' in line:
+                try:
+                    payload = json.loads(line)['payload']
+                except (ValueError, KeyError, TypeError):
+                    continue
+                role = {'user_message': 'user', 'agent_message': 'assistant'}.get(payload.get('type'))
+                text = payload.get('message') or ''
+            if role is None:
+                continue
+            if mode != 'e':
+                mode = 'e'
+                parsed.messages = [message for message in parsed.messages if message[0] != 'r']
+                parsed.drop_kind = 'r'
+                parsed.values.update(prompt='', last_user='', last_text='', last_role='')
+            kind = 'e'
+        elif mode != 'e' and b'"type":"message"' in line:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            payload = record.get('payload') if record.get('type') == 'response_item' else record
+            if not isinstance(payload, dict) or payload.get('type') != 'message':
+                continue
+            role = payload.get('role')
+            if role not in ('user', 'assistant'):
+                continue
+            text = codex_item_text(payload.get('content'))
+            kind = 'r'
+        else:
+            continue
+        text = text.strip()
+        if role == 'user' and text.startswith(CODEX_SKIP_USER):
+            continue
+        parsed.add(kind, role, text)
+    state['mode'] = mode
+
+
+def parse_opencode(candidate, parsed):
+    """Opencode keeps its sessions in a database, a row per message and one per
+    part of it. An answer is only taken once it is complete - its parts change
+    while it is written - so the messages only ever grow at the end, like a
+    file, and the number of them read so far is the offset to go on from.
+    Fewer of them than that means messages were taken back: read anew."""
+    connection = open_readonly(OPENCODE_DB)
+    rows = connection.execute(
+        "SELECT m.id, json_extract(m.data, '$.role'), p.data FROM message m"
+        ' JOIN part p ON p.message_id = m.id'
+        " WHERE m.session_id = ? AND json_extract(p.data, '$.type') = 'text'"
+        " AND (json_extract(m.data, '$.role') = 'user'"
+        "      OR json_extract(m.data, '$.time.completed') IS NOT NULL)"
+        ' ORDER BY m.time_created, m.id, p.id', (candidate.id,)).fetchall()
+    connection.close()
+    if len({row[0] for row in rows}) < parsed.offset:
+        parsed.restart = True
+        return
+    skip = parsed.offset
+    current_id = None
+    current_role = None
+    texts = []
+    for message_id, role, data in rows + [(None, None, None)]:
+        if message_id != current_id:
+            if current_id is not None:
+                if skip > 0:
+                    skip -= 1
+                else:
+                    parsed.offset += 1
+                    if current_role in ('user', 'assistant'):
+                        parsed.add('m', current_role, '\n'.join(texts))
+            current_id = message_id
+            current_role = role
+            texts = []
+        if data is None:
+            continue
+        try:
+            part = json.loads(data)
+        except ValueError:
+            continue
+        if part.get('synthetic') or part.get('ignored'):
+            continue
+        texts.append(part.get('text') or '')
+
+
+PARSERS = {'claude': parse_claude, 'codex': parse_codex, 'opencode': parse_opencode}
+
+
+# --- the index -----------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE sessions (
+    key TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    mtime REAL NOT NULL,
+    size INTEGER NOT NULL,
+    offset INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    last_seq INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    last_user TEXT NOT NULL,
+    last_text TEXT NOT NULL,
+    last_role TEXT NOT NULL,
+    hidden INTEGER NOT NULL
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE INDEX messages_key_seq ON messages(key, seq);
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    text, content='messages', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER messages_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER messages_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+"""
+
+ROW_DEFAULTS = {'cwd': '', 'title': '', 'prompt': '', 'last_user': '', 'last_text': '',
+                'last_role': '', 'hidden': 0}
+
+
+class Index:
+    """The sessions and their messages as far as they were read, in an SQLite
+    database shared by every process of a picker: the list, the previews and
+    the indexer in the background. Each of them writes a session in a
+    transaction of its own and only where the row is still the one it read
+    from, so two of them reading the same new lines store them once."""
+
+    def __init__(self):
+        os.makedirs(CACHE_FOLDER, exist_ok=True)
+        self.db = sqlite3.connect(INDEX_FILE, timeout=60, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        if self.db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+            self.create()
+        self.db.execute('PRAGMA synchronous=NORMAL')
+
+    def create(self):
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            if self.db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+                for kind, name in self.db.execute(
+                        "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+                        " AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'messages_fts_%'").fetchall():
+                    self.db.execute(f'DROP {kind} IF EXISTS "{name}"')
+                for statement in re.split(r';\n(?=CREATE|$)', SCHEMA.strip()):
+                    if statement.strip():
+                        self.db.execute(statement)
+                self.db.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+
+    def get(self, key):
+        row = self.db.execute('SELECT * FROM sessions WHERE key = ?', (key,)).fetchone()
+        return dict(row) if row else None
+
+    def ensure(self, candidate):
+        """The row of a session, read again where its file changed since."""
+        row = self.get(candidate.key)
+        if row and row['mtime'] == candidate.mtime and row['size'] == candidate.size:
+            return row
+        # the offset of opencode is the number of messages read, its size
+        # the time of its last change: it is told by the parser to start over
+        reset = row is None or (candidate.agent != 'opencode' and candidate.size < row['offset'])
+        if reset:
+            values = dict(ROW_DEFAULTS)
+            parsed = Parsed(values, {}, 0, True)
+        else:
+            values = {name: row[name] for name in ROW_DEFAULTS}
+            parsed = Parsed(values, json.loads(row['state']), row['offset'], False)
+        try:
+            PARSERS[candidate.agent](candidate, parsed)
+            if parsed.restart and not reset:
+                reset = True
+                parsed = Parsed(dict(ROW_DEFAULTS), {}, 0, True)
+                PARSERS[candidate.agent](candidate, parsed)
+        except (OSError, sqlite3.Error) as exception:
+            verbose(f'{candidate.key}: {exception}')
+            return row
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError as exception:
+            # another process holds the index for too long: what it has stored
+            # is shown, this read is left for the next look
+            verbose(f'{candidate.key}: {exception}')
+            return row
+        try:
+            current = self.get(candidate.key)
+            # another process stored what was read here already, or more
+            if (current is None) != (row is None) or (current and (
+                    current['offset'] != row['offset'] or current['generation'] != row['generation']
+                    or current['size'] != row['size'] or current['mtime'] != row['mtime'])):
+                self.db.execute('COMMIT')
+                return current
+            generation = row['generation'] if row else 0
+            last_seq = 0 if reset else row['last_seq']
+            if reset and row:
+                self.db.execute('DELETE FROM messages WHERE key = ?', (candidate.key,))
+            if parsed.drop_kind and not reset:
+                self.db.execute('DELETE FROM messages WHERE key = ? AND kind = ?',
+                                (candidate.key, parsed.drop_kind))
+            if reset or parsed.drop_kind:
+                generation += 1
+            rows = []
+            for kind, role, text in parsed.messages:
+                last_seq += 1
+                rows.append((candidate.key, last_seq, kind, role, text))
+            if rows:
+                self.db.executemany(
+                    'INSERT INTO messages (key, seq, kind, role, text) VALUES (?, ?, ?, ?, ?)', rows)
+            values = parsed.values
+            self.db.execute(
+                'INSERT OR REPLACE INTO sessions VALUES'
+                ' (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (candidate.key, candidate.agent, candidate.id, candidate.path, candidate.mtime,
+                 candidate.size, parsed.offset, generation, last_seq, json.dumps(parsed.state),
+                 values['cwd'], values['title'], values['prompt'], values['last_user'],
+                 values['last_text'], values['last_role'], values['hidden']))
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+        return self.get(candidate.key)
+
+    def messages(self, key, after=0):
+        return self.db.execute(
+            'SELECT seq, role, text FROM messages WHERE key = ? AND seq > ? ORDER BY seq',
+            (key, after)).fetchall()
+
+    def tail_messages(self, key, max_chars):
+        messages = []
+        total = 0
+        for row in self.db.execute(
+                'SELECT seq, role, text FROM messages WHERE key = ? ORDER BY seq DESC', (key,)):
+            if messages and total + len(row[2]) > max_chars:
+                break
+            messages.append(row)
+            total += len(row[2])
+        messages.reverse()
+        return messages
+
+    def search(self, pattern, ignore_case, keys):
+        """The keys of the sessions with a message the pattern matches. A
+        pattern without regex syntax narrows the messages down through the
+        trigram index first; every hit is confirmed with the pattern against
+        the message with its whitespace collapsed, so a phrase found across a
+        line break counts."""
+        if not keys:
+            return set()
+        flags = re.IGNORECASE if ignore_case else 0
+        try:
+            expression = re.compile(pattern, flags)
+        except re.error:
+            # typed at / without meaning a regex: searched for as it is
+            pattern = re.escape(pattern)
+            expression = re.compile(pattern, flags)
+        words = pattern.split()
+        literal = words and not any(char in REGEX_SPECIALS for char in pattern) \
+            and all(len(word) >= 3 for word in words)
+        if literal:
+            query = ' AND '.join('"' + word.replace('"', '""') + '"' for word in words)
+            rows = self.db.execute(
+                'SELECT m.key, m.text FROM messages_fts f JOIN messages m ON m.id = f.rowid'
+                ' WHERE messages_fts MATCH ?', (query,))
+        else:
+            rows = self.db.execute('SELECT key, text FROM messages')
+        found = set()
+        for key, text in rows:
+            if key in keys and key not in found and expression.search(collapse(text)):
+                found.add(key)
+        return found
+
+    def prune(self):
+        """Forgets the sessions whose files are gone."""
+        gone = [row[0] for row in self.db.execute(
+            "SELECT key FROM sessions WHERE agent != 'opencode'") if not os.path.exists(row[0])]
+        if not gone:
+            return
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            for key in gone:
+                self.db.execute('DELETE FROM messages WHERE key = ?', (key,))
+                self.db.execute('DELETE FROM sessions WHERE key = ?', (key,))
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+
+
+def session_view(row, candidate):
+    """The row of the index with what the agent's own database says on top:
+    a title given since, the prompt the user actually typed."""
+    view = dict(row)
+    for name in ('cwd', 'title', 'prompt'):
+        if candidate.extra.get(name):
+            view[name] = candidate.extra[name]
+    if candidate.extra.get('hidden'):
+        view['hidden'] = 1
+    view['mtime'] = candidate.mtime
+    view['display_title'] = view['title'] or view['prompt'] or '-'
+    return view
+
+
+# --- live sessions ---------------------------------------------------------------
+
+def read_text(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return ''
+
+
+def process_start(pid):
+    """The start of a process in clock ticks since boot, as the 22nd field of
+    its stat: the name in brackets before it can hold anything, the numbers
+    after the last bracket cannot."""
+    stat = read_text(f'/proc/{pid}/stat')
+    if not stat:
+        return None
+    fields = stat.rsplit(') ', 1)[-1].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def process_start_epoch(pid):
+    start = process_start(pid)
+    if start is None:
+        return None
+    for line in read_text('/proc/stat').splitlines():
+        if line.startswith('btime '):
+            return int(line.split()[1]) + int(start) / os.sysconf('SC_CLK_TCK')
+    return None
+
+
+def process_children(pid):
+    children = []
+    try:
+        tasks = os.listdir(f'/proc/{pid}/task')
+    except OSError:
+        return children
+    for task in tasks:
+        children.extend(int(child) for child in read_text(f'/proc/{pid}/task/{task}/children').split())
+    return children
+
+
+def agent_processes():
+    """The processes of codex and opencode, from one walk over /proc."""
+    found = {'codex': [], 'opencode': []}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return found
+    for name in names:
+        if not name.isdigit():
+            continue
+        comm = read_text(f'/proc/{name}/comm').strip()
+        if comm == 'codex':
+            found['codex'].append(int(name))
+        elif comm in ('opencode', '.opencode'):
+            found['opencode'].append(int(name))
+    return found
+
+
+def read_backwards_for(path, markers, chunk=262144):
+    """Which of the markers comes last in a file, read from its end, so a
+    session of megabytes costs the length of its last turn."""
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            longest = max(len(marker) for marker in markers)
+            while position > 0:
+                start = max(0, position - chunk)
+                handle.seek(start)
+                data = handle.read(position - start + longest)
+                best = None
+                best_index = -1
+                for marker in markers:
+                    index = data.rfind(marker)
+                    if index > best_index:
+                        best, best_index = marker, index
+                if best is not None:
+                    return best
+                position = start
+    except OSError:
+        pass
+    return None
+
+
+def tail_lines(path, max_bytes=524288, count=50):
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            data = handle.read()
+    except OSError:
+        return []
+    lines = data.split(b'\n')
+    if size > max_bytes:
+        lines = lines[1:]
+    return [line for line in lines if line.strip()][-count:]
+
+
+def codex_pending_prompt(path):
+    """What a working codex turn waits for, where its last call is one that
+    waits: a command that asks to run outside the sandbox, or a question to
+    the user, without any output after it yet."""
+    items = []
+    for line in tail_lines(path):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        payload = record.get('payload') if isinstance(record, dict) else None
+        items.append(payload if isinstance(payload, dict) else {})
+    calls = [index for index, item in enumerate(items)
+             if item.get('type') in ('custom_tool_call', 'function_call')]
+    if not calls:
+        return None
+    call = items[calls[-1]]
+    for item in items[calls[-1] + 1:]:
+        if item.get('call_id') == call.get('call_id') and str(item.get('type', '')).endswith('_output'):
+            return None
+    if call.get('name') == 'request_user_input':
+        return 'question'
+    if 'require_escalated' in str(call.get('input') or call.get('arguments') or ''):
+        return 'approval'
+    return None
+
+
+class Live:
+    """Which sessions are open in a running agent, and what they are doing.
+    None of it is cached: it is what the sessions do right now."""
+
+    def __init__(self, agents):
+        self.state = {}
+        self.detail = {}
+        self.pid = {}
+        self.path = {}
+        processes = agent_processes() if ('codex' in agents or 'opencode' in agents) else {}
+        if 'claude' in agents:
+            self.load_claude()
+        if 'codex' in agents:
+            self.load_codex(processes.get('codex', []))
+        if 'opencode' in agents:
+            self.load_opencode(processes.get('opencode', []))
+
+    def load_claude(self):
+        try:
+            names = os.listdir(CLAUDE_PEERS)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith('.json'):
+                continue
+            try:
+                peer = json.loads(read_text(os.path.join(CLAUDE_PEERS, name)) or '{}')
+            except ValueError:
+                continue
+            session_id = peer.get('sessionId')
+            pid = peer.get('pid')
+            # a file outlives the process that wrote it and a pid is handed
+            # out again, so the start of the process has to agree
+            if not session_id or not pid or str(process_start(pid)) != str(peer.get('procStart')):
+                continue
+            key = ('claude', session_id)
+            self.pid[key] = pid
+            status = peer.get('status')
+            self.state[key] = {'busy': 'working', 'shell': 'working',
+                               'waiting': 'waiting'}.get(status, 'open')
+            if peer.get('waitingFor'):
+                self.detail[key] = str(peer['waitingFor'])
+
+    def load_codex(self, pids):
+        """Codex publishes nothing, but the process that has a session open
+        holds its file open, and the last turn event in it says whether it is
+        working on something."""
+        # /proc names the files by their resolved paths
+        codex_sessions = os.path.realpath(CODEX_SESSIONS)
+        for pid in pids:
+            try:
+                descriptors = os.listdir(f'/proc/{pid}/fd')
+            except OSError:
+                continue
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(f'/proc/{pid}/fd/{descriptor}')
+                except OSError:
+                    continue
+                if not target.startswith(codex_sessions + '/') or not target.endswith('.jsonl'):
+                    continue
+                key = ('codex', codex_id_from_path(target))
+                self.pid[key] = pid
+                self.path[key] = target
+                # an interrupted turn ends with turn_aborted instead
+                last = read_backwards_for(
+                    target, (b'"task_started"', b'"task_complete"', b'"turn_aborted"'))
+                if last != b'"task_started"':
+                    self.state[key] = 'open'
+                    continue
+                self.state[key] = 'working'
+                pending = codex_pending_prompt(target)
+                # once the call runs, its command is a process below codex;
+                # the code mode host is one for as long as codex runs
+                if pending and not any(read_text(f'/proc/{child}/comm').strip() != 'codex-code-mode'
+                                       for child in process_children(pid)):
+                    self.state[key] = 'waiting'
+                    self.detail[key] = pending
+
+    def load_opencode(self, pids):
+        """Opencode names its session on the command line where it was given
+        one; otherwise it is the session of its directory written to since the
+        process started. A turn that is running has an assistant message
+        without an end; a question asked has its tool still running."""
+        if not pids or not os.path.isfile(OPENCODE_DB):
+            return
+        try:
+            connection = open_readonly(OPENCODE_DB)
+        except sqlite3.Error:
+            return
+        try:
+            for pid in pids:
+                arguments = read_text(f'/proc/{pid}/cmdline').split('\0')
+                session_id = None
+                for index, argument in enumerate(arguments):
+                    if argument in ('-s', '--session') and index + 1 < len(arguments):
+                        session_id = arguments[index + 1]
+                    elif argument.startswith('--session='):
+                        session_id = argument.split('=', 1)[1]
+                if not session_id:
+                    if any(argument in ('serve', 'web', 'acp', 'run', 'attach') for argument in arguments[1:2]):
+                        continue
+                    try:
+                        directory = os.readlink(f'/proc/{pid}/cwd')
+                    except OSError:
+                        continue
+                    started = process_start_epoch(pid)
+                    if started is None:
+                        continue
+                    row = connection.execute(
+                        'SELECT id FROM session WHERE directory = ? AND parent_id IS NULL'
+                        ' AND time_updated >= ? ORDER BY time_updated DESC LIMIT 1',
+                        (directory, int(started * 1000))).fetchone()
+                    if not row:
+                        continue
+                    session_id = row[0]
+                key = ('opencode', session_id)
+                if key in self.pid:
+                    continue
+                self.pid[key] = pid
+                self.state[key] = 'open'
+                message = connection.execute(
+                    "SELECT id, json_extract(data, '$.role'), json_extract(data, '$.time.completed')"
+                    ' FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC LIMIT 1',
+                    (session_id,)).fetchone()
+                if not message:
+                    continue
+                if message[1] == 'user' or (message[1] == 'assistant' and message[2] is None):
+                    self.state[key] = 'working'
+                    for tool, status in connection.execute(
+                            "SELECT json_extract(data, '$.tool'), json_extract(data, '$.state.status')"
+                            " FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'tool'",
+                            (message[0],)):
+                        if tool == 'question' and status in ('pending', 'running'):
+                            self.state[key] = 'waiting'
+                            self.detail[key] = 'question'
+        except sqlite3.Error as exception:
+            verbose(f'opencode database: {exception}')
+        finally:
+            connection.close()
+
+    def marker(self, agent, session_id):
+        state = self.state.get((agent, session_id))
+        if not state:
+            return LIVE_EMPTY, ''
+        detail = self.detail.get((agent, session_id))
+        return LIVE_MARKERS[state], '@' + state + (' ' + detail if detail else '')
+
+    def files(self, agents):
+        """The sessions open in a running agent, as candidates: the agents
+        name them, so no folder is searched for them."""
+        candidates = []
+        for (agent, session_id), _ in self.state.items():
+            if agent not in agents:
+                continue
+            candidate = None
+            if agent == 'claude':
+                for project in os.scandir(CLAUDE_PROJECTS) if os.path.isdir(CLAUDE_PROJECTS) else ():
+                    path = os.path.join(project.path, session_id + '.jsonl')
+                    if os.path.isfile(path):
+                        candidate = file_candidate('claude', path)
+                        break
+            elif agent == 'codex':
+                path = self.path[(agent, session_id)]
+                rows = codex_thread_rows('WHERE rollout_path = ?', (path,))
+                extra = codex_extra(*rows[0][2:7]) if rows else None
+                candidate = file_candidate('codex', path, extra)
+            elif agent == 'opencode':
+                candidate = candidate_for('opencode', 'opencode:' + session_id)
+            if candidate:
+                candidates.append(candidate)
+        candidates.sort(key=lambda candidate: candidate.mtime, reverse=True)
+        return candidates
+
+
+# --- listing -----------------------------------------------------------------
+
+class Options:
+    """What is listed: the agents, the age window or the count, the folder,
+    the search, the open sessions only. The open picker keeps these in its
+    state file, where its keys change them."""
+
+    def __init__(self):
+        self.agents = list(ALL_AGENTS)
+        self.days = DEFAULT_DAYS
+        self.limit = None
+        self.current_directory_only = False
+        self.current_directory = os.path.realpath(os.getcwd())
+        self.launch_directory = self.current_directory
+        self.open_only = False
+        self.grep = ''
+        self.igrep = ''
+        self.view = 'sessions'
+        self.prompt_column = False
+        self.print = False
+
+    STATE_FIELDS = ('agents', 'days', 'current_directory_only', 'current_directory',
+                    'launch_directory', 'open_only', 'grep', 'igrep', 'view')
+
+    def read_state(self, path):
+        try:
+            with open(path) as handle:
+                state = json.load(handle)
+        except (OSError, ValueError):
+            return
+        for name in self.STATE_FIELDS:
+            if name in state:
+                setattr(self, name, state[name])
+
+    def write_state(self, path):
+        state = {name: getattr(self, name) for name in self.STATE_FIELDS}
+        temporary = path + '.tmp'
+        with open(temporary, 'w') as handle:
+            json.dump(state, handle)
+        os.replace(temporary, path)
+
+
+def in_directory(cwd, directory):
+    if not cwd:
+        return False
+    return cwd == directory or resolve_directory(cwd) == directory
+
+
+def claude_project_folder(directory):
+    """Claude keeps the sessions of a directory in one folder, named after it
+    with everything that is not a letter or a digit turned into a dash. The
+    name does not give the directory back, but where the folder is there, it
+    rules out every other folder without a file being opened."""
+    return os.path.join(CLAUDE_PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', directory))
+
+
+def collect(options, live, index, limit=None, all_directories=False):
+    """The rows of the listing, newest first, each read again where its
+    session changed since the index last saw it."""
+    if options.open_only:
+        candidates = live.files(options.agents)
+    else:
+        cutoff = 0 if options.days is None else time.time() - options.days * 86400
+        candidates = discover(options.agents, cutoff)
+    directory = None
+    claude_folder = None
+    if options.current_directory_only and not all_directories:
+        directory = options.current_directory
+        folder = claude_project_folder(directory)
+        if os.path.isdir(folder):
+            claude_folder = folder + os.sep
+    pattern = options.grep or options.igrep
+    rows = []
+    for candidate in candidates:
+        if candidate.extra.get('hidden'):
+            continue
+        if directory:
+            if candidate.extra.get('cwd') and not in_directory(candidate.extra['cwd'], directory):
+                continue
+            if claude_folder and candidate.agent == 'claude' and not candidate.path.startswith(claude_folder):
+                continue
+        row = index.ensure(candidate)
+        if row is None:
+            continue
+        view = session_view(row, candidate)
+        if view['hidden'] or (directory and not in_directory(view['cwd'], directory)):
+            continue
+        rows.append(view)
+        if limit and not pattern and len(rows) >= limit:
+            break
+    if pattern:
+        found = index.search(pattern, bool(options.igrep), {row['key'] for row in rows})
+        rows = [row for row in rows if row['key'] in found]
+        if limit:
+            rows = rows[:limit]
+    return rows
+
+
+def format_rows(rows, live, options):
+    """The table of the rows: the display lines, the first of them the header."""
+    toage = load_toage()
+    now = time.time()
+    if options.print:
+        title_max = PRINT_TITLE_MAX_WIDTH
+        prompt_max = PRINT_PROMPT_MAX_WIDTH
+    elif options.prompt_column:
+        title_max = prompt_max = FZF_TEXT_MAX_WIDTH
+    else:
+        title_max = FZF_TITLE_MAX_WIDTH
+        prompt_max = FZF_TEXT_MAX_WIDTH
+    # The picker counts ages in minutes: its list is only loaded again when a
+    # row changed, and an age in seconds would change every row every second.
+    age_options = dict(AGE_OPTIONS)
+    if not options.print:
+        age_options['minimum'] = 60
+    cells = []
+    directories = {}
+    for row in rows:
+        marker, words = live.marker(row['agent'], row['id'])
+        if row['cwd'] not in directories:
+            directories[row['cwd']] = format_cwd(row['cwd']) if row['cwd'] else '-'
+        cells.append((
+            row['agent'], marker, words,
+            toage.format_span(now - row['mtime'], **age_options),
+            shorten(row['display_title'], title_max),
+            shorten(row['prompt'] or '-', prompt_max) if options.prompt_column else '',
+            directories[row['cwd']],
+        ))
+    agent_width = max([len('AGENT')] + [len(cell[0]) for cell in cells])
+    age_width = max([len('AGE')] + [visible_width(cell[3]) for cell in cells])
+    title_width = max([len('TITLE')] + [text_width(cell[4]) for cell in cells])
+    prompt_width = max([len('PROMPT')] + [text_width(cell[5]) for cell in cells])
+    header = f"{pad('AGENT', agent_width)}  {LIVE_EMPTY}  {pad('AGE', age_width)}  {pad('TITLE', title_width)}  "
+    if options.prompt_column:
+        header += f"{pad('PROMPT', prompt_width)}  "
+    lines = [header + 'DIRECTORY']
+    states = []
+    for agent, marker, words, age, title, prompt, cwd in cells:
+        line = (f'{C_AGENTS.get(agent, C_AGENT_OTHER)}{pad(agent, agent_width)}{C_RESET}  {marker}  '
+                f'{pad(age, age_width)}  {C_TITLE}{pad(title, title_width)}{C_RESET}  ')
+        if options.prompt_column:
+            line += f'{C_PROMPT}{pad(prompt, prompt_width)}{C_RESET}  '
+        lines.append(line + f'{C_DIRECTORY}{cwd}{C_RESET}')
+        states.append(words)
+    return lines, states
+
+
+def picker_rows(rows, live, options, track_key=None):
+    """The rows of the picker: the display line and, hidden behind it, the
+    agent, the key, the full title and prompt, the state and the end of the
+    conversation, which the fuzzy search of fzf matches as well. Returns them
+    with the position of the row of track_key, None where there is none."""
+    lines, states = format_rows(rows, live, options)
+    found = None
+    output = [lines[0] + '\tAGENT\tKEY\tFULL_TITLE\tFULL_PROMPT\tSTATE\tCONTENT']
+    for position, (row, line, words) in enumerate(zip(rows, lines[1:], states), start=1):
+        snippet = row['last_user'][:SNIPPET_CHARS]
+        if row['last_text'] and row['last_text'] != row['last_user']:
+            snippet += ' · ' + row['last_text'][:SNIPPET_CHARS]
+        output.append('\t'.join((
+            line, row['agent'], row['key'], single_line(row['display_title']),
+            single_line(row['prompt'][:SNIPPET_CHARS]), words, single_line(snippet))))
+        if found is None and row['key'] == track_key:
+            found = position
+    return output, found
+
+
+def folder_rows(rows, options, track_key=None):
+    """The folders view: the folders the listed sessions were recorded in,
+    each once and in order, led by the one that stands for all of them. The
+    cursor starts on the other way the scope can go."""
+    folders = sorted({row['cwd'] for row in rows if row['cwd']},
+                     key=lambda folder: display_path(folder).lower())
+    wanted = track_key or (options.launch_directory if not options.current_directory_only
+                           else FOLDERS_ALL)
+    output = ['FOLDER\tAGENT\tKEY\tFULL_TITLE\tFULL_PROMPT\tSTATE\tCONTENT',
+              f'{C_DIRECTORY}{FOLDERS_ALL}{C_RESET}\tfolder\t{FOLDERS_ALL}\t\t\t\t']
+    # a folder without sessions in the list is no row to go to either
+    found = 1
+    for position, folder in enumerate(folders, start=2):
+        output.append(f'{C_DIRECTORY}{display_path(folder)}{C_RESET}\tfolder\t{folder}\t\t\t\t')
+        if found == 1 and wanted != FOLDERS_ALL \
+                and resolve_directory(folder) == resolve_directory(wanted):
+            found = position
+    return output, found
+
+
+# --- rendering ---------------------------------------------------------------------
+
+ROLE_LABELS = {'user': 'User', 'assistant': 'Assistant'}
+
+
+def markdown(messages, previous_role=None):
+    """Messages as Markdown, a heading per turn: messages of one role that
+    follow each other - an answer around its tool calls - read as one."""
+    parts = []
+    for _, role, text in messages:
+        if role == previous_role:
+            parts.append(text)
+        else:
+            heading = f'### {ROLE_LABELS.get(role, role)}\n\n{text}'
+            parts.append(('---\n\n' if previous_role else '') + heading)
+        previous_role = role
+    return '\n\n'.join(parts)
+
+
+# the color of the heading of a turn: the user's in the color of the prompt
+# column, the agent's in the color of its agent
+ROLE_COLORS = {'user': 110}
+AGENT_COLOR_NUMBERS = {'claude': 141, 'codex': 40, 'opencode': 178}
+BLANK_LINE = re.compile(r'^(?:\s|\033\[[0-9;]*m)*$')
+
+
+def render(messages, width=None, agent=None, previous_role=None, color=True):
+    """Messages rendered for the terminal by rich, in this process: a rule
+    with the role at the start of every turn, the messages of a turn - an
+    answer around its tool calls - as Markdown under it. rich is loaded only
+    here, where something is rendered, as loading it costs more than the rest
+    of a preview. Without rich the Markdown is shown as it is."""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.rule import Rule
+        from rich.text import Text
+    except ImportError:
+        return markdown(messages, previous_role) + '\n'
+    import io
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=width or None, force_terminal=color,
+                      no_color=not color, color_system='truecolor' if color else None,
+                      highlight=False, emoji=False, soft_wrap=False)
+    for _, role, text in messages:
+        if role != previous_role:
+            color_number = ROLE_COLORS.get(role) or AGENT_COLOR_NUMBERS.get(agent, 208)
+            label = Text(f' {ROLE_LABELS.get(role, role)} ', style=f'bold color({color_number})')
+            console.print()
+            console.print(Rule(label, align='left', style='color(240)'))
+        console.print(Markdown(text, code_theme='monokai', hyperlinks=False))
+        console.print()
+        previous_role = role
+    return tidy_render(buffer.getvalue())
+
+
+def tidy_render(text):
+    """Runs of empty lines - rich puts one around every block, and a turn adds
+    its own - become one, and the empty lines at either end go."""
+    lines = []
+    for line in text.split('\n'):
+        if not BLANK_LINE.match(line):
+            lines.append(line)
+        elif lines and lines[-1]:
+            lines.append('')
+    while lines and not lines[-1]:
+        lines.pop()
+    return '\n'.join(lines) + '\n' if lines else ''
+
+
+def ensured_session(agent, key):
+    candidate = candidate_for(agent, key)
+    if candidate is None:
+        fail(f'Session not found: {key}')
+    index = Index()
+    row = index.ensure(candidate)
+    if row is None:
+        fail(f'Session cannot be read: {key}')
+    return index, candidate, session_view(row, candidate)
+
+
+def session_markdown(agent, key, last_only=False):
+    index, _, view = ensured_session(agent, key)
+    messages = index.messages(view['key'])
+    if last_only:
+        messages = messages[-1:]
+    return markdown(messages)
+
+
+class PreviewCache:
+    """What the preview of a session rendered last, so a preview started again
+    - for new messages, or by a reload of the list - prints it at once and
+    renders only the messages that came since. fzf keeps the old content until
+    the new one arrives, so nothing flickers."""
+
+    def __init__(self, key, width):
+        os.makedirs(RENDER_FOLDER, exist_ok=True)
+        self.path = os.path.join(RENDER_FOLDER, hashlib.sha1(key.encode()).hexdigest() + '.json')
+        self.signature = [PREVIEW_RENDER_VERSION, width]
+
+    def load(self, generation):
+        try:
+            with open(self.path) as handle:
+                cached = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        if cached.get('signature') != self.signature or cached.get('generation') != generation:
+            return None
+        return cached
+
+    def save(self, generation, last_seq, last_role, text):
+        write_json(self.path, {'signature': self.signature, 'generation': generation,
+                               'last_seq': last_seq, 'last_role': last_role, 'text': text})
+
+
+def write_json(path, value):
+    temporary = path + f'.{os.getpid()}'
+    try:
+        with open(temporary, 'w') as handle:
+            json.dump(value, handle)
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
+def preview(agent, key, state_file=None):
+    """The end of the conversation, scrolled to its last message by fzf. The
+    preview prints and ends - fzf shows a spinner for as long as a preview
+    runs - and the watcher of the picker starts it again once the session got
+    new messages. What it showed is left next to the state of the picker, for
+    the watcher to tell new messages from those."""
+    width = max(int(os.environ.get('FZF_PREVIEW_COLUMNS') or 80) - PREVIEW_WIDTH_MARGIN, 20)
+    index, _, view = ensured_session(agent, key)
+    cache = PreviewCache(view['key'], width)
+    cached = cache.load(view['generation'])
+    if cached and cached['last_seq'] <= view['last_seq'] \
+            and len(cached['text']) < PREVIEW_MAX_CHARS * 6:
+        text = cached['text']
+        last_seq = cached['last_seq']
+        new = index.messages(view['key'], last_seq)
+        if new:
+            chunk = render(new, width, agent, cached['last_role'])
+            text = text + '\n' + chunk if text and chunk else text + chunk
+            last_seq = new[-1][0]
+            cache.save(view['generation'], last_seq, new[-1][1], text)
+    else:
+        messages = index.tail_messages(view['key'], PREVIEW_MAX_CHARS)
+        text = render(messages, width, agent) if messages else ''
+        last_seq = messages[-1][0] if messages else 0
+        cache.save(view['generation'], last_seq, messages[-1][1] if messages else None, text)
+    if state_file:
+        write_json(state_file + '.preview', {'key': view['key'], 'last_seq': last_seq,
+                                             'generation': view['generation']})
+    try:
+        sys.stdout.write(text or f'{C_MUTED}No messages{C_RESET}\n')
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
+
+# --- acting on a session --------------------------------------------------------
+
+def tty_run(command, capture=True):
+    """A command that asks on the terminal, its answer read from its output;
+    None where it was not answered."""
+    try:
+        with open('/dev/tty') as tty:
+            result = subprocess.run(command, stdin=tty, text=True,
+                                    stdout=subprocess.PIPE if capture else None)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.rstrip('\n') if capture else ''
+
+
+def ask_create_directory(directory):
+    """A session whose folder is gone can still be resumed, and a fork can go
+    to a folder that is not there yet: the CLIs only need it to exist."""
+    if not directory or os.path.isdir(directory):
+        return True
+    require('prompt-yes-no')
+    if tty_run(['prompt-yes-no', '--no-abort-message',
+                f"Folder '{display_path(directory)}' is missing. Create it?"], capture=False) is None:
+        return False
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        fail(f'Cannot create directory: {directory}')
+    return True
+
+
+def exec_on_tty(command, cwd):
+    """Replaces this process with the agent, on the terminal: the picker that
+    started it handed its own input and output over to fzf."""
+    muted(f'cd -- {shlex.quote(cwd)} && {shlex.join(command)}')
+    try:
+        os.chdir(cwd)
+    except OSError:
+        fail(f'Cannot enter directory: {cwd}')
+    descriptor = os.open('/dev/tty', os.O_RDWR)
+    for target in (0, 1, 2):
+        os.dup2(descriptor, target)
+    try:
+        os.execvp(command[0], command)
+    except OSError as exception:
+        fail(f'Cannot start {command[0]}: {exception}')
+
+
+def resume_command(agent, session_id, cwd):
+    if agent == 'claude':
+        return ['claude', '--resume', session_id]
+    if agent == 'codex':
+        return ['codex', 'resume', '-C', cwd, session_id]
+    return ['opencode', '--session', session_id]
+
+
+def resume_session(agent, key):
+    _, _, view = ensured_session(agent, key)
+    cwd = view['cwd']
+    if not cwd:
+        fail('Session has no working directory')
+    if not ask_create_directory(cwd):
+        fail(f'Session directory not found: {cwd}')
+    require(agent)
+    exec_on_tty(resume_command(agent, view['id'], cwd), cwd)
+
+
+def continue_with_context(agent, target_agent, key, directory):
+    """A fresh session of the target agent with the conversation handed over
+    as its first prompt: how a fork into another agent works, and one into a
+    folder the agent would not look the session up in. A transcript too large
+    for a command line stays in its file and the agent is told to read it."""
+    content = session_markdown(agent, key)
+    handle = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', prefix='agent-session-fork.', delete=False)
+    with handle:
+        handle.write(f'User wants to continue a previous {agent} session. '
+                     f'This is the complete context:\n\n---\n\n{content}\n\n---\n\n'
+                     'Do nothing for now. Wait for the next user prompt.\n')
+    try:
+        inline = os.path.getsize(handle.name) <= FORK_PROMPT_MAX_BYTES
+        if inline:
+            with open(handle.name) as source:
+                prompt = source.read()
+        else:
+            prompt = (f'User wants to continue a previous {agent} session. Read the complete '
+                      f'context from {handle.name}. Do nothing else for now. '
+                      'Wait for the next user prompt.')
+        command = {
+            'claude': ['claude', prompt],
+            'codex': ['codex', '-C', directory, prompt],
+            'opencode': ['opencode', '--prompt', prompt],
+        }[target_agent]
+        # the transcript itself is shown as the file it is read from
+        shown = shlex.join(command)
+        if inline:
+            shown = shlex.join(command[:-1]) + ' "$(< ' + shlex.quote(handle.name) + ')"'
+        muted(f'cd -- {shlex.quote(directory)} && {shown}')
+        os.chdir(directory)
+        with open('/dev/tty', 'r+b', buffering=0) as tty:
+            subprocess.run(command, stdin=tty, stdout=tty, stderr=tty)
+    finally:
+        os.unlink(handle.name)
+
+
+def fork_session(agent, key, target_agent, directory):
+    """Continues the session in the chosen folder the shortest way the CLIs
+    allow: codex takes the working root as an argument and forks natively
+    anywhere, claude and opencode look a session up by the folder they run in
+    and fork natively only in the folder of the session. Everything else
+    starts fresh with the conversation as context."""
+    require(target_agent)
+    if not directory:
+        fail('Directory not found')
+    if not ask_create_directory(directory):
+        fail(f'Directory not found: {directory}')
+    _, _, view = ensured_session(agent, key)
+    if target_agent == agent:
+        same_folder = view['cwd'] and resolve_directory(view['cwd']) == resolve_directory(directory)
+        if agent == 'codex':
+            exec_on_tty(['codex', 'fork', '-C', directory, view['id']], directory)
+        if agent == 'claude' and same_folder:
+            exec_on_tty(['claude', '--resume', view['id'], '--fork-session'], directory)
+        if agent == 'opencode' and same_folder:
+            exec_on_tty(['opencode', '--session', view['id'], '--fork'], directory)
+    continue_with_context(agent, target_agent, key, directory)
+
+
+def focus_session(agent, key):
+    """Focus the running agent by PID. Titles help terminals with shared window owners."""
+    _, _, view = ensured_session(agent, key)
+    live = Live([agent])
+    pid = live.pid.get((agent, view['id']))
+    if not pid:
+        fail('Session is not running')
+    command = [require('window-focus-by-process')]
+    if view['title']:
+        command += ['--title', view['title']]
+    if view['cwd']:
+        command += ['--title', display_path(view['cwd'])]
+        if display_path(view['cwd']) != view['cwd']:
+            command += ['--title', view['cwd']]
+    result = subprocess.run(command + [str(pid)], stdout=subprocess.DEVNULL)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def ask_session_action(running):
+    """Copying and printing come in a whole and a last message variant, and
+    copying also as the session ID alone, that share a row, tab walking over
+    them; a session open in a running agent is
+    resumed already, so focusing its terminal takes the place of resuming."""
+    choices = ['focus=Focus terminal' if running else 'resume=Resume', 'fork=Fork',
+               'clipboard=Copy', 'clipboard-last=Copy last message',
+               'clipboard-id=Copy session ID',
+               'print=Print', 'print-last=Print last message']
+    return tty_run(['prompt-select', '--prompt', 'Continue session:', '--no-abort-message',
+                    '--cycle', 'clipboard|clipboard-last|clipboard-id',
+                    '--cycle', 'print|print-last'] + choices)
+
+
+def ask_fork_directory(session_directory, current_directory):
+    """The folder of the picker and the folder of the session, both even where
+    they are the same, so the keys of the question stay put."""
+    entries = [f'here={display_path(current_directory)} (current)']
+    if session_directory:
+        entries.append(f'session={display_path(session_directory)} (session)')
+    entries.append('other=...')
+    choice = tty_run(['prompt-select', '--prompt', 'Fork in:', '--no-abort-message'] + entries)
+    if choice == 'here':
+        return current_directory
+    if choice == 'session':
+        return session_directory
+    if choice == 'other':
+        folder = tty_run(['prompt-folder', '--prompt', 'Folder:', '--no-abort-message'])
+        return os.path.realpath(os.path.expanduser(folder)) if folder else None
+    return None
+
+
+def ask_fork_agent(agent):
+    choice = tty_run(['prompt-complete', '--prompt', 'Fork with:', '--default', agent,
+                      '--no-abort-message'] + list(ALL_AGENTS))
+    if choice is None:
+        return None
+    if choice not in ALL_AGENTS:
+        fail(f'Unknown fork agent: {choice}')
+    return choice
+
+
+def ask_fork(agent, key, current_directory):
+    """The questions of a fork, esc stepping back one question and out of the
+    first one without forking anything."""
+    for command in ('prompt-select', 'prompt-complete', 'prompt-folder'):
+        require(command)
+    _, _, view = ensured_session(agent, key)
+    step = 'directory'
+    directory = target_agent = None
+    while True:
+        if step == 'directory':
+            directory = ask_fork_directory(view['cwd'], current_directory)
+            if directory is None:
+                return
+            # no to creating a missing folder asks for the folder again
+            if ask_create_directory(directory):
+                step = 'agent'
+        else:
+            target_agent = ask_fork_agent(agent)
+            if target_agent:
+                break
+            step = 'directory'
+    fork_session(agent, key, target_agent, directory)
+
+
+def session_ask(agent, key, answer_file, current_directory):
+    """What is to happen with the selected session is asked while the picker
+    is still open, in as many steps as the answer needs, and the answers are
+    left in a file for the action that runs once the picker is gone. Out of
+    the first question esc answers nothing, which leaves the picker as it
+    was."""
+    for command in ('prompt-select', 'prompt-complete', 'prompt-folder'):
+        require(command)
+    open(answer_file, 'w').close()
+    _, _, view = ensured_session(agent, key)
+    running = bool(Live([agent]).pid.get((agent, view['id'])))
+    step = 'action'
+    action = directory = target_agent = print_format = None
+    while True:
+        if step == 'action':
+            action = ask_session_action(running)
+            if action is None:
+                return
+            if action == 'resume':
+                if ask_create_directory(view['cwd']):
+                    break
+            elif action in ('clipboard', 'clipboard-last', 'clipboard-id'):
+                break
+            elif action == 'focus':
+                # nothing to become: the picker stays where it is
+                session_action('focus', agent, key)
+                return
+            elif action == 'fork':
+                step = 'directory'
+            elif action in ('print', 'print-last'):
+                step = 'format'
+            else:
+                fail(f'Unknown session action: {action}')
+        elif step == 'directory':
+            directory = ask_fork_directory(view['cwd'], current_directory)
+            if directory is None:
+                step = 'action'
+            elif ask_create_directory(directory):
+                step = 'agent'
+        elif step == 'agent':
+            target_agent = ask_fork_agent(agent)
+            if target_agent:
+                break
+            step = 'directory'
+        elif step == 'format':
+            print_format = tty_run(['prompt-select', '--prompt', 'Print:', '--no-abort-message',
+                                    'markdown=Markdown', 'raw=Raw'])
+            if print_format:
+                break
+            step = 'action'
+    with open(answer_file, 'w') as handle:
+        json.dump({'action': action, 'format': print_format, 'directory': directory,
+                   'agent': target_agent}, handle)
+
+
+def read_answers(answer_file):
+    try:
+        with open(answer_file) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def session_run(agent, key, answer_file):
+    answers = read_answers(answer_file)
+    if not answers:
+        return
+    action = answers.get('action')
+    if action in ('resume', 'clipboard', 'clipboard-last', 'clipboard-id'):
+        session_action(action, agent, key)
+    elif action in ('print', 'print-last'):
+        session_action(answers.get('format') + action[len('print'):], agent, key)
+    elif action == 'fork':
+        fork_session(agent, key, answers.get('agent'), answers.get('directory'))
+    else:
+        fail(f'Unknown session action: {action}')
+
+
+def session_action(action, agent, key, answer_file=None, current_directory=None, state_file=None):
+    last_only = action.endswith('-last')
+    action = action[:-len('-last')] if last_only else action
+    if agent not in ALL_AGENTS:
+        fail(f'Unknown agent: {agent}')
+    if action == 'ask':
+        session_ask(agent, key, answer_file, current_directory)
+    elif action == 'become':
+        # an unanswered question leaves the file empty: nothing to become
+        if read_answers(answer_file):
+            sys.stdout.write('become(' + ' '.join(shlex.quote(part) for part in (
+                SCRIPT_PATH, '--fzf-answers', answer_file, '--fzf-action', 'run', agent, key)) + ')')
+    elif action == 'run':
+        session_run(agent, key, answer_file)
+    elif action == 'preview':
+        preview(agent, key, state_file)
+    elif action == 'markdown':
+        print_rendered(agent, key, last_only)
+    elif action == 'raw':
+        print_raw(agent, key, last_only)
+    elif action == 'clipboard-id':
+        _, _, view = ensured_session(agent, key)
+        if subprocess.run([require('clip')], input=view['id'], text=True).returncode:
+            fail('Failed to copy session ID to clipboard')
+        muted(f"Copied session ID to clipboard: {view['id']}")
+    elif action == 'clipboard':
+        content = session_markdown(agent, key, last_only)
+        if not content:
+            fail('Session has no messages')
+        if subprocess.run([require('clip')], input=content + '\n', text=True).returncode:
+            fail('Failed to copy session to clipboard')
+        muted('Copied the last message to clipboard' if last_only else 'Copied to clipboard')
+    elif action == 'focus':
+        try:
+            focus_session(agent, key)
+        except SystemExit:
+            if sys.stderr.isatty():
+                tty_run(['bash', '-c', 'read -r -s -n 1 -p "Press any key to go back"'],
+                        capture=False)
+            raise
+    elif action == 'resume':
+        resume_session(agent, key)
+    else:
+        fail(f'Unknown interactive action: {action}')
+
+
+# --- the picker ----------------------------------------------------------------------
+
+def quoted(*parts):
+    return ' '.join(shlex.quote(str(part)) for part in parts)
+
+
+def preview_action(kind):
+    """The preview is shown or hidden along with the view, which gives the
+    list another width: the footer of fzf-with-header is packed again for it
+    by the action that picker exports for this."""
+    action = f'{kind}-preview'
+    footer = os.environ.get('FZF_WITH_HEADER_FOOTER_ACTION')
+    return action + ('+' + footer if footer else '')
+
+
+def fzf_prompt(options):
+    """The prompt names what is shown - the open filter, the agent, the folder
+    scope, the age window and the search - each in the color of what it
+    names, followed by the arrow of the picker."""
+    parts = []
+    if options.open_only:
+        parts.append(f'{C_LIVE_OPEN}open{C_RESET}')
+    if len(options.agents) == 1:
+        parts.append(f'{C_AGENTS.get(options.agents[0], C_AGENT_OTHER)}{options.agents[0]}{C_RESET}')
+    scope = 'all'
+    if options.current_directory_only:
+        scope = os.path.basename(options.current_directory) or '/'
+    if options.view == 'folders':
+        scope = 'folders'
+    parts.append(f'{C_DIRECTORY}{scope}{C_RESET}')
+    if not options.open_only and options.limit is None and options.days:
+        parts.append(f'{C_MUTED}{options.days}d{C_RESET}')
+    prompt = ' '.join(parts)
+    if options.igrep:
+        prompt += f'{C_TITLE} ~ {options.igrep}{C_RESET}'
+    return prompt + ' > '
+
+
+def list_command(options, state_file, batch=False):
+    command = [SCRIPT_PATH, '--fzf-list', '--fzf-state', state_file]
+    if batch:
+        command += ['--fzf-batch', str(INITIAL_BATCH)]
+    if options.limit:
+        command += ['--limit', str(options.limit)]
+    if options.prompt_column:
+        command.append('--prompt-column')
+    return quoted(*command)
+
+
+def spawn_indexer(options):
+    """Reads the sessions of the window into the index in the background while
+    the picker shows the open ones, so the first tab finds them read."""
+    if options.limit:
+        return
+    try:
+        subprocess.Popen(
+            [SCRIPT_PATH, '--index', '--days', str(max(options.days or DEFAULT_DAYS, DEFAULT_DAYS))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, preexec_fn=lambda: os.nice(10))
+    except OSError:
+        pass
+
+
+def free_port():
+    import socket
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
+def browse(options, query):
+    fzf_with_header = require('fzf-with-header')
+    require('clip')
+    # the files of the picker lie in a folder of their own, which its watcher
+    # is told about changes in - and nothing else of the temporary folder
+    folder = tempfile.mkdtemp(prefix=f'{APP_NAME}.')
+    state_file = os.path.join(folder, 'state')
+    # the questions of a selected session are asked while the picker is open,
+    # so their answers are left here for the action that follows them
+    answer_file = os.path.join(folder, 'answers')
+    open(answer_file, 'w').close()
+    track_file = state_file + '.track'
+    # the open sessions are few and run anywhere, so the picker starts with all
+    # of them wherever they were started; held to the current directory by -c
+    # it starts with every session of that instead, and -o keeps it to the
+    # open ones there
+    if not options.current_directory_only:
+        options.open_only = True
+    options.write_state(state_file)
+    spawn_indexer(options)
+    port = free_port()
+    watcher = None
+    try:
+        # the watcher keeps the list and the preview current through the port
+        # fzf listens on; it ends with the state file, or once fzf is gone
+        watcher_command = [SCRIPT_PATH, '--fzf-state', state_file, '--fzf-watch', str(port)]
+        if options.limit:
+            watcher_command += ['--limit', str(options.limit)]
+        if options.prompt_column:
+            watcher_command.append('--prompt-column')
+        watcher = subprocess.Popen(watcher_command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, start_new_session=True)
+        initial = list_command(options, state_file, batch=True)
+        full = list_command(options, state_file)
+        state_command = quoted(SCRIPT_PATH, '--fzf-state', state_file)
+        script = shlex.quote(SCRIPT_PATH)
+        # a changed scope or search shows the first batch again and loads the
+        # rest in the background, the way the picker started: the load
+        # binding does that, so it is bound again before the reload
+        reload_actions = (f'rebind(load)+reload-sync({initial})'
+                          f'+transform-prompt({state_command} --fzf-prompt)')
+        reload_quoted = shlex.quote(reload_actions)
+        track = shlex.quote(track_file)
+        track_command = f'[ -z {{q}} ] && cat -- {track} 2>/dev/null; rm -f -- {track}'
+        preview_command = f'{state_command} --fzf-action preview {{2}} {{3}}'
+        answers = shlex.quote(answer_file)
+        enter_command = (f'{state_command} --fzf-answers {answers} --fzf-enter {reload_quoted}'
+                         ' {2} {3}')
+        keys = ('/:search,enter:use,tab:open or all,ctrl-o:older,ctrl-space:folders,'
+                'ctrl-d:this folder,ctrl-s:session folder,ctrl-f:focus,ctrl-a:agent,'
+                'ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit')
+        command = [
+            fzf_with_header,
+            '--command', initial,
+            '--columns', '1',
+            '--filter-columns', '1,4,5,6,7',
+            '--delimiter', '\t',
+            '--key-descriptions', keys,
+            '--',
+            f'--listen=127.0.0.1:{port}',
+            '--no-multi',
+            '--prompt', fzf_prompt(options),
+            '--preview', preview_command,
+            '--preview-window', 'right,60%,wrap,follow',
+            '--bind', f'load:reload-sync({full})+unbind(load)',
+            '--bind', f'result:transform:{track_command}',
+            '--bind', f'/:execute({state_command} --fzf-search >/dev/tty)+{reload_actions}',
+            '--bind', f'tab:execute-silent({state_command} --fzf-toggle-open)+{reload_actions}',
+            '--bind', f'ctrl-o:execute-silent({state_command} --fzf-cycle-days)+{reload_actions}',
+            '--bind', f'ctrl-space:transform:{state_command} --fzf-toggle-view {reload_quoted}',
+            '--bind', f'ctrl-d:transform:{state_command} --fzf-toggle-directory {reload_quoted}',
+            '--bind', f'ctrl-s:execute-silent({state_command} --fzf-scope-session {{2}} {{3}})'
+                      f'+{reload_actions}',
+            '--bind', f'ctrl-a:execute-silent({state_command} --fzf-cycle-agent)+{reload_actions}',
+            '--bind', f'ctrl-r:reload({full})',
+            # esc decides between clearing the search and leaving; its command
+            # follows a colon, the actions it hands back carry parentheses
+            '--bind', f'esc:transform:{state_command} --fzf-escape {reload_quoted}',
+            '--bind', 'ctrl-c:abort',
+            '--bind', f'ctrl-f:execute({script} --fzf-action focus {{2}} {{3}})',
+            '--bind', f'enter:transform:{enter_command}',
+        ]
+        if query:
+            command += ['--query', query]
+        result = subprocess.run(command)
+        return result.returncode
+    finally:
+        if watcher:
+            watcher.terminate()
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def picker_state_action(options, state_file, action, arguments):
+    """The keys of the open picker: each changes the state file or reports
+    from it, and the picker reloads afterwards."""
+    if action == 'prompt':
+        sys.stdout.write(fzf_prompt(options))
+    elif action == 'escape':
+        if options.view == 'folders':
+            options.view = 'sessions'
+            options.write_state(state_file)
+            sys.stdout.write(preview_action('show') + '+' + arguments[0])
+        elif not options.grep and not options.igrep:
+            sys.stdout.write('abort')
+        else:
+            options.grep = options.igrep = ''
+            options.write_state(state_file)
+            sys.stdout.write(arguments[0])
+    elif action == 'toggle-open':
+        options.open_only = not options.open_only
+        options.write_state(state_file)
+    elif action == 'cycle-days':
+        options.open_only = False
+        steps = list(DAYS_STEPS)
+        options.days = steps[(steps.index(options.days) + 1) % len(steps)] \
+            if options.days in steps else steps[0]
+        options.write_state(state_file)
+    elif action == 'cycle-agent':
+        cycle = [list(ALL_AGENTS)] + [[agent] for agent in ALL_AGENTS]
+        position = cycle.index(options.agents) if options.agents in cycle else 0
+        options.agents = cycle[(position + 1) % len(cycle)]
+        options.write_state(state_file)
+    elif action == 'toggle-view':
+        options.view = 'sessions' if options.view == 'folders' else 'folders'
+        options.write_state(state_file)
+        kind = 'show' if options.view == 'sessions' else 'hide'
+        sys.stdout.write(preview_action(kind) + '+' + arguments[0])
+    elif action == 'toggle-directory':
+        # straight to the sessions of the folder the picker was started in,
+        # open or not; again, back to every folder
+        if options.current_directory_only and options.current_directory == options.launch_directory:
+            options.current_directory_only = False
+        else:
+            options.current_directory = options.launch_directory
+            options.current_directory_only = True
+            options.open_only = False
+        if options.view == 'folders':
+            options.view = 'sessions'
+            options.write_state(state_file)
+            sys.stdout.write(preview_action('show') + '+' + arguments[0])
+            return
+        options.write_state(state_file)
+        sys.stdout.write(arguments[0])
+    elif action == 'scope-session':
+        agent, key = arguments
+        if agent not in ALL_AGENTS:
+            return
+        _, _, view = ensured_session(agent, key)
+        if view['cwd']:
+            options.current_directory = resolve_directory(view['cwd'])
+            options.current_directory_only = True
+            options.write_state(state_file)
+    elif action == 'search':
+        require('prompt')
+        term = tty_run(['prompt', '--complete', '--prompt', 'Search sessions:',
+                        '--prefill', options.igrep])
+        # an aborted prompt keeps the search that is already there
+        if term is not None:
+            options.grep = ''
+            options.igrep = term.strip()
+            options.write_state(state_file)
+    elif action == 'enter':
+        reload_actions, agent, key, answer_file = arguments
+        if options.view == 'folders':
+            if not key:
+                return
+            if key == FOLDERS_ALL:
+                options.current_directory_only = False
+            else:
+                options.current_directory = resolve_directory(key)
+                options.current_directory_only = True
+            options.view = 'sessions'
+            options.write_state(state_file)
+            sys.stdout.write(preview_action('show') + '+' + reload_actions)
+            return
+        if agent not in ALL_AGENTS:
+            return
+        base = [SCRIPT_PATH, '--fzf-state', state_file, '--fzf-answers', answer_file, '--fzf-action']
+        sys.stdout.write(f'execute({quoted(*base, "ask")} {{2}} {{3}})'
+                         f'+transform:{quoted(*base, "become")} {{2}} {{3}}')
+
+
+def picker_output(options, batch=None, track_key=None):
+    """The list of the picker as fzf reads it, with the position of the row
+    the cursor is to be put on."""
+    index = Index()
+    if options.view == 'folders':
+        live = Live(options.agents) if options.open_only else None
+        rows = collect(options, live, index, all_directories=True)
+        lines, found = folder_rows(rows, options, track_key)
+    else:
+        live = Live(options.agents)
+        limit = options.limit
+        if batch and (not limit or batch < limit):
+            limit = batch
+        rows = collect(options, live, index, limit=limit)
+        lines, found = picker_rows(rows, live, options, track_key)
+    return '\n'.join(lines) + '\n', found
+
+
+def write_track(state_file, position):
+    """Leaves the position the cursor is to go to for the result binding of
+    the picker, which moves it there once the list is in."""
+    if state_file and position:
+        with open(state_file + '.track', 'w') as handle:
+            handle.write(f'pos({position})')
+
+
+def list_signature(text):
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def list_for_picker(options, state_file, batch, track_key):
+    text, found = picker_output(options, batch, track_key)
+    # the folders view starts with its cursor on the other way the scope can go
+    if track_key is not None or options.view == 'folders':
+        write_track(state_file, found)
+    # what the picker shows, for the watcher to tell a changed list from it
+    if state_file and not batch:
+        with open(state_file + '.signature', 'w') as handle:
+            handle.write(list_signature(text))
+    sys.stdout.write(text)
+
+
+def fzf_request(port, action=None):
+    """Asks the picker for its state, or has it perform an action."""
+    import urllib.request
+    url = f'http://127.0.0.1:{port}'
+    if action is None:
+        with urllib.request.urlopen(url + '?limit=0', timeout=2) as response:
+            return json.load(response)
+    request = urllib.request.Request(url, data=action.encode(), method='POST')
+    with urllib.request.urlopen(request, timeout=2):
+        return None
+
+
+def read_file(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+class Inotify:
+    """The changes of files, from the kernel: inotify through libc, as the
+    standard library of Python has no module for it. None where there is none."""
+
+    MODIFY, ATTRIB, CLOSE_WRITE, MOVED_TO, CREATE, DELETE = 0x2, 0x4, 0x8, 0x80, 0x100, 0x200
+    CHANGES = MODIFY | CLOSE_WRITE | MOVED_TO | CREATE | DELETE
+
+    @classmethod
+    def open(cls):
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            descriptor = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        except (OSError, AttributeError):
+            return None
+        return cls(libc, descriptor) if descriptor >= 0 else None
+
+    def __init__(self, libc, descriptor):
+        self.libc = libc
+        self.descriptor = descriptor
+        self.paths = {}
+        self.watches = {}
+
+    def watch(self, folders):
+        """Watches these folders - every change of a file in them - and no
+        others."""
+        folders = {folder for folder in folders if folder and os.path.isdir(folder)}
+        for folder in set(self.watches) - folders:
+            self.libc.inotify_rm_watch(self.descriptor, self.watches.pop(folder))
+        for folder in folders - set(self.watches):
+            watch = self.libc.inotify_add_watch(self.descriptor, os.fsencode(folder), self.CHANGES)
+            if watch >= 0:
+                self.watches[folder] = watch
+                self.paths[watch] = folder
+
+    def wait(self, timeout):
+        """The files that changed within timeout seconds, as paths."""
+        import select
+        import struct
+        changed = set()
+        if not select.select([self.descriptor], [], [], max(timeout, 0))[0]:
+            return changed
+        while True:
+            try:
+                data = os.read(self.descriptor, 65536)
+            except BlockingIOError:
+                return changed
+            position = 0
+            while position + 16 <= len(data):
+                watch, _, _, length = struct.unpack_from('iIII', data, position)
+                name = data[position + 16:position + 16 + length].rstrip(b'\0')
+                position += 16 + length
+                folder = self.paths.get(watch)
+                if folder:
+                    changed.add(os.path.join(folder, os.fsdecode(name)))
+
+
+def watched_folders(state_file, text):
+    """The folders whose changes can change the picker: its own folder, where
+    the preview names the session under the cursor; every project of claude
+    and the folder of its running sessions; the folders of the codex sessions
+    listed and of today; the folder of the database of opencode."""
+    folders = {os.path.dirname(state_file), CLAUDE_PEERS, CLAUDE_PROJECTS,
+               os.path.dirname(OPENCODE_DB),
+               os.path.join(CODEX_SESSIONS, time.strftime('%Y/%m/%d'))}
+    try:
+        folders.update(entry.path for entry in os.scandir(CLAUDE_PROJECTS) if entry.is_dir())
+    except OSError:
+        pass
+    for line in text.split('\n')[1:]:
+        fields = line.split('\t')
+        if len(fields) > 2 and fields[1] == 'codex':
+            folders.add(os.path.dirname(fields[2]))
+    return folders
+
+
+def watch_picker(options, state_file, port):
+    """Keeps the open picker current. It is told by the kernel which files
+    changed and does nothing while none did: once the session under the
+    cursor - the one the preview names in the folder of the picker - got a
+    message the preview does not show yet, it has fzf start the preview again;
+    once any session changed, it makes the list and has fzf load it where it
+    differs from what fzf shows. Without inotify it looks every few seconds."""
+    index = Index()
+    inotify = Inotify.open()
+    picker = os.getppid()
+    preview_file = state_file + '.preview'
+    own_files = {state_file + suffix for suffix in ('.list', '.list.tmp', '.signature', '.track')}
+    # fzf has just loaded the list
+    listed = time.time()
+    previewed = 0.0
+    list_due = True
+    preview_due = True
+    asked = {}
+    text = read_file(state_file + '.list') or ''
+    while os.path.exists(state_file) and os.getppid() == picker:
+        now = time.time()
+        if inotify:
+            inotify.watch(watched_folders(state_file, text))
+            # what is due waits for its interval, everything else for a change;
+            # the picker going away is looked for every few seconds
+            waits = [10.0, listed + WATCH_LIST_SECONDS - now]
+            if list_due:
+                waits.append(listed + REFRESH_SECONDS - now)
+            if preview_due:
+                waits.append(previewed + WATCH_PREVIEW_SECONDS - now)
+            changed = inotify.wait(min(waits)) - own_files
+        else:
+            time.sleep(WATCH_POLL_SECONDS)
+            changed = {None}
+        try:
+            shown = json.loads(read_file(preview_file) or '{}')
+        except ValueError:
+            shown = {}
+        key = shown.get('key')
+        if changed:
+            list_due = True
+            # a write of the session under the cursor, or any write to the
+            # database of opencode, where all of its sessions are
+            if None in changed or preview_file in changed or key in changed or (
+                    key and key.startswith('opencode:')
+                    and any(path and path.startswith(OPENCODE_DB) for path in changed)):
+                preview_due = True
+        now = time.time()
+        if preview_due and key and now - previewed >= WATCH_PREVIEW_SECONDS:
+            preview_due = False
+            previewed = now
+            agent = 'opencode' if key.startswith('opencode:') else (
+                'codex' if key.startswith(CODEX_SESSIONS) else 'claude')
+            candidate = candidate_for(agent, key)
+            row = index.ensure(candidate) if candidate else None
+            if row:
+                current = (row['last_seq'], row['generation'])
+                if current != (shown.get('last_seq'), shown.get('generation')) \
+                        and asked.get(key) != current:
+                    asked[key] = current
+                    try:
+                        fzf_request(port, 'refresh-preview')
+                    except OSError:
+                        pass
+        if not (list_due and now - listed >= REFRESH_SECONDS) and now - listed < WATCH_LIST_SECONDS:
+            continue
+        list_due = False
+        listed = now
+        fresh = Options()
+        fresh.limit = options.limit
+        fresh.prompt_column = options.prompt_column
+        fresh.read_state(state_file)
+        if fresh.limit:
+            fresh.days = None
+        # in the folders view the preview is away and names no row
+        text, found = picker_output(fresh, None, key if fresh.view != 'folders' else None)
+        signature = list_signature(text)
+        if signature == read_file(state_file + '.signature'):
+            continue
+        list_file = state_file + '.list'
+        with open(list_file + '.tmp', 'w') as handle:
+            handle.write(text)
+        os.replace(list_file + '.tmp', list_file)
+        with open(state_file + '.signature', 'w') as handle:
+            handle.write(signature)
+        if fresh.view != 'folders':
+            write_track(state_file, found)
+        try:
+            fzf_request(port, f'reload(cat -- {shlex.quote(list_file)})')
+        except OSError:
+            pass
+
+
+def print_table(options):
+    index = Index()
+    live = Live(options.agents)
+    rows = collect(options, live, index, limit=options.limit)
+    lines, _ = format_rows(rows, live, options)
+    sys.stdout.write('\n'.join(lines) + '\n')
+
+
+def find_session(options, wanted, all_directories):
+    """The one session an ID or a part of one refers to."""
+    matches = []
+    for candidate in discover(options.agents, 0):
+        if wanted not in candidate.id:
+            continue
+        if candidate.extra.get('hidden'):
+            continue
+        matches.append(candidate)
+    if not all_directories and options.current_directory_only:
+        index = Index()
+        kept = []
+        for candidate in matches:
+            row = index.ensure(candidate)
+            if row and in_directory(session_view(row, candidate)['cwd'], options.current_directory):
+                kept.append(candidate)
+        matches = kept
+    if not matches:
+        fail(f'No such session: {wanted}')
+    if len(matches) > 1:
+        fail(f'Multiple matches for session: {wanted}')
+    verbose(f'{matches[0].agent} {matches[0].key}')
+    return matches[0]
+
+
+def print_rendered(agent, key, last_only=False):
+    index, _, view = ensured_session(agent, key)
+    messages = index.messages(view['key'])
+    if last_only:
+        messages = messages[-1:]
+    color = sys.stdout.isatty()
+    header = f"Session ID: {view['id']}"
+    sys.stdout.write((f'{C_MUTED}{header}{C_RESET}' if color else header) + '\n\n')
+    sys.stdout.write(render(messages, agent=agent, color=color))
+
+
+def print_raw(agent, key, last_only=False):
+    """The raw Markdown, the session ID in front of it."""
+    index, _, view = ensured_session(agent, key)
+    messages = index.messages(view['key'])
+    if last_only:
+        messages = messages[-1:]
+    print(f"Session ID: {view['id']}\n")
+    print(markdown(messages))
+
+
+def print_session(options, candidate):
+    if options.raw:
+        print_raw(candidate.agent, candidate.key)
+    else:
+        print_rendered(candidate.agent, candidate.key)
+
+
+def run_index(options):
+    index = Index()
+    for candidate in discover(options.agents, 0 if options.days is None
+                              else time.time() - options.days * 86400):
+        if not candidate.extra.get('hidden'):
+            index.ensure(candidate)
+    index.prune()
+    # what the previews rendered is worth keeping as long as it is looked at
+    cutoff = time.time() - 30 * 86400
+    try:
+        for entry in os.scandir(RENDER_FOLDER):
+            if entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+
+
+def completion(arguments):
+    previous = arguments[0] if arguments else ''
+    if previous in ('-a', '--agent'):
+        print(' '.join(ALL_AGENTS))
+        return
+    if previous in ('-n', '--limit', '-d', '--days', '-g', '--grep', '-i', '--igrep'):
+        return
+    agents = list(ALL_AGENTS)
+    for position, argument in enumerate(arguments[1:-1], start=1):
+        if argument in ('-a', '--agent') and arguments[position + 1] in ALL_AGENTS:
+            agents = [arguments[position + 1]]
+    if previous not in ('--resume', '--fork'):
+        print('-h --help -a --agent -l --last -n --limit -d --days -A --all-directories '
+              '-c --current-directory -o --open -p --print -P --prompt-column -g --grep '
+              '-i --igrep -r --raw --resume --fork --index --verbose')
+    for candidate in discover(agents, 0):
+        if not candidate.extra.get('hidden'):
+            print(candidate.id)
+
+
+def preselected_agents():
+    for agent in ALL_AGENTS:
+        if APP_NAME == f'{agent}-session':
+            return [agent]
+    return list(ALL_AGENTS)
+
+
+def main(argv):
+    global verbose_enabled
+    options = Options()
+    options.agents = preselected_agents()
+    options.raw = False
+    session_id = None
+    resume_id = fork_id = None
+    last = False
+    index_only = False
+    days_explicit = limit_explicit = False
+    state_file = answer_file = None
+    fzf_action = None
+    picker_action = None
+    picker_arguments = []
+    fzf_list = False
+    watch_port = None
+    fzf_batch = None
+    track_key = None
+    query = ''
+
+    def value(option):
+        if not argv:
+            fail(f'Missing argument for {option}')
+        return argv.pop(0)
+
+    def number(option, text):
+        if not re.fullmatch(r'[0-9]+', text) or int(text) <= 0:
+            fail(f'Invalid {option.lstrip("-")}: {text}')
+        return int(text)
+
+    argv = list(argv)
+    while argv:
+        argument = argv.pop(0)
+        if argument in ('-h', '--help'):
+            usage()
+        elif argument == (
+                # the completion of cli-helpers looks for this line to know the
+                # tool completes itself
+                "--bash-completion"):
+            completion(argv)
+            return 0
+        elif argument == '--fzf-action':
+            if len(argv) < 3:
+                fail('Missing arguments for --fzf-action')
+            fzf_action = [argv.pop(0), argv.pop(0), argv.pop(0)]
+        elif argument == '--fzf-list':
+            fzf_list = True
+        elif argument == '--fzf-batch':
+            fzf_list = True
+            fzf_batch = number(argument, value(argument))
+        elif argument == '--fzf-track':
+            track_key = value(argument)
+        elif argument == '--fzf-state':
+            state_file = value(argument)
+        elif argument == '--fzf-answers':
+            answer_file = value(argument)
+        elif argument == '--fzf-watch':
+            watch_port = number(argument, value(argument))
+        elif argument == '--fzf-query':
+            query = value(argument)
+        elif argument in ('--fzf-prompt', '--fzf-search', '--fzf-toggle-open',
+                          '--fzf-cycle-agent', '--fzf-cycle-days'):
+            picker_action = argument[len('--fzf-'):]
+        elif argument in ('--fzf-escape', '--fzf-toggle-view', '--fzf-toggle-directory'):
+            picker_action = argument[len('--fzf-'):]
+            picker_arguments = [value(argument)]
+        elif argument == '--fzf-scope-session':
+            picker_action = 'scope-session'
+            picker_arguments = [value(argument), value(argument)]
+        elif argument == '--fzf-enter':
+            picker_action = 'enter'
+            picker_arguments = [value(argument), value(argument), value(argument)]
+        elif argument in ('-a', '--agent'):
+            agent = value(argument)
+            if agent not in ALL_AGENTS:
+                fail(f'Unknown agent: {agent}')
+            options.agents = [agent]
+        elif argument in ('-r', '--raw'):
+            options.raw = True
+        elif argument in ('-l', '--last'):
+            last = True
+        elif argument == '--resume':
+            resume_id = value(argument) or fail('Missing argument for --resume')
+        elif argument == '--fork':
+            fork_id = value(argument) or fail('Missing argument for --fork')
+        elif argument in ('-n', '--limit'):
+            options.limit = number(argument, value(argument))
+            limit_explicit = True
+        elif argument in ('-d', '--days'):
+            options.days = number(argument, value(argument))
+            days_explicit = True
+        elif argument in ('-A', '--all-directories'):
+            options.current_directory_only = False
+        elif argument in ('-c', '--current-directory'):
+            options.current_directory_only = True
+        elif argument in ('-o', '--open'):
+            options.open_only = True
+        elif argument in ('-p', '--print'):
+            options.print = True
+        elif argument in ('-P', '--prompt-column'):
+            options.prompt_column = True
+        elif argument in ('-g', '--grep'):
+            options.grep = value(argument) or fail('Missing argument for --grep')
+        elif argument in ('-i', '--igrep'):
+            options.igrep = value(argument) or fail('Missing argument for --igrep')
+        elif argument == '--index':
+            index_only = True
+        elif argument == '--verbose':
+            verbose_enabled = True
+        elif argument.startswith('-') and argument != '-':
+            error(f'Unknown option: {argument}')
+            usage()
+        elif session_id is None:
+            session_id = argument
+        else:
+            usage()
+
+    if fzf_action:
+        name, agent, key = fzf_action
+        if name in ('ask', 'become', 'run') and not answer_file:
+            fail('The picker questions require --fzf-answers')
+        current_directory = options.current_directory
+        if state_file:
+            options.read_state(state_file)
+            current_directory = options.launch_directory
+        session_action(name, agent, key, answer_file, current_directory, state_file)
+        return 0
+
+    if limit_explicit and days_explicit:
+        fail('--limit and --days cannot be used together')
+    if limit_explicit:
+        options.days = None
+
+    # the scope and the search of the open picker come from its state file,
+    # not from the arguments its list command was built with
+    if state_file:
+        options.read_state(state_file)
+        if picker_action:
+            if picker_action == 'enter':
+                picker_arguments.append(answer_file or '')
+            picker_state_action(options, state_file, picker_action, picker_arguments)
+            return 0
+    elif picker_action:
+        fail('The picker actions require --fzf-state')
+
+    direct = '--resume' if resume_id else '--fork' if fork_id else None
+    if resume_id and fork_id:
+        fail('--resume and --fork cannot be used together')
+    if direct:
+        for given, name in ((session_id, 'SESSION'), (last, '--last'), (options.grep, '--grep'),
+                            (options.igrep, '--igrep'), (options.print, '--print')):
+            if given:
+                fail(f'{direct} cannot be used with {name}')
+    if last and session_id:
+        fail('--last cannot be used with SESSION')
+    for pattern, name in ((options.grep, '--grep'), (options.igrep, '--igrep')):
+        if pattern and session_id:
+            fail(f'{name} cannot be used with SESSION')
+        if pattern and last:
+            fail(f'{name} cannot be used with --last')
+        # a search typed at / in the picker is searched for literally where it
+        # is no regex; one given on the command line is checked
+        if pattern and not state_file:
+            try:
+                re.compile(pattern)
+            except re.error:
+                fail(f'Invalid {name} pattern: {pattern}')
+    if options.grep and options.igrep:
+        fail('--grep and --igrep cannot be used together')
+
+    if not any(os.path.isdir(folder) for agent, folder in (
+            ('claude', CLAUDE_PROJECTS), ('codex', CODEX_SESSIONS),
+            ('opencode', os.path.dirname(OPENCODE_DB))) if agent in options.agents):
+        fail(f'No session folder found for: {" ".join(options.agents)}')
+
+    if index_only:
+        run_index(options)
+    elif direct:
+        # the session is named, so it is looked for wherever it was recorded
+        candidate = find_session(options, resume_id or fork_id, True)
+        if direct == '--resume':
+            session_action('resume', candidate.agent, candidate.key)
+        else:
+            ask_fork(candidate.agent, candidate.key, options.current_directory)
+    elif last:
+        options.days = None
+        rows = collect(options, Live([]), Index(), limit=1)
+        if not rows:
+            fail('No sessions found')
+        print_session(options, candidate_for(rows[0]['agent'], rows[0]['key']))
+    elif session_id:
+        print_session(options, find_session(options, session_id, not options.current_directory_only))
+    elif watch_port:
+        if not state_file:
+            fail('The picker watcher requires --fzf-state')
+        watch_picker(options, state_file, watch_port)
+    elif fzf_list:
+        list_for_picker(options, state_file, fzf_batch, track_key)
+    elif options.print:
+        print_table(options)
+    else:
+        return browse(options, query)
+    return 0
+
+
+def terminate(signal_number, _):
+    # the picker removes its state files on the way out, also when killed
+    sys.exit(128 + signal_number)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGHUP, terminate)
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

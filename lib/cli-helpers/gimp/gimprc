@@ -1,0 +1,36 @@
+# GIMP gimprc
+#
+# The preferences of cli-helpers, merged into the user's gimprc by updater gimp.
+
+(language "en_US")
+(user-manual-online yes)
+(show-welcome-dialog no)
+(image-resize-layer-set all)
+(layer-merge-type clip-to-bottom-layer)
+(selection-feather-radius 2)
+(selection-grow-radius 15)
+(selection-shrink-radius 10)
+(selection-border-radius 2)
+(fill-options
+    (style fg-color)
+    (custom-style solid-color)
+    (antialias yes)
+    (feather no)
+    (feather-radius 10))
+(stroke-options
+    (style fg-color)
+    (custom-style solid-color)
+    (antialias yes)
+    (feather no)
+    (feather-radius 10)
+    (method line)
+    (width 6)
+    (unit pixels)
+    (cap-style butt)
+    (join-style miter)
+    (miter-limit 10)
+    (dash-offset 0)
+    (dash-info 0)
+    (emulate-brush-dynamics no))
+
+# end of gimprc

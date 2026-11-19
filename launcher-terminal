@@ -1,0 +1,399 @@
+#!/bin/bash
+# for a command run in the launcher window: close the window right after it (the
+# launcher watches LAUNCHER_EXIT_FILE, which it gives the shell in its window);
+# anywhere else it does nothing, so an alias can end with it in every shell
+if [ "${1}" = "--exit" ]; then
+    [ -n "${LAUNCHER_EXIT_FILE}" ] && touch "${LAUNCHER_EXIT_FILE}"
+    exit 0
+fi
+
+# the real location: linked into $(BINDIR) by make install-links, the launcher uses
+# the shared files of the checkout it comes from (its Ptyxis files, the window
+# helpers), even while $(LIBDIR) links to another checkout
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+# one word, so window-by-title also finds it on X11 (it compares wmctrl's first title word)
+name="Launcher-Terminal"
+bin_path="${0}"
+bin_name="$(basename "${bin_path}")"
+
+real_config="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+# a file of the launcher's own setup of a terminal:
+# ~/.config/cli-helpers/launcher-terminal/<terminal>/<name> when the user keeps one,
+# else the one shipped with cli-helpers (the repo's when run from it)
+launcher_file() {
+    local dir
+    for dir in "${real_config}/cli-helpers/${bin_name}/${1}" "${SCRIPT_DIR}/lib/cli-helpers/launcher/${1}" \
+        "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/${1}"; do
+        if [ -f "${dir}/${2}" ]; then
+            echo "${dir}/${2}"
+            return 0
+        fi
+    done
+    echo "ERROR: ${1}/${2} of the launcher not found" >&2
+    return 1
+}
+
+# the look of the launcher window, the same in every terminal: launcher/theme, and
+# on top of it the keys of ~/.config/cli-helpers/launcher-terminal/theme
+declare -A theme=()
+
+theme_read() {
+    local file="${1}" line key value number=0
+    if [ ! -f "${file}" ]; then
+        echo "ERROR: ${file} not found" >&2
+        return 1
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        ((number++))
+        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+        if ! [[ "${line}" =~ ^[[:space:]]*([a-z0-9-]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
+            echo "ERROR: ${file}:${number}: not a key = value line" >&2
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        # in double quotes, a value keeps the spaces at its ends (prompt = " ❯")
+        [[ "${value}" =~ ^\"(.*)\"$ ]] && value="${BASH_REMATCH[1]}"
+        case "${key}" in
+            font)
+                # it ends up in quotes in the terminals' configs
+                if [[ "${value}" =~ [\'\"\\] ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} cannot hold quotes or backslashes" >&2
+                    return 1
+                fi
+                ;;
+            opacity)
+                if ! [[ "${value}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a number from 0 to 1, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            padding)
+                if ! [[ "${value}" =~ ^[0-9]{1,2}([[:space:]]+[0-9]{1,2}){0,3}$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is 1 to 4 numbers of pixels from 0 to 99 like in CSS (4 0), not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            columns | rows)
+                if ! [[ "${value}" =~ ^[1-9][0-9]{0,4}$ ]] || (( value > 65535 )); then
+                    echo "ERROR: ${file}:${number}: ${key} must be an integer from 1 to 65535" >&2
+                    return 1
+                fi
+                ;;
+            prompt)
+                # bash's prompt, read through an environment variable: no quotes needed
+                ;;
+            foreground | background | cursor | cursor-text | color[0-9] | color1[0-5])
+                if ! [[ "${value}" =~ ^#[0-9a-fA-F]{6}$ ]]; then
+                    echo "ERROR: ${file}:${number}: ${key} is a color like #32383f, not ${value}" >&2
+                    return 1
+                fi
+                ;;
+            *)
+                echo "ERROR: ${file}:${number}: unknown key ${key}" >&2
+                return 1
+                ;;
+        esac
+        theme["${key}"]="${value}"
+    done < "${file}"
+}
+
+theme_load() {
+    local key colors=() sides
+    if [ -f "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" ]; then
+        theme_read "${SCRIPT_DIR}/lib/cli-helpers/launcher/theme" || return 1
+    else
+        theme_read "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/launcher/theme" || return 1
+    fi
+    if [ -f "${real_config}/cli-helpers/${bin_name}/theme" ]; then
+        theme_read "${real_config}/cli-helpers/${bin_name}/theme" || return 1
+    fi
+    for key in font prompt foreground background cursor cursor-text opacity padding columns rows \
+        color{0..15}; do
+        if [ -z "${theme[${key}]}" ]; then
+            echo "ERROR: the theme of the launcher has no ${key}" >&2
+            return 1
+        fi
+    done
+    # the forms only some terminals take: the 16 colors as one list (Terminator), a
+    # background that lets the desktop through only below opacity 1
+    for key in {0..15}; do
+        colors+=("${theme[color${key}]}")
+    done
+    theme[palette]="$(IFS=:; echo "${colors[*]}")"
+    # the padding on each side, top, right, bottom, left, from its 1 to 4 numbers the
+    # way CSS reads them, and as CSS (Ptyxis' gtk.css)
+    read -ra sides <<< "${theme[padding]}"
+    case "${#sides[@]}" in
+        1) sides=("${sides[0]}" "${sides[0]}" "${sides[0]}" "${sides[0]}") ;;
+        2) sides=("${sides[0]}" "${sides[1]}" "${sides[0]}" "${sides[1]}") ;;
+        3) sides=("${sides[0]}" "${sides[1]}" "${sides[2]}" "${sides[1]}") ;;
+    esac
+    theme[padding-top]="$((10#${sides[0]}))"
+    theme[padding-right]="$((10#${sides[1]}))"
+    theme[padding-bottom]="$((10#${sides[2]}))"
+    theme[padding-left]="$((10#${sides[3]}))"
+    theme[padding-css]="${theme[padding-top]}px ${theme[padding-right]}px ${theme[padding-bottom]}px ${theme[padding-left]}px"
+    if [[ "${theme[opacity]}" == 1* ]]; then
+        theme[background-type]=solid
+    else
+        theme[background-type]=transparent
+    fi
+}
+
+# inside the terminal window: the launcher calls itself as the terminal's command,
+# because a single-instance terminal (Ptyxis, GNOME Terminal) hands the window to
+# its already running process, so the pid of the started terminal says nothing.
+# The shell runs as a child instead of being exec'd: the window has to close when
+# the launcher hangs the shell up, and terminals like Ptyxis keep a window open
+# whose process died from a signal, but close it on a clean exit
+if [ "${1}" = "--shell" ]; then
+    echo "$$" > "${2}"
+    # so a command run in the launcher can close it once it is done (--exit)
+    export LAUNCHER_EXIT_FILE="${3}"
+    shell="${SHELL:-/bin/bash}"
+    # bash reads the launcher's startup file: ~/.bashrc, then the short prompt, the
+    # theme's (its errors are the launcher's to report, the startup file has one of
+    # its own to fall back on)
+    if [ "${shell##*/}" = bash ] && rcfile="$(launcher_file bash bashrc)"; then
+        theme_load 2>/dev/null && export LAUNCHER_PROMPT="${theme[prompt]}"
+        "${shell}" --rcfile "${rcfile}"
+    else
+        "${shell}"
+    fi
+    exit 0
+fi
+
+pid=$(pidof -x "${bin_path}")
+if [ "${pid}" != "$$" ]; then
+    window-focus-by-title "${name}"
+    echo "Focus on ${bin_name}"
+    exit 0
+fi
+
+cli_helpers_require_command xdg-terminal-exec || exit 1
+
+max_seconds=3
+
+PID_FILE="/tmp/${bin_name}-$$.pid"
+EXIT_FILE="/tmp/${bin_name}-$$.exit"
+rm -rf "${PID_FILE}" "${EXIT_FILE}"
+trap 'rm -rf "${PID_FILE}" "${EXIT_FILE}"' EXIT
+
+real_data="${XDG_DATA_HOME:-${HOME}/.local/share}"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/${bin_name}"
+ptyxis_dir="${runtime_dir}/ptyxis"
+
+# a stand-in for one of the user's directories: every entry links to the real one,
+# except the ones named, which the launcher's Ptyxis gets of its own
+shadow_dir() {
+    local real="${1}" shadow="${2}" entry skip
+    local entries=()
+    shift 2
+    mkdir -p "${shadow}" || return 1
+    for entry in "${real}"/* "${real}"/.[!.]*; do
+        [ -e "${entry}" ] || continue
+        for skip in "${@}"; do
+            [ "${entry##*/}" = "${skip}" ] && continue 2
+        done
+        entries+=("${entry}")
+    done
+    # one ln for all of them, one per entry costs a second; -n: should a link exist
+    # already, fail instead of creating the new one inside the real directory it
+    # points to
+    [ "${#entries[@]}" -eq 0 ] || ln -sn -t "${shadow}" "${entries[@]}"
+}
+
+# a file of the launcher's setup of a terminal, with the theme's values in place of
+# its placeholders (@font@ for the theme's font)
+theme_fill() {
+    local file="${1}" content key
+    content="$(< "${file}")" || return 1
+    for key in "${!theme[@]}"; do
+        content="${content//"@${key}@"/"${theme[${key}]}"}"
+    done
+    if [[ "${content}" =~ @[a-z0-9-]+@ ]]; then
+        echo "ERROR: ${file}: the theme of the launcher has no ${BASH_REMATCH[0]//@/}" >&2
+        return 1
+    fi
+    printf '%s\n' "${content}"
+}
+
+# font metrics for Terminator's pixel geometry, cached until the font or text
+# scaling changes
+cell_size() {
+    local font="${1}" cache="${runtime_dir}/terminator/${2}" scale key line size
+    scale="$(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null)"
+    key="${font}|${scale:-1}"
+    [ ! -r "${cache}" ] || line="$(< "${cache}")"
+    if [ "${line%|*}" = "${key}" ]; then
+        echo "${line##*|}"
+        return 0
+    fi
+    size="$(cli_helpers_terminal_cell_size --text-scale "${scale:-1}" "${font}")" || return 1
+    echo "${key}|${size}" > "${cache}"
+    echo "${size}"
+}
+
+# Ptyxis can neither hide its header bar nor open a window with another profile from
+# its command line, so the launcher runs a Ptyxis process of its own on stand-ins for
+# the config and data directories: settings in a keyfile instead of dconf (the
+# launcher's profile and font), its own palette and session, and a stylesheet that
+# collapses the header bar. Everything else links to the real directories, and
+# nothing of the user's Ptyxis is touched. Rebuilt on every start, as only one
+# launcher runs at a time
+ptyxis_prepare() {
+    local css keyfile palette
+    css="$(launcher_file ptyxis gtk.css)" && keyfile="$(launcher_file ptyxis settings.keyfile)" \
+        && palette="$(launcher_file ptyxis launcher.palette)" && theme_load || return 1
+    rm -rf "${ptyxis_dir}"
+    shadow_dir "${real_config}" "${ptyxis_dir}/config" gtk-4.0 glib-2.0 dconf org.gnome.Ptyxis \
+        && shadow_dir "${real_config}/gtk-4.0" "${ptyxis_dir}/config/gtk-4.0" gtk.css \
+        && shadow_dir "${real_data}" "${ptyxis_dir}/data" org.gnome.Ptyxis \
+        && mkdir -p "${ptyxis_dir}/config/glib-2.0/settings" "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes" \
+        || return 1
+    {
+        # the user's own stylesheet still applies
+        [ -f "${real_config}/gtk-4.0/gtk.css" ] && echo "@import url(\"file://${real_config}/gtk-4.0/gtk.css\");"
+        theme_fill "${css}"
+    } > "${ptyxis_dir}/config/gtk-4.0/gtk.css" \
+        && theme_fill "${keyfile}" > "${ptyxis_dir}/config/glib-2.0/settings/keyfile" \
+        && theme_fill "${palette}" > "${ptyxis_dir}/data/org.gnome.Ptyxis/palettes/launcher.palette"
+}
+
+# Terminator takes the launcher's own config (borderless, always on top, the
+# launcher's profile) and a size in pixels on its command line, the config filled
+# with the theme
+terminator_prepare() {
+    local config cell_width cell_height title_height
+    config="$(launcher_file terminator config)" && theme_load && mkdir -p "${runtime_dir}/terminator" || return 1
+    theme[terminator-title-font]="Sans 17"
+    read -r cell_width cell_height < <(cell_size "${theme[font]}" cell-size) || return 1
+    read -r _ title_height < <(cell_size "${theme[terminator-title-font]}" title-size) || return 1
+    # Allow for the stock VTE border (one pixel per side) and Terminator's title bar.
+    window_width=$(( theme[columns] * cell_width + 2 ))
+    window_height=$(( theme[rows] * cell_height + 2 + title_height ))
+    theme_fill "${config}" > "${runtime_dir}/terminator/config"
+}
+
+terminal_cmd=()
+shell_env=()
+terminal_id="$(xdg-terminal-exec --print-id 2>/dev/null)"
+case "${terminal_id%%:*}" in
+    org.gnome.Ptyxis.desktop)
+        if command -v ptyxis >/dev/null 2>&1 && ptyxis_prepare; then
+            terminal_cmd=(env "XDG_CONFIG_HOME=${ptyxis_dir}/config" "XDG_DATA_HOME=${ptyxis_dir}/data"
+                GSETTINGS_BACKEND=keyfile
+                ptyxis --standalone --new-window "--title=${name}" "--working-directory=${PWD}" --)
+            # the shell gets the user's directories back, or what it starts would read
+            # the stand-ins (and a GTK app would lose its header bar as well)
+            shell_env=(env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u GSETTINGS_BACKEND)
+            [ -n "${XDG_CONFIG_HOME}" ] && shell_env+=("XDG_CONFIG_HOME=${XDG_CONFIG_HOME}")
+            [ -n "${XDG_DATA_HOME}" ] && shell_env+=("XDG_DATA_HOME=${XDG_DATA_HOME}")
+            [ -n "${GSETTINGS_BACKEND}" ] && shell_env+=("GSETTINGS_BACKEND=${GSETTINGS_BACKEND}")
+        fi
+        ;;
+    terminator.desktop)
+        # --no-dbus keeps the window out of a Terminator that already runs with the
+        # user's config
+        if command -v terminator >/dev/null 2>&1 && terminator_prepare; then
+            terminal_cmd=(terminator "--config=${runtime_dir}/terminator/config" --no-dbus "--title=${name}"
+                "--geometry=${window_width}x${window_height}" "--working-directory=${PWD}" --execute)
+        fi
+        ;;
+esac
+if [ "${#terminal_cmd[@]}" -eq 0 ]; then
+    # xdg-terminal-exec cannot pass a size, nor any of the terminal's own options, so
+    # the window looks like any other window of the default terminal
+    terminal_cmd=(xdg-terminal-exec "--title=${name}" "--dir=${PWD}" --)
+fi
+shell_cmd=("${shell_env[@]}" "${SCRIPT_DIR}/${bin_name}" --shell "${PID_FILE}" "${EXIT_FILE}")
+echo "+ ${terminal_cmd[*]} ${shell_cmd[*]}" >&2
+"${terminal_cmd[@]}" "${shell_cmd[@]}" &
+
+# the window stays where the window manager puts it; it is only kept above the
+# others and focused, which the window manager may have denied a fresh window
+# while another always-on-top window was in front
+if cli_helpers_is_wayland; then
+    cli_helpers_gnome_window_place --title "${name}" --above --focus --timeout 5 >/dev/null
+else
+    attempts=1
+    while ! wmctrl -F -r "${name}" -b add,above 2>/dev/null; do
+        ((attempts++))
+        sleep 0.5
+        [ "${attempts}" -gt 10 ] && break
+    done
+    window-focus-by-title "${name}" >/dev/null 2>&1
+fi
+
+# the pid of the launcher's own process in the terminal, the parent of its shell
+attempts=1
+while [ ! -s "${PID_FILE}" ]; do
+    ((attempts++))
+    if [ "${attempts}" -gt 50 ]; then
+        echo "ERROR: ${name} did not start in the default terminal" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+pid="$(cat "${PID_FILE}")"
+
+# a command is running when the shell inside the launcher window has children
+# of its own
+launcher_command_running() {
+    local shell
+    for shell in $(pgrep -P "${pid}" 2>/dev/null); do
+        [ -n "$(pgrep -P "${shell}" 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
+counter=0
+interval=0.5
+ignore_active=0
+max_seconds_after_kill=${interval}
+max_seconds_after_command=5
+command_was_running=0
+while true; do
+    kill -0 ${pid} 2>/dev/null || exit 0
+
+    # kill file exists, wait only for process
+    # and already exit immediately
+    if [ -f "${EXIT_FILE}" ]; then
+        rm -rf "${EXIT_FILE}"
+        counter=0
+        max_seconds=${max_seconds_after_kill}
+        ignore_active=1
+    fi
+
+    counter=$(echo "${counter}+${interval}" | bc)
+
+    # launcher in focus resets the counter
+    launcher_window="$(window-by-title "${name}")"
+    [ "${ignore_active}" -eq 0 ] && [[ "$(window-active)" == "${launcher_window}" ]] && counter=0
+
+    # running process in launcher resets the counter; once it finishes the
+    # launcher stays open a bit longer so the output can still be read
+    if launcher_command_running; then
+        counter=0
+        command_was_running=1
+    elif [ "${command_was_running}" -eq 1 ]; then
+        command_was_running=0
+        counter=0
+        [ "${ignore_active}" -eq 0 ] && max_seconds=${max_seconds_after_command}
+    fi
+
+    # otherwise exit launcher after max_seconds: hanging up the shell lets the
+    # launcher's process in the terminal exit cleanly, which closes the window
+    (( $(echo "${counter} >= ${max_seconds}" | bc -l) )) && pkill -HUP -P ${pid} && exit 0
+
+    sleep ${interval}
+done

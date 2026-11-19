@@ -1,0 +1,65 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-h|--help] [--no-fix-paths] [-s|--single-file] [<file>]"
+    exit 1
+}
+
+file=""
+fix_paths=1
+single_file=0
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --no-fix-paths)
+            fix_paths=0
+            ;;
+        -s|--single-file)
+            single_file=1
+            ;;
+        *)
+            if [ -z "${file}" ]; then
+                file="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${file}" ] && file="/dev/stdin"
+
+patch_content="$(cat "${file}")"
+if [ "${patch_content: -1}" != $'\n' ]; then
+    patch_content+=$'\n'
+fi
+
+if [ "${fix_paths}" -eq 1 ] || [ "${single_file}" -eq 1 ]; then
+    first_path=""
+    updated_patch_content=""
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^[+-]{3} ]]; then
+            prefix="${line:0:3}"
+            new_path="$(echo "${line}" | awk '{print $2}')"
+            remainder="$(echo "${line}" | awk '{print $3,$4,$5}')"
+            if [ "${fix_paths}" -eq 1 ] && [[ "${new_path}" == /* ]] && [[ "${new_path}" != /dev/* ]]; then
+                new_path="${new_path#/}"
+            fi
+            if [ -z "${first_path}" ]; then
+                first_path="${new_path}"
+            elif [ "${single_file}" -eq 1 ]; then
+                new_path="${first_path}"
+            fi
+            updated_patch_content+="${prefix} ${new_path} ${remainder}"
+        else
+            updated_patch_content+="${line}"
+        fi
+        updated_patch_content+=$'\n'
+    done <<< "${patch_content}"
+    patch_content="${updated_patch_content}" 
+fi
+
+patch -u -p0 <<< "${patch_content}"

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $(basename "${0}") <pattern>" 1>&2
+    exit 1
+fi
+# mktemp only adds u+rw
+if tmpfile="$(mktemp "${1}" -u)"; then
+    touch "${tmpfile}"
+    echo "${tmpfile}"
+fi

@@ -1,0 +1,48 @@
+# BEGIN cli-helpers managed rules
+# reviews
+prefix_rule(pattern=["codex-review"], decision="allow")
+prefix_rule(pattern=["/usr/local/bin/codex-review"], decision="allow")
+
+# git
+prefix_rule(pattern=["git", ["blame", "diff", "log", "rev-parse", "show", "status"]], decision="allow")
+prefix_rule(pattern=["git", ["add", "apply", "branch", "checkout", "cherry-pick", "commit", "merge", "rebase", "restore", "stash", "switch", "tag"]], decision="allow")
+prefix_rule(pattern=["git", ["clone", "fetch", "pull", "push", "remote"]], decision="allow")
+
+# GitHub and GitLab
+prefix_rule(pattern=["gh", ["api", "pr"]], decision="allow")
+prefix_rule(pattern=["glab", ["api", "ci", "mr"]], decision="allow")
+prefix_rule(pattern=[["gh", "glab"], ["issue", "release", "repo"], ["list", "view"]], decision="allow")
+prefix_rule(pattern=["gh", "run", ["list", "view", "watch"]], decision="allow")
+prefix_rule(pattern=["gh", "workflow", ["list", "view"]], decision="allow")
+
+# builds, tests and linters
+prefix_rule(pattern=["go", ["test", "vet"]], decision="allow")
+prefix_rule(pattern=["env", "-u", "NO_COLOR", "go", "test"], decision="allow")
+prefix_rule(pattern=["golangci-lint", "run"], decision="allow")
+prefix_rule(pattern=["gofmt"], decision="allow")
+prefix_rule(pattern=["pytest"], decision="allow")
+prefix_rule(pattern=["make", ["build", "check", "generate", "help", "lint", "test", "vet"]], decision="allow")
+prefix_rule(pattern=["make", "fmt"], decision="allow")
+prefix_rule(pattern=["make", "vuln"], decision="allow")
+
+# kubectl inspection
+prefix_rule(pattern=["kubectl", ["api-resources", "api-versions", "cluster-info", "describe", "events", "explain", "get", "logs", "top", "version"]], decision="allow")
+prefix_rule(pattern=["kubectl", "config", ["current-context", "get-clusters", "get-contexts", "get-users"]], decision="allow")
+prefix_rule(pattern=["kubectl", "rollout", ["history", "status"]], decision="allow")
+
+# Helm and Helmfile inspection
+prefix_rule(pattern=["helm", ["env", "get", "help", "history", "lint", "list", "ls", "search", "show", "status", "template", "verify", "version"]], decision="allow")
+prefix_rule(pattern=["helm", ["dependency", "plugin", "repo"], "list"], decision="allow")
+prefix_rule(pattern=["helm", "diff", ["local", "release", "revision", "rollback", "upgrade"]], decision="allow")
+prefix_rule(pattern=["helmfile", ["build", "diff", "help", "lint", "list", "show-dag", "status", "template", "version"]], decision="allow")
+
+# file and text inspection
+prefix_rule(pattern=[["cat", "cut", "diff", "grep", "head", "jq", "nl", "tr", "uniq", "wc"]], decision="allow")
+prefix_rule(pattern=[["dirname", "du", "ls", "pwd", "readlink", "realpath", "sha256sum", "stat"]], decision="allow")
+prefix_rule(pattern=["rg", "--pre"], decision="forbidden", justification="Use rg without an external preprocessor.")
+
+# system inspection
+prefix_rule(pattern=["tail"], decision="allow")
+prefix_rule(pattern=["ps"], decision="allow")
+prefix_rule(pattern=["loginctl", "show-user"], decision="allow")
+# END cli-helpers managed rules

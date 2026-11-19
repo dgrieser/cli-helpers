@@ -1,0 +1,4 @@
+description: Screenshot
+bindings: ['Print']
+launch:
+  command: [screenshot]

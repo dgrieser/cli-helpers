@@ -1,0 +1,36 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") [--suffix|-s <suffix, default: '. '>] [--align|-a]" 1>&2
+    exit 1
+}
+
+suffix='. '
+align=0
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        --suffix|-s)
+            shift
+            [ -z "${1}" ] && usage
+            suffix="${1}"
+            ;;
+        --align|-a)
+            align=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+list="$(cat)"
+if [ "${align}" -eq 1 ]; then
+    count="$(echo "${list}" | wc -l)"
+    number_len="${#count}"
+else
+    number_len=1
+fi
+
+echo "${list}" | nl -n rn -s "${suffix}" -w "${number_len}"

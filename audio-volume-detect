@@ -1,0 +1,14 @@
+#!/bin/bash
+
+function usage {
+    echo "usage: $(basename "${0}") <file>"
+    exit 1
+}
+
+if [ -z "${1}" ]; then
+    usage
+fi
+
+file="${1}"
+
+ffmpeg -i "${file}" -af "volumedetect" -vn -sn -dn -f null /dev/null 2>&1 | egrep -o 'max_volume:.+$' | awk '{print $2}'

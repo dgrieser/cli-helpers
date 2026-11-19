@@ -1,0 +1,61 @@
+#!/bin/bash
+
+__complete_prompt_command() {
+    local cur="${READLINE_LINE}"
+    local matches
+    matches=$(compgen -c -- "${cur}" | head -20)
+    
+    local count=$(wc -l <<<"${matches}")
+    if [[ ${count} -eq 1 && -n "${matches}" ]]; then
+        READLINE_LINE="${matches}"
+        READLINE_POINT=${#READLINE_LINE}
+    elif [[ -n "${matches}" ]]; then
+        echo
+        echo "${matches}" | column 1>&2
+    fi
+}
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [-d|--default <command>]
+
+Prompt for a command with readline completion.
+
+Options:
+  -h, --help               Show this help.
+  -d, --default <command>  Default command, just press enter to use it.
+EOF
+    exit 1
+}
+
+default_command=""
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -d|--default)
+            shift
+            [ $# -gt 0 ] || usage
+            default_command="${1}"
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+bind -x '"\t":__complete_prompt_command' 2>/dev/null
+if [ -n "${default_command}" ]; then
+    read -e -p "Enter command (${default_command}): " command
+    [ -z "${command}" ] && command="${default_command}"
+else
+    read -e -p "Enter command: " command
+fi
+bind '"\t":complete' 2>/dev/null  # Restore default
+
+echo "${command}"

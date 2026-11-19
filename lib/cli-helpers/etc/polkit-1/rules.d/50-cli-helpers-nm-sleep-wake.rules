@@ -1,0 +1,8 @@
+// power-trigger wakes NetworkManager when a resume killed systemd-logind before
+// it sent PrepareForSleep(false); without this only root may call Sleep
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.NetworkManager.sleep-wake" &&
+        subject.local && subject.active && subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});

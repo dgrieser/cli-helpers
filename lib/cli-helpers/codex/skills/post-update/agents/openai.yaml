@@ -1,0 +1,4 @@
+interface:
+  display_name: "Post Change Update"
+  short_description: "Summarize undocumented changes in a PR or MR"
+  default_prompt: "Use $post-update to draft a short German comment about changes we made that the PR or MR description and comments do not already cover."

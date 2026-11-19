@@ -1,0 +1,67 @@
+[global_config]
+  borderless = True
+  tab_position = hidden
+  hide_from_taskbar = True
+  always_on_top = True
+  inactive_color_offset = 0.8068181818181818
+  enabled_plugins = LaunchpadBugURLHandler, LaunchpadCodeURLHandler, APTURLHandler, TerminalShot, MavenPluginURLHandler, ActivityWatch, InactivityWatch
+  invert_search = True
+  link_single_click = True
+[keybindings]
+  new_tab = <Primary>t
+  go_up = <Shift><Alt>Up
+  go_down = <Shift><Alt>Down
+  go_left = <Shift><Alt>Left
+  go_right = <Shift><Alt>Right
+  split_horiz = <Primary><Alt>Down
+  split_vert = <Primary><Alt>Right
+  close_term = <Primary><Alt>d
+  page_up_half = <Shift>Page_Up
+  page_down_half = <Shift>Page_Down
+  reset_clear = <Primary>l
+  hide_window = ""
+  new_window = <Primary>n
+[profiles]
+  # the launcher's profile: the @-placeholders get the values of launcher/theme on
+  # every start, palette as its 16 colors in one list, background-type as solid,
+  # or transparent below opacity 1
+  [[default]]
+    icon_bell = False
+    background_color = "@background@"
+    background_darkness = @opacity@
+    background_type = @background-type@
+    cursor_color_default = False
+    cursor_fg_color = "@cursor-text@"
+    cursor_bg_color = "@cursor@"
+    font = "@font@"
+    foreground_color = "@foreground@"
+    scrollbar_position = hidden
+    scrollback_infinite = True
+    palette = "@palette@"
+    use_system_font = False
+    copy_on_selection = True
+    title_hide_sizetext = True
+    title_transmit_fg_color = "@foreground@"
+    title_transmit_bg_color = "@background@"
+    title_inactive_fg_color = "#9099a5"
+    title_inactive_bg_color = "@background@"
+    title_use_system_font = False
+    title_font = @terminator-title-font@
+[layouts]
+  [[default]]
+    [[[child0]]]
+      type = Window
+      parent = ""
+      order = 0
+      maximised = False
+      fullscreen = False
+      last_active_term = ef7fc29b-2db4-4b72-b238-1e8e0cda40c7
+      last_active_window = False
+    [[[terminal1]]]
+      type = Terminal
+      parent = child0
+      order = 0
+      title = ⌨
+      profile = default
+      uuid = ef7fc29b-2db4-4b72-b238-1e8e0cda40c7
+[plugins]

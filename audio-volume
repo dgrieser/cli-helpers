@@ -1,0 +1,15 @@
+#!/bin/bash
+
+function usage {
+    echo "usage: $(basename "${0}") <file> <volume>"
+    exit 1
+}
+
+if [ -z "${1}" ] || [ -z "${2}" ]; then
+    usage
+fi
+
+file="${1}"
+volume="${2}"
+new_file="$(tmpfile /tmp/volume.XXXXXXXX.mp3)"
+ffmpeg -y -v quiet -hide_banner -i "${file}" -af "volume=${volume}dB" -vn -acodec libmp3lame -ac 2 -ab 160k -ar 48000 "${new_file}" && echo "${new_file}"

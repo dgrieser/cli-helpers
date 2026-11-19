@@ -1,0 +1,718 @@
+#!/bin/bash
+# Backs up on the old machine every file setup.sh restores on the new one: the
+# keyring files, the reminders, the shell histories, the Keys folder of the
+# documents folder with the SSH keys the SSH config names, the keys of
+# ~/.ssh/authorized_keys that may log in over SSH, the private scripts of ~/bin (gen, which dials the VPN, and .power with .in and .out)
+# configured Kubernetes lists, the
+# session of Sublime Text with its open files, the profile of Google Chrome
+# with the keyring file of its key, the Downloads folder, the sessions, histories,
+# memories and settings of Claude Code, Codex and opencode, and what only the
+# git repos of the workspace hold: uncommitted changes, stashes, local branches
+# and tags, and the worktrees of ~/workspace.worktree.
+# Before the keyring files are copied it offers to store the current SSH config
+# and the API key of Codeium in the keyring, so setup.sh restores those and not
+# older copies.
+
+APP_NAME="$(basename "${0}")"
+# the prompts and keyring-cli next to it, so it also runs from the repo before
+# cli-helpers is installed
+BIN_DIR="$(cd "$(dirname "${0}")" && pwd)"
+LOCAL_CONFIG_LIBRARY="$(dirname "$(readlink -f "${0}")")/lib/cli-helpers/local-config"
+[ -r "${LOCAL_CONFIG_LIBRARY}" ] || LOCAL_CONFIG_LIBRARY="/usr/local/lib/cli-helpers/local-config"
+. "${LOCAL_CONFIG_LIBRARY}"
+LOCAL_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+
+KEYRING_DIR="${HOME}/.local/share/keyrings"
+REMINDER_DIR="${HOME}/.cache/reminder"
+# the history files of bash_aliases.d's install-home
+HISTORY_FILES=(.bash_super_history .kube_history)
+SSH_CONFIG="${HOME}/.ssh/config"
+# the keys that may log in to this machine over SSH
+AUTHORIZED_KEYS="${HOME}/.ssh/authorized_keys"
+# where the Vim plugin of Codeium keeps its API key (apiKey): .codeium under
+# XDG_DATA_HOME when set, else under HOME; its Sublime Text plugin keeps only
+# the key in a file of its own, always under HOME
+CODEIUM_CONFIG="${XDG_DATA_HOME:-${HOME}}/.codeium/config.json"
+CODEIUM_SUBLIME_KEY="${HOME}/.codeium/sublime/codeium-api-key.txt"
+HOME_BIN="${HOME}/bin"
+# Back up existing private helpers, including the legacy VPN helper.
+read -r -a HOME_BIN_FILES <<< "$(local_config_value "${LOCAL_CONFIG_DIR}/cli-helpers/setup-backup.conf" private_bin_files)"
+# the lists the kubectl-helpers read, e.g. the evil-eye namespaces of k-ctx
+KUBE_LISTS_PATH="$(local_config_value "${LOCAL_CONFIG_DIR}/cli-helpers/setup.conf" kube_lists_path)"
+KUBE_LISTS_DIR="${HOME}/${KUBE_LISTS_PATH}"
+# the session of Sublime Text: its windows, tabs and the unsaved text in them
+SUBLIME_DIR="${HOME}/.config/sublime-text/Local"
+# the profile of Google Chrome: bookmarks, history, passwords, cookies,
+# extensions and settings; left out are the caches, which Chrome builds again,
+# and the lock links of a running Chrome (relative to CHROME_DIR, * stays
+# within one folder, so */ is a profile like Default)
+CHROME_DIR="${HOME}/.config/google-chrome"
+CHROME_EXCLUDES=('*/Cache' '*/Code Cache' '*/GPUCache' '*/DawnGraphiteCache' '*/DawnWebGPUCache'
+    GrShaderCache GraphiteDawnCache ShaderCache component_crx_cache extensions_crx_cache
+    optimization_guide_model_store 'Crash Reports' 'BrowserMetrics*' 'Singleton*')
+# the coding agents, each into agents/NAME.tar.gz of what is under ~: the
+# sessions, histories, memories, settings, skills and plugins; left out are the
+# logins (setup.sh asks to log in again), the installed programs, caches, logs
+# and what only lives as long as a running session (locks, shell snapshots)
+AGENTS=(claude codex opencode)
+AGENT_PATHS_claude=(.claude .claude.json)
+AGENT_EXCLUDES_claude=(.claude/.credentials.json .claude/cache .claude/telemetry
+    .claude/shell-snapshots .claude/session-env .claude/sessions
+    .claude/.last-cleanup .claude/.last-update-result.json
+    '.claude/policy-limits.json*' .claude/remote-settings.json)
+AGENT_PATHS_codex=(.codex)
+AGENT_EXCLUDES_codex=(.codex/auth.json .codex/installation_id .codex/packages
+    .codex/.tmp .codex/tmp .codex/cache .codex/models_cache.json .codex/version.json
+    '.codex/logs_*.sqlite*' .codex/app-server-control .codex/app-server-daemon
+    .codex/thread-writer-locks .codex/shell_snapshots .codex/.sqlite-maintenance.lock)
+AGENT_PATHS_opencode=(.config/opencode .local/share/opencode)
+AGENT_EXCLUDES_opencode=(.config/opencode/node_modules .local/share/opencode/auth.json
+    .local/share/opencode/log)
+# the git repos: every one under these folders (the worktrees folder also holds
+# clones of its own); a worktree is only backed up when it is in one of them
+GIT_DIRS=("${HOME}/workspace" "${HOME}/workspace.worktree")
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [-h] [--find] [FOLDER]
+
+Back up every file setup.sh restores on a new machine into a new folder
+setup-backup-<host>-<date> in FOLDER. Without FOLDER it offers the attached
+drives and media (mounted under /media/\$USER, /run/media/\$USER or /mnt),
+or asks for a folder when there are none. setup.sh asks once for that folder
+and finds every part in it by this layout:
+
+  keyrings/     the keyring files of ${KEYRING_DIR} (with several, the
+                ones checked in a list), with the SSH keys, the SSH config,
+                the network connections and the API key of Codeium stored in
+                them
+  reminder/     the reminders of ${REMINDER_DIR}
+  history/      ${HISTORY_FILES[*]}
+  Keys/         the Keys folder of the documents folder, plus the SSH keys
+                ~/.ssh/config names that are in neither it nor the keyring
+  ssh/          authorized_keys of ${AUTHORIZED_KEYS%/*}, the keys that may log
+                in over SSH; setup.sh adds the ones the new machine lacks
+  bin/         ${HOME_BIN_FILES[*]} of ${HOME_BIN}
+  local-config/   private per-component settings, credentials stay in the keyring
+  kube-lists/
+                the lists of ${KUBE_LISTS_DIR}
+  sublime-text/ the session of Sublime Text of ${SUBLIME_DIR}: the open
+                windows and tabs, with the unsaved text in them
+  chrome/       google-chrome.tar.gz of ${CHROME_DIR} without its
+                caches, and the keyring file that holds the key Chrome
+                encrypts its passwords and cookies with
+  downloads/    the Downloads folder, without unfinished downloads
+  agents/       ${AGENTS[*]}: their sessions, histories, memories and
+                settings, one NAME.tar.gz each, without the logins
+  git/          what only the git repos of ~/workspace and
+                ~/workspace.worktree hold, one folder per repo at its path
+                under ~: the uncommitted changes
+                (staged, unstaged and untracked, not the ignored files), the
+                stashes, the branches and tags no remote has and the
+                worktrees; the rest comes from the remotes again
+
+The backup holds private keys, the keyring files, the Chrome profile and the
+agent sessions: keep it somewhere safe.
+
+Options:
+  -f, --find    List the backups on the attached drives and media, newest
+                first, and exit (setup.sh offers them)
+  -h, --help    Show this help message and exit
+EOF
+    exit 1
+}
+
+info() {
+    echo 1>&2
+    echo -e "\033[1m${1}\033[0m" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    echo "ERROR: ${1}" 1>&2
+    exit 1
+}
+
+failed=()
+
+# a prompt aborted with Ctrl-C (exit 130) aborts the whole backup
+ask() {
+    "${BIN_DIR}/prompt-yes-no" "${1}"
+    local status="${?}"
+    [ "${status}" -eq 130 ] && { echo 1>&2; fail "Aborted"; }
+    return "${status}"
+}
+
+# the SSH config in the keyring is what setup.sh restores, so an outdated one is
+# offered to be replaced before the keyring files are copied
+store_ssh_config() {
+    local stored
+    [ -f "${SSH_CONFIG}" ] || return 0
+    command -v secret-tool > /dev/null 2>&1 || return 0
+    stored="$(secret-tool lookup type ssh-config name config 2>/dev/null)"
+    [ "${stored}" = "$(cat "${SSH_CONFIG}")" ] && return 0
+    if [ -z "${stored}" ]; then
+        info "The SSH config is not stored in the keyring"
+    else
+        info "The SSH config in the keyring differs from ${SSH_CONFIG}"
+    fi
+    ask "Store ${SSH_CONFIG} in the keyring (keyring-cli ssh-config-store)?" || return 0
+    "${BIN_DIR}/keyring-cli" ssh-config-store --overwrite "${SSH_CONFIG}" || failed+=("keyring-cli ssh-config-store")
+}
+
+# the API key of Codeium in the keyring is what setup.sh restores for both
+# plugins, like the SSH config, so a missing or outdated one is offered to be
+# stored: the one of the Vim plugin, else the one of the Sublime Text plugin
+store_codeium_key() {
+    local file="${CODEIUM_CONFIG}" key stored
+    command -v secret-tool > /dev/null 2>&1 && command -v jq > /dev/null 2>&1 || return 0
+    key="$(jq -r '.apiKey // empty' "${file}" 2>/dev/null)"
+    if [ -z "${key}" ] && [ -s "${CODEIUM_SUBLIME_KEY}" ]; then
+        file="${CODEIUM_SUBLIME_KEY}"
+        key="$(cat "${file}")"
+    fi
+    [ -n "${key}" ] || return 0
+    stored="$(secret-tool lookup type codeium name api-key 2>/dev/null)"
+    [ "${stored}" = "${key}" ] && return 0
+    if [ -z "${stored}" ]; then
+        info "The API key of Codeium is not stored in the keyring"
+    else
+        info "The API key of Codeium in the keyring differs from the one of ${file}"
+    fi
+    ask "Store the API key of Codeium of ${file} in the keyring (keyring-cli codeium-store)?" || return 0
+    "${BIN_DIR}/keyring-cli" codeium-store --overwrite "${file}" || failed+=("keyring-cli codeium-store")
+}
+
+# the keyring files to back up into keyring_files: with several and a
+# terminal, the ones checked in a list, which starts with the default keyring
+# (login unless the default file names another) checked; without a terminal
+# all of them
+choose_keyrings() {
+    local default file chosen status
+    local -a files items=() checked=()
+    mapfile -t files < <(find "${KEYRING_DIR}" -maxdepth 1 -type f -name '*.keyring' 2>/dev/null | sort)
+    keyring_files=("${files[@]}")
+    [ "${#files[@]}" -le 1 ] || [ ! -t 0 ] && return 0
+    default="$(cat "${KEYRING_DIR}/default" 2>/dev/null)"
+    default="${KEYRING_DIR}/${default:-login}.keyring"
+    [ -f "${default}" ] && checked=(--checked "${default}")
+    for file in "${files[@]}"; do
+        items+=("${file}"$'\t'"$(basename "${file}") ($(du -h "${file}" | cut -f 1), changed $(date -r "${file}" +%Y-%m-%d))")
+    done
+    chosen="$("${BIN_DIR}/prompt-multiselect" --delimiter $'\t' -p "Keyrings to back up:" \
+        "${checked[@]}" "${items[@]}")"
+    status="${?}"
+    [ "${status}" -eq 130 ] && { echo 1>&2; fail "Aborted"; }
+    keyring_files=()
+    [ "${status}" -eq 0 ] && [ -n "${chosen}" ] && mapfile -t keyring_files <<< "${chosen%$'\n'}"
+    return 0
+}
+
+backup_keyrings() {
+    local target="${1}/keyrings"
+    if [ "${#keyring_files[@]}" -eq 0 ]; then
+        warning "No keyring files backed up"
+        failed+=("keyrings")
+        return 0
+    fi
+    if ! { mkdir -p "${target}" && cp -p "${keyring_files[@]}" "${target}/"; }; then
+        failed+=("keyrings")
+        return 0
+    fi
+    echo "keyrings: $(basename -a "${keyring_files[@]}" | paste -sd ' ')" 1>&2
+}
+
+backup_reminders() {
+    local target="${1}/reminder"
+    if ! compgen -G "${REMINDER_DIR}/*.md*" > /dev/null; then
+        echo "reminder: none" 1>&2
+        return 0
+    fi
+    # -a keeps the modification times, which order the reminders without an order
+    cp -a "${REMINDER_DIR}" "${target}" || { failed+=("reminder"); return 0; }
+    echo "reminder: $(find "${target}" -maxdepth 1 -type f -name '*.md' | wc -l) open," \
+        "$(find "${target}" -maxdepth 1 -type f -name '*.md_*' | wc -l) done" 1>&2
+}
+
+backup_histories() {
+    local target="${1}/history" name
+    for name in "${HISTORY_FILES[@]}"; do
+        [ -f "${HOME}/${name}" ] || continue
+        mkdir -p "${target}" && cp -p "${HOME}/${name}" "${target}/${name}" \
+            && echo "history: ${name}" 1>&2 || failed+=("history ${name}")
+    done
+}
+
+# the Keys folder of the documents folder, whole: the dotfiles link the SSH keys
+# of the SSH config from there, and it holds other keys and tokens too; then
+# the keys of the SSH config that are in neither it nor the keyring, as
+# setup.sh restores only the stored ones
+backup_keys() {
+    local target="${1}/Keys" keys_dir name key count
+    local -A stored=()
+    keys_dir="$(xdg-user-dir DOCUMENTS 2>/dev/null || echo "${HOME}/Documents")/Keys"
+    if [ -d "${keys_dir}" ]; then
+        # editor swap files are no keys
+        if ! { mkdir -p "${target}" \
+            && find "${keys_dir}" -mindepth 1 -maxdepth 1 ! -name '.*.sw?' \
+                -exec cp -a -t "${target}" {} +; }; then
+            failed+=("Keys ${keys_dir}")
+        fi
+        count="$(find "${target}" -type f | wc -l)"
+        echo "Keys: ${count} files of ${keys_dir}" 1>&2
+    fi
+
+    [ -f "${SSH_CONFIG}" ] || return 0
+    while read -r name _; do
+        stored["${name}"]=1
+    done < <("${BIN_DIR}/keyring-cli" ssh-list 2>/dev/null | tail -n +2)
+    while read -r name; do
+        [ -n "${stored[${name}]:-}" ] && continue
+        [ -e "${target}/${name}" ] && continue
+        key="${HOME}/.ssh/${name}"
+        if [ ! -f "${key}" ]; then
+            warning "The SSH config names ~/.ssh/${name}, which does not exist"
+            continue
+        fi
+        if ! { mkdir -p "${target}" && cp -pL "${key}" "${target}/${name}"; }; then
+            failed+=("Keys ${name}")
+            continue
+        fi
+        [ -f "${key}.pub" ] && cp -pL "${key}.pub" "${target}/${name}.pub"
+        echo "Keys: ${name} of ~/.ssh, in neither ${keys_dir} nor the keyring" 1>&2
+    done < <(awk 'tolower($1) == "identityfile" && $2 ~ /^~\/\.ssh\/[^\/]+$/ {print substr($2, 8)}' "${SSH_CONFIG}" | sort -u)
+}
+
+# the keys that may log in over SSH, which no other part holds: the public keys
+# of other machines and apps
+backup_ssh() {
+    local target="${1}/ssh"
+    if [ ! -s "${AUTHORIZED_KEYS}" ]; then
+        echo "ssh: none" 1>&2
+        return 0
+    fi
+    # -L: a link is backed up as the file it points to
+    if ! { mkdir -p "${target}" && cp -pL "${AUTHORIZED_KEYS}" "${target}/authorized_keys"; }; then
+        failed+=("ssh")
+        return 0
+    fi
+    echo "ssh: $(grep -c -v -E '^[[:space:]]*(#|$)' "${target}/authorized_keys") keys of ${AUTHORIZED_KEYS}" 1>&2
+}
+
+backup_bin() {
+    local target="${1}/bin" name
+    local -a files=()
+    for name in "${HOME_BIN_FILES[@]}"; do
+        [[ "${name}" != */* && "${name}" != . && "${name}" != .. ]] || continue
+        if [ -f "${HOME_BIN}/${name}" ]; then
+            files+=("${HOME_BIN}/${name}")
+        else
+            warning "No ${HOME_BIN}/${name}"
+        fi
+    done
+    [ "${#files[@]}" -eq 0 ] && return 0
+    # -L: a link is backed up as the file it points to
+    if ! { mkdir -p "${target}" && cp -pL "${files[@]}" "${target}/"; }; then
+        failed+=("bin")
+        return 0
+    fi
+    echo "bin: ${#files[@]} files of ${HOME_BIN}" 1>&2
+}
+
+backup_local_config() {
+    local target="${1}/local-config" file src
+    for file in "${CLI_HELPERS_CONFIG_FILES[@]}"; do
+        src="${LOCAL_CONFIG_DIR}/${file}"
+        [ -f "${src}" ] || continue
+        install -D -m 0600 "${src}" "${target}/${file}" || failed+=("local-config/${file}")
+    done
+}
+
+backup_kube_lists() {
+    local target="${1}/kube-lists" count
+    if [ -z "${KUBE_LISTS_PATH}" ] || ! compgen -G "${KUBE_LISTS_DIR}/*" > /dev/null; then
+        echo "kube-lists: none" 1>&2
+        return 0
+    fi
+    cp -a "${KUBE_LISTS_DIR}" "${target}" || { failed+=("kube-lists"); return 0; }
+    count="$(find "${target}" -type f | wc -l)"
+    echo "kube-lists: ${count} files of ${KUBE_LISTS_DIR}" 1>&2
+}
+
+backup_sublime() {
+    local target="${1}/sublime-text"
+    if [ ! -d "${SUBLIME_DIR}" ]; then
+        echo "sublime-text: none" 1>&2
+        return 0
+    fi
+    cp -a "${SUBLIME_DIR}" "${target}" || { failed+=("sublime-text"); return 0; }
+    echo "sublime-text: $(find "${target}" -type f | wc -l) files of ${SUBLIME_DIR}" 1>&2
+}
+
+# chrome_keyring: the keyring file that holds the key of Chrome ("Chrome Safe
+# Storage"), by the keyring of its item; D-Bus object paths escape other
+# characters than [A-Za-z0-9] as _XX
+chrome_keyring() {
+    local item name
+    item="$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service SearchItems 'a{ss}' 1 application chrome 2>/dev/null \
+        | grep -o '"/org/freedesktop/secrets/collection/[^"]*"' | head -n 1)"
+    [ -n "${item}" ] || return 1
+    item="${item//\"/}"
+    name="${item%/*}"
+    name="$(printf '%b' "$(sed 's/_\([0-9a-fA-F]\{2\}\)/\\x\1/g' <<< "${name##*/}")")"
+    [ -f "${KEYRING_DIR}/${name}.keyring" ] || return 1
+    echo "${KEYRING_DIR}/${name}.keyring"
+}
+
+# the profile of Google Chrome into chrome/google-chrome.tar.gz, with a copy of
+# the keyring file that holds its key: Chrome encrypts the passwords and
+# cookies with it, setup.sh imports only that key from the file
+backup_chrome() {
+    local target="${1}/chrome" path keyring status
+    local -a excludes=()
+    if [ ! -d "${CHROME_DIR}" ]; then
+        echo "chrome: none" 1>&2
+        return 0
+    fi
+    for path in "${CHROME_EXCLUDES[@]}"; do
+        excludes+=("--exclude=${CHROME_DIR#"${HOME}/"}/${path}")
+    done
+    mkdir -p "${target}" || { failed+=("chrome"); return 0; }
+    # a running Chrome keeps writing its files: tar says so with status 1
+    tar -czf "${target}/google-chrome.tar.gz" -C "${HOME}" --anchored --no-wildcards-match-slash \
+        --warning=no-file-changed --warning=no-file-removed "${excludes[@]}" "${CHROME_DIR#"${HOME}/"}"
+    status="${?}"
+    if [ "${status}" -gt 1 ]; then
+        failed+=("chrome")
+        return 0
+    fi
+    echo "chrome: google-chrome.tar.gz ($(du -h "${target}/google-chrome.tar.gz" | cut -f 1)) of ${CHROME_DIR}" 1>&2
+    if ! keyring="$(chrome_keyring)"; then
+        warning "The key of Chrome is in no keyring file, its passwords and cookies cannot be read on the new machine"
+        failed+=("chrome key")
+        return 0
+    fi
+    cp -p "${keyring}" "${target}/" || { failed+=("chrome key"); return 0; }
+    echo "chrome: its key is in $(basename "${keyring}")" 1>&2
+}
+
+# the Downloads folder, whole; a download that is still running or broke off
+# (.crdownload of Chrome, .part of Firefox) is left out
+backup_downloads() {
+    local target="${1}/downloads" dir
+    dir="$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "${HOME}/Downloads")"
+    if [ ! -d "${dir}" ] || [ "${dir}" = "${HOME}" ] || [ -z "$(ls -A "${dir}")" ]; then
+        echo "downloads: none" 1>&2
+        return 0
+    fi
+    if ! { mkdir -p "${target}" \
+        && find "${dir}" -mindepth 1 -maxdepth 1 ! -name '*.crdownload' ! -name '*.part' \
+            -exec cp -a -t "${target}" {} +; }; then
+        failed+=("downloads ${dir}")
+        return 0
+    fi
+    echo "downloads: $(find "${target}" -type f | wc -l) files ($(du -sh "${target}" | cut -f 1)) of ${dir}" 1>&2
+}
+
+backup_agents() {
+    local target="${1}/agents" name path status ref
+    local -a paths excludes
+    for name in "${AGENTS[@]}"; do
+        paths=()
+        ref="AGENT_PATHS_${name}[@]"
+        for path in "${!ref}"; do
+            [ -e "${HOME}/${path}" ] && paths+=("${path}")
+        done
+        if [ "${#paths[@]}" -eq 0 ]; then
+            echo "agents: no ${name}" 1>&2
+            continue
+        fi
+        excludes=()
+        ref="AGENT_EXCLUDES_${name}[@]"
+        for path in "${!ref}"; do
+            excludes+=("--exclude=${path}")
+        done
+        mkdir -p "${target}" || { failed+=("agents ${name}"); continue; }
+        # a running session keeps writing its files: tar says so with status 1,
+        # what it read is still a whole archive
+        tar -czf "${target}/${name}.tar.gz" -C "${HOME}" --anchored \
+            --warning=no-file-changed --warning=no-file-removed "${excludes[@]}" "${paths[@]}"
+        status="${?}"
+        if [ "${status}" -gt 1 ]; then
+            failed+=("agents ${name}")
+            continue
+        fi
+        echo "agents: ${name}.tar.gz ($(du -h "${target}/${name}.tar.gz" | cut -f 1)) of ${paths[*]}" 1>&2
+    done
+}
+
+# in_git_dirs PATH: whether PATH is in one of GIT_DIRS
+in_git_dirs() {
+    local dir
+    for dir in "${GIT_DIRS[@]}"; do
+        [[ "${1}/" == "${dir}/"* ]] && return 0
+    done
+    return 1
+}
+
+# backup_git_repo REPO TARGET: what only REPO holds into TARGET, which is left
+# out when there is nothing: a manifest of the remotes, branches, tags, stashes
+# and worktrees, repo.bundle with the commits no remote has (the stashes and
+# uncommitted changes as commits, as git stash create makes them) and
+# untracked-N.tar with the untracked files of worktree N; returns 1 for a repo
+# that holds nothing of its own
+backup_git_repo() {
+    local repo="${1}" target="${2}"
+    local name url upstream sha message index line wt head branch wip untracked tmp status
+    local changed=0 n=-1
+    local -a manifest=() refs=() files=() worktrees=()
+    local -A local_only=()
+    cd "${repo}" || return 1
+    git rev-parse --verify -q HEAD > /dev/null || return 1
+
+    # the commits no remote-tracking branch has, of all branches and HEADs at
+    # once; a tag only counts without remotes, as the tags of a remote are not
+    # all on its branches
+    while IFS= read -r sha; do
+        local_only["${sha}"]=1
+    done < <({ git for-each-ref --format='%(objectname)' refs/heads
+               git worktree list --porcelain | sed -n 's/^HEAD //p'; } \
+        | git rev-list --stdin --not --remotes 2>/dev/null)
+
+    while IFS= read -r name; do
+        url="$(git remote get-url "${name}")"
+        manifest+=("remote"$'\t'"${name}"$'\t'"${url}")
+    done < <(git remote)
+    # \x1f between the fields, as read joins tabs in a row and loses an empty one
+    while IFS=$'\x1f' read -r name upstream sha; do
+        [ -n "${local_only[${sha}]:-}" ] || continue
+        manifest+=("branch"$'\t'"${name}"$'\t'"${upstream}")
+        refs+=("refs/heads/${name} ${sha}")
+    done < <(git for-each-ref --format='%(refname:lstrip=2)%1f%(upstream:short)%1f%(objectname)' refs/heads)
+    if [ -z "$(git remote)" ]; then
+        while IFS=$'\x1f' read -r name sha; do
+            manifest+=("tag"$'\t'"${name}")
+            refs+=("refs/tags/${name} ${sha}")
+        done < <(git for-each-ref --format='%(refname:lstrip=2)%1f%(objectname)' refs/tags)
+    fi
+    index=0
+    while IFS=$'\x1f' read -r sha message; do
+        manifest+=("stash"$'\t'"${index}"$'\t'"${message}")
+        refs+=("refs/backup/stash/${index} ${sha}")
+        index=$((index + 1))
+    done < <(git stash list --format='%H%x1f%gs')
+
+    # the main worktree first, then the linked ones; one that is gone (prunable)
+    # or outside the workspace is left out
+    while IFS= read -r line; do
+        case "${line}" in
+            "worktree "*) worktrees+=("${line#worktree }") ;;
+            prunable*|bare) unset 'worktrees[-1]' ;;
+        esac
+    done < <(git worktree list --porcelain)
+    for wt in "${worktrees[@]}"; do
+        n=$((n + 1))
+        if [ "${n}" -gt 0 ]; then
+            in_git_dirs "${wt}" || continue
+            changed=1
+        fi
+        head="$(git -C "${wt}" rev-parse HEAD)"
+        # not symbolic-ref --short, it gives heads/NAME when a tag is named NAME too
+        branch="$(git -C "${wt}" branch --show-current)"
+        if [ -z "${branch}" ] && [ -n "${local_only[${head}]:-}" ]; then
+            refs+=("refs/backup/head/${n} ${head}")
+        fi
+        wip=""
+        if [ -n "$(git -C "${wt}" status --porcelain --untracked-files=no --ignore-submodules)" ]; then
+            if ! wip="$(git -C "${wt}" stash create "setup-backup of ${wt#"${HOME}/"}")" || [ -z "${wip}" ]; then
+                warning "Cannot save the uncommitted changes of ${wt}"
+                return 2
+            fi
+            refs+=("refs/backup/wip/${n} ${wip}")
+        fi
+        # a nested repo shows up as its folder, it is backed up on its own
+        files=()
+        while IFS= read -r -d '' line; do
+            [[ "${line}" == */ ]] || files+=("${line}")
+        done < <(git -C "${wt}" ls-files -o --exclude-standard -z)
+        untracked=0
+        if [ "${#files[@]}" -gt 0 ]; then
+            mkdir -p "${target}" && printf '%s\0' "${files[@]}" \
+                | tar -cf "${target}/untracked-${n}.tar" -C "${wt}" --null -T - || return 2
+            untracked=1
+            changed=1
+        fi
+        manifest+=("worktree"$'\t'"${n}"$'\t'"${wt#"${HOME}/"}"$'\t'"${branch}"$'\t'"${head}"$'\t'"${wip}"$'\t'"${untracked}")
+    done
+
+    [ "${#refs[@]}" -gt 0 ] && changed=1
+    [ "${changed}" -eq 0 ] && return 1
+    mkdir -p "${target}" || return 2
+    printf '%s\n' "${manifest[@]}" > "${target}/manifest" || return 2
+    [ "${#refs[@]}" -eq 0 ] && return 0
+
+    # the refs go into a bundle of a scratch repo that borrows the objects of
+    # this one, so the repo itself gets no refs; the commits the remotes have
+    # are left out, a clone has them
+    tmp="$(mktemp -d)"
+    git init -q --bare "${tmp}" \
+        && git rev-parse --path-format=absolute --git-common-dir | sed 's#$#/objects#' > "${tmp}/objects/info/alternates" \
+        && { printf 'create %s\n' "${refs[@]}"
+             git for-each-ref --format='create %(refname) %(objectname)' refs/remotes; } \
+            | git -C "${tmp}" update-ref --stdin \
+        && git -C "${tmp}" bundle create -q "${target}/repo.bundle" "${refs[@]%% *}" --not --remotes
+    status="${?}"
+    rm -rf "${tmp}"
+    [ "${status}" -eq 0 ] || return 2
+}
+
+# the git repos of the workspace, each that holds something of its own (see
+# backup_git_repo); a worktree whose repo does not know it any more (e.g. one
+# copied from another machine) is only warned about
+backup_git() {
+    local target="${1}/git" dir repo gitdir count=0 status
+    local -a repos=()
+    command -v git > /dev/null 2>&1 || return 0
+    for dir in "${GIT_DIRS[@]}"; do
+        [ -d "${dir}" ] || continue
+        while IFS= read -r repo; do
+            repos+=("${repo%/.git}")
+        done < <(find "${dir}" \( -name node_modules -o -name .venv \) -prune \
+            -o -name .git -type d -print -prune 2>/dev/null)
+        while IFS= read -r repo; do
+            gitdir="$(sed -n 's/^gitdir: //p' "${repo}")"
+            # a submodule points into the .git/modules of its parent
+            [[ "${gitdir}" == */worktrees/* ]] || continue
+            [ -d "${gitdir}" ] && [ "$(cat "${gitdir}/gitdir" 2>/dev/null)" = "${repo}" ] && continue
+            warning "${repo%/.git} is a worktree its repo does not know (${gitdir}), not backed up: git -C REPO worktree repair ${repo%/.git}"
+            failed+=("git ${repo%/.git}")
+        done < <(find "${dir}" \( -name node_modules -o -name .venv \) -prune -o -name .git -type f -print 2>/dev/null)
+    done
+    mapfile -t repos < <(printf '%s\n' "${repos[@]}" | sort -u)
+    for repo in "${repos[@]}"; do
+        # a repo in a folder its parent ignores is a build artifact, e.g. a
+        # checkout of gitlab-ci-local or a build
+        dir="$(git -C "$(dirname "${repo}")" rev-parse --show-toplevel 2>/dev/null)" \
+            && git -C "${dir}" check-ignore -q "${repo}" && continue
+        ( backup_git_repo "${repo}" "${target}/${repo#"${HOME}/"}" )
+        status="${?}"
+        case "${status}" in
+            0) count=$((count + 1))
+               echo "git: ${repo#"${HOME}/"} ($(du -sh "${target}/${repo#"${HOME}/"}" | cut -f 1))" 1>&2 ;;
+            1) ;;
+            *) failed+=("git ${repo}") ;;
+        esac
+    done
+    echo "git: ${count} of ${#repos[@]} repos hold something of their own" 1>&2
+}
+
+# the mount points of the attached drives and media: where udisks mounts them
+# for the user (/media/USER on Debian and Ubuntu, /run/media/USER elsewhere)
+# and what is mounted under /mnt
+media_dirs() {
+    local user
+    user="$(id -un)"
+    findmnt -n -l -o TARGET | grep -E "^(/media/${user}|/run/media/${user}|/mnt)/" | sort -u
+}
+
+# the backups on the attached drives and media, at their top or one folder
+# down, newest first by the date in their name
+find_backups() {
+    local dir
+    while IFS= read -r dir; do
+        find "${dir}" -mindepth 1 -maxdepth 2 -type d -name 'setup-backup-*' 2>/dev/null
+    done < <(media_dirs) | awk '{ print substr($0, length($0) - 14) "\t" $0 }' | sort -r | cut -f 2-
+}
+
+# the folder to store the backup in: one of the attached drives and media, or
+# any other folder
+choose_folder() {
+    local other="(another folder)" dir choice status
+    local -a items=()
+    while IFS= read -r dir; do
+        items+=("${dir}"$'\t'"${dir} ($(df -h --output=avail "${dir}" | tail -n 1 | tr -d ' ') free)")
+    done < <(media_dirs)
+    if [ "${#items[@]}" -gt 0 ]; then
+        choice="$("${BIN_DIR}/prompt-select" --delimiter $'\t' -p "Folder to store the backup in:" \
+            "${items[@]}" "${other}"$'\t'"${other}")"
+        status="${?}"
+        [ "${status}" -ne 0 ] && return "${status}"
+        [ "${choice}" != "${other}" ] && { echo "${choice}"; return 0; }
+    fi
+    "${BIN_DIR}/prompt-folder" "Folder to store the backup in:"
+}
+
+folder=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -f|--find) find_backups; exit 0 ;;
+        -h|--help) usage ;;
+        -*)        echo "ERROR: Unknown option ${1}" 1>&2; usage ;;
+        *)         [ -n "${folder}" ] && usage; folder="${1}" ;;
+    esac
+    shift
+done
+
+if [ -z "${folder}" ]; then
+    [ -t 0 ] || fail "No FOLDER given and no terminal to ask for one"
+    folder="$(choose_folder)"
+    [ "${?}" -eq 130 ] && { echo 1>&2; fail "Aborted"; }
+    [ -z "${folder}" ] && fail "No folder given"
+fi
+folder="${folder/#\~/${HOME}}"
+[ -d "${folder}" ] || fail "No such folder: ${folder}"
+
+[ -t 0 ] && store_ssh_config
+[ -t 0 ] && store_codeium_key
+# Sublime Text writes its session (and the unsaved text) only now and then and
+# when it closes, so a running one may have newer text than the session file
+if [ -d "${SUBLIME_DIR}" ] && pgrep -x sublime_text > /dev/null 2>&1; then
+    warning "Sublime Text is running, its session file may miss the latest unsaved text"
+    if [ -t 0 ]; then
+        while pgrep -x sublime_text > /dev/null 2>&1; do
+            ask "Close Sublime Text now, then continue (no: back up the session as it is)?" || break
+        done
+    fi
+fi
+# a running Chrome writes its databases all the time, a copy of them may be broken
+if [ -d "${CHROME_DIR}" ] && pgrep -x chrome > /dev/null 2>&1; then
+    warning "Chrome is running, the copy of its profile may have broken databases"
+    if [ -t 0 ]; then
+        while pgrep -x chrome > /dev/null 2>&1; do
+            ask "Close Chrome now, then continue (no: back up the profile as it is)?" || break
+        done
+    fi
+fi
+keyring_files=()
+choose_keyrings
+
+backup="${folder%/}/setup-backup-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+umask 077
+mkdir "${backup}" || fail "Cannot create ${backup}"
+info "Backing up to ${backup}"
+backup_keyrings "${backup}"
+backup_reminders "${backup}"
+backup_histories "${backup}"
+backup_keys "${backup}"
+backup_ssh "${backup}"
+backup_bin "${backup}"
+backup_local_config "${backup}"
+backup_kube_lists "${backup}"
+backup_sublime "${backup}"
+backup_chrome "${backup}"
+backup_downloads "${backup}"
+backup_agents "${backup}"
+backup_git "${backup}"
+
+if [ "${#failed[@]}" -gt 0 ]; then
+    info "Done, but these failed:"
+    printf '  %s\n' "${failed[@]}" 1>&2
+    exit 1
+fi
+info "Done, it holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe"
+echo "${backup}"

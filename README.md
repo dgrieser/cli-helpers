@@ -1,0 +1,3325 @@
+# cli-helpers
+
+A collection of small, single-purpose command-line tools, mostly Bash, some Python, for:
+- Audio
+- Clipboard
+- Window/Display management
+- AI helpers
+- Text Processing/Conversion
+- and day-to-day shell ergonomics
+
+Built for Linux, running on GNOME with either X11 or Wayland.
+
+## Installation
+
+To set up a new machine, clone the repo and run `./setup.sh` from a terminal as your user. It installs what the
+`Makefile` needs and asks once for the backup to restore from: it lists the backups of `setup-backup` it finds on the
+attached drives and media (`setup-backup --find`), and you can also enter another folder or go without one. Every
+restore step then finds its part in that folder by the layout of `setup-backup` and skips a missing one; a file
+that is already on the machine is kept. It imports the old keyring files of the backup (`keyring-cli import`) and offers to restore the SSH
+keys, the SSH config, the network connections and the API key of Codeium stored in the keyring (`keyring-cli ssh-restore`,
+`keyring-cli ssh-config-restore`, `keyring-cli nm-restore`, e.g. the
+work Wi-Fi and VPN, `keyring-cli codeium-restore` for its plugins of Vim and Sublime Text), offers to create the install folders (`sudo make setup-dirs`), installs cli-helpers as symlinks or
+copies, restores your own scripts of `~/bin`, sets up the configured work VPN (the OpenVPN plugin
+of NetworkManager with its GNOME part and the configured profile for use by `work-link`), sets up the configured IKEv2 VPN (the strongSwan plugin of NetworkManager, its `charon-nm` patched by `lib/cli-helpers/charon-nm-psk-patch` to take a pre-shared key shorter than 20 characters and, with `remote-identity=%any`, whatever identity the gateway sends (e.g. its changing IPv6 address), again after every upgrade by a `DPkg::Post-Invoke` hook, a split tunnel for the home network and its DNS domain only, and the connection written with the settings of the keyring: `type vpn-home` with `name host`, `name network`, `name dns-search` (e.g. `~home.example`, `~` for routing only, several separated by `;`), `name ipsec-id` and `name ipsec-key`), installs the files of
+`lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
+is up, with the configured domains to search, and sets the Slack status, as the configured work Wi-Fi does. The MT7922 and Intel AX210 also get calmer
+roaming scans. The files turn wifi power save off and add a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
+internal names too. Setup installs the local NetworkManager settings as root-owned configuration and asks before overwriting an existing file), runs
+`fix-mt7922-6ghz-roaming` to migrate the old udev rule and apply the 6 GHz fix on MediaTek MT7922 cards (setup waits for Wi-Fi after a possible driver reload).
+The Wi-Fi step also sets the configured Wi-Fi profile when its band is unrestricted to 5 GHz on Intel AX210 because that band restored internal HTTPS.
+Setup then installs `gh` and
+`glab` and asks you to log in with them (before the `glab` login to the configured GitLab host it asks you to dial the VPN
+when the host is not reachable, using `work-link` if configured, and then offers the `glab` login to gitlab.com), sets up
+`glab` as the Docker credential helper of the registries of the hosts it is logged in to (`updater glab-docker`: `glab
+auth configure-docker`, without the configured private registries, so `docker login` and `docker logout` work for them), stores the
+host key of the configured SSH host in `~/.ssh/known_hosts` (through the VPN when needed; that host can use `sshpass`,
+which fails silently on an unknown host key), restores the session of Sublime Text (its open windows
+and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome
+with the key of its passwords and cookies (`keyring-cli import --match application=chrome --overwrite`; a profile that is
+already there is only replaced when you say so, and moved aside to `google-chrome.before-restore-<date>`), writes the desktop
+entries of the apps installed in Chrome again, which Chrome keeps outside its profile (`lib/cli-helpers/chrome-web-apps`: for every
+app Chrome made a shortcut for, from its web app database in `Sync Data/LevelDB` of each profile, with the icons, the jump list and
+the links the app opens, such as `mailto` or `web+msteams`; these become the default in `~/.config/mimeapps.list` unless a default
+of your own is set there, of several apps the one launched last), installs the `base` software with `updater`,
+restores the `Keys` folder of the documents folder and the shell histories, runs `make install` of bash_aliases.d once more with a terminal (it asks for SSH keys and history backups
+the backup did not have, which `updater` cannot), restores the reminders of `reminder`, the configured Kubernetes lists that the kubectl-helpers read, the Downloads folder and the sessions, histories, memories and settings of Claude Code, Codex and opencode, offers to restore the git repos of the workspace (cloning the missing ones from their remotes, after dialing the VPN for the configured GitLab host, then bringing back their local branches, stashes, worktrees and uncommitted changes), and then asks for the GNOME extensions (only on GNOME) and for each other category of `updater` (`updater --list`).
+It then offers to log in to Claude Code (`claude auth login`) and Codex (`codex login`) when they are installed and not logged in yet.
+With the kubectl-helpers installed it then writes the shell shorthands of `k-ctx` (`k-ctx shell-init`, sourced by bash_aliases.d) and offers to set up `netbox-cli` (`NETBOX_URL`, and `NETBOX_TOKEN` stored in the keyring for the
+dotfiles) and to fetch a kubeconfig for every cluster `k-ctx list --remote` can fetch one for that has none in `~/.kube`
+(`k-ctx add --yes`).
+Finally it offers to make browser-router the default browser (`browser-router --set-default`) and, on GNOME, to
+apply the GNOME settings (`gnome-apply-settings`) and bind the app shortcuts (`app-shortcut --bind`).
+`./setup.sh --list` lists these steps in this order, and `./setup.sh STEP...` runs only those, still in this order (a step
+that restores from the backup asks for the backup first), e.g. `./setup.sh etc` for the files of `/etc` alone.
+On a headless system (no desktop installed, see `headless`), e.g. a server or a Raspberry Pi OS Lite, a full run
+leaves out what only a desktop needs: the steps `sublime`, `chrome`, `chrome-apps`, `browser` and `gnome` (naming one
+still runs it), the GNOME extension and the desktop entries of cli-helpers, the GNOME part of the OpenVPN plugin, and
+the `gui` software of `updater`; a category with nothing else in it is not asked for.
+
+Run `setup-backup` on the old machine first: it copies every file `setup.sh` restores into a new folder
+`setup-backup-<host>-<date>` (the keyring files, checked in a list when there are several, the reminders, the shell histories and the `Keys` folder of the documents
+folder with the SSH keys of the SSH config, and the configured private scripts from `~/bin`, the configured Kubernetes lists, the session of Sublime Text (`~/.config/sublime-text/Local`, it offers to wait until you
+closed Sublime Text, so the session has the latest unsaved text), the profile of Google Chrome without its caches
+(`~/.config/google-chrome`, it offers to wait until you closed Chrome) with the keyring file that holds its key, the Downloads folder (without unfinished downloads) and one archive each of
+`~/.claude` with `~/.claude.json`, `~/.codex` and opencode's `~/.config/opencode` with `~/.local/share/opencode`, without
+their logins, caches and installed programs, and what only the git repos of `~/workspace` and `~/workspace.worktree` hold: uncommitted changes, stashes, branches no remote has and the worktrees). Without a folder it offers the attached drives and media (mounted under
+`/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
+config and the API key of Codeium (of `~/.codeium/config.json` of its Vim plugin, else of `~/.codeium/sublime/codeium-api-key.txt` of its Sublime Text plugin) in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
+
+The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`, `prompt`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
+
+```bash
+make list                     # show targets and the full command list
+make update                   # update installed software (use UPDATE_ARGS='--dry-run apt')
+sudo make install-links       # install as symlinks back to this repo (no copy)
+sudo make install             # copy commands + shared helpers + GNOME extension
+sudo make uninstall           # remove installed files
+make list-install             # show install destinations
+```
+
+To install without `sudo` afterwards, run `sudo make setup-dirs` once: it creates the install folders (`BINDIR`,
+`LIBDIR`, `PYTHONDIR`, the completions folder) owned by `root:<your group>` and group-writable, and does the same for
+the system completions folder `/usr/share/bash-completion/completions` (`SYSTEM_COMPLETIONSDIR`). The group is the
+primary group of the user who ran `sudo`; override it with `INSTALL_GROUP=...`. The `.pth` file still needs root
+once (`sudo make install-pth`), since it lives in the system's `/usr/lib/python3/dist-packages`.
+
+Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`, `PYTHONDIR=...`.  
+The GNOME extension steps (packaging, installing, enabling) are skipped automatically when no GNOME Shell is
+detected, so the install works unchanged on non-GNOME systems; set `ENABLE_GNOME_EXTENSION=0` to skip them on a
+GNOME system too, or `ENABLE_GNOME_EXTENSION=1` to force them.
+
+`make install` and `make install-links` also install the systemd user timer that keeps the index of
+[`agent-session`](#agent-session) current (`make install-agent-session-timer` on its own): the units
+`agent-session-index.service` and `agent-session-index.timer` are copied to `~/.config/systemd/user` of the user who
+runs make - under `sudo` the one in `SUDO_USER` - with `ExecStart` pointing into `BINDIR`, and the timer is enabled in
+that user's session. Without a running session the units are installed and the command that enables them is printed.
+A staged install (`DESTDIR=...`) and `INSTALL_USER_ASSETS=0` skip it; `make uninstall` (or
+`make uninstall-agent-session-timer`) disables and removes it.
+
+## Contents
+
+- [Audio Media](#audio-media)
+- [Webcam](#webcam)
+- [Clipboard](#clipboard)
+- [AI Helpers](#ai-helpers)
+- [Color and Terminal Text Styling](#color-and-terminal-text-styling)
+- [Text and Data Processing](#text-and-data-processing)
+- [Format, Encoding and Conversion](#format-encoding-and-conversion)
+- [Files and Shell Command Helpers](#files-and-shell-command-helpers)
+- [Interactive Input Prompts](#interactive-input-prompts)
+- [SSH, Network and System](#ssh-network-and-system)
+- [Window and Display Management](#window-and-display-management)
+
+---
+
+## Audio Media
+
+### `browser-audio-record`
+
+Opens a dedicated Google Chrome session. Use the top-right **Start recording**
+and **Stop recording** button to save Chrome's playback as MP3 while listening
+through your usual output. The recorder prompts for any missing URL or recording
+name using `prompt`.
+
+```bash
+browser-audio-record
+browser-audio-record --url https://example.com --name interview
+browser-audio-record --url https://example.com --name ~/Music/interview.mp3 --auto-start
+```
+
+`--auto-start` starts recording before Chrome opens the URL. Closing the
+original tab or pressing Ctrl+C saves any active recording and ends the session.
+Names are relative to the current directory unless you provide an absolute path.
+Repeated takes get a numbered suffix. Requires Google Chrome, PipeWire with
+`pipewire-pulse`, and FFmpeg with PulseAudio and MP3 encoding support.
+`updater base` includes FFmpeg in its media tools and installs Chrome if needed
+on desktops already running PipeWire and WirePlumber with PipeWire's PulseAudio
+service available. Install the recorder with `make install` or `make install-links`.
+
+### `audio-levels`
+Continuously displays live audio statistics from a PulseAudio source using `sox`, stopping when Esc, `q`, or Enter is pressed.
+
+**Usage:** `audio-levels [-h|--help|--list-devices] <pulseaudio-device>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<pulseaudio-device>` | The PulseAudio source device to monitor. Defaults to `default` if omitted. |
+| `-h, --help` | Show the usage message. |
+| `--list-devices` | List available PulseAudio source device names and exit. |
+| `--bash-completion` | Output completion candidates (flags plus device names) for shell completion. |
+
+**Examples:**
+```bash
+audio-levels --list-devices
+audio-levels
+audio-levels alsa_input.pci-0000_00_1f.3.analog-stereo
+```
+
+### `audio-normalize`
+Detects the maximum volume of an audio file and re-encodes it to an MP3 with that peak shifted to 0 dB (normalized), writing the result to `<file>_normalized.mp3`.
+
+**Usage:** `audio-normalize <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The input audio file to normalize. |
+
+**Examples:**
+```bash
+audio-normalize recording.mp3
+audio-normalize interview.wav
+```
+
+### `audio-renamer`
+Renames every `.mp3` file in the current directory based on its embedded title tag, sanitizing the title into a safe filename and appending a numeric suffix to avoid collisions (falling back to `ole` when no title is present).
+
+**Usage:** `audio-renamer`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+cd ~/Music/album && audio-renamer
+```
+
+### `audio-restart`
+Restarts the user's PipeWire and WirePlumber services to recover from audio problems.
+
+**Usage:** `audio-restart`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+audio-restart
+```
+
+### `audio-segment`
+Splits an audio file into fixed-length segments using `ffmpeg` (stream copy, no re-encoding) and prints the names of the generated segment files.
+
+**Usage:** `audio-segment [-h|--help] [-v|--verbose] [-s|--segment-seconds <seconds>] <input file> [<output file basename>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<input file>` | The audio file to split into segments. |
+| `<output file basename>` | Base name for the output segments; defaults to `<input file without extension>_seg`. Segments are named `<basename>_<index>.<ext>`. |
+| `-h, --help` | Show the usage message. |
+| `-v, --verbose` | Enable verbose output and `ffmpeg` verbose logging. |
+| `-s, --segment-seconds <seconds>` | Length of each segment in seconds (must be a positive integer). Defaults to `600`. |
+
+**Examples:**
+```bash
+audio-segment lecture.mp3
+audio-segment -s 300 podcast.mp3
+audio-segment --verbose --segment-seconds 120 recording.wav chunk
+```
+
+### `audio-trim`
+Trims an audio file between a start time and an optional end time (defaulting to the file's full duration) and re-encodes the result to MP3, writing it to `<audio-file>_trimmed.<ext>`.
+
+**Usage:** `audio-trim <audio-file> <start-time> [<end-time>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<audio-file>` | The input audio file to trim. |
+| `<start-time>` | Start time in `HH:MM:SS` or `HH:MM:SS.ms` format. |
+| `<end-time>` | Optional end time in `HH:MM:SS` or `HH:MM:SS.ms` format; defaults to the file's full duration. |
+
+**Examples:**
+```bash
+audio-trim song.mp3 00:00:30
+audio-trim interview.mp3 00:01:15 00:05:45.5
+```
+
+### `audio-volume`
+Adjusts an audio file's volume by a given decibel amount, re-encoding it to a temporary MP3 file and printing the new file's path.
+
+**Usage:** `audio-volume <file> <volume>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The input audio file. |
+| `<volume>` | The volume adjustment in decibels (e.g. `5` to boost, `-3` to reduce), passed to the `ffmpeg` `volume` filter as `<volume>dB`. |
+
+**Examples:**
+```bash
+audio-volume quiet.mp3 6
+audio-volume loud.mp3 -4
+```
+
+### `audio-volume-detect`
+Detects and prints the maximum volume (in dB) of an audio file using the `ffmpeg` `volumedetect` filter.
+
+**Usage:** `audio-volume-detect <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The audio file to analyze. |
+
+**Examples:**
+```bash
+audio-volume-detect recording.mp3
+```
+
+### `audio-volume-detect-time`
+Analyzes an audio file in 0.1-second slices and prints the RMS level (in dB) for each slice alongside a timestamp, giving a time-stamped volume profile of the file.
+
+**Usage:** `audio-volume-detect-time <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The audio file to analyze. |
+
+**Examples:**
+```bash
+audio-volume-detect-time recording.mp3
+```
+
+### `convert-to-mp3`
+Converts a video or audio file into an MP3 file using `ffmpeg`, with configurable encoding parameters and optional metadata tagging.
+
+**Usage:** `convert-to-mp3 <video|audio> [target-mp3] [--bitrate <bitrate>] [--sample-rate <sample-rate>] [--channels <channels>] [--strip-metadata] [--title <title>] [--artist <artist>] [--album <album>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<video\|audio>` | Source media file to convert (required). |
+| `[target-mp3]` | Output MP3 path. If omitted, derives `<source>.mp3`, appending `-1`, `-2`, etc. to avoid overwriting an existing file. |
+| `--bitrate <bitrate>` | Audio bitrate in kbps (digits only). Default: 160. |
+| `--sample-rate <sample-rate>` | Sample rate in Hz (digits only). Default: 48000. |
+| `--channels <channels>` | Number of audio channels (digits only). Default: 2. |
+| `--strip-metadata` | Discard all metadata from the source (`-map_metadata -1`). |
+| `--title <title>` | Set the MP3 title metadata tag. |
+| `--artist <artist>` | Set the MP3 artist metadata tag. |
+| `--album <album>` | Set the MP3 album metadata tag. |
+
+**Examples:**
+```bash
+convert-to-mp3 lecture.mp4
+convert-to-mp3 song.flac out.mp3 --bitrate 320 --sample-rate 44100
+convert-to-mp3 interview.wav --strip-metadata --title "Episode 1" --artist "Jane Doe"
+```
+
+### `play-track`
+Plays one or more audio files quietly through `mpg123`, accepting file paths as arguments or a whitespace-separated list on stdin.
+
+**Usage:** `play-track <files or - for stdin>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<files>` | One or more audio file paths to play. |
+| `-` | Read the list of files from stdin instead of arguments. |
+
+**Examples:**
+```bash
+play-track song.mp3
+play-track track1.mp3 track2.mp3
+ls *.mp3 | play-track -
+```
+
+### `rec`
+Records audio from the default ALSA input via `ffmpeg` into a temporary MP3 file, stopping when Enter is pressed (or cleaning up and aborting on interrupt), then prints the recording's path.
+
+**Usage:** `rec`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+rec
+track="$(rec)"
+```
+
+### `readme`
+Reads typed text aloud: collects the text in [prompt](#prompt)'s multi-line editor (Ctrl-D when done), asks for confirmation, converts the text to speech via an OpenAI or ElevenLabs TTS engine, and plays the resulting MP3.
+
+**Usage:** `readme [--tts <11labs|openai>] [-r|--repeat] [-v|--voice <voice name>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--tts <11labs\|openai>` | TTS engine to use. Default: `openai`. |
+| `-r, --repeat` | Replay the last generated audio and exit. |
+| `-v, --voice <voice name>` | Voice to use (defaults: `nova` for openai, `Dorothy` for 11labs). |
+| `--bash-completion <command>` | Output shell-completion candidates. |
+
+**Examples:**
+```bash
+readme
+readme --tts 11labs --voice Dorothy
+readme --repeat
+```
+
+---
+
+## Webcam
+
+### `cam`
+Interactive terminal tool for live-adjusting webcam V4L2 settings (brightness, contrast, saturation, hue, gamma, white balance, backlight compensation) via single keypresses, and for applying or storing camera presets through `cam-settings`.
+
+**Usage:** `cam`
+
+Takes no arguments. Once running, it reads single keys in a loop:
+
+| Key | Description |
+|---|---|
+| Arrow Up / Down | Increase / decrease brightness |
+| Arrow Left / Right | Decrease / increase contrast |
+| Page Up / Down | Increase / decrease saturation |
+| `,` / `.` | Decrease / increase gamma |
+| `+` / `#` | Increase / decrease hue |
+| `-` / `_` | Increase / decrease backlight compensation |
+| `ü` / `ä` | Increase / decrease white balance temperature (disables auto white balance first) |
+| `ö` | Toggle automatic white balance on/off |
+| `r` | Reset all settings to camera defaults |
+| `d` | Apply the `default` preset (if present) |
+| `b`, `B`, `n`, `N` | Apply the 1st–4th non-default preset (if present) |
+| `p` | Pick a preset to apply from a list |
+| `P` | Prompt for a name, completing against the existing presets, and store the current settings under it |
+| `h` | Print the key-binding help again |
+
+**Examples:**
+```bash
+cam
+```
+
+### `cam-settings`
+Reads and writes webcam controls through `v4l2-ctl`, supporting getting/setting/increasing/decreasing/resetting individual settings as well as listing, showing, applying, and storing named presets under `~/.config/cam-settings`.
+
+**Usage:** `cam-settings [--list-settings] [--list-keys <setting>] set <setting> <value> | get [-r|--raw] <setting> | increase <setting> | decrease <setting> | reset <setting> | preset list|apply|store|show <name>`
+
+| Argument / Flag | Description |
+|---|---|
+| `--list-settings` | List the names of all available camera settings. |
+| `--list-keys <setting>` | List the properties (min, max, step, value, default, etc.) of the given setting. |
+| `set <setting> <value>` | Set a setting to a specific value. |
+| `get [-r\|--raw] <setting>` | Print a setting's current value; `-r`/`--raw` prints only the bare value without the leading `setting:` label. |
+| `increase <setting>` | Increase a setting by one step (clamped to its maximum). |
+| `decrease <setting>` | Decrease a setting by one step (clamped to its minimum). |
+| `reset <setting>` | Reset a setting to its default value. |
+| `preset list` | List the names of stored presets. |
+| `preset apply <name>` | Apply a stored preset to the camera. |
+| `preset store <name>` | Store the current camera settings as a named preset. |
+| `preset show <name>` | Print the raw contents of a stored preset. |
+
+Preset names are sanitized so any non-alphanumeric character becomes an underscore.
+
+**Examples:**
+```bash
+cam-settings set brightness 128
+cam-settings get --raw white_balance_automatic
+cam-settings preset store "evening light"
+cam-settings preset apply evening_light
+```
+
+---
+
+## Clipboard
+
+### `clip`
+Copies text from a file or stdin into the clipboard and records it in the history of `clip-history`. It handles both Wayland (the GNOME extension, else `wl-copy`) and X11 (`xclip`). Options target the clipboard and/or primary selection, strip newlines, and echo the content.
+
+A secret (`--secret`, or `clip-secret`) is never recorded. Before it reaches the clipboard, its sha1 goes into a marker in `$XDG_RUNTIME_DIR/cli-helpers/clip/secrets`. Every history write skips marked text, also the text the `clip-history` service records from GUI copies. An entry the history already holds for the same text is removed. Before the secret reaches the clipboard, `clip` also keeps what the clipboard holds at that moment, next to the marker. After the timeout, `clip-clear --secret` takes the secret out of each selection that still holds it, in a session of its own, so closing the terminal does not stop it. Then the kept text goes back into the clipboard, but only if the history holds it too. So text the history leaves out never comes back, for example a password that a password manager copied right before the secret. In that case, or when the clipboard was empty, the clipboard is only cleared. If the secret replaced another secret that has not expired yet, the text from before that one is kept, so an expired secret never comes back. Text you copy in the meantime stays untouched. The input is staged in `$XDG_RUNTIME_DIR` (tmpfs), so a secret never lands on disk.
+
+**Usage:** `clip [--print] [-c|--clipboard|-p|--primary] [-n|--no-newline] [-s|--secret] [-t|--timeout SECONDS] [-H|--history-only] [<file, or stdin>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--print` | Also print the copied content to stdout. |
+| `-c, --clipboard` | Copy to the clipboard selection only (default is both clipboard and primary). |
+| `-p, --primary` | Copy to the primary selection only. |
+| `-n, --no-newline` | Strip all newline and carriage-return characters before copying. |
+| `-s, --secret` | Do not record the text, and clear it after the timeout. |
+| `-H, --history-only` | Only record the text in the history, leave the clipboard as it is (like `clip-history add`). Excludes `--secret`, `--timeout`, `--clipboard` and `--primary`. |
+| `-t, --timeout SECONDS` | Timeout of a secret, `0` keeps it in the clipboard (default `30`, or `CLIP_SECRET_TIMEOUT`). Implies `--secret`. |
+| `<file>` | File to copy; if omitted (or `-`), content is read from stdin. |
+
+| Environment | Description |
+|---|---|
+| `CLIP_HISTORY=0` | Do not record anything. |
+| `CLIP_HISTORY_DIR` | The folder of the history (default `~/.local/share/cli-helpers/clip-history`). |
+| `CLIP_SECRET_TIMEOUT` | Default timeout of a secret in seconds. |
+| `CLIP_SECRET_RESTORE=0` | Only clear an expired secret, do not put back what the clipboard held before. |
+
+**Examples:**
+```bash
+clip notes.txt
+git rev-parse HEAD | clip -c -n
+echo "hello" | clip --print
+git log -1 --format=%H | clip -n --history-only
+ssh pi two github | clip -n --secret
+generate-password | clip -t 10
+```
+
+### `clip-clear`
+Clears the contents of the clipboard or primary selection on either Wayland or X11. With `--secret` it is the clean-up that `clip --secret` schedules. It clears the marked secret only in the selections that still hold it. It puts back into the clipboard what it held before the secret, if the history holds that text too (unless `CLIP_SECRET_RESTORE=0`).
+
+**Usage:** `clip-clear [-c|--clipboard|-p|--primary] [--after SECONDS] [--secret ID]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-c, --clipboard` | Clear the clipboard selection (default). |
+| `-p, --primary` | Clear the primary selection. |
+| `--after SECONDS` | Wait `SECONDS` before clearing. |
+| `--secret ID` | Clear the secret that `clip --secret` marked as `ID`, in the clipboard and the primary selection, and remove the marker. Does nothing once the marker is gone. |
+
+**Examples:**
+```bash
+clip-clear
+clip-clear --primary
+clip-clear --after 60 &
+```
+
+### `clip-files`
+Copies the names and contents of one or more files into the clipboard (via `clip`), optionally wrapping each file's content in a Markdown code block.
+
+**Usage:** `clip-files [-m|--markdown] <files ...>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-m, --markdown` | Wrap each file's content in triple-backtick Markdown code blocks. |
+| `<files ...>` | One or more files whose name and content are copied. |
+
+**Examples:**
+```bash
+clip-files main.go util.go
+clip-files --markdown README.md
+```
+
+### `clip-history`
+Keeps a history of copied text and puts entries back into the clipboard, by command or with an fzf picker. `clip` records everything it copies. The user service `clip-history.service` (`clip-history watch`, installed and started by `updater clip-history`) also records the text copied anywhere in GNOME. For that, the cli-helpers GNOME extension announces every clipboard change with the D-Bus signal `ClipboardChanged`, and `gnome-clipboard-bridge watch` reads the new text. The extension leaves out the primary selection and text that a password manager marks with `x-kde-passwordManagerHint` (KeePassXC does this). Secrets copied with `clip --secret` or `clip-secret` are never recorded. After you update the extension, log out and in again: GNOME on Wayland loads extension code only at login.
+
+The history is one file per text in `~/.local/share/cli-helpers/clip-history` (or `CLIP_HISTORY_DIR`), named after the text's sha1. The folder is `0700` and the files are `0600`. The same text copied again only moves to the top, and there is no limit on the number of entries. Text that is only whitespace is not recorded.
+
+The picker and `list` (on a terminal) color their columns like `agent-session`: ages under an hour are green and italic, older ones faded, and sizes grey. Ages come from one `toage` call, with the same precision as in `agent-session`. Every entry also gets a type, guessed quickly from its first 40 lines by the first rule that fits. The text is colored by its type, and plain text keeps the color of the terminal. In the picker, `^TYPE` (for example `^json`) searches by type, because only the type and the text are searched.
+
+| Type | Detected by | Preview |
+|---|---|---|
+| `secret` | A private key, a token of a known service (`ghp_`, `glpat-`, `xox?-`, `sk-`, `AKIA…`, JWT), a bearer token, a value assigned to a key such as `password` or `token`, or a single word with letters, digits and signs that looks like a password or a random key | A warning above the text |
+| `diff` | `diff`, `Index:`, `@@` or `---`/`+++` at the start | Highlighted by `glow` |
+| `url` | Every line a URL (`scheme://…` or `mailto:`) | Text |
+| `path` | Every line an absolute, `~/` or `./` path without spaces | Text and `ls -la` when it is a single path that exists |
+| `uuid`, `hash` | A single UUID; a single hex word with 7 or more characters (a commit, a sha1), or `sha256:…` | Text |
+| `semver`, `num` | A single version such as `v1.24.3-rc.1`; a single number | Text |
+| `json` | Starts with `{` or `[` the way JSON does | Pretty-printed by `jq` |
+| `html`, `xml` | Starts with a common HTML tag or doctype; starts with `<?xml` or a tag | Highlighted by `glow` |
+| `md` | Two points of Markdown: fences, sub-headings and tables give two, and a heading, a list, a quote, a link, bold, emphasis or a code span give one each | Rendered by `glow` |
+| `yaml` | Lines of `key:`, list items and indented continuations, at least two | Highlighted by `glow` |
+| `tsv`, `csv` | The same number of tabs in every line; a header row of names and the same number of `,` (or `;`) in every line | Aligned by `column` |
+| `shell` | A shell shebang, `$ ` or `sudo`, or a known command at the start (a command that is also an English word, such as `make` or `find`, needs options, a pipe or a path after it) | Highlighted by `glow` |
+| `code` | At least a third of the lines look like code: they end with `;`, `{` or `}`, start with a keyword, or hold `=>`, `->`, `::` or `==` | Highlighted by `glow`, with a guessed language |
+| `text` | Anything else | Text |
+
+**Usage:** `clip-history [select [QUERY] | list [-n N] [--raw] | show ENTRY | restore ENTRY | delete ENTRY... | clear [-y] | add [FILE] | watch | path]`
+
+`ENTRY` is an index of `list` (`0` is the newest) or the start of an entry's hash (at least 4 characters).
+
+| Command / Flag | Description |
+|---|---|
+| `select [QUERY]` | Pick an entry with fzf and copy it into the clipboard and the primary selection (the default command). The preview shows the whole text, rendered by its type. |
+| `-p, --print` | `select`: print the entry instead of copying it. |
+| `list` | List the entries, newest first: index, age, size, type, and the start of the text, with `↵` for line breaks. |
+| `-n, --limit N` | `list`: only the newest `N` entries. |
+| `--raw` | `list`: tab-separated hash, mtime, bytes, age, size, type and text, without colors. |
+| `show ENTRY` | Print an entry. |
+| `restore ENTRY` | Copy an entry into the clipboard again, which moves it to the top. |
+| `delete ENTRY...` | Remove entries. |
+| `clear` | Remove all entries, after asking. |
+| `-y, --yes` | `clear`: do not ask first. |
+| `add [FILE]` | Record the text of `FILE`, or of stdin. |
+| `watch` | Record every text copied in GNOME (what the service runs). |
+| `path` | Print the folder of the history. |
+
+| Key in `select` | Description |
+|---|---|
+| `enter` | Copy the entry. |
+| `alt-enter` | Print the entry. |
+| `ctrl-d` | Remove the entry. |
+| `esc` | Exit. |
+
+**Examples:**
+```bash
+clip-history
+clip-history select ssh
+clip-history list -n 10
+clip-history restore 1
+clip-history delete 0 3
+cmd="$(clip-history select --print)"
+updater clip-history
+systemctl --user status clip-history
+```
+
+### `clip-image`
+Reads a file path from stdin, determines its MIME type, and copies the file into the clipboard as that type (useful for putting an image on the clipboard) on either Wayland or X11.
+
+**Usage:** `<command producing a file path> | clip-image`
+
+Takes no arguments; requires a file path piped in on stdin.
+
+**Examples:**
+```bash
+echo /path/to/screenshot.png | clip-image
+clip-paste-image | clip-image
+```
+
+### `clip-paste`
+Prints the current clipboard or primary-selection contents to stdout or a file, on either Wayland or X11, with an option to ensure a trailing newline.
+
+**Usage:** `clip-paste [-n|--new-line] [-c|--clipboard|-p|--primary] [-f|--file <file>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-n, --new-line` | Ensure the output ends with a trailing newline. |
+| `-p, --primary` | Read from the primary selection (default). |
+| `-c, --clipboard` | Read from the clipboard selection. |
+| `-f, --file <file>` | Write the contents to the given file instead of stdout. |
+
+**Examples:**
+```bash
+clip-paste
+clip-paste --clipboard --new-line
+clip-paste -c -f out.txt
+```
+
+### `clip-paste-collect`
+Repeatedly reads the clipboard, appends each new value to a file (or stdout), clears the clipboard, and waits for the next change, effectively accumulating a log of everything copied; built on `clip-paste-wait` and `clip-clear`.
+
+**Usage:** `clip-paste-collect [-h|--help] [--verbose] [-r|--clear] [-c|--clipboard|-p|--primary] [FILE]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--verbose` | Print progress and each collected value (prefixed with `>>`) to stderr. |
+| `-r, --clear` | Clear the clipboard once before starting the collection loop. |
+| `-c, --clipboard` | Operate on the clipboard selection. |
+| `-p, --primary` | Operate on the primary selection. |
+| `FILE` | Optional output file; its parent directory is created if needed. Defaults to stdout. |
+
+**Examples:**
+```bash
+clip-paste-collect
+clip-paste-collect -r --verbose -c collected.txt
+```
+
+### `clip-paste-image`
+Extracts an image from the clipboard (or downloads it if the clipboard holds an http(s) URL), saves it to a temporary file with the correct extension, optionally converts it to JPEG, and prints the resulting file path; works on Wayland or X11.
+
+**Usage:** `clip-paste-image [--jpg]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--jpg` | Convert the extracted image to JPEG (via `convert`) before printing its path. |
+
+**Examples:**
+```bash
+clip-paste-image
+saved="$(clip-paste-image --jpg)"
+```
+
+### `clip-paste-wait`
+Polls the clipboard (or primary selection) once per second and prints its contents as soon as it becomes non-empty, on either Wayland or X11.
+
+**Usage:** `clip-paste-wait [-h|--help] [-p|--primary|-c|--clipboard]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-c, --clipboard` | Wait on and read from the clipboard selection (default). |
+| `-p, --primary` | Wait on and read from the primary selection. |
+
+**Examples:**
+```bash
+clip-paste-wait
+clip-paste-wait --primary
+```
+
+### `clip-secret`
+`clip --secret`: copies a secret, such as a password, a token or a 2FA code, into the clipboard without recording it in the history, and clears it after the timeout (default 30 seconds). What the clipboard held before then goes back into it, if the history holds that text too. It takes the same options as `clip`.
+
+**Usage:** `clip-secret [-c|--clipboard|-p|--primary] [-n|--no-newline] [-t|--timeout SECONDS] [<file, or stdin>]`
+
+**Examples:**
+```bash
+ssh pi two github | clip-secret -n
+generate-password | clip-secret -n -t 10
+```
+
+### `copy-base64`
+Base64-encodes a file and copies a self-contained reconstruction command to the clipboard, so pasting and running it elsewhere recreates the original file.
+
+**Usage:** `copy-base64 <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The file to encode and turn into a clipboard reconstruction command (required). |
+
+**Examples:**
+```bash
+copy-base64 config.tar.gz
+copy-base64 ./secret-key.pem
+```
+
+### `serve-clip`
+Restarts a BusyBox HTTP server on port 9090 serving `~/Dokumente/html/`, clearing the clipboard first.
+
+**Usage:** `serve-clip`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+serve-clip
+```
+
+---
+
+## AI Helpers
+
+### `agent-session`
+Browses, searches, resumes and forks the conversation sessions of the Claude CLI (`~/.claude/projects`), the Codex CLI (`~/.codex/sessions` and its `state_*.sqlite` thread database) and opencode (`~/.local/share/opencode/opencode.db`), showing user and agent messages and rendering them as Markdown (with the Python module `rich`, `python3-rich`) unless raw output is requested. With no session argument, a colorful `fzf-with-header` picker lists each session's agent, live state, age, generated title and directory by last activity. Titles come from Claude's `custom-title`/`ai-title` records, the names and titles of Codex's thread database and opencode's session titles, falling back to the first prompt; the prompt gets no column of its own by default but stays searchable, and `--prompt-column` shows it (shortening the title column from 50 to 30 characters; `--print` uses 50/60-character columns). Ages under 60 minutes are green and italic, older ones faded, with the precision of `toage` shrinking as a session gets older. Codex subagent threads (reviews, spawned agents) and opencode child sessions are left out, as are archived Codex threads.
+
+The tool is written in Python and keeps an index of every session it has read in an SQLite database under `~/.cache/agent-session`: the title, first prompt, directory, last messages and every user and agent message, the messages also in a trigram full-text table. A session file is only read again where it changed, and then only from the byte the last read stopped at, since Claude and Codex only ever append; a line still being written is left for the next look. Lines are told apart by their bytes before one is decoded, so API requests, tool calls and tool output - nearly all of the gigabytes these files hold - are never parsed. Codex sessions are read in all three shapes Codex has written over time (`item_completed` events of `UserMessage`/`AgentMessage` items, the older `user_message`/`agent_message` events, and the plain response items of the first versions); opencode sessions are read from its database whenever their update time changes, an answer once it is complete, so their messages only grow at the end as well. Reading the last 7 days takes a few seconds once, then a listing takes about a tenth of a second; the whole history (several gigabytes) takes about half a minute once and gives an index of about 200 MB. Removing the folder costs the next listing its speed and nothing else.
+
+`make install` and `make install-links` install a systemd user timer (`agent-session-index.timer`) that runs `agent-session --index --days 7` a minute after login and then 30 minutes after each run, at the lowest CPU and I/O priority. A run that finds nothing new takes less than a tenth of a second of CPU, and the picker always opens on an index that is at most half an hour behind, so `tab` and `/` only read what was written since.
+
+**Usage:** `agent-session [OPTIONS] [SESSION]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SESSION` | The ID of the session to print (a part of one is enough when it is unique); omit to browse sessions interactively. |
+| `-h, --help` | Show the help message and exit. |
+| `-a, --agent AGENT` | Only use sessions of `claude`, `codex` or `opencode` (default: all of them). |
+| `-l, --last` | Print the latest session. |
+| `-n, --limit LIMIT` | Limit sessions by count instead of the default age cutoff; cannot be combined with `--days`. |
+| `-d, --days DAYS` | Only list sessions active within the last `DAYS` days (default: 7); cannot be combined with `--limit`. |
+| `-c, --current-directory` | Only list sessions recorded in the current directory, for the picker, `--print`, `--last` and a `SESSION` lookup. The picker then starts with all sessions of the current directory, open or not; `ctrl-d` widens it to every folder. |
+| `-A, --all-directories` | List sessions from all recorded working directories; the default. |
+| `-o, --open` | Only list the sessions open in a running agent, however long ago they were last active. The picker starts with these anyway, except with `--current-directory`, where `--open` keeps it to the open sessions of the current directory; `tab` shows all of them. |
+| `-p, --print` | Print the formatted session table instead of opening the interactive picker. |
+| `-P, --prompt-column` | Show the first prompt as a column of its own; without it the prompt stays searchable in the picker. |
+| `-g, --grep GREP` | Filter listed sessions to those with a user or agent message the given (Python) regex matches. |
+| `-i, --igrep GREP` | Filter listed sessions by a case-insensitive regex match in their messages. |
+| `-r, --raw` | Print the raw Markdown instead of rendering it. |
+| `--resume SESSION` | Resume the session with the given ID right away, in the directory it was recorded in; a directory that is gone is created again when confirmed. |
+| `--fork SESSION` | Fork the session with the given ID right away, asking for the working root and the agent; a working root that does not exist is created when confirmed. |
+| `--index` | Bring the index up to date for the selected agents and age window (`--days`) and exit; it also forgets sessions whose files are gone. The picker starts this in the background for its window. |
+| `--bash-completion` | Output shell-completion candidates (flags, agent names and session IDs). |
+| `--verbose` | Print verbose diagnostic output to stderr. |
+
+Filtering with `--grep`, `--igrep` and the picker's `/` matches the messages only, so hits in tool calls, tool output or file contents do not list a session. A pattern without regex syntax whose words have three characters or more is looked up in the full-text index and confirmed against the messages; any other pattern is matched against every indexed message of the listed sessions. Either way a message is matched with its whitespace collapsed, so a phrase across a line break counts. Searching the sessions of all time takes well under a second once they are indexed.
+
+`--resume` and `--fork` take a session ID and go straight to what `enter` would reach in the picker, without listing anything: `--resume` continues the session in the folder it was recorded in, `--fork` asks for the working root and the agent the way the picker does and then forks. Both look the session up in every recorded working directory, because they enter its folder themselves. Neither combines with `SESSION`, `--last`, `--grep`, `--igrep` or `--print`, and they do not combine with each other.
+
+Called as `claude-session`, `codex-session` or `opencode-session` (symlinks) the matching agent is preselected; `--agent` still overrides it.
+
+A session open in a running agent carries a marker next to its agent: `▶` working, `⌨︎` (blinking) waiting for the user - a question, a permission, a plan to confirm - and `✔` open at the prompt with nothing to do. Claude publishes a file per process in `~/.claude/sessions` naming its session and state; a file is only trusted while the start time of its process still agrees. Codex publishes nothing, but its process holds the session file open, the last `task_started`/`task_complete`/`turn_aborted` event (read from the end of the file) says whether a turn runs, and a last call that asks to run outside the sandbox or asks the user a question, with no output after it and no command process below Codex, counts as waiting. Opencode is found by its processes: the session named by `--session`, or else the session of its working directory written to since the process started; an assistant message without an end means working, a `question` tool still running means waiting. The state is searchable in the picker as `'@working`, `'@waiting` or `'@open`.
+
+The picker binds `/` to prompt for a full-text message search, `enter` to use the selected session, `tab` to toggle between the open sessions and all of them, `ctrl-o` to widen the age window (7, 30, 90, 365 days, then back to 7), `ctrl-space` to pick the folder of the scope, `ctrl-d` to toggle between the sessions of the current directory and those of every folder, `ctrl-s` to make the folder of the selected session that scope, `ctrl-a` to walk the agent filter (all, `claude`, `codex`, `opencode`), `ctrl-f` to focus the terminal a running session is open in, `ctrl-r` to refresh the list, `esc` to clear an active search and to exit without one, and `ctrl-c` to exit.
+
+The fuzzy search of fzf matches more than the visible columns: every row carries the full title, the first prompt, the state, the last user message and the last message as hidden fields, so typing a word from the end of a conversation finds it without a separate search. `/` searches every message of the listed sessions through the index instead.
+
+The picker starts with the sessions open in a running agent, over every folder - the agents name them, so nothing is searched for them and the picker is there right away - while the sessions of the last 7 days are read into the index in the background, so `tab` shows all of them a moment later without waiting for files to be read. After a change of the filter, the scope or the search the newest 20 sessions are shown first and the rest is loaded behind them. The list keeps itself current: a watcher next to the picker is told by the kernel (inotify, through libc) when a file in the folders of the sessions changes - every project of Claude, the folder of its running sessions, today's folder of Codex and those of the listed Codex sessions, the folder of the opencode database - and does nothing while none does, so an idle picker costs no CPU. After a change it makes the list again, at most every 5 seconds and otherwise once a minute (ages, and agents that ended without writing anything), and has fzf load it only where it differs from what fzf shows. Without inotify it looks every 2 seconds instead. Ages in the picker count in minutes for that reason, so a row changes once a minute and not every second. The cursor stays on its session when the rows move under it, as long as nothing is searched for.
+
+The preview shows the end of the conversation: as many of the last messages as fit into 40000 characters, rendered by `rich` in the process itself and scrolled to the bottom, a rule naming the role at the start of every turn (the user in the color of the prompt column, the agent in its own color) and the messages of a turn - an answer around its tool calls - as Markdown under it. It renders one column narrower than the preview, so fzf wraps no line into an empty one. The preview prints and ends - fzf shows a spinner for as long as a preview runs, so a preview that kept following its session would show one all the time. Instead the preview names the session it shows in the folder of the picker, which the watcher is told about like the sessions: once the file of that session changes, the watcher reads what was written since into the index - at most twice a second while it is being written - and has fzf start the preview again (over the port fzf listens on) once there is a message the preview does not show yet. What a preview rendered is kept in the cache, so the next one prints it at once and renders only the new messages; fzf keeps the old content until the new one arrives, so nothing flickers, and nothing restarts the preview while its session does not change.
+
+`ctrl-space` turns the list into the folders the listed sessions were recorded in, open ones only or all of them as `tab` has it, each once, sorted alphabetically and led by `<all>`, with the preview put away and the cursor on the other way the scope can go: on the folder the picker was started in while every folder is listed, on `<all>` while one folder is. `enter` makes the folder under the cursor the scope and shows the sessions again; `esc` and `ctrl-space` go back to them without changing it. `ctrl-d` is the short way to the folder the picker was started in: it lists all sessions of that folder, open or not; pressed again, it goes back to every folder. `ctrl-s` takes the scope from the selected session. Searching, the scope, the age window and the agent filter live in a state file the list command reads, so a key only changes that file and reloads the list. The prompt names what is shown: `open` while only the open sessions are listed, the agent while one is selected, the folder, `all` or `folders`, the age window, and `~ PATTERN` while a search is active.
+
+`enter` asks what is to happen with the selected session, in as many steps as the answer needs, and `esc` steps back to the question before it - out of the first one into the picker again, with its query, its cursor and its list where they were. `Continue session:` offers `Resume`, `Fork`, `Copy` and `Print`; a session open in a running agent is resumed already, so `Focus terminal` takes the place of `Resume` for it. `Copy` and `Print` share their row with `Copy last message` and `Print last message`, `tab` (`shift-tab` backwards) walking over the two. `Fork` asks for the working root first, offering the folder of the picker as `(current)`, the folder the session was recorded in as `(session)` and `...` for any other one (`Folder:` with directory completion); then for the agent, with completion over `claude`, `codex` and `opencode` and the session's own as the default. `Print` asks for `Markdown` or `Raw`. The questions are asked while the picker is still running and their answers are left in a file the picker turns into what it does next. `Focus terminal` and `ctrl-f` bring the terminal window the session runs in to the front through `window-focus-by-process` and leave the picker open. In Ptyxis they also select the tab containing the running session.
+
+Resume starts `claude --resume ID`, `codex resume -C DIR ID` or `opencode --session ID` from the session's recorded working directory with standard input, output and error reattached to the terminal; a directory that no longer exists is asked for first - `Folder '~/path' is missing. Create it?`. A fork takes the shortest route the CLIs allow: `codex fork -C DIR ID` forks into any directory, `claude --resume ID --fork-session` and `opencode --session ID --fork` only in the folder the session was recorded in, because both look a session up by the folder they run in. Everything else - another agent, or a Claude or opencode session forked into another folder - starts a fresh session with the rendered conversation as its first prompt (`claude PROMPT`, `codex -C DIR PROMPT`, `opencode --prompt PROMPT`); a transcript over 100000 bytes stays in its temporary file and the prompt tells the agent to read it. The clipboard confirmation and the exact resume or fork command are printed in a muted color.
+
+**Examples:**
+```bash
+agent-session
+agent-session --print
+agent-session --last
+agent-session --days 30
+agent-session --current-directory
+agent-session --prompt-column
+agent-session --agent codex -n 10 --grep "TODO"
+agent-session 3f9a1c2b-abcd-1234-ef56-7890abcdef12 --raw
+agent-session --resume 3f9a1c2b-abcd-1234-ef56-7890abcdef12
+agent-session --fork 3f9a1c2b
+agent-session --index --days 365
+claude-session -n 20 --igrep "docker compose"
+codex-session --last
+opencode-session --print
+```
+
+### `aish`
+Edits or creates a file or command using an AI CLI tool, runs a syntax check, and shows a diff. The CLI to run is picked with completion over `codex`, `claude` and `opencode` (default `claude`), and any other command can be typed instead.
+
+Symlinks are resolved first. If the resulting file lives inside a git repository, the AI CLI is started in that repository and edits the file in place — no temporary repository is created and nothing has to be copied back. Change detection compares `HEAD` and `git status --porcelain` against the state from before the run, so a repository that was already dirty is not mistaken for changes made by the agent. Afterwards the repository path, the current branch and `git status --short --branch` are printed and a selection asks what should happen with the repository: nothing, push the changes with `git-push` or move them to a new branch with `git-change`. Otherwise the file is copied into a temporary git repository (together with `bash-cli-instructions.md`) and copied back to the original location after the changes have been confirmed, using sudo when the target folder is not writable.
+
+**Usage:** `aish [OPTIONS] COMMAND`
+
+| Argument / Flag | Description |
+|---|---|
+| `COMMAND` | The command or file to edit. Absolute paths (`/`) and relative paths (`./`) are used directly; otherwise resolved via `which`, falling back to `/usr/local/bin/<COMMAND>`. |
+| `-h, --help` | Show the help message. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
+
+**Examples:**
+```bash
+aish backup-single-file
+aish /usr/local/bin/my-script
+aish ./new-tool
+```
+
+### `claude-session`
+Symlink to [`agent-session`](#agent-session) that only uses sessions of the Claude CLI.
+
+### `codex-chat`
+Sends a prompt to the Codex AI CLI (run in `--full-auto exec` mode and instructed to ground answers with web search), automatically creating or resuming a per-TTY session and storing chat logs under `~/.codex-chat`.
+
+**Usage:** `codex-chat [OPTIONS] PROMPT...`
+
+| Argument / Flag | Description |
+|---|---|
+| `PROMPT...` | The prompt text to send; words are joined into a single prompt. |
+| `-h, --help` | Display the help message and exit. |
+| `-c, --clip` | Insert the current clipboard contents into the prompt; repeatable. |
+| `-f, --file <file>` | Insert the contents of a file into the prompt (use `-` for stdin); repeatable. |
+| `-r, --resume <id>` | Resume a specific session ID, overriding the current TTY session. |
+| `--print-last` | Print the most recent chat log and exit. |
+| `--print-current` | Print the current TTY session's chat log and exit. |
+| `--print-history` | Print a table of all past chat logs (ID and prompt) and exit. |
+
+**Examples:**
+```bash
+codex-chat What is the capital of France?
+codex-chat I see this error: -c What is wrong here? Maybe look at -f somefile
+cat error.log | codex-chat Can you analyze this error log? -f -
+codex-chat --print-history
+```
+
+### `codex-session`
+Symlink to [`agent-session`](#agent-session) that only uses sessions of the Codex CLI.
+
+### `codex-review`
+Runs a Codex review of the current Git repository with `codex exec review`. The default `review` profile uses GPT-6.2 Sol with medium reasoning. `CODEX_REVIEW_PROFILE` can select another profile for standard reviews. `--deep` selects `review-deep`, which uses GPT-6.2 Astra with high reasoning. Codex TUI presets 1 and 2 use the same model and reasoning settings.
+
+Without a target, the review is chosen from the state of the repository:
+
+1. Uncommitted changes (staged, unstaged, or untracked): review those changes.
+2. On the default branch, as detected by `git-default` from dev-helpers: review the whole repository.
+3. On any other branch: review the changes against the default branch.
+
+When stdin and stdout are a terminal, the commands Codex runs are shown as progress on stderr, and the response is rendered with `glow` when it is installed. Afterwards, a menu offers:
+
+- **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
+- **Prompt** sends a follow-up to the current Codex session (`codex exec resume`).
+- **Repeat** opens a menu with the review detected from the current repository state, the initial review settings, and the remaining modes. Each review starts a new Codex session with the same profile. Follow-up prompts go to the new session.
+- **Quit** (or Esc).
+
+Otherwise, for example in a pipe, or with `--print`, only the response goes to stdout; the progress stays on stderr.
+
+**Usage:** `codex-review [--deep] [--print] [full | base [BRANCH] | uncommitted | commit [SHA]]`
+
+| Argument / Flag | Description |
+|---|---|
+| `full` | Review the whole repository. |
+| `base [BRANCH]` | Review changes against a base branch, local or remote. Without `BRANCH`, or with `default`, the default branch as detected by `git-default`. |
+| `uncommitted` | Review staged, unstaged, and untracked changes. |
+| `commit [SHA]` | Review the changes of one commit; `SHA` can be any commit ref (default: `HEAD`). |
+| `--deep` | Use GPT-6.2 Astra with high reasoning. |
+| `-p, --print` | Print only the response, even in a terminal. |
+| `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags and review targets, `default` and branches after `base`, `HEAD`, local branches and tags after `commit`). |
+
+**Examples:**
+```bash
+codex-review                  # Review what the repository state suggests
+codex-review base             # Review changes against the default branch
+codex-review base main        # Review changes against main
+codex-review commit           # Review the HEAD commit
+codex-review full             # Review the whole repository
+codex-review --deep base main  # Run a deep review against main
+codex-review > review.md      # Print only the response
+codex-review --print commit HEAD~1
+```
+
+### `opencode-run`
+Starts an interactive OpenCode session that immediately runs a slash command or submits a prompt, so a command like `lintfix` can be kicked off from the shell and then be watched and worked with in the TUI.
+
+The session starts in the git root of the working directory unless `--dir` names a directory, which is what makes the tool usable from any subdirectory of a repository. A command name is accepted with or without its leading `/`, and everything after it is handed to the command as `$ARGUMENTS`, so options of the command itself are passed through instead of being parsed. Command names are looked up in the directories OpenCode reads them from — `command` and `commands` below `${XDG_CONFIG_HOME:-~/.config}/opencode` and below the `.opencode` of the start directory and each of its parents — plus the built-in `init` and `review`. A command in a subdirectory of a command directory is named with that path as a prefix (`group/nested`). A name that is not found is only reported as a warning and still handed to OpenCode, because commands provided by a plugin or a skill do not exist as a file.
+
+**Usage:** `opencode-run [OPTIONS] [COMMAND [ARGUMENTS...]]`
+
+| Argument / Flag | Description |
+|---|---|
+| `COMMAND` | The slash command to run, with or without a leading `/`. |
+| `ARGUMENTS...` | Arguments handed to the slash command as `$ARGUMENTS`; everything after `COMMAND` is taken verbatim. |
+| `-h, --help` | Show the help message and exit. |
+| `-c, --command NAME` | The slash command to run; same as the positional `COMMAND`. |
+| `-p, --prompt TEXT` | Submit `TEXT` as a prompt instead of running a slash command. |
+| `-C, --dir DIR` | Start OpenCode in `DIR`; defaults to the git root of the working directory, the working directory otherwise. |
+| `-l, --list-commands` | List the available slash commands and exit. |
+| `-v, --verbose` | Print the OpenCode command line to stderr. |
+| `--bash-completion` | Output shell-completion candidates (flags plus the available slash command names). |
+
+A command and a prompt are mutually exclusive. The completion of `--dir` falls back to filename completion, and a prompt is not completed at all.
+
+**Examples:**
+```bash
+opencode-run lintfix
+opencode-run --command lintfix
+opencode-run /review branch
+opencode-run --prompt 'Run make lint, fix legitimate errors, and show the diff.'
+opencode-run -C ~/src/my-project lintfix
+opencode-run --list-commands
+```
+
+### `vim-fzf`
+Picks a file with fzf (with a preview of its contents) and opens it in vi, appending the `vi` command to the shell history. Bound to `z` in the shipped yazi keymap.
+
+**Usage:** `vim-fzf [-h] [QUERY]`
+
+| Argument / Flag | Description |
+|---|---|
+| `QUERY` | An initial query to pass to fzf. |
+| `-h, --help` | Show the help message and exit. |
+
+**Examples:**
+```bash
+vim-fzf
+vim-fzf updater
+```
+
+### `vish`
+Edits or creates a file or command in vim (using sudo when needed), making new files executable bash scripts, handling vim swap-file recovery, and running a syntax check on save with the option to re-edit.
+
+**Usage:** `vish [-h] COMMAND`
+
+| Argument / Flag | Description |
+|---|---|
+| `COMMAND` | The file or command to edit. Absolute (`/...`) and relative (`./...`) paths are used directly; otherwise resolved via `which`, falling back to `/usr/local/bin/COMMAND`. |
+| `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
+
+**Examples:**
+```bash
+vish my-script
+vish ./local-tool
+vish /usr/local/bin/some-command
+```
+
+---
+
+## Color and Terminal Text Styling
+
+### `color-parse`
+Converts a color/style specification into ANSI escape codes, optionally wrapping supplied text (or piped stdin) with the codes and a trailing reset; supports named colors, 256-color indices, hex (`#rrggbb` / `0xrgb`), `rgb(...)`, `fg=`/`bg=` keys, text styles, and `raw(...)` passthrough codes.
+
+**Usage:** `color-parse [-n] <color_spec|end> [text...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `color_spec` | A colon-separated style spec, e.g. `fg=red:bold`, `gray:italic`, `#c0ffee`, or `rgb(255,0,0):bold`. |
+| `end` | The literal word `end`, which prints only the ANSI reset code. |
+| `text...` | Optional text to print wrapped in the color codes; if omitted and stdin is piped, the piped text is colored instead. |
+| `-n, --newline` | Always print a trailing newline at the end of the output. |
+| `-h, --help` | Show the help/usage message and exit. |
+
+**Examples:**
+```bash
+color-parse "gray:italic"
+color-parse "fg=white:bold:underline" "Hello World"
+color-parse "#c0ffee" "Colored text"
+color-parse end
+echo -e "hi" | color-parse red
+```
+
+#### Symlink alias family
+`color-parse` changes behavior based on the name it is invoked as (`argv[0]`). When invoked through a symlink, it derives an environment-variable name from the link name (uppercased, dashes → underscores) and uses that variable's value as the color spec; if unset, it errors out.
+
+- `color-*` aliases look up the matching `COLOR_*` variable (e.g. `color-text-muted` reads `$COLOR_TEXT_MUTED`) and emit codes + text **without** a forced trailing newline.
+- `print-*` aliases map to the same `COLOR_*` variable but **always append** a trailing newline.
+
+| Alias family | Environment variable(s) | Purpose |
+|---|---|---|
+| `color-text-default` / `print-text-default` | `COLOR_TEXT_DEFAULT` | Default body text style. |
+| `color-text-bold` / `print-text-bold` | `COLOR_TEXT_BOLD` | Bold text. |
+| `color-text-italic` / `print-text-italic` | `COLOR_TEXT_ITALIC` | Italic text. |
+| `color-text-muted` / `print-text-muted` | `COLOR_TEXT_MUTED` | Muted/de-emphasized text. |
+| `color-text-muted-faded` / `print-text-muted-faded` | `COLOR_TEXT_MUTED_FADED` | Muted text, faded down a step. |
+| `color-text-faded` / `print-text-faded` | `COLOR_TEXT_FADED` | Faded text. |
+| `color-text-info` / `print-text-info` | `COLOR_TEXT_INFO` | Informational text. |
+| `color-text-code` / `print-text-code` | `COLOR_TEXT_CODE` | Inline code snippet, as [glow](https://github.com/charmbracelet/glow) renders `` `code` `` (`203:bg=236`). Used by [prompt](#prompt) for quoted spans. |
+| `color-text-success[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_SUCCESS[_LIGHT\|_STRONG]` | Success text, three intensities. |
+| `color-text-warning[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_WARNING[_LIGHT\|_STRONG]` | Warning text, three intensities. |
+| `color-text-error[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_ERROR[_LIGHT\|_STRONG]` | Error text, three intensities. |
+| `color-text-numeric[-light\|-strong]` (+ `print-*`) | `COLOR_TEXT_NUMERIC[_LIGHT\|_STRONG]` | Numeric value text, three intensities. |
+| `color-table-header` / `print-table-header` | `COLOR_TABLE_HEADER` | Table header styling. |
+| `color-table-column-1`…`-6` / `print-table-column-1`…`-6` | `COLOR_TABLE_COLUMN_1`…`_6` | Per-column table cell styling. |
+
+### `color-clear`
+Strips ANSI escape sequences (colors, styles, cursor codes) from text read on stdin, writing the cleaned text to stdout.
+
+**Usage:** `color-clear` (reads stdin, writes stdout)
+
+Takes no arguments.
+
+**Examples:**
+```bash
+some-colorful-command | color-clear
+color-clear < colored.log > plain.log
+```
+
+### `color-reset-bw`
+Rewrites ANSI escape sequences read on stdin so that pure black and pure white foreground colors (codes `30`, `97`, `38;5;0`, `38;5;15`) are reset to the terminal's default color, leaving other colors intact.
+
+**Usage:** `color-reset-bw` (reads stdin, writes stdout)
+
+Takes no arguments.
+
+**Examples:**
+```bash
+some-colorful-command | color-reset-bw
+color-reset-bw < colored.log > readable.log
+```
+
+---
+
+## Text and Data Processing
+
+### `number`
+Prepends line numbers to text read from stdin, with a configurable suffix and optional right-alignment of the numbers.
+
+**Usage:** `number [--suffix|-s <suffix, default: '. '>] [--align|-a]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--suffix, -s <suffix>` | String placed after each line number (default: `. `). |
+| `--align, -a` | Right-align the numbers by padding to the width of the largest line number. |
+
+**Examples:**
+```bash
+cat list.txt | number
+cat list.txt | number --align
+cat list.txt | number -s ') '
+```
+
+### `table`
+Formats tab-separated input from stdin into an aligned, tab-separated table with the given column headers.
+
+**Usage:** `table [-h] HEADER`
+
+| Argument / Flag | Description |
+|---|---|
+| `HEADER` | Comma-separated list of column header names. |
+| `-h, --help` | Show the help message and exit. |
+
+**Examples:**
+```bash
+printf 'a\t1\nb\t2\n' | table "Name,Value"
+```
+
+### `tsv`
+Converts a space-separated table on stdin into a tab-separated table (collapsing runs of two or more spaces into tabs), after stripping color codes.
+
+**Usage:** `tsv [-h]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Display the help message and exit. |
+
+**Examples:**
+```bash
+ls -l | tsv
+```
+
+### `tohex`
+Reads data from stdin and prints a numbered hex dump (offsets plus uppercase, space-grouped bytes) with a configurable line width.
+
+**Usage:** `tohex [--width|-w <width>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-w, --width <width>` | Number of bytes per line; must be even (divisible by 2). Defaults to 8. May also be given as a bare positional argument. |
+
+**Examples:**
+```bash
+echo -n "hello world" | tohex
+echo -n "hello world" | tohex -w 16
+cat file.bin | tohex 4
+```
+
+### `ocr`
+Extracts text from an image file using Tesseract OCR (via `tesserocr`), with selectable recognition language.
+
+**Usage:** `ocr [-l|--language LANGUAGE] image-path`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the help message and exit. |
+| `-l, --language LANGUAGE` | Language to use for OCR (default: `eng`); must be a Tesseract language installed on the system. |
+| `image-path` | Path to the image file to read text from. |
+
+**Examples:**
+```bash
+ocr scan.png
+ocr --language deu document.jpg
+```
+
+### `hgrep`
+Greps your shell history case-insensitively (using `history_read`), stripping leading ISO timestamps and excluding prior `hgrep` invocations, with optional grep-style context lines.
+
+**Usage:** `hgrep [options] <pattern ...>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the help message and exit. |
+| `-B <n>, --before-context=<n>` | Show `n` lines before each match. |
+| `-A <n>, --after-context=<n>` | Show `n` lines after each match. |
+| `-C <n>, --context=<n>` | Show `n` lines of context around each match. |
+| `<pattern ...>` | The search pattern (multiple words are joined with spaces); at least one required. |
+
+**Examples:**
+```bash
+hgrep docker
+hgrep -C 3 git rebase
+hgrep --after-context=2 ssh
+```
+
+### `ygrep`
+Greps YAML documents (including Kubernetes-style lists) read from stdin, matching a regex against each resource and printing selected fields alongside the matching lines, with grep-like context options.
+
+**Usage:** `ygrep [-i] [-f FIELD] [-m N] [-C N] [-B N] [-A N] [-L | -l] <pattern>`
+
+| Argument / Flag | Description |
+|---|---|
+| `pattern` | Regex pattern to search for within each YAML resource. |
+| `-i, --ignore-case` | Case-insensitive search. |
+| `-f, --fields FIELD` | YAML field(s) to print as a prefix; repeatable. Defaults to `name`, or `metadata.namespace` + `metadata.name` when available. |
+| `-m, --max-count N` | Maximum number of matches to print per resource. |
+| `-C, --context N` | Print `N` lines of context before and after each match. |
+| `-B, --before-context N` | Print `N` lines of context before each match. |
+| `-A, --after-context N` | Print `N` lines of context after each match. |
+| `-L, --fields-without-matches` | Print only the fields of resources with no match. |
+| `-l, --fields-with-matches` | Print only the fields of resources that have a match. |
+
+`-l` and `-L` are mutually exclusive, and neither can be combined with context or `--max-count`.
+
+**Examples:**
+```bash
+kubectl get pods -o yaml | ygrep -i imagepullbackoff
+kubectl get deploy -o yaml | ygrep -l -f metadata.name 'replicas: 0'
+cat resources.yaml | ygrep -C 2 'image:'
+```
+
+### `paginate`
+Automates reading multiple pages from a paginating command, auto-detecting the page-index and page-size argument names (from the command's `--help`) and stopping on an empty result, an empty JSON/null result, or a configured page/item limit.
+
+**Usage:** `paginate [OPTIONS] COMMAND [ARGUMENTS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the help message and exit. |
+| `-S, --page-size <n>` | Items per page (numeric); defaults to 50. |
+| `-M, --max-items <n>` | Stop after enough whole pages to cover this many items (numeric). |
+| `-P, --max-pages <n>` | Maximum number of pages to read (numeric). |
+| `-p, --page-index-argument <name>` | Name of the page-index argument; auto-detected if omitted. |
+| `-s, --page-size-argument <name>` | Name of the page-size argument; auto-detected if omitted. |
+| `--verbose` | Print the commands being run and detection details to stderr. |
+| `--` | Marks the end of options; everything after is the command and its arguments. |
+| `COMMAND [ARGUMENTS]` | The command to invoke per page, with its arguments. |
+
+**Examples:**
+```bash
+paginate glab issue list --state opened
+paginate --page-size 100 --max-items 500 nexus-cli search
+paginate -p --page -s --limit -- my-api-tool list --format json
+```
+
+### `loop`
+Reads stdin line by line and runs a command template for each line, substituting placeholders for the whole line, a line index, and (with a delimiter) individual fields.
+
+**Usage:** `loop [-d "<delimiter>"] '<commands>'`
+
+| Argument / Flag | Description |
+|---|---|
+| `-d "<delimiter>"` | Single-character field delimiter used to split each line into fields. |
+| `'<commands>'` | Command template run per line. Supports `{}` (whole line), `{i}` (zero-based index), and, with a delimiter, `{0}`–`{9}` (fields) and `{n}` (field count). |
+
+**Examples:**
+```bash
+ls | loop 'echo file: {}'
+cat data.csv | loop -d ',' 'echo row {i}: col1={1} col2={2} of {n}'
+```
+
+### `read-in-chunks`
+Reads stdin and pipes it into a command in fixed-size chunks of lines, pausing after each full chunk to ask (on the terminal) whether to continue.
+
+**Usage:** `read-in-chunks <lines> <command>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show usage and exit. |
+| `<lines>` | Number of lines per chunk (must be > 0). |
+| `<command>` | The command each chunk is piped into (run via `eval`). |
+
+**Examples:**
+```bash
+cat urls.txt | read-in-chunks 10 'xargs -n1 curl -sO'
+some-command | read-in-chunks 50 'wc -l'
+```
+
+### `base64-find`
+Scans a file line by line and prints those lines that contain a base64-encoded string which decodes to printable UTF-8 text longer than 10 characters.
+
+**Usage:** `base64-find <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The file to search for base64-encoded strings. |
+| `-h, --help` | Show the help message. |
+
+**Examples:**
+```bash
+base64-find config.env
+base64-find secrets.txt
+```
+
+---
+
+## Format, Encoding and Conversion
+
+### `csv2md`
+Parses one or more CSV files into Markdown tables. The command of the `csv2md` Python package, installed by `updater pip-tools`, not part of this repo.
+
+**Usage:** `csv2md [-d DELIMITER] [-q QUOTECHAR] [-C COLUMNS] [-c [COLS ...]] [-r [COLS ...]] [-H] [CSV_FILE ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[CSV_FILE ...]` | One or more CSV files to parse (reads stdin if none given). |
+| `-h, --help` | Show help and exit. |
+| `-d, --delimiter DELIMITER` | Delimiter character. Default: `,`. |
+| `-q, --quotechar QUOTECHAR` | Quotation character. Default: `"`. |
+| `-C, --columns COLUMNS` | Comma-separated list of zero-based column indices or ranges, e.g. `"0,3-5,7"`. |
+| `-c, --center-aligned-columns [COLS ...]` | Zero-based column numbers to center-align. |
+| `-r, --right-aligned-columns [COLS ...]` | Zero-based column numbers to right-align. |
+| `-H, --no-header-row` | Treat input as having no header row; generates default Excel-style headers. |
+
+**Examples:**
+```bash
+csv2md data.csv > data.md
+csv2md -d ';' -r 2 3 sales.csv
+csv2md -H -C "0,2-4" export.csv
+```
+
+### `markdown-table`
+Converts a tab- or space-separated table from stdin into a Markdown table, or (with a flag) converts a Markdown table back into tab- or comma-separated values.
+
+**Usage:** `markdown-table [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--to-tsv` | Convert a Markdown table (stdin) to tab-separated values. |
+| `--to-csv` | Convert a Markdown table (stdin) to comma-separated values. |
+| `-h, --help` | Show the help message and exit. |
+
+With no option, input is treated as a tab/space-separated table (columns split on a tab or two-or-more spaces, first row is the header) and converted to a Markdown table. Empty/filler header cells still get a valid separator (`---`). Multiple tables are supported: two or more blank lines end a table, and the next non-blank row starts a new table with its own header. `--to-tsv` and `--to-csv` are mutually exclusive.
+
+**Examples:**
+```bash
+printf 'Name\tAge\nAlice\t30\n' | markdown-table
+cat table.md | markdown-table --to-csv
+cat table.md | markdown-table --to-tsv
+```
+
+### `markdown-to-html`
+Converts Markdown read from stdin into HTML using `pandoc`.
+
+**Usage:** `markdown-to-html`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+cat README.md | markdown-to-html > README.html
+echo '# Title' | markdown-to-html
+```
+
+### `markdown-to-rtf`
+Converts Markdown read from stdin into RTF using `pandoc`.
+
+**Usage:** `markdown-to-rtf`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+cat notes.md | markdown-to-rtf > notes.rtf
+echo '**bold**' | markdown-to-rtf
+```
+
+### `slack-mrkdwn`
+Converts a Markdown file (or stdin) into Slack's mrkdwn format and prints it to stdout.
+
+**Usage:** `slack-mrkdwn -f FILE`
+
+| Argument / Flag | Description |
+|---|---|
+| `-f, --file FILE` | The Markdown file to convert, or `-` to read from stdin (required). |
+
+**Examples:**
+```bash
+slack-mrkdwn -f notes.md
+cat notes.md | slack-mrkdwn -f -
+```
+
+### `jsonformat`
+Formats a JSON file in place using `jq`, with optional recursive sorting of object keys either everywhere or under specific paths.
+
+**Usage:** `jsonformat [OPTIONS] JSON_FILE`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the help message and exit. |
+| `--sort-all-keys` | Sort object keys recursively at all levels. |
+| `--sort-keys PATH` | Sort object keys recursively under the given dot-notation `PATH` (e.g. `.models[].scores`). Repeatable. |
+| `JSON_FILE` | Path to the JSON file to format in place (must exist and be writable). |
+
+**Examples:**
+```bash
+jsonformat data.json
+jsonformat --sort-all-keys config.json
+jsonformat --sort-keys '.models' --sort-keys '.models[].scores' report.json
+```
+
+### `kmlformat`
+Pretty-prints a KML file by reformatting its XML and breaking each set of coordinates onto separate, indented lines.
+
+**Usage:** `kmlformat <kml-file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the usage message and exit. |
+| `<kml-file>` | Path to the KML file to format. |
+
+**Examples:**
+```bash
+kmlformat route.kml
+```
+
+### `htmlentities`
+Encodes or decodes HTML entities from stdin using Perl's `HTML::Entities` module (decoding also converts non-breaking spaces to regular spaces).
+
+**Usage:** `htmlentities [--decode|-d] [--encode|-e]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-e, --encode` | Encode HTML entities read from stdin (default mode). |
+| `-d, --decode` | Decode HTML entities read from stdin. |
+
+**Examples:**
+```bash
+echo '<a href="x">' | htmlentities --encode
+echo '&lt;a&gt;' | htmlentities -d
+```
+
+### `image-base64`
+Reads an image file and prints it as a base64-encoded `data:` URL (with a fixed `image/jpeg` MIME type).
+
+**Usage:** `image-base64 <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | Path to the image file to encode. |
+
+**Examples:**
+```bash
+image-base64 logo.png
+echo "<img src=\"$(image-base64 logo.png)\">"
+```
+
+### `excel-extract`
+Extracts and prints the formulas, cell values, VBA macro code, and defined names/custom functions from an Excel workbook.
+
+**Usage:** `excel-extract <xlsm_file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show help and exit. |
+| `<xlsm_file>` | Path to the Excel file to extract content from (required). |
+
+**Examples:**
+```bash
+excel-extract report.xlsm
+excel-extract /path/to/model.xlsx
+```
+
+### `parse-excel-date`
+Parses a German abbreviated month/year string (the kind Excel produces, e.g. `Mrz 24`) and prints it as an ISO date (`YYYY-MM-DD`).
+
+**Usage:** `parse-excel-date <date string>`
+
+| Argument / Flag | Description |
+|---|---|
+| `date` | One or more tokens forming the Excel date string (joined with spaces), e.g. `Mrz 24`. |
+| `-h, --help` | Show the help message. |
+
+**Examples:**
+```bash
+parse-excel-date "Mrz 24"
+parse-excel-date Jan 25
+```
+
+### `toage`
+Turns timestamps into compact, human readable ages: `5d`, `2h13m`, `47s`. Without arguments it works as a filter and replaces every ISO 8601 timestamp found on stdin by its age, which is what the table output of other tools is piped through. With `TIME` arguments, or with `--lines`, it prints one age per line instead, so a whole column can be rendered by a single call. The precision can shrink as a span grows: `--drop-seconds`, `--drop-minutes` and `--drop-hours` name the span from which on that unit is left out. Weeks are opt-in, so days keep accumulating (`41d3h`) unless `--units wdhms` is given (`5w6d`). It is installed as a command and as the importable `toage` Python module (`toage()`, `format_span()`), which is how `k-format` renders its age column.
+
+**Usage:** `toage [OPTIONS] [TIME ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `TIME` | ISO 8601 timestamp or epoch seconds to print the age of, one age per line; omit to filter stdin. |
+| `-h, --help` | Show the help message and exit. |
+| `-n, --now TIME` | Reference point instead of the current time, so a batch of ages stays consistent. |
+| `-U, --units UNITS` | Units that may appear, largest first; a unit left out rolls into the next smaller one (default: `dhms`). |
+| `-u, --max-units N` | Print at most `N` units, `0` for all (default: 2). |
+| `--drop-seconds SPAN` | Leave out seconds from `SPAN` on, `never` to always keep them (default: `1h`). |
+| `--drop-minutes SPAN` | Leave out minutes from `SPAN` on (default: `never`). |
+| `--drop-hours SPAN` | Leave out hours from `SPAN` on (default: `never`). |
+| `-m, --min SPAN` | Shortest span to report, so anything younger is still printed as `SPAN` instead of as nothing (default: `0`, which prints nothing). |
+| `-c, --color RULE` | Color spans below `SPAN`, as `SPAN=COLOR` or as a plain `COLOR` for every span; repeatable, the first matching rule wins. |
+| `-l, --lines` | Read one timestamp or epoch per line from stdin instead of scanning lines for timestamps. |
+
+Spans are written as `90`, `90s`, `2h` or `1d12h`. A timestamp without an offset is read as local time, and one in the future has no age.
+
+Coloring keeps the palette with the caller: `COLOR` is an escape sequence, its written `\033[36m` form, or bare SGR codes like `38;5;6`, and the age is wrapped in it followed by a reset. Rules are checked in the order they are given, so the smallest span comes first and a rule without a span is the fallback for everything above it - one call can therefore highlight a recent age and fade an old one. An empty age stays uncolored.
+
+**Examples:**
+```bash
+git log --pretty=format:'%h %cI %s' | toage
+git log --pretty=format:'%h %cI %s' | toage --color '\033[38;5;6m'
+toage 2026-08-10T09:00:00Z 1754812345
+toage --units wdhms --min 1s --drop-seconds 1m --drop-minutes 2h --drop-hours 2d 1754812345
+toage --color '1h=38;5;40;3' --color '38;5;245' 1754812345
+find . -maxdepth 1 -printf '%T@\n' | toage --lines
+```
+
+### `file-ext`
+Determines a file's appropriate extension from its MIME type, using `/etc/mime.types` plus a small built-in override table (e.g. `audio/mpeg` → `mp3`).
+
+**Usage:** `file-ext <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The file to inspect; its detected extension is printed, or the command exits non-zero if none can be determined. |
+
+**Examples:**
+```bash
+file-ext downloaded-blob
+mv data "data.$(file-ext data)"
+```
+
+### `mime-to-ext`
+Looks up a MIME type in `/etc/mime.types` and prints its associated file extensions, one per line.
+
+**Usage:** `mime-to-ext <mime-type>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<mime-type>` | The MIME type to look up (e.g. `image/png`). |
+
+**Examples:**
+```bash
+mime-to-ext image/png
+mime-to-ext application/pdf
+```
+
+---
+
+## Files and Shell Command Helpers
+
+### `catsh`
+Prints the contents of a script or command, resolving a bare command name through `which` (falling back to `/usr/local/bin/`) so you can quickly view a shell helper without knowing its full path.
+
+**Usage:** `catsh <file|command>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file\|command>` | An absolute path, a `./` relative path, or a command name to resolve via `which` and print. |
+| `--bash-completion` | Output shell-completion candidates (every command in `PATH`). |
+
+**Examples:**
+```bash
+catsh clip
+catsh ./cam-settings
+```
+
+### `cpsh`
+Copies one executable/script over another using sudo, resolving each argument through `which` (or falling back to `/usr/local/bin`) when not given as an absolute or `./` path.
+
+**Usage:** `cpsh <command-source> <command-target>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show usage and exit. |
+| `<command-source>` | Source command/script (resolved via path, `which`, or `/usr/local/bin/<name>`; must exist). |
+| `<command-target>` | Destination command/script, resolved the same way; copied to with `sudo cp -v`. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
+
+**Examples:**
+```bash
+cpsh ./mytool mytool
+cpsh /home/user/bin/deploy deploy
+```
+
+### `mvsh`
+Moves (renames) one executable to another using `sudo`, resolving each argument via `PATH` (or falling back to `/usr/local/bin`) unless given as an absolute or `./` path.
+
+**Usage:** `mvsh <command-source> <command-target>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the usage message and exit. |
+| `<command-source>` | Source command or path to move. |
+| `<command-target>` | Target command or path. |
+| `--bash-completion` | Output shell-completion candidates (flags plus every command in `PATH`). |
+
+**Examples:**
+```bash
+mvsh oldtool newtool
+mvsh ./local-script /usr/local/bin/installed-script
+```
+
+### `sush`
+Installs a file or command into `/usr/local/bin` as a root-owned, executable copy, showing a colored diff and prompting before overwriting an existing target, and optionally deleting the source.
+
+**Usage:** `sush <file|command>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file\|command>` | A file path, or a command name resolved via `which`, to copy into `/usr/local/bin`. |
+| `--bash-completion` | Output shell-completion candidates (every command in `PATH`). |
+
+**Examples:**
+```bash
+sush ./my-script
+sush some-command
+```
+
+### `sucp`
+Thin wrapper that runs `cp` with `sudo`.
+
+**Usage:** `sucp [cp arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[cp arguments]` | All arguments are passed through to `sudo cp`. |
+
+**Examples:**
+```bash
+sucp file.conf /etc/file.conf
+sucp -r dir/ /opt/dir/
+```
+
+### `sumv`
+Thin wrapper that runs `mv` with `sudo`.
+
+**Usage:** `sumv [mv arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[mv arguments]` | All arguments are passed through to `sudo mv`. |
+
+**Examples:**
+```bash
+sumv file.conf /etc/file.conf
+sumv old-name /opt/new-name
+```
+
+### `suvi`
+Thin wrapper that runs `vim` with `sudo`.
+
+**Usage:** `suvi [vim arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[vim arguments]` | All arguments are passed through to `sudo vim`. |
+
+**Examples:**
+```bash
+suvi /etc/hosts
+```
+
+### `cp-diff`
+Recursively copies files from a source directory to a destination, showing a [prompt](#prompt) select list (overwrite, skip, or edit via meld) whenever a destination file or symlink already differs from the source, and asking whether to continue after each change.
+
+**Usage:** `cp-diff <source_directory> <destination_directory>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<source_directory>` | Directory whose files and symlinks are copied (must exist). |
+| `<destination_directory>` | Target directory; differing files trigger an interactive prompt. |
+
+**Examples:**
+```bash
+cp-diff ./dotfiles ~/
+cp-diff /etc/myapp/defaults /etc/myapp
+```
+
+### `backup-single-file`
+Creates a timestamped backup copy of a single file in the same directory and deletes previous backups of that file older than a configurable number of days.
+
+**Usage:** `backup-single-file [--days <days>] <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The file to back up; must be an existing regular file. |
+| `--days <days>` | Retention period in days (positive integer); older backups are deleted. Defaults to `7`. |
+| `--help` | Show the usage message. |
+
+**Examples:**
+```bash
+backup-single-file config.yaml
+backup-single-file --days 30 /etc/important.conf
+```
+
+### `tmpfile`
+Creates an empty temporary file matching the given `mktemp` pattern and prints its path.
+
+**Usage:** `tmpfile <pattern>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<pattern>` | An `mktemp` template/pattern (e.g. `myapp.XXXXXX`) used to generate the filename. |
+
+**Examples:**
+```bash
+tmpfile myapp.XXXXXX
+tmpfile /tmp/data-XXXX.txt
+```
+
+### `file-date`
+Prints a file's last-modification time as a compact `YYMMDDHHMMSS` timestamp string.
+
+**Usage:** `file-date <file>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<file>` | The file whose modification time is formatted and printed (required). |
+
+**Examples:**
+```bash
+file-date report.pdf
+mv photo.jpg "photo-$(file-date photo.jpg).jpg"
+```
+
+### `get-image`
+Downloads a file from an HTTP(S) URL to a temporary file (preserving the original extension) and prints the temp file path.
+
+**Usage:** `get-image <url>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<url>` | The URL to download; must begin with `http`. Exactly one argument required. |
+
+**Examples:**
+```bash
+get-image https://example.com/photo.jpg
+open "$(get-image https://example.com/diagram.png)"
+```
+
+### `curl-cached`
+Fetches a URL with curl and caches the response in `/tmp`, serving the cached copy instead of re-fetching while it is younger than the given TTL.
+
+**Usage:** `curl-cached <url> <ttl-seconds>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show usage and exit. |
+| `<url>` | The URL to fetch and cache (required). |
+| `<ttl-seconds>` | Cache lifetime in seconds (digits only); cache is reused if newer than this. |
+
+**Examples:**
+```bash
+curl-cached https://api.example.com/data 300
+curl-cached https://example.com/feed.xml 60
+```
+
+### `go-run`
+Creates a temporary Go file from a template, then repeatedly opens it in `vi`, runs it with `go run`, and prompts whether to continue editing, cleaning up the temp file on exit.
+
+**Usage:** `go-run`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+go-run
+```
+
+### `bump-version`
+Increments the lowest meaningful numeric component of a version string, preferring the build segment, then the prerelease segment, then a plain integer version, and otherwise bumping the semver patch level; the new version is printed to stdout.
+
+**Usage:** `bump-version <version> [--no-semver]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<version>` | The version string to increment (e.g. `1.2.3`, `v7`, `1.0.0-rc1`, `1.0.0+build5`). |
+| `--no-semver` | Skip the semver validity check, allowing non-semver version strings. |
+| `-h, --help` | Show the usage message. |
+
+**Examples:**
+```bash
+bump-version 1.2.3
+bump-version 1.0.0-rc1
+bump-version 1.0.0+build5
+bump-version v42 --no-semver
+```
+
+### `install-git-release`
+Downloads a release artifact from a GitHub or GitLab project (resolving repository names via `git-search`, with platform/architecture-aware artifact selection for amd64, arm64, 32-bit ARM and i386), then installs a chosen binary, a `.deb` package, or a bundled application, with dry-run, post-install hooks, and renaming support.
+
+**Usage:** `install-git-release [OPTIONS] PROJECT`
+
+| Argument / Flag | Description |
+|---|---|
+| `PROJECT` | Name or URL of the project to install (required). |
+| `-h, --help` | Display help and exit. |
+| `-p, --pattern PATTERN` | Glob pattern for the release artifact; repeatable. `{arch}` stands for each name of the architecture (e.g. `amd64`, `x86_64`, `x64`, or `armhf`, `armv7l`, `armv7`, ... on a 32-bit Raspberry Pi), one pattern per name. Defaults to Linux builds for the architecture. |
+| `-a, --arch ARCH` | Architecture to install for: a Debian name (`amd64`, `arm64`, `armhf`, `armel`, `i386`, ...) or another name of one from the table in the script, such as `armv7l` or `i686` (default: the userland's, from `dpkg --print-architecture`, else `uname -m`, so a 32-bit Raspberry Pi OS on a 64-bit kernel gets `armhf` builds). Builds for other architectures are never chosen; on `armhf`, ARMv7 builds win over ARMv6 ones, which serve as fallback. |
+| `-b, --binary PATTERN` | Pattern of the binary to install from within the artifact. |
+| `-n, --name NAME` | Name to install the final binary as (default: original binary name). |
+| `-i, --install-path PATH` | Path to install the binary (default: `/usr/local/bin`). |
+| `--bundle` | Install the archive as a bundled app rather than a single binary. |
+| `--bundle-path PATH` | Path to install bundled app contents (default: `/usr/local/share`). |
+| `-c, --post-install CMD` | Command to run after a successful install (in the unpacked dir); repeatable. Receives env vars `INSTALL_PATH`, `BINARY_NAME`, `BINARY_PATH`, `ARTIFACT`, `UNPACK_DIR`, and `SUDO` (`sudo` when `INSTALL_PATH` is not writable, else empty); the function `sudo_for_path PATH` prints `sudo` when another path cannot be created or written. |
+| `-y, --yes` | Answer yes to all prompts (non-interactive). |
+| `-d, --dry-run` | Trial run: download and inspect but make no changes. |
+| `--bash-completion` | Output shell-completion candidates; release tags are offered when `PROJECT` is an explicit repository. |
+
+**Examples:**
+```bash
+install-git-release fzf
+install-git-release --dry-run https://github.com/junegunn/fzf
+install-git-release -p '*linux_{arch}.tar.gz' -b 'mytool' -n mt my/project
+install-git-release --arch arm64 --dry-run https://github.com/junegunn/fzf
+install-git-release -c 'sudo setcap cap_net_raw+ep "$BINARY_PATH"' some/network-tool
+```
+
+Exit status `4` means the release has no build for the architecture: nothing matched, but the patterns pick an asset for another architecture, or only builds for other architectures matched. `updater` skips such a software instead of failing.
+
+### `npm-pkg-dir`
+Prints the directory of a globally installed npm package, resolved under `npm root -g` (so it follows the active nvm node). Only top-level global packages count, never the dependencies bundled inside npm itself. `updater` uses it to back up a package before a forced reinstall. Needs `node` and `npm` on `PATH`.
+
+**Usage:** `npm-pkg-dir <package-name>`
+
+| Argument / Flag | Description |
+|---|---|
+| `<package-name>` | Name of the global package, scoped names included (e.g. `@openai/codex`). |
+| `-h, --help` | Show the usage message. |
+
+Exit codes: `0` found, `1` usage error, `2` package not installed globally, `3` `npm root -g` failed.
+
+**Examples:**
+```bash
+npm-pkg-dir @openai/codex
+cd "$(npm-pkg-dir npm)"
+```
+
+### `generate-password`
+Generates a random password of a given length using `openssl` for randomness, optionally enforcing minimum counts of lowercase, uppercase, digit, and special characters.
+
+**Usage:** `generate-password [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Print the help message and exit. |
+| `-l, --length LENGTH` | Length of the password to generate (default: 12). |
+| `-L, --lower COUNT` | Require at least COUNT lowercase letters. |
+| `-U, --upper COUNT` | Require at least COUNT uppercase letters. |
+| `-d, --digits COUNT` | Require at least COUNT digits. |
+| `-s, --special COUNT` | Require at least COUNT special characters. |
+| `-x, --exclude CHARS` | Never use any character contained in CHARS. |
+
+**Examples:**
+```bash
+generate-password
+generate-password --length 20
+generate-password -l 16 -d 2 -s 2
+generate-password -x '0O1lI'
+generate-password -l 20 -x '0O1lI[]{}()<>'
+```
+
+### `retry`
+Repeatedly runs a command until it succeeds (exit 0) or is interrupted (exit 130), with a configurable delay between attempts and an optional cap on the number of retries.
+
+**Usage:** `retry [-r retries] [-d delay] '<command>'`
+
+| Argument / Flag | Description |
+|---|---|
+| `-r <retries>` | Maximum number of retries (numeric); default unlimited (`-1`). |
+| `-d <delay>` | Delay in seconds between attempts (numeric); defaults to 1. |
+| `'<command>'` | The command to run (executed via `bash -c`). |
+
+**Examples:**
+```bash
+retry 'curl -sf https://example.com/health'
+retry -r 5 -d 3 'ping -c1 host'
+retry -d 10 'make deploy'
+```
+
+### `whichis`
+Prints information about a command, bash function, or alias, including its resolved path and symlink chain, file type, owning package, and (optionally truncated) source content.
+
+**Usage:** `whichis [-l <#> | -L] COMMAND`
+
+| Argument / Flag | Description |
+|---|---|
+| `COMMAND` | The command, function, or alias to inspect. |
+| `-l, --lines <#>` | Number of content lines to print (default 10). |
+| `-L, --all-lines` | Print all content lines. |
+| `-h, --help` | Print the help message and exit. |
+| `--bash-completion` | Output shell-completion candidates (flags plus commands, functions, and aliases). |
+
+**Examples:**
+```bash
+whichis ls
+whichis -L my-function
+whichis --lines 20 grep
+```
+
+### `lastcmd`
+Prints the most recent command from shell history, excluding invocations of `lastcmd`/`lcmd` themselves and omitting the timestamp.
+
+**Usage:** `lastcmd`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+lastcmd
+```
+
+### `history-cli`
+Reads, writes, inspects and repairs a bash history file. With `HISTTIMEFORMAT` set, bash writes a `#<epoch>` line before each entry; entries without one (from before it was set, or appended by other tools) show no time and confuse tools that read the timestamps.
+
+**Usage:** `history-cli COMMAND [OPTIONS]`
+
+| Command / Flag | Description |
+|---|---|
+| `read` | Print the entries (trimmed, without empty ones), each with the ISO time of its timestamp (`2024-01-31T12:00:00+0100`) unless `--no-timestamp`. |
+| `append` | Append stdin as one entry, with a timestamp line when `$HISTTIMEFORMAT` is set or with `--with-timestamp`. Does nothing without `--file` or `$HISTFILE`, e.g. in a shell without a history. |
+| `stats` | Count the entries with and without a timestamp and show the time of the first and the last one. |
+| `fix-timestamps` | Give every entry without a timestamp one: the one of the entry before it, so the order stays the same (the first timestamp of the file for the entries before it). Prints the result unless `--in-place` is given. |
+| `-f, --file FILE` | History file (default: `$HISTFILE`, else `~/.bash_history`). |
+| `-l, --lines N` | `read`: only the last `N` entries. |
+| `-e, --exclude REGEX` | `read`: leave out entries matching the extended regular expression; repeatable. |
+| `--no-timestamp` | `read`: print only the entries. |
+| `--with-timestamp` | `append`: always write a timestamp. |
+| `-t, --timestamp WHEN` | `fix-timestamps`: give all entries without a timestamp this one, as epoch seconds or a date `date -d` understands. |
+| `-i, --in-place` | `fix-timestamps`: rewrite the file, keeping the old one as `FILE.bak`. |
+
+A line counts as one entry: with `lithist`, a multi-line command written as several lines after one timestamp would be split into entries.
+
+**Examples:**
+```bash
+history-cli read -l 50 --no-timestamp -e '^ls' -e '^cd'
+echo "make deploy" | history-cli append
+history-cli stats
+history-cli fix-timestamps -i
+history-cli fix-timestamps -f ~/.kube_history -t "2024-01-31 12:00" -i
+```
+
+### `history_append`, `history_read`
+Symlinks to [history-cli](#history-cli) that keep the old commands working: `history_read [OPTIONS]` is `history-cli read [OPTIONS]`, and `history_append [OPTIONS]` is `history-cli append [OPTIONS]`, where `-t` still means `--with-timestamp`.
+
+```bash
+history_read --lines 50 --no-timestamp
+echo "make deploy" | history_append -t -f ~/project.history
+```
+
+### `patch-apply`
+Applies a unified diff with `patch -u -p0`, optionally stripping leading slashes from absolute paths in the patch header and optionally forcing every hunk onto a single target file.
+
+**Usage:** `patch-apply [-h|--help] [--no-fix-paths] [-s|--single-file] [<file>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show usage and exit. |
+| `--no-fix-paths` | Do not rewrite absolute (`/`-prefixed) paths in the `---`/`+++` header lines to relative ones. |
+| `-s, --single-file` | Force all hunks to apply to the first path seen in the patch. |
+| `<file>` | The patch file to apply; if omitted, read from stdin. |
+
+**Examples:**
+```bash
+patch-apply changes.diff
+git diff | patch-apply --no-fix-paths
+patch-apply --single-file - < my.patch
+```
+
+### `reminder`
+An interactive terminal tool for managing Markdown reminders stored in `~/.cache/reminder`, with a two-pane edit UI (titles plus a `glow`-rendered preview), staged edits/adds/done-toggles that are only written on save, persistent custom ordering, and an open/done view split (completed reminders are renamed rather than deleted).
+
+**Usage:** `reminder [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-p, --print, --list` | Render all active reminders with `glow` and exit, wrapped to fit the terminal width. |
+| `-a, --add` | Open an editor to compose a single new reminder, save it, and exit. |
+| `-h, --help` | Show the help message and exit. |
+
+Default edit-mode keybindings: `↑`/`↓` (or `k`/`j`) move between reminders; `tab` switches open/done views; `shift+↑`/`shift+↓` scroll the preview; `space` toggles done; `o` enters reorder mode (open view); `e` edits in vim; `n` adds a new reminder; `enter` saves all staged changes; `esc` backs out / aborts (prompting to discard if anything is staged).
+
+**Examples:**
+```bash
+reminder
+reminder --print   # or --list / -p
+reminder --add     # or -a
+```
+
+---
+
+### `brutto-netto`
+Computes the German net salary for a gross salary with the calculator of brutto-netto-rechner.info and prints the taxes (Lohnsteuer, Solidaritätszuschlag, Kirchensteuer) and social security contributions per month and per year. The tax year defaults to the newest the calculator offers, the health insurance surcharge (Zusatzbeitrag) to its average of that year. Your own tax details are best kept as defaults in `~/.config/cli-helpers/brutto-netto.yaml`, whose keys are the long option names (`tax-class: 3`); `--save` writes the options given into it.
+
+Without `BRUTTO` it asks for the salary with [prompt-input](#prompt), and as long as no tax details are saved also for the tax class, federal state, church tax, age and children ([prompt-select](#prompt) lists, filtered by typing), starting from the defaults; `--interactive` always asks for them. Afterwards it offers to save the details that changed. Esc or Ctrl-D in a prompt aborts, Ctrl-C exits with 130.
+
+**Usage:** `brutto-netto [OPTIONS] [BRUTTO]`
+
+| Argument / Flag | Description |
+|---|---|
+| `BRUTTO` | Gross salary per month (per year with `--yearly`), e.g. `4500` or `4.500,50`; asked for when missing. |
+| `-y, --yearly` | `BRUTTO` is per year. |
+| `--hours H --new-hours N` | Scale `BRUTTO` from `H` to `N` weekly hours, e.g. for the same job part-time. |
+| `--year YEAR` | Tax year (default: the newest the calculator offers). |
+| `-k, --tax-class 1-6` | Tax class, Steuerklasse (default: 1). |
+| `-s, --state STATE` | Federal state, e.g. `bayern` (default: `nordrhein-westfalen`). |
+| `--church`, `--no-church` | Pay church tax or not (default: not). |
+| `-a, --age AGE` | Age in years (default: 30). |
+| `-c, --children 0-5` | Number of children, for the care insurance (default: 0). |
+| `--child-allowance 0-5` | Child allowances (Kinderfreibeträge) in steps of 0.5 (default: `--children`). |
+| `--health-surcharge PERCENT` | Additional contribution of the health insurance. |
+| `--private-health AMOUNT` | Privately insured with this monthly premium; `--no-employer-health` without employer contribution. |
+| `--no-pension`, `--no-unemployment` | Not in the statutory pension or unemployment insurance. |
+| `--tax-allowance AMOUNT` | Monthly tax allowance (Steuerfreibetrag). |
+| `--benefit AMOUNT` | Monthly non-cash benefit (geldwerter Vorteil), e.g. a company car. |
+| `-q, --quiet` | Print only the net amount (per month, per year with `--yearly`). |
+| `-i, --interactive` | Ask for the tax details (and `BRUTTO` when missing), starting from the defaults. |
+| `--save` | Save the tax options given as defaults. |
+
+**Examples:**
+```bash
+brutto-netto                     # asks for everything
+brutto-netto -i 4500             # asks for the tax details
+brutto-netto 4500
+brutto-netto 60000 --yearly --tax-class 3 --children 2
+brutto-netto 4500 --hours 40 --new-hours 32
+brutto-netto --tax-class 3 --children 2 --state bayern --save
+```
+
+### `perplexity-invoices`
+Lists, downloads and mails the invoices (Rechnungen) of a perplexity.ai subscription, from the API the settings page of perplexity.ai uses (`/rest/stripe/customer-invoices`, paged until the last one), as PDFs from Stripe. It logs in with the cookies of perplexity.ai of Google Chrome, read from the profile and decrypted with the key Chrome keeps in the keyring (`Chrome Safe Storage`, through `secret-tool`). Cloudflare only lets the requests through with the `cf_clearance` cookie of Chrome and the user agent of the same Chrome version, so both are sent along; when Cloudflare still refuses, opening perplexity.ai in Chrome once renews its check. Needs `python3-cryptography` and `libsecret-tools`.
+
+The session cookie is `__Secure-pplx.session.<account id>` (with several accounts the one of `__Host-pplx-last-active-account`), sent with that account id in the header `x-pplx-account`; the older `__Secure-next-auth.session-token` works as well. `login` opens perplexity.ai in Chrome and waits until the session cookie shows up in the profile (Chrome writes its cookies to disk with a delay of some seconds). The login of perplexity.ai lasts about a month.
+
+`send` mails all invoices that were not sent yet in one mail, e.g. to the accounting: their PDFs attached, a list of them, oldest first, with their Stripe links and the total in the text. It remembers the invoices sent in `~/.local/state/perplexity-invoices/sent.json` (`$XDG_STATE_HOME`), only after the mail went out, so a failed run sends them again next time; an invoice whose PDF cannot be downloaded is left out (exit code 1) and sent with the next run. `--mark-sent` marks the invoices as sent without mailing them, e.g. the old ones already handed in. The SMTP server comes from `setup-email`, a wizard like `probonio-setup-email` of bahn-probonio-bot, with the prompts of cli-helpers ([prompt-select](#prompt) lists filtered by typing, [prompt-input](#prompt) pre-filled with the current values; Esc or Ctrl-D aborts): provider presets (Gmail, Outlook, Microsoft 365, iCloud, GMX, WEB.DE, T-Online, mailbox.org, Posteo) or any server, the login, the sender, the recipients and the subject prefix (`-` for none), then a test mail. Without settings of its own it takes the server, login and addresses of bahn-probonio-bot as defaults. The settings are kept in `~/.config/perplexity-invoices/email.json` (`$XDG_CONFIG_HOME`, mode 0600), the SMTP password in the keyring (`service=perplexity-invoices key=smtp-password`; `$SMTP_PASSWORD` overrides it; without a keyring, on request, in `email.json`):
+
+```json
+{
+  "host": "smtp.gmail.com", "port": 587, "security": "starttls",
+  "username": "me@gmail.com",
+  "from": "me@gmail.com", "fromName": "perplexity-invoices",
+  "to": ["me@gmail.com", "accounting@example.com"],
+  "subjectPrefix": "[perplexity-invoices]"
+}
+```
+
+An empty `subjectPrefix` sends the subjects without a prefix.
+
+`security` is `starttls`, `tls` (implicit TLS, port 465), `opportunistic` (STARTTLS when the server offers it) or `none`.
+
+**Usage:** `perplexity-invoices [--profile PROFILE] [--user-data-dir DIR] [list|download|send|setup-email|login] [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `list` | Print date, invoice id, amount and status of each invoice, tab-separated, newest first (the default command). `--json` prints the invoices as JSON, with their Stripe links. |
+| `download` | Download the PDFs as `perplexity-<date>-<invoice id>.pdf` and print the path of each new one; a PDF that is already there is skipped (`-f, --force` downloads it again). |
+| `send` | Mail all invoices not sent yet in one mail with their PDFs and print for each `Sent: <date> <invoice id> <amount>`; `-n, --dry-run` only prints the invoices it would send, `--mark-sent` marks them as sent without mailing. |
+| `setup-email` | Wizard for the SMTP settings of `send`; `--test` sends a test mail, `--show` prints the settings (without the password), `--remove` deletes them and the stored password. |
+| `login` | Open perplexity.ai in Chrome and wait for the login (`-t, --timeout SECONDS`, default 300; `-f, --force` also when already logged in). |
+| `--since YYYY-MM-DD` | `list`, `download`, `send`: only the invoices from this date on. |
+| `-o, --output DIR` | `download`: folder for the PDFs (default: the Downloads folder, `xdg-user-dir DOWNLOAD`), created when missing. |
+| `--profile PROFILE` | Chrome profile folder (default: `Default`). |
+| `--user-data-dir DIR` | Chrome user data folder (default: `~/.config/google-chrome`). |
+
+**Examples:**
+```bash
+perplexity-invoices login
+perplexity-invoices
+perplexity-invoices download -o ~/Documents/Rechnungen/perplexity
+perplexity-invoices download --since 2026-01-01
+perplexity-invoices setup-email
+perplexity-invoices send --mark-sent   # all invoices so far count as sent
+perplexity-invoices send -n
+perplexity-invoices send
+```
+
+## Interactive Input Prompts
+
+### `prompt`
+Reads input from the terminal in one of four modes: multi-line (collecting lines until Ctrl-D), single-line, list selection (`--select`), or single-line input with completion (`--complete`), with optional custom prompt text, masked secret entry, and a default value; behavior also changes depending on the name it is invoked under (see aliases below).
+
+**Usage:** `prompt [--prompt PROMPT] [--prompt-char CHAR] [--single-line] [--protected] [--default VALUE] [--select|--complete] [--delimiter DELIM|--delimiter-regex REGEX|--key-regex REGEX] [--return key|title|index|number] [--show-keys] [--filter] [--header-lines N] [--no-header-uppercase] [--ignore-case] [--substring] [--files|--dirs] [--prefill TEXT] [--height N] [--no-color] [items or candidates ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-p, --prompt <text>` | Custom prompt text; defaults to `(Press Ctrl-D when done)` (multi-line), `Enter input:` (single-line, completion mode) or `Choose:` (select mode, and nothing at all when `--header-lines` is given). An empty value (`-p ''`) shows no prompt in any mode. |
+| `--files` | Completion mode only: complete against file and directory names instead of a candidate list. Completing a directory appends a slash, so the next completion descends into it; hidden entries appear once a dot is typed. |
+| `--dirs` | Like `--files`, but offers directories only. |
+| `-c, --prompt-char <char>` | Custom prompt character; defaults to `> ` (multi-line), empty (single-line, completion mode) or `❯` (the pointer in select mode). |
+| `-s, --single-line` | Read a single line (no prompt character shown). On a terminal this is an editable line: the cursor keys, Home/End, Backspace, Delete and Ctrl-A/E/U/K/W all work, while `↑`/`↓`, Tab and Esc do nothing. |
+| `-P, --protected` | Prompt for a secret (input masked via `getpass`). |
+| `-d, --default <value>` | Default value used when the user enters nothing (or clears the input again); in select mode the key, title or number of the entry the cursor starts on. In single-line mode, multi-line mode and the `--files`/`--dirs` modes it is pre-filled into the input, so Enter (or Ctrl-D) accepts it while it stays editable, and the `(default)` hint is then dropped as redundant. Cannot be combined with `--protected`. |
+| `-l, --select` | Select one entry from a colored list; prints the selected item's key (see `--return`). |
+| `-a, --complete` | Read a single line with Tab-completion against the given candidates. |
+| `--delimiter <delim>` | Select mode only: splits each item into `<key><delim><title>` (default `=`); escape sequences like `\t` are honored, an empty value disables key parsing. |
+| `--delimiter-regex <regex>` | Select mode only: like `--delimiter`, but the split point is the first (non-empty) match of this regular expression, e.g. `\s{2,}` for "at least two spaces"; the matched text itself is dropped. |
+| `--key-regex <regex>` | Select mode only: takes the key from the first match of this regular expression (capture group 1 when the pattern has one) and keeps the whole item as the title, e.g. `^\S+` to display a full table row but return its first column. Mutually exclusive with `--delimiter` and `--delimiter-regex`. |
+| `--return key\|title\|index\|number` | Select mode only: print the item's key (default), its title, its 0-based index or its 1-based number. |
+| `--show-keys` | Select mode only: show the item keys next to the titles. |
+| `--filter` | Select mode only: typing filters the list instead of triggering the `j`/`k`, `g`/`G`, `q` and digit shortcuts. An item stays when every word typed appears somewhere in its key or title, in any order, ignoring case. The filter is shown above the list as `filter: <text>`, with the label faded and the text plain. Items keep their numbers from the whole list, and what `--return` prints still refers to the whole list. Backspace, Ctrl-W and Ctrl-U edit the filter. Esc clears it, and aborts once it is empty. |
+| `--cycle <key>\|<key>[\|...]` | Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long instead of taking a row each. The row sits where the first of its items was, and selecting it returns the item it currently shows (`--return index`/`number` stay the item's own position in the input). Items are named by key, title or number; repeatable for several groups. |
+| `--header-lines <n>` | Select mode only: treat the first `n` input lines as a header (default `0`). They are printed above the list in the `COLOR_TABLE_HEADER` style, indented so their columns line up with the item titles, and are neither selectable nor numbered. Header lines go through the same key parsing as the items, so only their title part is shown. Header lines are upper-cased (see `--no-header-uppercase`). Since the header already labels the list, the default `Choose:` prompt is suppressed (pass `-p` to get one anyway). |
+| `--no-header-uppercase` | Select mode only: print the `--header-lines` header as given instead of upper-casing it. |
+| `--ignore-case` | Completion mode only: match candidates case-insensitively. |
+| `--substring` | Completion mode only: match candidates anywhere instead of at the start (disables the inline suggestion). |
+| `--prefill <text>` | Pre-filled, editable input text for single-line, completion and multi-line mode. Wins over `-d`, which then keeps its `(default)` hint and stays the fallback for an emptied input. Not valid with `--protected` or in select mode. |
+| `--height <n>` | Maximum number of list rows shown at once; defaults to what fits the terminal. |
+| `--no-color` | Disable colored output (also honored: `NO_COLOR`, `TERM=dumb`, non-terminal output). |
+| `--no-abort-message` | Leave the terminal as it was when the prompt is aborted, instead of noting the abort on a line of its own. For a caller that asks the next question in its place, e.g. one whose `esc` steps back to the question before. |
+| `<items ...>` | Select/completion mode only: the list items or completion candidates. Lines piped on stdin are appended to them. |
+
+All modes draw their prompt on stderr (select and completion mode fall back to `/dev/tty` when stderr is redirected) and print the result to stdout. Colors come from the same `COLOR_*` variables the [color-parse](#color-parse) family uses and are dropped automatically when the output is not a terminal, when `--no-color` is given, or when `NO_COLOR` is set or `TERM` is empty/`dumb`:
+
+| Element | Variable |
+|---|---|
+| Question text, prompt character (`> `), pointer (`❯`) | `COLOR_TEXT_INFO` (bold) |
+| Highlighted select mode row | `COLOR_TEXT_INFO` on `COLOR_SELECTION_BACKGROUND` |
+| Typed input | never styled — plain terminal text |
+| Instruction prompts, i.e. fully parenthesized ones like `(Press Ctrl-D when done)` | `COLOR_TEXT_FADED` |
+| `[y/N]` style options and the trailing colon, `(default)` hint, key hints, inline completion suggestion | `COLOR_TEXT_FADED` |
+| The default choice inside `[y/N]` (the upper-case one) | `COLOR_TEXT_DEFAULT` |
+| Select mode items, the selected item echoed after Enter | `COLOR_TEXT_DEFAULT`, `COLOR_TEXT_SUCCESS` |
+| Item numbers, item keys | `COLOR_TEXT_NUMERIC`, `COLOR_TEXT_MUTED` |
+| `--header-lines` header | `COLOR_TABLE_HEADER` |
+| Quoted spans in the question text, e.g. the branch name in `Create branch "chore/bump-deps"?` | `COLOR_TEXT_CODE` (`203` on `236`, i.e. how [glow](https://github.com/charmbracelet/glow) renders `` `code` ``) |
+
+Spans wrapped in `"`, `'` or `` ` `` are drawn as inline code snippets: the quotes become the padding of the highlighted block, so the prompt keeps its width. The quote has to open after a space or an opening bracket and close before a space or punctuation, so an apostrophe in `the user's file` is left alone.
+
+Select and completion mode exit with status 1 when aborted with Esc and 130 on Ctrl-C.
+
+It is also the importable `prompt` Python module (`prompt.py`, see [Installation](#installation)), so Python tools ask in-process instead of running the command: `input_line(question, default)`, `multiline(question, default)`, `password(question)`, `confirm(question, default)`, `select(question, items, default, filter, returns, header_lines)` (items as `(key, title)` pairs or plain strings) and `complete(question, candidates, default, ignore_case, substring)` return the answer (`confirm` `True` or `False`, it takes `y`/`yes` and `n`/`no` and asks again on anything else), or `None` when it was aborted (Esc, Ctrl-D), and Ctrl-C raises `KeyboardInterrupt`; `run(arguments, name)` takes any option, as if called under the name `name`, and returns the exit status and the answer. `brutto-netto`, `perplexity-invoices` and `screen-color` ask with it, and load it from next to themselves in a checkout that is not installed yet.
+
+#### Single-line mode keys (`--single-line` / `prompt-input` and the confirmation aliases)
+On a terminal the line is edited in place, so a pre-filled `-d`/`--prefill` value can be changed instead of only accepted or retyped. Piped input and `--protected` use a plain read instead.
+
+| Key | Action |
+|---|---|
+| `←` / `→`, Home / End, Ctrl-A / Ctrl-E | Move within the line. |
+| Backspace / Delete | Delete before / under the cursor. |
+| Ctrl-U / Ctrl-K / Ctrl-W | Kill to start of line / to end of line / the previous word. |
+| Enter | Submit; an empty line returns `-d` when one was given. |
+| `↑` / `↓`, Tab, Esc | Ignored. |
+| Ctrl-D | Abort on an empty line (exit 1); with `--protected` also on piped input that ended. |
+| Ctrl-C | Abort (exit 130). |
+
+#### Multi-line mode keys (`prompt` / `prompt-multiline`)
+On a terminal, multi-line mode is a small editor: the text is redrawn in place, so the cursor can be moved freely through everything typed so far. `-d`/`--prefill` seed the buffer with editable text (newlines included), and an emptied buffer falls back to `-d`. Piped input and `--protected` keep using the plain line reader instead, so `printf 'a\nb\n' | prompt` behaves as before.
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Move by one character, wrapping into the previous/next line. |
+| `↑` / `↓` | Move between lines, keeping the column you started from even across shorter lines. |
+| PageUp / PageDown | Move by one screen. |
+| Home / End, Ctrl-A / Ctrl-E | Jump to start / end of the current line. |
+| Backspace | Delete before the cursor; at column 0 it joins the line to the previous one. |
+| Delete | Delete under the cursor; at the end of a line it pulls the next line up. |
+| Enter | Split the line at the cursor. |
+| Tab | Insert a literal tab (drawn four columns wide). |
+| Ctrl-U / Ctrl-K / Ctrl-W | Kill to start of line / to end of line / the previous word. |
+| Ctrl-D | Finish and print the text. |
+| Ctrl-C | Abort (exit 130). |
+
+Lines longer than the terminal scroll sideways instead of wrapping (the off-screen part is marked with `…`), and when the text outgrows the screen the visible window follows the cursor and a faded `line/total` counter is shown.
+
+Pasting works as expected: a pasted `\r\n` counts as one line break rather than two (so blank lines inside pasted text stay single), tabs are kept, and while a paste is still arriving the redraw is held back until the burst is through, so large pastes neither flicker nor slow down.
+
+#### Select mode keys (`--select` / `prompt-select`)
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `k` / `j`, Ctrl-P / Ctrl-N | Move the cursor (wraps around). |
+| PageUp / PageDown | Move by one screen. |
+| Home / `g`, End / `G` | Jump to the first / last entry. |
+| `1`…`9`, `0` | Jump to that entry (`0` is the tenth). |
+| Tab / Shift-Tab | On a `--cycle` row, show its next / previous item; elsewhere ignored. |
+| Space (with `--multi`) | Check / uncheck the highlighted entry. |
+| `a` (with `--multi`) | Check all entries, or uncheck all when all are checked. |
+| any character (with `--filter`) | Add it to the filter; the cursor stays on its row while that still matches. |
+| Backspace / Ctrl-W / Ctrl-U (with `--filter`) | Delete a character / a word / the whole filter. |
+| Enter | Select the highlighted entry and print it; with `--multi`, print the checked entries, one per line (nothing when none is checked). |
+| Esc, `q` | Abort (exit 1). With `--filter`, Esc first clears the filter and `q` is filter text. |
+| Ctrl-C | Abort (exit 130). |
+
+#### Completion mode keys (`--complete` / `prompt-complete`)
+
+| Key | Action |
+|---|---|
+| Tab | Complete as far as all matches agree; when that is ambiguous, open the candidate menu, then cycle forward through it. |
+| Shift-Tab | Cycle backwards through the menu. |
+| `↑` / `↓` | Open the menu (at the last / first candidate) and move through it; the input line always shows the highlighted candidate. |
+| `→` at end of line | Accept the greyed-out inline suggestion. |
+| Enter | Submit the current line (the highlighted candidate when the menu is open). |
+| Esc | Close the menu and restore what was typed; with no menu open, abort (exit 1). |
+| `←` / `→`, Home / End, Ctrl-A / Ctrl-E, Backspace, Delete, Ctrl-U, Ctrl-K, Ctrl-W | Standard line editing. |
+| Ctrl-C | Abort (exit 130). |
+
+**Examples:**
+```bash
+prompt --single-line --prompt "Your name:"
+prompt --protected --single-line --prompt "Password:"
+echo | prompt --single-line --default "fallback"
+prompt --select --prompt "Pick a service:" api worker db
+prompt --complete --prompt "Branch:" main develop staging
+```
+
+#### Symlink aliases (all point to `prompt`)
+The script branches on its invoked name (`argv[0]`):
+
+| Alias | Behavior |
+|---|---|
+| `prompt-continue` | Confirmation `Continue [y/N]:` (or custom text); exit 0 only on `y`/`Y`, else 1. |
+| `prompt-continue-yes` | Confirmation `Continue [Y/n]:`; exit 0 on `y`/`Y` or empty (defaults to yes), else 1. |
+| `prompt-yes-no` | Confirmation; trailing args + ` [Y/n]:` (default `Do it? [Y/n]:`); exit 0 on yes/empty, else 1. |
+| `prompt-no-yes` | Confirmation; trailing args + ` [y/N]:` (default `Do it? [y/N]:`); exit 0 only on `y`/`Y`, else 1. |
+| `prompt-input` | Single-line input; prints the entered value; trailing args become the prompt text. |
+| `prompt-multiline` | Multi-line input (until Ctrl-D), printing all lines; trailing args become the prompt text. |
+| `prompt-password` | Single-line masked secret entry (prompt `Password:`), printing the entered value. |
+| `prompt-select` | Implies `--select`; trailing args are the list items (not the prompt text, use `-p` for that). |
+| `prompt-multiselect` | Implies `--select --multi`; trailing args are the list items, the checked ones are printed one per line. |
+| `prompt-complete` | Implies `--complete`; trailing args are the completion candidates (not the prompt text, use `-p` for that). |
+| `prompt-file` | Implies `--complete --files` with prompt `Enter file:`, pre-filled with the current directory; trailing args become the prompt text. |
+| `prompt-folder` | Implies `--complete --dirs` with prompt `Enter directory:`, pre-filled with the current directory; trailing args become the prompt text. |
+
+**Examples:**
+```bash
+prompt-continue "Delete everything?" && rm -rf ./build
+prompt-yes-no "Proceed with deploy" && deploy
+name="$(prompt-input "What is your name?")"
+secret="$(prompt-password)"
+service="$(prompt-select -p "Pick a service:" "api=Public API gateway" "worker=Background worker")"
+number="$(prompt-select --return number apple banana cherry)"
+kubectl get pods -o name | prompt-select -p "Pod:" --delimiter ''
+kubectl get pods | prompt-select -p "Pod:" --delimiter '' --header-lines 1
+id="$(docker ps | prompt-select -p "Container:" --key-regex '^\S+' --header-lines 1)"
+sha="$(git log --oneline -20 | prompt-select -p "Commit:" --delimiter-regex '\s+')"
+action="$(prompt-select --cycle 'review|approve|merge' "review=Approve + Merge" "approve=Approve" "merge=Merge" "diff=Diff")"
+mapfile -t hosts < <(prompt-multiselect --checked web-01 -p "Hosts:" web-01 web-02 db-01)
+branch="$(git branch --format '%(refname:short)' | prompt-complete -p "Branch:")"
+host="$(prompt-complete --ignore-case -p "Host:" web-01 web-02 db-01)"
+config="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
+```
+
+### `prompt-command`
+Prompts the user for a shell command using readline, with custom Tab-completion that completes against available commands; an optional default can be accepted by pressing Enter.
+
+**Usage:** `prompt-command [-d|--default <command>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the help message and exit. |
+| `-d, --default <command>` | Default command; press Enter at the prompt to use it. |
+
+**Examples:**
+```bash
+prompt-command
+cmd="$(prompt-command --default 'git status')"
+```
+
+### `prompt-file`
+Symlink to [prompt](#prompt) implying `--complete --files`: prompts for a file path with path completion (Tab completes the current component, completing a directory descends into it), pre-filled with the current working directory, and prints the chosen path.
+
+**Usage:** `prompt-file [<prompt text ...>] [-d|--default PATH] [--prefill PATH] [--height N]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<prompt text ...>` | Custom prompt text; defaults to `Enter file:`. |
+| `-d, --default <path>` | Default path: it is pre-filled into the input line (so Enter accepts it, and it stays editable and completable) and is also used when the line is cleared. |
+| `--prefill <path>` | Start from this path instead of the current working directory or the default. |
+| `--height <n>` | Maximum number of candidate rows shown at once. |
+
+**Examples:**
+```bash
+file="$(prompt-file)"
+file="$(prompt-file "Config to edit:" --prefill "${HOME}/.config/")"
+file="$(prompt-file -d "${HOME}/.bashrc")"
+```
+
+### `prompt-folder`
+Symlink to [prompt](#prompt) implying `--complete --dirs`: same as `prompt-file`, but only directories are offered.
+
+**Usage:** `prompt-folder [<prompt text ...>] [-d|--default PATH] [--prefill PATH] [--height N]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<prompt text ...>` | Custom prompt text; defaults to `Enter directory:`. |
+| `-d, --default <path>` | Default path: it is pre-filled into the input line (so Enter accepts it, and it stays editable and completable) and is also used when the line is cleared. |
+| `--prefill <path>` | Start from this path instead of the current working directory or the default. |
+| `--height <n>` | Maximum number of candidate rows shown at once. |
+
+**Examples:**
+```bash
+dir="$(prompt-folder)"
+dir="$(prompt-folder "Where to install:" --prefill /usr/local/)"
+dir="$(prompt-folder -d "${HOME}/Downloads")"
+```
+
+### `choose`
+Thin wrapper around [prompt](#prompt)'s select mode for callers that pass their items as one newline separated string: shows the colored, arrow-key navigable list on stderr and prints the chosen item to stdout. Exits 1 when aborted with Esc and 130 on Ctrl-C.
+
+**Usage:** `choose [-p|--prompt <prompt>] [-n|--newlines] <list of choices>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-p, --prompt <prompt>` | Custom prompt text shown above the list (default: "Choose from list"). |
+| `-n, --newlines` | Print a blank line before and after the menu. |
+| `<list of choices>` | One or more positional arguments, each a selectable menu item; arguments containing newlines are split into one item per line. |
+
+**Examples:**
+```bash
+choose apple banana cherry
+selected="$(choose -p "Pick a branch" -n main develop staging)"
+```
+
+### `readkey`
+Reads a single keystroke from the terminal and prints a human-readable name for it, decoding escape sequences for arrow, navigation, and editing keys as well as space, enter, backspace, and escape.
+
+**Usage:** `readkey`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+readkey
+key="$(readkey | tail -n1)"
+```
+
+### `fzf-with-header`
+A wrapper around `fzf` that treats the first input line as a fixed header, with support for column selection, periodic command reloads, dispatching the selection to a key command, and asking the user a question inside the running picker. The mapped keys (built-in bindings plus any `--bind`/`--expect` keys passed after `--`) are displayed at the top, wrapped to the width of the list pane; for `execute`/`become` bindings the bound command is shown, otherwise the fzf action name. The key list shrinks on short terminals so the list keeps at least three rows: it is packed into fewer lines with the keys that no longer fit dropped behind a `…`, and once not even one line is left it is hidden completely. The wrapping follows the picker while it runs: `fzf` packs the key list again on a resize of the terminal and after `ctrl-p`/`ctrl-g`, so a preview next to the list narrows it, a hidden one gives the whole width back, and a preview above or below takes lines away instead. A caller that shows or hides the preview from actions it prints itself (e.g. through a `transform`) adds `+$FZF_WITH_HEADER_FOOTER_ACTION` to them to get the same; the action is exported into everything started from inside `fzf` whenever there is a key list.
+
+Whenever a preview window is configured, `shift-left`/`shift-right` turn its line wrapping on and off, `ctrl-p` hides and shows the preview pane and `ctrl-g` cycles how much room it gets (70 %, 85 %, 40 %, then the size the caller asked for again, in the position the caller put it); all of them are listed in the key list. The `ctrl-p` and `ctrl-g` bindings are skipped when the caller uses those keys itself, be it through `--bind`/`--expect` or one of the keys handled inside `fzf`.
+
+**Usage:** `fzf-with-header [--command <command>] [--key-command <command>] [--key-descriptions <key>:<description>,...] [--reload-keys <key>,...] [--exec-reload-keys <key>,...] [--silent-keys <key>,...] [--exec-keys <key>,...] [--ask <key>:<question>] [--confirm <key>:<question>] [--pick <key>:<question>] [--pick-command <key>:<command>] [--question-command <key>:<command>] [--ask-prefill <key>:<command>] [--ask-keep-keys <key>,...] [--prompt-command <command>] [--footer-prefix <command>] [--watch <seconds>] [--watch-delay <seconds>] [--watch-while <command>] [--watch-interval-command <command>] [--columns <cols>] [--filter-columns <cols>] [--delimiter <delimiter>] [--hscroll] [<query ...>] -- [fzf args]`
+
+Rows stay left-aligned and clip on the right by default. Pass `--hscroll` before the `--` separator to let fzf shift rows sideways to reveal matches.
+
+On fzf versions older than 0.63.0, the picker omits the footer. It uses the installed version's list reload and preview controls, so search, selection and supported action keys still work. Preview resizing and periodic refresh are available when fzf supports them. When fzf cannot show a question inline, the picker closes, asks through `prompt` or a separate candidate picker, and reopens with the original search after an answer or cancellation. Tools that pass their own fzf options or bindings may require a newer version.
+
+An `--expect` key ends `fzf`, so its key command runs with the picker gone and the picker is started again afterwards - the screen is torn down and rebuilt on every such key press. The four key options below handle a key inside the running `fzf` instead. They take the same key command: it is handed the payload an `--expect` exit would have produced, the key on the first line and the selected line on the second, so a key moves from `--expect` to one of them without the key command changing. Its exit code is ignored, and a key cannot be listed twice.
+
+They differ in two things: whether the key command gets the terminal handed over, and whether the list is reloaded afterwards. A key command that keeps the screen must not write to stdout, since that is the command substitution around `fzf`; whatever it writes to stderr is shown in red above the header, wrapped to the list width, until the next key press. A key command that gets the terminal handed over draws on the screen itself, stdout included, and is on its own for showing what it did. A reload replaces the list with `reload-sync` and puts the cursor back on the first entry, so the view ends up where a restart of `fzf` would have left it - unless the caller positions the cursor on the `load` event itself, which `fzf` fires again after every reload. Keys that have to end the picker, because they return something on stdout or because another picker takes over, stay in `--expect`.
+
+A key handled inside `fzf` can ask something first, on the query line of the running picker instead of on a prompt of its own: `--ask` asks for a line of text, `--confirm` for a yes or no, `--pick` for one of a list of candidates. The question leads the input line, the search is switched off while it stands, so the list stays the one the question was asked about, and every other key is dead until it is answered - apart from the ones `--ask-keep-keys` names, which are the question's own - nothing ends the picker in the middle of a question. A picker that shows no input line of its own shows one for as long as the question stands. `enter` submits, `esc` drops the question, and the footer names both while one is open. A watched list does not reload while a question stands either, and whether one does is decided by `fzf` itself, so a reload already on its way cannot land in the middle of one. Afterwards the prompt, the query, the ghost text and the footer are what they were before, and the key command runs the way its key option says: with the terminal handed over or not, with a reload or not. It is given the answer in `FZF_WITH_HEADER_ANSWER` and the same payload as always, the line being the one that was under the cursor when the question was asked. A `--confirm` key runs its command on a `y` or `yes` and on nothing else; an empty answer is a no, which is why its question is shown with a `[y/N]` behind it. Every question takes the placeholders of an `fzf` binding, so it can name what it is about, e.g. `--confirm 'ctrl-d:Delete {1}?'`; a question naming something the keys themselves change comes from `--question-command` instead, which is asked again every time the question is put on the screen.
+
+A `--pick` key answers with a candidate instead of typed text: its `--pick-command` takes the place of the list (header line and all, exactly like `--command`), so the answer is fuzzy-found the way everything else in the picker is - `enter` answers with the row the cursor is on, and with the query as it was typed when it matches nothing, which leaves room for a value the list does not offer. The list is emptied before the candidates are loaded, and the caller's list comes back the same way: what these two swap are lists of different things, so a row of the one must not be answered - or acted upon - as a row of the other while the next one is still on its way. Since `fzf` keeps the rows it has on the screen until a load it started is through, the load is left to the `load` event of the emptied list, which is why the picker shows an empty list and the `fzf` spinner while a slow candidate command runs instead of the rows that were there before. The caller's preview belongs to the rows of the list and not to the candidates, so it is taken away while they are shown and given back afterwards, a hidden one staying hidden. `esc` drops the candidates and brings the list back untouched. Since the list has to be listable again, a picking key needs `--command`.
+
+A question can be asked with nothing in the list as well, e.g. to name the namespace of a view that came back empty: `fzf` runs no command carrying a placeholder while nothing is matched, so what a question says about a row (`{1}`, `{}`) is left out of it there, and the key command is given an empty line the way an `--expect` exit would have given it one.
+
+Since `enter` and `esc` answer the question, they are routed through `fzf-with-header` as soon as one key asks something - and so is the `load` event, which the emptied list of a picking key needs: what the caller had on the three, `--bind` or `--expect`, is what they still do while nothing is being asked. The other `--expect` keys become bindings of their own for the same reason - a key that only waits in `--expect` cannot be switched off while a question is open - and print their name themselves, so the payload a key command reads stays the one it always was. A caller that binds `accept` to a key itself has to print that key with it (`--bind 'ctrl-y:print(ctrl-y)+accept'`) to get the same first line.
+
+| Argument / Flag | Description |
+|---|---|
+| `--command <command>` | Command whose output the list is made of; enables `--print-query` and is required for `--watch`. `fzf` opens first and runs the command itself on its `start` event, so the picker (header, footer, prompt) is on the screen while a slow command is still running instead of after it. Binds `ctrl-r` to reload the output on demand (skipped if `ctrl-r` is already bound or described by the caller). A `start:` binding of the caller is not replaced by that: it is taken out of the `--bind` arguments and run right after the reload. |
+| `--key-command <command>` | Command invoked with the selected result; exit 1 quits with success, 255 quits with failure, anything else loops again. It is given the query the list was narrowed down to in `FZF_WITH_HEADER_QUERY`, so a key command can reproduce what was on the screen (e.g. by matching the rows again with `fzf --filter`). |
+| `--key-descriptions <key>:<description>,...` | When given, only these keys are shown at the top, with these descriptions and in this order (inferred keys are suppressed). Useful for `--expect` keys, whose effect lives in the `--key-command`. |
+| `--reload-keys <key>,...` | Keys that run the `--key-command` inside the running `fzf` and reload the list afterwards, instead of ending `fzf` and starting it again (requires `--command` and `--key-command`). For a key that changes what the list shows without needing the screen. |
+| `--exec-reload-keys <key>,...` | Like `--reload-keys`, but the key command gets the terminal handed over, for a pager, an editor or a prompt (requires `--command` and `--key-command`). |
+| `--silent-keys <key>,...` | Like `--reload-keys` without the reload, for a key that leaves the list as it is (requires `--key-command`). |
+| `--exec-keys <key>,...` | Like `--exec-reload-keys` without the reload (requires `--key-command`). |
+| `--ask <key>:<question>` | Ask this question on the query line of the running `fzf` before the key runs its command, which is given the answer in `FZF_WITH_HEADER_ANSWER`. The key has to be one of the keys handled inside `fzf` above, and cannot be `enter` or `esc`. The question may use the placeholders of an `fzf` binding (`{}`, `{1}`, `{q}`, ...) to name what is under the cursor. Repeat the option for more than one key. |
+| `--confirm <key>:<question>` | Like `--ask`, but for a yes or no: the question is shown with a `[y/N]`, and only a `y` or `yes` runs the key command - anything else, an empty answer included, drops it. |
+| `--pick <key>:<question>` | Like `--ask`, but the answer is picked from the candidates of `--pick-command`: they take the place of the list while the question stands, so the answer is searched for the way the list is. `enter` answers with the row the cursor is on, or with the query when it matches nothing; `esc` brings the list back untouched. Requires `--command`. |
+| `--pick-command <key>:<command>` | Command whose output the candidates of a `--pick` key are, header line included, exactly like `--command` (required for a `--pick` key). |
+| `--ask-keep-keys <key>,...` | Keys of the caller that keep working while a question is open, instead of being dead like every other one. For a key that belongs to the question rather than to the list - one that walks the candidates of a `--pick`, say. The binding is the caller's own and is not touched, so it has to know itself whether a question stands (a `transform` binding does). |
+| `--question-command <key>:<command>` | Command whose output is the question of that key, asked again whenever it is put on the screen - for a question naming a state the keys change, which the text of `--ask`/`--confirm`/`--pick` cannot (it is fixed when the picker starts). What it prints is the question as it is, colors and trailing space included; a `--confirm` key still gets its `[y/N]` behind it. |
+| `--ask-prefill <key>:<command>` | Command whose output the input line of an asking key starts with, so a value can be edited instead of typed again (requires a question for that key). It is run when the question opens and may use the placeholders of an `fzf` binding, e.g. `--ask-prefill 'ctrl-t:printf %s {1}'`. For a `--pick` key it prefills the search instead. |
+| `--prompt-command <command>` | Command printing the prompt, asked again after every key handled inside `fzf` - the answered questions included, so a prompt naming what the picker shows names it again once a key changed it. The caller sets the initial prompt itself (`--prompt`). |
+| `--footer-prefix <command>` | Command whose output leads the key list, in front of the `↻ <n>s` indicator, separated by ` · `. For a caller with a state of its own to name there, e.g. the sorting a picker is showing. The command is asked again whenever the footer is rebuilt: on every reload (through the `load` event, so a key that changes the state shows it right away) and on every footer the watcher posts. The room the prefix takes is reserved on the first footer line, measured on what the command prints each time with its colors stripped. The `load` binding is skipped when the caller uses that event itself. |
+| `--watch <seconds>` | Reload command output every `n` seconds (non-negative integer; requires `--command`). A leading `↻ <n>s` indicator in the key list names the current reload interval (the delay until the first reload, then the interval); `ctrl-r` restarts the interval. |
+| `--watch-delay <seconds>` | Delay before the first reload (default: the `--watch` interval, so the first reload comes no sooner than every one after it). For a caller whose list is worth having earlier than the interval - or later, e.g. one whose first list comes from the start event anyway. |
+| `--watch-command <command>` | Command the watched list is reloaded with, instead of `--command` (requires `--watch`). For a caller that can refresh a list it already made cheaper than it can make one, e.g. from a snapshot the first listing left behind. The command takes the placeholders of an `fzf` binding, so it can be told the line under the cursor. |
+| `--watch-while <command>` | Keep reloading only while this command exits successfully; it is checked after each reload interval, so the first reload always happens. Lets a view stop refreshing once whatever it watches reached a final state (requires `--watch`). The indicator switches to `↻ off` once reloading stopped; a manual `ctrl-r` refresh puts the watching back on its interval (indicator back to `↻ <n>s`), so if the reload of that refresh brought the watched state back the reloading continues, otherwise it stops again after one interval. A key command can do the same without the user pressing anything: the file named in `FZF_WITH_HEADER_WATCH_RESET` (exported into everything started from inside `fzf` while watching) restarts the interval when it is touched, so a key that ended whatever the watching waits for can resume it itself. |
+| `--watch-interval-command <command>` | Command printing the seconds to wait before the next reload; asked again once a second while watching, so a caller whose view turned into a more expensive one can slow the reloading down (and speed it up again) while the picker runs (requires `--watch`). A new interval restarts the wait and updates the `↻ <n>s` indicator. Anything but a positive integer is ignored, so the interval of `--watch` keeps applying. The room the indicator gets is reserved from what the command prints at start, so a later, wider interval may rewrap the footer. |
+| `--columns <cols>` | Comma-separated columns to display (passed to `fzf --with-nth`). |
+| `--filter-columns <cols>` | Comma-separated columns to match against (passed to `fzf --nth`). |
+| `--delimiter <delimiter>` | Field delimiter for `fzf` (default: two-or-more spaces). |
+| `--help` | Show usage and exit. |
+| `<query ...>` | Initial query terms pre-filled into `fzf`. |
+| `-- [fzf args]` | Everything after `--` is passed straight through to `fzf`. |
+
+**Examples:**
+```bash
+fzf-with-header --command "ps aux" --watch 5
+fzf-with-header --command "list-builds" --watch 5 --watch-delay 3 --watch-while "has-running-builds"
+fzf-with-header --command "cat data.tsv" --columns 1,3 --delimiter $'\t'
+fzf-with-header docker -- --height=40%
+fzf-with-header --key-command handle-key --key-descriptions "ctrl-x:delete entry,ctrl-r:refresh" -- --expect=ctrl-x,ctrl-r
+fzf-with-header --command "list-items" --key-command handle-key --reload-keys "alt-d,alt-r" --exec-keys "ctrl-d" --silent-keys "ctrl-o" --key-descriptions "alt-d:delete,alt-r:reset,ctrl-d:diff,ctrl-o:open,enter:pick" -- --expect=enter
+fzf-with-header --command "list-items" --key-command handle-key --reload-keys "ctrl-n,alt-d" --ask "ctrl-n:New name:" --confirm "alt-d:Delete {1}?" --key-descriptions "ctrl-n:new,alt-d:delete,enter:pick" -- --expect=enter
+fzf-with-header --command "list-branches" --key-command handle-key --reload-keys "ctrl-t" --ask "ctrl-t:Branch:" --ask-prefill "ctrl-t:git branch --show-current" -- --expect=enter
+fzf-with-header --command "list-pods" --key-command handle-key --reload-keys "ctrl-n" --pick "ctrl-n:Namespace" --pick-command "ctrl-n:list-namespaces" --prompt-command "print-prompt" -- --expect=enter
+```
+
+---
+
+## SSH, Network and System
+
+### `ssh`
+Wrapper around `/usr/bin/ssh` that records the command in shell history (skipping `git@`, `-G`, and hosts excluded in local settings) before executing the real SSH client.
+
+**Usage:** `ssh [ssh arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[ssh arguments]` | All arguments are passed through to the underlying `ssh` command. |
+
+**Examples:**
+```bash
+ssh user@example.com
+ssh -p 2222 user@host
+```
+
+### `sshr`
+Re-adds an SSH host's key to `known_hosts` (resolving its real hostname via `ssh -G`) and then connects, taking the SSH command from arguments or the most recent `ssh` line in bash history.
+
+**Usage:** `sshr [--prompt] [ssh arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--prompt` | Ask for confirmation before re-adding the host to `known_hosts`. |
+| `[ssh arguments]` | The SSH command/arguments; if omitted, the last `ssh` command from history is used. |
+
+**Examples:**
+```bash
+sshr user@example.com
+sshr --prompt user@host
+sshr
+```
+
+### `ssh-httpd-tunnel`
+Starts a local Python HTTP server on a generated port and opens a reverse SSH tunnel so the remote host can reach it on the same port.
+
+**Usage:** `ssh-httpd-tunnel [ssh arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[ssh arguments]` | Arguments (typically the destination host) passed through to `ssh` for the reverse tunnel. |
+
+**Examples:**
+```bash
+ssh-httpd-tunnel user@remote-host
+```
+
+### `ssh-terminal`
+Opens a new Terminator window that SSHes into the given host, falling back to `sshr` (re-add known host) if the connection fails, and drops into a login shell afterward.
+
+**Usage:** `ssh-terminal [ssh arguments]`
+
+| Argument / Flag | Description |
+|---|---|
+| `[ssh arguments]` | Arguments (typically the destination host) passed to the SSH connection. |
+
+**Examples:**
+```bash
+ssh-terminal user@example.com
+```
+
+### `terminal-session`
+Opens an SSH session to the local host as the current user and dumps the interactive login shell's declared variables (`declare -p`).
+
+**Usage:** `terminal-session`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+terminal-session
+```
+
+### `screener`
+Interactive menu for listing, resuming, force-detaching, or creating GNU `screen` sessions, built on [prompt](#prompt)'s select mode (arrow keys, Esc cancels).
+
+**Usage:** `screener`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+screener
+```
+
+### `vpn-up`
+Brings a NetworkManager VPN connection up or down by name, reading a VPN password from stdin when one is piped in.
+
+**Usage:** `vpn-up <vpn-name> [-d|--down]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<vpn-name>` | Name of the VPN connection to act on. |
+| `-d, --down` | Bring the VPN connection down instead of up. |
+
+**Examples:**
+```bash
+vpn-up work
+vpn-up work --down
+echo 'mypassword' | vpn-up work
+```
+
+### Private component settings
+
+Keep machine-specific values under `${XDG_CONFIG_HOME:-$HOME/.config}`. For `cli-helpers/*.conf` use literal `key=value` lines without quotes or shell expansion. `browser-router.conf` retains its existing shell assignment format.
+
+| File under the config directory | Settings |
+| --- | --- |
+| `cli-helpers/setup.conf` | `gitlab_host`, `vpn_name`, optional `home_vpn_name`, `openvpn_package`, `openvpn_desktop_package`, `ax210_5ghz_profile`, `ssh_host`, and `kube_lists_path` relative to your home. |
+| `cli-helpers/setup-backup.conf` | `private_bin_files`, a space-separated list of files in `~/bin`. |
+| `cli-helpers/wifi.conf` | `home`, `work`, and `mobile` aliases. Use `|` to associate multiple SSIDs with one alias. |
+| `cli-helpers/networkmanager.conf` | `vpn_profile`, `wifi_profile_pattern`, and space-separated `vpn_domains`. Run `./setup.sh etc` to install the root-owned copy and dispatcher hooks. |
+| `cli-helpers/set-slack-profile.json` | `networks` maps SSIDs or Ethernet domain suffixes to status names. `statuses` maps status names to persist flags and includes `InTransit`. |
+| `cli-helpers/browser-router.conf`, `cli-helpers/chrome-search-engines.json` | Private auth hosts and additional search engines, respectively. |
+| `cli-helpers/updater.conf`, `cli-helpers/opencode.json` | Private software sources and optional OpenCode defaults. The updater preserves an existing OpenCode config. |
+| `cli-helpers/ssh.conf`, `cli-helpers/gnome.conf` | Optional `skip_history_host` and `terminal_profile_label`, respectively. |
+| `work-link/config.toml` | Wi-Fi preferences, VPN profile, internal HTTPS probe, and a command to obtain VPN credentials. |
+
+For example, a NetworkManager config could use:
+
+```ini
+vpn_profile=Work VPN
+wifi_profile_pattern=Office*
+vpn_domains=internal.example.com corp.example.com
+```
+
+Store the OpenVPN profile through `keyring-cli nm-store "Work VPN"`. For Slack, store each webhook with `secret-tool store --label="Slack status" service cli-helpers-slack-status status STATUS`. Enter the URL at the prompt. Keep credentials out of the local component files.
+
+`setup-backup` includes these files in `local-config/` with mode `0600`. Its existing keyring backup handles credentials separately. On restore, `./setup.sh local-config` keeps files already present. The full setup restores private config before VPN and networking setup.
+
+### `work-link`
+
+Keeps an internal HTTPS endpoint reachable through NetworkManager. Leave Wi-Fi selection in GNOME. The service keeps any active or connecting Wi-Fi profile, including a new network, and tries available preferred profiles if Wi-Fi disconnects. It respects the Wi-Fi radio switch and lets GNOME handle captive portal login. GNOME displays the existing Wi-Fi and VPN indicators.
+
+The VPN starts when the verified HTTPS probe fails on a connected uplink. Local failures before dialling, such as an unavailable credential provider, retry with a backoff of up to two minutes. Each VPN activation that could have submitted credentials uses one of two persistent attempt slots. Ambiguous failures also count. A successful VPN activation clears the counter. After two failures, check access before running `work-link reset-auth`. The service and CLI share the counter. Manual VPN attempts from other applications have their own lifecycle.
+
+Install `python3-gi`, `gir1.2-nm-1.0`, `curl` and the NetworkManager OpenVPN plugin. Use a saved OpenVPN password profile with password storage set to **Ask every time**, and VPN persistence disabled. Create `${XDG_CONFIG_HOME:-$HOME/.config}/work-link/config.toml`:
+
+```toml
+vpn_profile = "Work VPN"
+probe_url = "https://internal.example.com/"
+wifi_profiles = ["Work", "Home", "Phone hotspot"]
+credential_command = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "credential-host", "get-vpn-credential"]
+```
+
+Profile names or UUIDs refer to NetworkManager profiles. List preferred Wi-Fi profiles in fallback order. Pick an internal endpoint that answers HTTPS HEAD with 2xx, 3xx or 401. The credential command runs without a shell or terminal and prints one line containing the complete VPN credential. Keep its settings local. Use an empty array to supply credentials only with `work-link connect --ask`.
+
+After installing `work-link`, run as the desktop user:
+
+```bash
+install -Dm644 lib/cli-helpers/systemd-user/work-link.service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/work-link.service"
+systemctl --user daemon-reload
+systemctl --user enable --now work-link.service
+```
+
+`work-link` checks access and makes one connection attempt if needed. `work-link connect --wifi "Phone hotspot" --ask` explicitly switches Wi-Fi and prompts for the VPN password and one-time code. `work-link status` checks current access. Use `status --quiet` (or `-q`) for an exit-code-only check, or `status --follow` (or `-f`) to stream background progress.
+
+The background service sends a GNOME notification if access remains unavailable for about a minute, or immediately when the VPN attempt limit is reached. Notifications use `notify-send` from `libnotify-bin`. Stop automatic connection with `systemctl --user disable --now work-link.service`.
+
+Run the connection and config tests with `/usr/bin/python3 -m unittest discover -s tests`.
+
+### `wifi`
+Manages Wi-Fi connections via NetworkManager using friendly names mapped to SSIDs, supporting auto-selection, reconnect, disconnect, kernel-module reload, and various listing options.
+
+**Usage:** `wifi [OPTIONS] NAME`
+
+| Argument / Flag | Description |
+|---|---|
+| `NAME` | Connection to connect to: one of `mobile`, `work`, `home`, or `auto`. With no arguments, prints the current connection's mapped name. |
+| `-m, --map SSID` | Print the friendly name mapped to the given SSID. |
+| `-r, --reconnect` | Force a reconnect by toggling the radio off and back on. |
+| `-k, --reload-module` | Reload the wireless kernel module. |
+| `-d, --disconnect` | Toggle the radio off and on (disconnect). |
+| `-f, --force` | Force reconnect even if already connected to the target SSID. |
+| `--list-available-ssids` | List currently available SSIDs. |
+| `--list-available-names` | List available SSIDs mapped to their friendly names. |
+| `--print-names` | Print all possible names (including `auto`). |
+| `-h, --help` | Show the help message and exit. |
+
+**Examples:**
+```bash
+wifi
+wifi work
+wifi auto
+wifi --force home
+wifi --list-available-names
+```
+
+### `loggedin`
+Reports the currently logged-in graphical-session user, optionally as a numeric UID, a UID/name pair, or the user's home directory. Without a graphical session (e.g. a headless Raspberry Pi reached by SSH) it reports the user running it, or, when run as root through `sudo`, the user who ran `sudo`.
+
+**Usage:** `loggedin [-h|--help] [--id] [--id-name] [--home]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the usage message and exit. |
+| `--id` | Output the user's numeric UID instead of the name. |
+| `--id-name` | Output both the UID and the name (colon-separated). |
+| `--home` | Output the user's home directory instead of the name. |
+
+`--id`, `--id-name`, and `--home` are mutually exclusive; by default the username is printed.
+
+**Examples:**
+```bash
+loggedin
+loggedin --id
+loggedin --home
+```
+
+### `headless`
+Tells whether this system is headless: no desktop is installed that a graphical session could start, as every desktop
+installs its session in `/usr/share/xsessions` (X11) or `/usr/share/wayland-sessions` (Wayland), e.g. not on a server or
+a Raspberry Pi OS Lite. Whether a session runs now does not matter, so a desktop reached by SSH or a cron job on one is
+not headless. `updater` and `setup.sh` use it to leave out the desktop apps.
+
+**Usage:** `headless [-h|--help] [-v|--verbose]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-v, --verbose` | Print `headless`, or `desktop` with the session file found. |
+| `-h, --help` | Show the usage message and exit. |
+
+Exit status `0` means headless, `1` means a desktop is installed, `2` a usage error.
+
+**Examples:**
+```bash
+headless --verbose
+headless || echo "a desktop is installed"
+```
+
+### `updater`
+Updates a selectable set of system packages, desktop applications, and CLI tools using their appropriate package managers, vendor repositories, install scripts, or Git releases. With no software arguments, it processes every supported type except entries explicitly disabled in the script.
+
+**Usage:** `updater [OPTIONS] [SOFTWARE ...]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SOFTWARE` | One or more software types or groups to update, or `all`; omit to process all supported types. |
+| `-d, --dry-run` | Check for updates without installing them. |
+| `-x, --exclude NAME` | Leave out a software or a whole group; repeatable, e.g. `updater base -x firmware`. |
+| `-l, --list` | List the groups with their software and exit. |
+| `-t, --types TYPES` | Deprecated comma-separated alternative to positional software types. |
+| `--no-config` | Update the software only: skip merging the shipped configs and setting the dconf keys. |
+| `--verbose` | Print commands and additional update details. |
+| `-h, --help` | Show usage and the current list of supported software types. |
+| `--bash-completion` | Output completion candidates (flags plus software types). |
+
+The updater is intended for Debian/Ubuntu-style systems and uses `loggedin` to preserve the graphical-session user while elevating individual system operations with `sudo`.
+
+Every software belongs to at least one group (`base`, `dev`, `k8s`, `mw`, `agents`, `media`, `comms`, `desktop`, `personal`, `gnome`, `gnome-extensions`), so a group selects a category of software; `updater --list` shows them. The members of `gnome` are skipped when GNOME Shell is not installed. The group `gui` marks the software only a desktop needs (desktop apps, fonts, terminal emulators, the lid and audio of a laptop); on a headless system (see `headless`) it is skipped when it comes from a group, `all` or no argument, e.g. `updater base`, but installed when it is named itself, e.g. `updater sublime`. Software built only for some architectures is skipped on the others (the `software_arches` list in `updater`, by the userland's `dpkg --print-architecture`): Zoom, Slack, Spotify, Chrome, Threema and the Android SDK are amd64 only; AWS CLI v2, Claude Code, forskap, Ollama, opencode, Sublime Text, WezTerm and Zed are amd64 and arm64; TeamViewer adds armhf. Codeium (in Vim and Sublime Text) is only set up on amd64. Release downloads through `install-git-release` pick the build for the architecture, and a software whose release has none is skipped too.
+
+Some software also gets its settings: the configs shipped in `$(LIBDIR)/<name>` (Terminator, yazi, Zed, Gradia, GIMP, RQuickShare, vim, git, himalaya and its jq module, glow, Sublime Text, the Qwen commands, Zoom, Spotify, the default apps, ...) are merged into the user's with `config-merge`, which keeps everything else in those files (`@HOME@` in a shipped file is the user's home), and the dconf dumps in `$(LIBDIR)/dconf` set the keys that differ, e.g. of the Random Wallpaper and Unblank extensions (`@HOME@` and `@PICTURES@` in a value are the user's home and pictures folder). `--no-config` skips both, and WirePlumber is not restarted then.
+
+With `make install-links`, `updater claude` links `~/.claude/CLAUDE.md`, the status line and skill folders to `lib/cli-helpers/claude`. `updater codex` links `~/.codex/hooks.json`, the `review` profile and skill folders to `lib/cli-helpers/codex`. Existing files that differ move to `FILE.before-link`, and skill folders move to `skills.before-link/NAME`. After `make install`, the updater merges the installed files into the user's config instead of linking them.
+
+The updater always merges `~/.claude/settings.json` and `~/.codex/config.toml`, preserving machine-specific settings such as trusted projects and model choices. `updater codex` also merges the repo's command allowlist into a managed block in `~/.codex/rules/default.rules`. Approvals saved in the Codex TUI stay in that file outside the managed block. The updater archives the old repo-managed `cli-helpers.rules` as `cli-helpers.rules.before-default` and keeps customized copies active. `~/.claude/settings.local.json` remains machine-local.
+
+A repo that breaks `apt-get update` does not fail every apt install after it: when the update fails on a repo (a key apt rejects, e.g. one bound with SHA1, a missing Release file, two files naming it with different keys, a malformed source file), its file in `/etc/apt/sources.list.d` is renamed to `.disabled`, which apt skips, with a warning that tells how to re-enable it, and the update runs again. `ubuntu.sources` and network errors are left alone; `--dry-run` only tells which files it would disable. Slack is installed from its `.deb` for that reason, not from its packagecloud repo, whose key apt 3 rejects.
+
+Secrets stay in the GNOME keyring, never in the repo: `updater opencode` writes the API keys stored with `secret-tool store --label="opencode PROVIDER" service opencode provider PROVIDER` into `~/.local/share/opencode/auth.json` (mode `600`), and keeps the other entries there, e.g. logins. `updater aws` does the same for S3 access keys: each item stored as `service aws profile PROFILE endpoint URL`, whose secret is the `credential_process` JSON (`{"Version": 1, "AccessKeyId": "...", "SecretAccessKey": "..."}`), becomes a profile of `~/.aws/config` with `credential_process = secret-tool lookup service aws profile PROFILE` and `endpoint_url`, so the keys are read from the keyring on each call and never written to a file. `setup-backup` copies them with the keyring files, so `setup.sh` hands them over to a new machine before the updater runs.
+
+`updater hardware` blacklists the driver of a built-in device that is never used (the WWAN modem's `iosm`) only on a machine that has such a device, and keeps WirePlumber away from the audio of the USB-C dock and the webcam, and from an AMD GPU's HDMI audio where there is one.
+
+A software whose tools are missing installs them first, once per run: e.g. `updater atoss-cli` on a new machine installs the base packages and `glab` before it, `npm` software gets `nodejs`, `go install` tools get `go`. Releases from GitHub need a `gh auth login`, those from private GitLab hosts a `glab auth login`; `updater` stops with that hint when the login is missing.
+
+**Examples:**
+```bash
+updater --dry-run apt flatpak
+updater codex claude
+updater --list
+updater base k8s
+updater base -x gui
+updater --verbose all
+make update UPDATE_ARGS='--dry-run apt'
+```
+
+### `debian-dist-check`
+Shows which Debian releases are still on deb.debian.org and which have moved to archive.debian.org, with their version, suite and the apt line to use, and fixes the apt sources of a system whose release was archived. It needs only bash (HTTP over `/dev/tcp`), so it also runs in a minimal chroot or container without curl or wget. A release on the archive counts as archived even when deb.debian.org still serves its stale index.
+
+**Usage:** `debian-dist-check [OPTIONS] [CODENAME]`
+
+| Argument / Flag | Description |
+|---|---|
+| `CODENAME` | Debian codename, e.g. `buster`. Without options: the table row of only this release. With `--print`/`--fix` it defaults to the codename of the system (`/etc/os-release`). |
+| `-c, --codename NAME` | Same as `CODENAME`. |
+| `-p, --print` | Print the `sources.list` content for the release: the release, its `-updates` and its security suite (`CODENAME-security`, or `CODENAME/updates` before bullseye), from the archive once it is archived. |
+| `-f, --fix` | Write that content to `/etc/apt/sources.list` (as root). The old file is kept as `sources.list.bak`, and the Debian lists in `/etc/apt/sources.list.d` (also `debian.sources`) are moved to `.bak`, which apt ignores. |
+| `-C, --components LIST` | Components for `--print`/`--fix`, e.g. `"main contrib"` (default: the ones of the current Debian line in `sources.list`, else `main`). |
+
+**Examples:**
+```bash
+debian-dist-check                 # table of every release
+debian-dist-check buster          # only buster
+debian-dist-check -p -c stretch   # the sources.list for stretch
+sudo debian-dist-check --fix      # fix this system's sources.list
+```
+
+### `fix-mt7922-6ghz-roaming`
+Makes 6 GHz Wi-Fi work on the PCIe MediaTek MT7922 (`14c3:0616`, driver `mt7921e`). It disables firmware CLC with the shared `mt7921_common` module option and installs a udev rule that sets a system-wide regulatory hint only when the MT7922 radio appears. Applying the fix can briefly drop Wi-Fi to reload the driver. On other adapters it scopes the old rule to MT7922, retaining its country, and moves the old module config aside if it contains only the generated option. Logs go to `~/.local/state/fix-mt7922-6ghz-roaming.log`. Use the country you are in when applying the fix. `00` selects the world domain.
+
+**Usage:** `fix-mt7922-6ghz-roaming [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-c, --country CC` | Regulatory domain to pin, the country you are in (default: `DE`). |
+
+**Examples:**
+```bash
+fix-mt7922-6ghz-roaming
+fix-mt7922-6ghz-roaming --country AT
+```
+
+### `fix-touchpad`
+Brings back an I2C-HID touchpad (e.g. of a Framework laptop) that stopped working, without a reboot: it unbinds the device from `i2c_hid_acpi` and binds it again. Asks for sudo.
+
+**Usage:** `fix-touchpad`
+
+### `bluetooth-trigger`
+Listens on the system D-Bus for BlueZ Bluetooth device add/remove events and prints the device object path as each device appears or disappears (with commented-out scaffolding for triggering actions on a specific MAC address).
+
+**Usage:** `bluetooth-trigger`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+bluetooth-trigger
+```
+
+### `power-log`
+Prints log entries from the `power-trigger.service` user systemd unit for the last 72 hours, piped into `less`, defaulting to just lid open/close events.
+
+**Usage:** `power-log [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Print the help message and exit. |
+| `-a, --all` | Print all log entries, not just lid open/close events. |
+
+**Examples:**
+```bash
+power-log
+power-log --all
+```
+
+### `power-trigger`
+A long-running D-Bus service daemon that watches UPower lid and battery state plus logind sleep signals, and automatically locks the screen on lid close and suspends the laptop (after unmounting CIFS shares) when the lid stays closed on battery; meant to be run as a systemd user service.
+
+`updater power-trigger` installs and enables the user service, and writes the logind drop-in `/etc/systemd/logind.conf.d/50-power-trigger.conf`: logind ignores the lid (on battery, on AC and docked), so closing it locks instead of suspending, the power button suspends and a long press powers off.
+
+**Usage:** `power-trigger`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+power-trigger
+systemctl --user start power-trigger.service
+```
+
+### `disk-mount`
+Mounts and unmounts the volumes of external drives safely, picking the device from a [prompt](#prompt) select menu (or a menu for the action when no command is given). On the way to a filesystem it unlocks encrypted volumes (LUKS, BitLocker) and activates LVM volume groups; on the way back it unmounts from the deepest level up, deactivates the volume groups and locks the encrypted volumes, and only then reports the drive safe to unplug. When a filesystem is busy, it lists the processes that still use it (`fuser -vm`). It also finds and removes the stale device mappings that a drive unplugged without unmounting leaves behind, which make unlocking it again fail with `Failed to activate device: File exists`; the unlock offers this removal itself when such a mapping is in the way.
+
+Mounting, unlocking, locking and powering off go through `udisksctl`, so they need no root; LVM (`pvs`, `vgchange`), `fsck`, `swapoff` and the cleanup (`dmsetup remove`, `umount -l`) run with `sudo`, and each `sudo` command is printed before it runs.
+
+**Usage:** `disk-mount [COMMAND] [OPTIONS] [DEVICE]`
+
+| Argument / Flag | Description |
+|---|---|
+| `mount [DEVICE]` | Mount a volume, unlocking and activating what it sits on; asks when a container holds more than one volume. |
+| `unmount [DEVICE]` | Unmount a volume, or every volume of a drive, and lock and deactivate what it sits on. `DEVICE` can also be a mount point. |
+| `eject [DRIVE]` | Unmount every volume of a drive and power it off. |
+| `cleanup` | Remove stale device mappings and mounts of drives that were unplugged without unmounting. |
+| `list` | List the drives, their volumes and stale mappings. |
+| `-a, --all` | Include internal drives; drives holding a mount of the running system (`/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`) are always left out. |
+| `-c, --check` | `mount` only: run `fsck -p` before mounting (ext2/3/4, vfat and exfat). |
+| `-y, --yes` | `cleanup` only: remove without asking for confirmation. |
+| `-h, --help` | Show the help message and exit. |
+| `--bash-completion` | Output completion candidates (commands, options, and the devices that fit the command) for shell completion. |
+
+External drives are the hotplug or removable disks reported by `lsblk`.
+
+**Examples:**
+```bash
+disk-mount
+disk-mount mount
+disk-mount mount --check /dev/sdb3
+disk-mount unmount /run/media/$USER/data
+disk-mount eject /dev/sdb
+disk-mount cleanup
+disk-mount list
+```
+
+### `disk-backup`
+Backs up a mounted filesystem (an old system disk, a home partition, ...) into a read-only squashfs image that can be mounted later (`mount -o loop IMAGE DIR`), uncompressed by default. It skips data that can be regenerated: on a root filesystem swap, virtual filesystems, temp dirs, package caches and snap/flatpak data; in every home it finds (`home/*`, `root`, or SOURCE itself) `~/.cache`, the trash, package caches of go, npm, yarn, gradle, maven, cargo and conda, browser/electron app caches and `node_modules`, `__pycache__`, `.terraform`, `.pytest_cache` and `.mypy_cache`. The list of excluded paths and the `mksquashfs` log are written next to the image. Runs itself again with `sudo` when not root.
+
+Without SOURCE it is interactive, using [prompt](#prompt): it offers the mounted filesystems in a select menu (or any folder), asks for the folder and name of the image, the compression (none or one of the compressors `mksquashfs` supports), whether to use the default exclusions and for more paths to skip, skipping what the options already give; before building it shows a summary (source size, free space, number of excluded paths, the list on request) and asks to go on.
+
+**Usage:** `disk-backup [OPTIONS] [SOURCE]`
+
+| Argument / Flag | Description |
+|---|---|
+| `SOURCE` | Mount point of the filesystem to back up; without it the tool asks. |
+| `-o, --output FILE` | Image to write (default: `OUTPUT_DIR/NAME-YYYY-MM-DD.sqfs`). |
+| `-d, --output-dir DIR` | Directory of the image (default: current directory). |
+| `-n, --name NAME` | Name of the image (default: last part of SOURCE, `root` for `/`). |
+| `-e, --exclude PATH` | Also skip PATH, relative to SOURCE, globs allowed (repeatable). |
+| `-E, --exclude-from FILE` | Also skip the paths listed in FILE, one per line. |
+| `-c, --compress ALGO` | Compress with ALGO, one of those of `mksquashfs` (`zstd`, `xz`, `gzip`, `lz4`, `lzo`, `lzma`) or `none` (default). |
+| `--no-default-excludes` | Skip only the paths given by `--exclude` and `--exclude-from`. |
+| `--dry-run` | Print the excluded paths and stop. |
+
+**Examples:**
+```bash
+disk-backup
+sudo disk-backup /mnt/old-disk -d ~/backups -n old-system
+sudo disk-backup /mnt/old-disk -e 'home/*/Downloads/*.iso' -e home/me/venv
+sudo disk-backup /mnt/data -c zstd -o /media/usb/data.sqfs
+disk-backup --dry-run /mnt/old-disk
+```
+
+### `set-slack-profile`
+Sets your Slack status via a webhook, either automatically based on the current network connection (Wi-Fi SSID or Ethernet domain) or by a manual override, with optional time-limited persistence.
+
+**Usage:** `set-slack-profile [-s STATUS [DAYS]] [-l] [-r]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-s, --status STATUS [DAYS]` | Manually set the given status, overriding auto-detection. Optional `DAYS` auto-resets the override after N days (persistable statuses only). |
+| `-l, --list` | List the available statuses (`InTransit`, `OnVacation`, `HomeOffice`, `AtWork`) and exit. |
+| `-r, --reset` | Reset (remove) the persisted manual override. |
+
+**Examples:**
+```bash
+set-slack-profile
+set-slack-profile --list
+set-slack-profile --status OnVacation 5
+set-slack-profile --reset
+```
+
+### `remapkeys`
+Applies an X11 keyboard remap: sets the German layout, enables mouse keys, and maps keycode 135 to the right mouse button; refuses to run on Wayland (pointing the user to GNOME Settings and `ydotool` instead).
+
+**Usage:** `remapkeys`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+remapkeys
+```
+
+### `launcher-terminal`
+Opens a quick-launch window in the default terminal (`xdg-terminal-exec`, `~/.config/xdg-terminals.list`): always on top, with a short prompt (` ❯ `, from the theme), and left where GNOME places new windows. It closes after 3 idle seconds without focus, stays open while a command runs and 5 seconds after, and refocuses the existing window instead of opening a second one.
+
+The look of the launcher window is the same in Ptyxis and Terminator and comes from one theme, `$(LIBDIR)/launcher/theme`: `font` (a Pango font description), `prompt` (the prompt of bash, followed by a space; bash's escapes like `\w` work, and a [color-parse](#color-parse) spec in braces colors it from there on, `{fg=green:bold}\w {end}❯`), `foreground`, `background`, `cursor`, `cursor-text`, `opacity` (0 to 1, 1 is opaque), `padding` (the space around the text in pixels, 1 to 4 numbers like in CSS, `4 0` for 4 px above and below; only in Ptyxis), `color0` to `color15` (the 16 ANSI colors), `columns` and `rows` (the size of the terminal grid in characters, integers from 1 to 65535), one `key = value` per line, colors as `#rrggbb`, a value in double quotes keeps the spaces at its ends (`prompt = " ❯"`). By default that is the Material palette as Ptyxis ships it (background `#1e282c`, text `#c3c7d1`, cursor `#657b83`), the prompt ` ❯` (with a space in front) without a color of its own, Ptyxis' padding above and below (7 px and 4 px) and none left and right, Agave Nerd Font Mono 13 and a terminal grid 128 columns wide by 8 rows high. A `~/.config/cli-helpers/launcher-terminal/theme` is read on top of it, so it needs only the keys it changes:
+
+```
+background = #1e1e2e
+opacity = 0.9
+columns = 100
+rows = 12
+```
+
+Replace any `width` and `aspect-ratio` entries in an existing theme with `columns` and `rows`.
+
+On every start the launcher writes each terminal's files with the theme's values in place of their placeholders (`@font@`, `@background@`, ...). An unknown key, a malformed value or a placeholder the theme has no value for is reported, and the launcher falls back to `xdg-terminal-exec`.
+
+When Ptyxis is the default terminal, the launcher runs a Ptyxis process of its own (`ptyxis --standalone`) without a header bar and with its own profile, the theme's look and size, no scrollbar. The launcher passes the theme's columns and rows directly to Ptyxis through its settings keyfile. That process runs on stand-ins for `~/.config` and `~/.local/share` in `$XDG_RUNTIME_DIR/launcher-terminal/ptyxis`, rebuilt on every start: every entry links to the real one, except its settings (a GSettings keyfile instead of dconf), its palette, its session (`org.gnome.Ptyxis`) and a `gtk-4.0/gtk.css` that collapses the header bar (your own `gtk.css` is imported). Your Ptyxis settings, profiles and session stay untouched, and the shell inside gets the real directories back. The three files come with cli-helpers in `$(LIBDIR)/launcher/ptyxis` (`gtk.css`, `settings.keyfile`, `launcher.palette`, all three with the theme's placeholders); one of the same name in `~/.config/cli-helpers/launcher-terminal/ptyxis` takes precedence. Changes made in the preferences of the launcher's Ptyxis do not stick. The stylesheet pulls the header bar up by its height in libadwaita (46 px), so a libadwaita that changes it can leave a strip of it visible.
+
+When Terminator is the default terminal, the launcher runs a Terminator process of its own (`--no-dbus`) with its own config and pixel geometry (`--geometry`), calculated from the theme's columns and rows, font metrics, title bar and VTE padding: borderless, always on top, hidden from the taskbar, using no Terminator plugin of your own, in the theme's look. It comes with cli-helpers in `$(LIBDIR)/launcher/terminator/config`, with the theme's placeholders (`@palette@` for the 16 colors as one list, `@background-type@` for `solid`, or `transparent` below opacity 1), and is written filled in to `$XDG_RUNTIME_DIR/launcher-terminal/terminator/config` on every start. Font metrics are measured by `$(LIBDIR)/terminal-cell-size` (Python and Pango) and cached until the font or text scaling changes. A `~/.config/cli-helpers/launcher-terminal/terminator/config` of your own takes precedence.
+
+Any other terminal is started with `xdg-terminal-exec`, which passes no terminal options, so the window looks like any other window of that terminal and has its default size.
+
+Only Terminator gives a borderless window without a taskbar entry, and no terminal fades the window while unfocused. The launcher runs itself as the terminal's command and starts your `$SHELL` from there, because a single-instance terminal (Ptyxis, GNOME Terminal) leaves no process of its own to watch; it closes the window by hanging up that shell. A command run in it can close it right after it finishes with `launcher-terminal --exit`, which touches `$LAUNCHER_EXIT_FILE`, the file the launcher gives the shell in its window; anywhere else it does nothing, so an alias can end with it in every shell.
+
+When `$SHELL` is bash, it starts with the launcher's own startup file, `$(LIBDIR)/launcher/bash/bashrc` (`bash --rcfile`; a `~/.config/cli-helpers/launcher-terminal/bash/bashrc` of your own takes precedence): it reads your `~/.bashrc` without printing its reminders (`reminder --print`), then puts the theme's prompt (`$LAUNCHER_PROMPT`, which the launcher sets from the theme; ` ❯` should the theme fail), its color specs turned into codes by `color-parse` once, in place of powerline-shell's by replacing `_powerline_ps1` of `prompt.bash`, so neither `~/.bashrc` nor the prompt needs to know about the launcher. Any other shell starts as it is.
+
+The desktop entry is installed by `make install-desktop`; `app-shortcut launcher-terminal` starts it through that entry and is bound to `<Shift><Control>l` and `AudioMedia`.
+
+**Usage:** `launcher-terminal [--exit]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--exit` | Close the launcher window once the command it ends has run; outside the launcher it does nothing. |
+
+**Examples:**
+```bash
+launcher-terminal
+alias lcmd='lastcmd | to_clip && launcher-terminal --exit'
+```
+
+### `cron-to-ical`
+Generates an iCalendar (`.ics`) feed on stdout containing an event for each occurrence of a cron expression over a date range, converting times to UTC.
+
+**Usage:** `cron-to-ical <cron> [--duration <duration>] [--start_date YYYY-MM-DD] [--end_date YYYY-MM-DD]`
+
+| Argument / Flag | Description |
+|---|---|
+| `<cron>` | The cron expression to expand into calendar events (required). |
+| `--duration <duration>` | Event length, e.g. `"1d 2h 3m 4s"` or a bare number of seconds. Default: `1d`. |
+| `--start_date <date>` | First date to generate events from (`YYYY-MM-DD`). Default: today. |
+| `--end_date <date>` | Last date to generate events through (`YYYY-MM-DD`). Default: 50 years from start. |
+
+**Examples:**
+```bash
+cron-to-ical "0 9 * * 1-5" > workdays.ics
+cron-to-ical "30 8 * * *" --duration "1h 30m" --end_date 2026-12-31
+cron-to-ical "0 0 1 * *" --start_date 2026-01-01 --duration 3600
+```
+
+### `keyring-cli`
+Manages keyrings (Secret Service collections, e.g. GNOME keyring): lists them, creates new ones, merges all items of one keyring into another with `secret-tool`, imports keyring files from a backup, and stores SSH keys, NetworkManager connections and the API key of Codeium. Needs `secret-tool`, `busctl` and `jq`; `create`, `merge` and `import` also need PyGObject with libsecret (`python3-gi`, `gir1.2-secret-1`), `import` also `python3-cryptography`: `secret-tool` cannot create a keyring, and it cannot store binary secrets (not UTF-8 or with NUL bytes, e.g. the app secrets of the xdg desktop portal). `updater secret-tool` installs all of them (`libsecret-tools`, `python3-gi`, `gir1.2-secret-1`, `python3-cryptography`; `jq` comes with `updater packages`).
+
+`merge` keeps label and attributes of each item. A target item with the same attributes is the same entry: it is kept, unless `--overwrite` is given and its label or secret differs. The source keyring is not changed. Locked keyrings are unlocked first through the keyring's unlock prompt, also with `--dry-run`. Items without attributes cannot be read by `secret-tool` and are skipped.
+
+`import` reads a gnome-keyring file, e.g. a backup of `~/.local/share/keyrings/login.keyring` from an old machine, and asks for its password in the terminal; a running gnome-keyring does not reliably load a keyring file copied into its folder. Its items go into the target keyring like with `merge`, binary secrets included.
+
+`nm-store` stores a NetworkManager connection (e.g. a wifi with 802.1x certificates or an OpenVPN connection) as its profile file, which holds its secrets and is read with `sudo`, plus every certificate and key file the profile names, with the attributes `type=nm-connection`, `name=NAME` and `part=keyfile|file`. `nm-restore` writes these files back (moved into the current `HOME` when the home of the user differs) and loads the profile from `/etc/NetworkManager/system-connections/NAME.nmconnection`. `setup.sh` imports a keyring backup early and then restores the stored SSH keys, SSH config, network connections and API key of Codeium.
+
+`ssh-store` stores an SSH private key and its `.pub` file as two items with the attributes `type=ssh-key`, `name=<file name>` and `part=private|public`. `ssh-config-store` stores the SSH client config (`~/.ssh/config`, or what it links to) as one item with `type=ssh-config` and `name=config`, so it stays out of any repo; `ssh-config-restore` writes it back with mode `600` and replaces a symlink instead of writing through it. `ssh-load` pipes the key into `ssh-add -`, so the key is not written to disk. `ssh-restore` writes the key files back with mode `600` (private) and `644` (public). Keep a passphrase on the key: any process of the session can read the items of an unlocked keyring.
+
+`codeium-store` stores the API key of Codeium as one item with `type=codeium` and `name=api-key`: the `apiKey` of `~/.codeium/config.json` (or `$XDG_DATA_HOME/.codeium/config.json` when set), where its Vim plugin keeps it after `:Codeium Auth`, else the content of `~/.codeium/sublime/codeium-api-key.txt`, where its Sublime Text plugin keeps it after `Codeium: Sign In`; `FILE` may be either. Storing the same key again changes nothing. `codeium-restore` writes it back for both plugins with mode `600`: into the config of Vim, keeping the other settings in it, and as the key file of Sublime Text, which holds only the key without a newline. With `FILE` it only writes that config of Vim. Vim and Sublime Text read the key when they start.
+
+**Usage:** `keyring-cli COMMAND [OPTIONS]`
+
+| Command / Flag | Description |
+|---|---|
+| `list` | List the keyrings with label, lock state and item count. |
+| `create NAME` | Create the keyring `NAME`; the keyring service asks for its password. |
+| `merge SOURCE TARGET` | Copy all items of `SOURCE` into `TARGET`. Both are a keyring name (e.g. `old-login`), label, alias (e.g. `default`) or D-Bus object path. |
+| `import FILE [TARGET]` | Copy all items of the gnome-keyring file `FILE` into `TARGET` (default: `default`); asks for the password of `FILE`. |
+| `nm-store NAME` | Store the NetworkManager connection `NAME` with its secrets and its certificate and key files (reads the profile with `sudo`). |
+| `nm-list` | List the stored network connections. |
+| `nm-restore NAME` | Restore the stored network connection `NAME`: its files and its profile (with `sudo`). |
+| `ssh-store FILE` | Store the SSH private key `FILE` and `FILE.pub` under the name of `FILE` (e.g. `id_ed25519`). |
+| `ssh-list` | List the stored SSH keys with their fingerprint. |
+| `ssh-load NAME` | Add the stored SSH key `NAME` to the ssh-agent. |
+| `ssh-restore NAME [DIR]` | Write the stored SSH key `NAME` to `DIR/NAME` and `DIR/NAME.pub` (default `DIR`: `~/.ssh`). |
+| `ssh-config-store [FILE]` | Store the SSH client config `FILE` (default: `~/.ssh/config`). |
+| `ssh-config-restore [FILE]` | Write the stored SSH client config to `FILE` (default: `~/.ssh/config`). |
+| `codeium-store [FILE]` | Store the API key of Codeium of `FILE`, the config of its Vim plugin or the key file of its Sublime Text plugin (default: `~/.codeium/config.json`, else `~/.codeium/sublime/codeium-api-key.txt`). |
+| `codeium-restore [FILE]` | Write the stored API key of Codeium into the config `FILE` of its Vim plugin, keeping the other settings in it; without `FILE` into `~/.codeium/config.json` and `~/.codeium/sublime/codeium-api-key.txt`. |
+| `-n, --dry-run` | `merge`, `import`: show what would be copied, without writing. |
+| `-o, --overwrite` | `merge`, `import`: replace target items with the same attributes whose label or secret differs. `ssh-store`, `ssh-config-store`, `nm-store`, `codeium-store`: replace a stored SSH key, SSH config, connection with the same name or API key of Codeium. `ssh-restore`, `ssh-config-restore`, `nm-restore`: replace existing files and connections. `codeium-restore`: replace another API key in the files. |
+| `-m, --match KEY=VALUE` | `merge`, `import`: copy only the items with the attribute `KEY` set to `VALUE`; repeat to require several attributes. E.g. `application=chrome` for the key of Chrome (`Chrome Safe Storage`), which encrypts its saved passwords and cookies. |
+| `-k, --keyring KEYRING` | `ssh-store`, `ssh-config-store`, `codeium-store`: store into `KEYRING` instead of the default keyring. |
+| `-h, --help` | Show the usage message. |
+
+**Examples:**
+```bash
+keyring-cli list
+keyring-cli create work
+keyring-cli merge --dry-run old-login login
+keyring-cli merge old-login default
+keyring-cli import --dry-run /media/backup/keyrings/login.keyring
+keyring-cli import /media/backup/keyrings/login.keyring
+keyring-cli import --match application=chrome /media/backup/keyrings/login.keyring
+keyring-cli nm-store "Work Wi-Fi"
+keyring-cli nm-restore "Work Wi-Fi"
+keyring-cli ssh-store ~/.ssh/id_ed25519
+keyring-cli ssh-list
+keyring-cli ssh-load id_ed25519
+keyring-cli ssh-restore id_ed25519
+keyring-cli codeium-store /media/old/home/USER/.codeium/config.json
+keyring-cli codeium-restore
+```
+
+---
+
+### `setup-backup`
+Backs up on the old machine every file `setup.sh` asks for on a new one, into a new folder `setup-backup-<host>-<date>` in `FOLDER` (asked for when not given). Before copying the keyring files it offers to store `~/.ssh/config` and the API key of Codeium (`apiKey` of `~/.codeium/config.json`, else `~/.codeium/sublime/codeium-api-key.txt`) in the keyring when the stored copy is missing or differs, since `setup.sh` restores both from there. The backup holds private keys, the keyring files, the Chrome profile and the agent sessions: keep it somewhere safe.
+
+| Folder | What | Where `setup.sh` asks for it |
+|---|---|---|
+| `keyrings/` | `~/.local/share/keyrings/*.keyring`, with the SSH keys, SSH config, network connections and API key of Codeium stored in them | "Keyring file or folder" |
+| `reminder/` | `~/.cache/reminder`, modification times kept | "Reminder folder or archive" |
+| `history/` | `~/.bash_super_history`, `~/.kube_history` | dotfiles: "Path of a backup of ~/..." |
+| `Keys/` | the `Keys` folder of the documents folder (without editor swap files), plus the SSH keys `~/.ssh/config` names that are in neither it nor the keyring | dotfiles: copy it to `Documents/Keys` |
+| `local-config/` | private component settings, mode `0600` | `./setup.sh local-config` |
+| `bin/` | the private scripts selected in `setup-backup.conf` | "Backup of ~/bin" |
+| `chrome/` | `google-chrome.tar.gz` of `~/.config/google-chrome` without the caches (`Cache`, `Code Cache`, `GPUCache` and the Dawn caches of each profile, the shader, component, extension and model caches, crash reports, metrics and the lock links of a running Chrome), and a copy of the keyring file that holds the key Chrome encrypts its passwords and cookies with (`Chrome Safe Storage`) | "Replace the Chrome profile here?" when there is one: it is moved aside to `google-chrome.before-restore-<date>`; the key is imported with `keyring-cli import --match application=chrome --overwrite`, which asks for the password of the old keyring |
+| `downloads/` | the Downloads folder (`xdg-user-dir DOWNLOAD`), modification times kept, without unfinished downloads (`*.crdownload`, `*.part`) | restored into the Downloads folder, a file that is there already is kept |
+| `git/` | what only the git repos of `~/workspace` and `~/workspace.worktree` hold, one folder per repo at its path under `~`: a `manifest` (remotes, branches, stashes, worktrees), `repo.bundle` with the commits no remote has (branches and detached HEADs no remote has, the stashes, the staged and unstaged changes as `git stash create` makes them; the tags only of a repo without remotes) and `untracked-N.tar` with the untracked files of worktree `N` (not the ignored ones). A repo with nothing of its own, and one in a folder its parent repo ignores (a build), is left out; a worktree its repo does not know any more is warned about (`git worktree repair`) | "Restore these N git repos?": a missing repo is cloned and its worktrees get the branches of the old machine, at the old commit when the remote deleted the branch (merged) or the uncommitted changes were made on it, so they go back into the worktree; in a repo that was already there a branch that went another way is kept and the old one comes back as `NAME-setup-backup`, and changes that do not fit the worktree become a stash; running it twice changes nothing |
+
+**Usage:** `setup-backup [-h] [FOLDER]`
+
+**Examples:**
+```bash
+setup-backup
+setup-backup /media/usb
+```
+
+---
+
+## Window and Display Management
+
+These tools work on both X11 (via `xdotool`/`wmctrl`/`xrandr`) and Wayland/GNOME (via the bundled `cli-helpers-window-bridge` GNOME Shell extension installed by `make install`).
+
+The extension also keeps the monitors in `$XDG_RUNTIME_DIR/cli-helpers/monitors`, rewritten whenever they change (plugged in or out, resolution, scale, layout): a line `pid <gnome-shell>`, then one `<connector> <x> <y> <width> <height> <scale>` per monitor in logical pixels, as `gnome-display-config list --geometry` prints them. Scripts read it instantly instead of asking Mutter's DisplayConfig through Python (about 100 ms); it counts only while the gnome-shell that wrote it runs, and the extension removes it when it is disabled (also on the lock screen), so it is never stale. A new version of the extension takes effect after logging in again.
+
+### `gnome-apply-settings`
+Applies a personal set of GNOME settings for the current user with `gsettings`/`dconf`: keyboard layout and NumLock, shortcuts (no workspace, input source or window group switching keys, show desktop on Super+D, Shift+Print records the screen), dark Yaru theme and monospace font, clock and panel, mouse/touchpad, power (no suspend, no dimming), dock (layout, behavior, pinned Settings > Displays), Files (list view columns, icon captions; with a nautilus-python extension, Shift+Delete asks with Cancel focused and then moves to the trash like Delete, which does not ask, and the dialogs confirming a permanent delete or emptying the trash focus Cancel; in these dialogs Tab goes from Cancel straight to Delete) and hidden files in the GTK 4 file chooser, extensions (no desktop icons, tiling assistant), Ptyxis, and app settings of Evolution, Evince, Meld, gedit and Drawing. Pinning only adds what is missing, so other pinned apps stay. Refuses to run as root, since that would change root's settings. Run it with `make gnome-settings`.
+
+**Usage:** `gnome-apply-settings [-h|--help]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Show the usage message. |
+
+### `app-shortcut`
+The action behind a keyboard shortcut: focuses an app's window, or launches the app when it has none, so a GNOME custom shortcut is just `app-shortcut <app>`. `--bind` (or `make bind-shortcuts` for all apps) turns the `bindings` of the YAML files into such GNOME custom shortcuts. They live under their own paths (`custom-keybindings/app-shortcut-<app>-<n>/`), so binding again replaces exactly them and leaves shortcuts made in Settings alone; a key GNOME already uses itself (e.g. `Print` for the screenshot UI, the media key in `media-static`) is taken away from that GNOME shortcut, which keeps its other keys (`--bind --dry-run` shows what would be freed).
+
+Each app is one YAML file, `<app>.yaml`. The shipped ones live in `$(LIBDIR)/app-shortcuts` (from `lib/cli-helpers/app-shortcuts` in this repo); a file of the same name in `~/.config/cli-helpers/app-shortcuts` wins, so a shortcut is changed by copying its file there and editing it.
+
+```yaml
+description: Files                          # shown by --list
+bindings: ['<Shift><Control>e', '<Super>e'] # what --bind binds
+focus:                                      # optional: focus an existing window ...
+  class: [org.gnome.Nautilus]               #   any of these WM classes (or title: <window title>)
+launch:                                     # ... otherwise start it
+  desktop: org.gnome.Nautilus               #   gtk-launch <desktop> [args], or command: [cmd, args...]
+  args: ['~/Downloads']                     #   ~ and $VARS are expanded
+```
+
+Instead of `focus` and `launch`, `default: terminal` stands for the default terminal as `xdg-terminal-exec` picks it (`~/.config/xdg-terminals.list`), looked up each time the shortcut runs: it focuses a window of that terminal (its desktop ID or `StartupWMClass`) and otherwise starts it with `xdg-terminal-exec`. `terminal.yaml` uses it.
+
+For an app whose desktop entry ID differs between systems, such as a Chrome web app (`chrome-<id>-<profile>.desktop`), `find` picks the first entry in the applications directories (`~/.local/share/applications` first) whose file name and `Name=` match its globs (the name ignoring case). It focuses the entry's windows the same way and otherwise starts it with `gtk-launch`; `launch.args` still apply. `outlook.yaml` and `teams.yaml` use it:
+
+```yaml
+find:
+  file: 'chrome-*.desktop'
+  name: 'Outlook*'
+```
+
+Shipped apps: `chrome`, `chrome-new`, `files`, `launcher-terminal`, `mic-toggle`, `outlook`, `screenshot`, `slack`, `teams`, `terminal`, `wallpaper`, `zed`.
+
+**Usage:** `app-shortcut [-l] [-p] [-b] [-n] [APP]`
+
+| Argument / Flag | Description |
+|---|---|
+| `APP` | Name of the app, i.e. its YAML file without `.yaml`. |
+| `-l, --list` | List the apps with description, bindings and the file that defines them. |
+| `-p, --path` | Print the file that defines `APP`. |
+| `-b, --bind` | Bind the `bindings` of `APP` (all apps without `APP`) as GNOME custom shortcuts. |
+| `-n, --dry-run` | Print the focus/launch commands (with `--bind`: the shortcuts) instead of running/binding them. |
+| `-h, --help` | Show the help message. |
+
+**Examples:**
+```bash
+app-shortcut slack
+app-shortcut --dry-run files
+app-shortcut --list
+app-shortcut --bind --dry-run
+app-shortcut --bind slack
+```
+
+### `browser-router`
+Acts as the default browser and decides per URL where it opens. Regular URLs go to the normal browser, while URLs belonging to an interactive authentication flow open in a small chromeless window that stays above other windows (see `browser-2fa-window`), so a login prompt started from the command line cannot get lost behind the browser window.
+
+A URL counts as an authentication URL when it is a loopback URL on one of the authentication ports, a loopback URL on one of the probe ports that answers with a redirect to an authorization endpoint, or a URL on one of the authentication hosts whose path matches the authentication path pattern.
+
+The probe exists because `kubelogin` hands the browser its own loopback entry point (`http://localhost:8000` by default) and shares those ports with ordinary development servers. Only the bare entry point is probed, never a URL with a path or a query.
+
+Meeting, chat and other links of Microsoft Teams open in the Teams app, the web app installed in Chrome, instead of a browser tab: a link on one of the Teams hosts (`teams.microsoft.com`, `teams.cloud.microsoft`) to `/l/...` (e.g. `/l/meetup-join/...`, `/l/chat/...`) or `/meet/...`, also through the Teams launcher (`/dl/launcher/launcher.html?url=...`) or the old client (`/_#/l/...`), becomes the `web+msteams:` link that the launcher hands the app (`web+msteams:/l/meetup-join/...`) and is opened with `xdg-open`. That needs an app registered for `web+msteams` links, which `lib/cli-helpers/chrome-web-apps` (`setup.sh chrome-apps`) does for the Teams app; without one, or when it cannot be started, the link opens in the browser as before. Chrome asks once whether the app may open these links. Any other Teams URL, and Teams for home (`teams.live.com`), go to the browser. Links clicked in Chrome itself, also in the Outlook app, never reach browser-router; the Chrome extension `chrome-link-router` opens those in the Teams app.
+
+Register it as the default browser with `browser-router --set-default` or `make set-default-browser` (run as your user, not root; it calls `xdg-settings set default-web-browser browser-router.desktop`). When Google Chrome is installed, it also installs the Chrome policy `DefaultBrowserSettingEnabled: false` to `/etc/opt/chrome/policies/managed/default-browser.json` (asking for `sudo` only for that file), so Chrome never asks to become the default browser again. The desktop entry is installed by `make install-desktop`, which `make install` and `make install-links` run as well; both end with a hint while browser-router is not the default yet.
+
+**Usage:** `browser-router [OPTIONS] [URL ...]` or `browser-router --set-default [--dry-run]`
+
+**Options:**
+- `-a`, `--auth` — treat every URL as an authentication URL
+- `-r`, `--regular` — treat every URL as a regular URL
+- `-d`, `--dry-run` — print the routing decision without opening anything
+- `-n`, `--no-probe` — never probe loopback URLs
+- `--set-default` — make browser-router the default browser of the current user and install the Chrome policy (with `--dry-run`, only show what it would do)
+- `-h`, `--help` — show the help message and exit
+
+**Configuration:** `~/.config/cli-helpers/browser-router.conf`, overridden by the environment:
+- `BROWSER_ROUTER_BROWSER` — regular browser command (default `google-chrome`)
+- `BROWSER_ROUTER_AUTH_COMMAND` — command opening authentication URLs (default `browser-2fa-window`)
+- `BROWSER_ROUTER_AUTH_PORTS` — loopback ports counting as authentication (default `47823 47824`)
+- `BROWSER_ROUTER_PROBE_PORTS` — loopback ports decided by a probe (default `8000 18000`)
+- `BROWSER_ROUTER_PROBE_TIMEOUT` — probe timeout in seconds (default `1`)
+- `BROWSER_ROUTER_AUTH_HOSTS` — hosts counting as authentication
+- `BROWSER_ROUTER_AUTH_PATH_REGEX` — path pattern for authentication hosts
+- `BROWSER_ROUTER_AUTH_REDIRECT_REGEX` — redirect pattern accepted by the probe
+- `BROWSER_ROUTER_TEAMS_HOSTS` — hosts whose Teams links open in the Teams app (default `teams.microsoft.com teams.cloud.microsoft`, empty for none)
+- `BROWSER_ROUTER_LOG` — log file for routing decisions
+
+**Examples:**
+```bash
+browser-router --dry-run http://localhost:8000 https://example.com
+browser-router --dry-run https://teams.microsoft.com/l/meetup-join/...
+browser-router https://example.com
+kubectl oidc-login get-token --browser-command=browser-router ...
+```
+
+### `chrome-link-router` (Chrome extension)
+Opens the links of some sites in their apps also when they are clicked in Chrome itself, in a tab or in a web app such as Outlook, which never hands them to browser-router. It is a Manifest V3 extension without code in `chrome-link-router/`: every route is a redirect rule in `rules.json` (`declarativeNetRequest`) from the URLs of a site to the URL scheme of its app, and Chrome opens the link in the app that handles that scheme. Chrome applies the rules to every top-level navigation, also after server redirects such as Outlook Safe Links, and only on the hosts in `host_permissions` of `manifest.json`.
+
+Routes:
+- Teams: `https://teams.microsoft.com/l/...` and `/meet/...` (and the same on `teams.cloud.microsoft`) become `web+msteams:/l/...`, which opens the Teams app, as browser-router does for links from other apps; navigations that Teams starts itself stay as they are.
+
+To add a route, add a rule with a new `id` to `rules.json` and the hosts of its URLs to `host_permissions`, then click Reload at the extension in `chrome://extensions`.
+
+Load it once per Chrome profile: open `chrome://extensions`, turn on Developer mode, click Load unpacked and pick `chrome-link-router` of the repo. The `key` in `manifest.json` fixes its ID (`pjdgjggkcakidfjfchanemeicledahda`) on every machine. Chrome loads it from that folder at every start, also in a profile restored by `setup.sh` while the repo is at the same path; `setup.sh chrome-apps` says when it is not loaded.
+
+### `browser-2fa-window`
+Opens a URL in a small chromeless browser window that stays above other windows, meant for interactive authentication (2FA/OIDC) prompts. The window uses the regular browser profile, so an existing single sign-on session is reused.
+
+The window is opened with the browser's `--app` mode, which leaves out the tab strip and the address bar. On X11 the browser applies the geometry itself; on Wayland the window is moved and resized through the window bridge afterwards, which needs a GNOME Shell restart after the extension has been updated.
+
+The address bar is gone, so on Wayland a badge at the bottom of the window shows the domain the login runs on, drawn by the window bridge extension (again, after a GNOME Shell restart). That way the login windows of different identity providers, such as two Keycloak instances, can be told apart. For a loopback URL such as `http://localhost:8000`, the entry point of `kubelogin`, the domain is the one it redirects to; like in `browser-router`, only a bare entry point is asked for that redirect, never a URL with a path or a query. The badge shows the domain of the first page only and does not follow later navigation. On X11 there is no badge.
+
+Once the window title reports a finished login (for example the `Authenticated` page of kubelogin, or a title like `Login successful` or `You can close this window`), the window closes by itself after a second. A background watcher polls the title for as long as the window is open; there is no timeout, and nothing gets closed when the title never matches.
+
+**Usage:** `browser-2fa-window [OPTIONS] URL`
+
+**Options:**
+- `-s`, `--size WIDTHxHEIGHT` — window size (default `520x780`)
+- `-p`, `--position POSITION` — window position as `X,Y`, or `center`, `pointer`, `active` (default `center`)
+- `-b`, `--browser BROWSER` — browser command to use (default `google-chrome`)
+- `-t`, `--timeout SECONDS` — how long to wait for the window to appear (default `10`)
+- `--no-above` — do not keep the window above other windows
+- `--no-close` — do not close the window after authentication
+- `--close-pattern REGEX` — case-insensitive extended regex matched against the window title to detect a finished login (default: built-in list of success titles)
+- `-l`, `--label TEXT` — text of the badge (default: the login domain)
+- `--no-label` — do not show the badge
+- `-q`, `--quiet` — do not print the window ID
+- `-h`, `--help` — show the help message and exit
+
+**Environment:** `CLI_HELPERS_2FA_BROWSER`, `CLI_HELPERS_2FA_SIZE`, `CLI_HELPERS_2FA_POSITION`, `CLI_HELPERS_2FA_TIMEOUT` and `CLI_HELPERS_2FA_CLOSE_PATTERN` change the defaults.
+
+**Examples:**
+```bash
+browser-2fa-window http://localhost:8000
+browser-2fa-window --size 480x720 --position pointer https://auth.example.com/realms/master/protocol/openid-connect/auth
+```
+
+### `window-active`
+Prints the window ID of the currently focused (active) window, on both Wayland and X11.
+
+**Usage:** `window-active`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+window-active
+```
+
+### `window-by-class`
+Prints the IDs of all windows whose WM class (or sandboxed app ID on Wayland) matches one of the given class names.
+
+**Usage:** `window-by-class <classes ...>`
+
+| Argument / Flag | Description |
+|---|---|
+| `classes ...` | One or more WM class names to match against open windows. |
+
+**Examples:**
+```bash
+window-by-class firefox
+window-by-class org.gnome.Console code
+```
+
+### `window-by-title`
+Prints the IDs of all windows whose title exactly matches the given string.
+
+**Usage:** `window-by-title <title>`
+
+| Argument / Flag | Description |
+|---|---|
+| `title` | The exact window title to match. |
+
+**Examples:**
+```bash
+window-by-title "Inbox - Mozilla Thunderbird"
+```
+
+### `window-focus`
+Focuses (activates and raises) the window with the given ID, on both Wayland and X11.
+
+**Usage:** `window-focus <id>`
+
+| Argument / Flag | Description |
+|---|---|
+| `id` | The ID of the window to focus. |
+
+**Examples:**
+```bash
+window-focus 0x03400007
+window-focus "$(window-by-class firefox | head -n 1)"
+```
+
+### `window-focus-by-class`
+Cycles focus through all windows matching the given WM class(es); if one is already active it focuses the next one in sorted order, otherwise the first match, optionally waiting for a matching window to appear.
+
+**Usage:** `window-focus-by-class [--wait <seconds>] <classes ...>`
+
+| Argument / Flag | Description |
+|---|---|
+| `--wait <seconds>` | Retry once per second for up to this many seconds until a matching window appears. |
+| `classes ...` | One or more WM class names to match against open windows. |
+
+**Examples:**
+```bash
+window-focus-by-class firefox
+window-focus-by-class --wait 5 org.gnome.Console
+```
+
+### `window-focus-by-process`
+Focuses the window a process runs in - typically the terminal of a program - without knowing which terminal emulator that is. The ancestors of the process are walked upwards until one of them owns a window (`wmctrl -lp` on X11, the `pid` the window bridge extension reports on GNOME Wayland). A terminal serving several windows from one process owns all of them, so the `--title` texts decide between them, tried in the order given, the first one found in a window title winning; without a match the first of its windows is taken, the most recently used one on GNOME. A process inside `tmux` continues the walk from the clients attached to its session, and its window and pane are selected in `tmux` as well. Where the windows carry no process - an older window bridge extension - the `--title` texts are matched against all windows instead.
+
+Ptyxis tab selection uses its GTK accessibility interface (`python3-gi`, `gir1.2-atspi-2.0`). With multiple tabs or windows, the helper briefly marks the target terminal title, restores it, and reports an error if it cannot identify the tab.
+
+**Usage:** `window-focus-by-process [--title <text>]... [--print] <pid>`
+
+| Argument / Flag | Description |
+|---|---|
+| `--title <text>` | A text the title of the window may hold; repeatable, tried in order. |
+| `--print` | Print the window id and title instead of focusing the window. |
+| `pid` | The process whose window is to be focused. |
+
+**Examples:**
+```bash
+window-focus-by-process "$(pgrep -n vim)"
+window-focus-by-process --title "Fix alerts" --title "~/workspace/project" 12345
+```
+
+### `window-focus-by-title`
+Cycles focus through all windows matching the given title; if one is already active it focuses the next one, otherwise the first match, optionally waiting for a matching window to appear.
+
+**Usage:** `window-focus-by-title [--wait <seconds>] <title>`
+
+| Argument / Flag | Description |
+|---|---|
+| `--wait <seconds>` | Retry once per second for up to this many seconds until a matching window appears. |
+| `title` | The window title to match. |
+
+**Examples:**
+```bash
+window-focus-by-title "Inbox - Mozilla Thunderbird"
+window-focus-by-title --wait 10 "Calculator"
+```
+
+### `window-launch-or-focus-by-class`
+Focuses an existing window matching the given WM class(es), or launches the named desktop application via `gtk-launch` if no such window exists.
+
+**Usage:** `window-launch-or-focus-by-class <desktop> <classes ...> -- [<arguments...>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `desktop` | The desktop file (application) to launch if no matching window is found. |
+| `classes ...` | One or more WM class names to look for before launching. |
+| `-- [<arguments...>]` | Arguments after `--` are passed through to `gtk-launch`. |
+
+**Examples:**
+```bash
+window-launch-or-focus-by-class firefox.desktop firefox --
+window-launch-or-focus-by-class org.gnome.Console.desktop org.gnome.Console --
+```
+
+### `window-launch-or-focus-by-title`
+Focuses an existing window matching the given title, or launches the named desktop application via `gtk-launch` if no such window exists.
+
+**Usage:** `window-launch-or-focus-by-title <desktop> <title> [<arguments...>]`
+
+| Argument / Flag | Description |
+|---|---|
+| `desktop` | The desktop file (application) to launch if no matching window is found. |
+| `title` | The window title to look for before launching. |
+| `arguments...` | Any further arguments are passed through to `gtk-launch`. |
+
+**Examples:**
+```bash
+window-launch-or-focus-by-title org.gnome.Calculator.desktop "Calculator"
+```
+
+### `window-list`
+Lists all open windows with their ID, workspace, host, WM class, and title, in a format compatible with `wmctrl -xl`, on both Wayland and X11.
+
+**Usage:** `window-list`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+window-list
+window-list | grep -i firefox
+```
+
+### `window-send-key`
+Sends one or more keystrokes (or types literal text) to the focused window using `ydotool` on Wayland or `xdotool` on X11.
+
+**Usage:** `window-send-key [--type] <key> ...`
+
+| Argument / Flag | Description |
+|---|---|
+| `--type` | Type the arguments as literal text instead of sending key combinations. |
+| `key ...` | One or more keys/key combinations (or text, with `--type`) to send. |
+
+**Examples:**
+```bash
+window-send-key ctrl+c
+window-send-key Return
+window-send-key --type "hello world"
+```
+
+### `window-shortcuts`
+Lists GNOME keyboard shortcuts (including custom media-key shortcuts) as a colorized, space-separated table with key, bindings, and descriptions.
+
+**Usage:** `window-shortcuts [--schema-regex REGEX] [--color [auto|always|never]] [--include-schema]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--schema-regex REGEX` | Regex filtering which gsettings schemas are shown (default: all). |
+| `--color [auto\|always\|never]` | Colorize the output; `auto` colorizes only when writing to a terminal (default). |
+| `--include-schema` | Include the SCHEMA column in the output. |
+
+**Examples:**
+```bash
+window-shortcuts
+window-shortcuts --include-schema
+window-shortcuts --schema-regex 'wm.keybindings' --color always
+```
+
+### `window-screen-focused`
+Finds the name of the relevant monitor, by default preferring the monitor of the active window, then the mouse cursor, then the primary monitor.
+
+**Usage:** `window-screen-focused [--mouse | --primary | --window | --help]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--mouse` | Find the monitor where the mouse cursor is located. |
+| `--primary` | Get the name of the primary monitor. |
+| `--window` | Find the monitor containing the currently active window. |
+| `--help` | Display the help message and exit. |
+
+Only one mode flag at a time. With no flag, tries active window, then mouse, then primary.
+
+**Examples:**
+```bash
+window-screen-focused
+window-screen-focused --mouse
+window-screen-focused --primary
+```
+
+### `window-screen-geometry`
+Prints the geometry (width, height, x, y, and optionally scale) of a named display, accounting for the display scale unless told otherwise. On Wayland it reads the monitors file of the window bridge extension (a few ms) and asks Mutter only when that file is missing or does not list the display.
+
+**Usage:** `window-screen-geometry [-h|--help] [--ignore-scale] [-r|--raw] <display>`
+
+| Argument / Flag | Description |
+|---|---|
+| `-h, --help` | Display the help message and exit. |
+| `--ignore-scale` | Do not apply the display scale factor to the geometry. |
+| `-r, --raw` | Print the geometry as a single `WxH+X+Y` string instead of separate lines. |
+| `display` | The name of the display/monitor to query (e.g. `DP-1`). |
+
+**Examples:**
+```bash
+window-screen-geometry DP-1
+window-screen-geometry --raw HDMI-1
+window-screen-geometry --ignore-scale eDP-1
+```
+
+### `window-screen-list`
+Lists all monitors, optionally limited to one display, printing names and optionally their geometry, or just the primary monitor.
+
+**Usage:** `window-screen-list [-d|--display <name>] [-g|--geometry] [-p|--primary] [-h|--help]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-d, --display <name>` | Select a single display by name. |
+| `-g, --geometry` | Print monitor geometry (`name x y w h`) instead of just names. |
+| `-p, --primary` | Print only the primary monitor (cannot be combined with `--display`). |
+| `-h, --help` | Display the help message and exit. |
+
+**Examples:**
+```bash
+window-screen-list
+window-screen-list --geometry
+window-screen-list --primary
+window-screen-list --display DP-1 --geometry
+```
+
+### `screen-color`
+Interactive terminal tool for adjusting per-output display gamma (color) on X11 or Wayland/GNOME, with support for saving and loading named presets.
+
+**Usage:** `screen-color [--list] [--load ALIAS] [--x11] [output]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--list` | List available display outputs and exit. |
+| `--load ALIAS` | Load and apply a saved preset by alias (non-interactive), then exit. |
+| `--x11` | Force X11 mode, using `xrandr` instead of the Wayland/GNOME DBus backend. |
+| `output` | The display output to adjust (defaults to the first available output). |
+
+Interactive keys: `q/a`, `w/s`, `e/d` raise/lower red, green, blue gamma; `TAB` cycles outputs; `r` resets to 1.0; `p` loads a preset; `P` saves a preset; `ESC` exits.
+
+**Examples:**
+```bash
+screen-color --list
+screen-color HDMI-1
+screen-color --load night
+```
+
+### `screenshot`
+Takes an interactive screenshot with the Gradia Flatpak editor and starts a watchdog that closes the editor once its window has been unfocused for a while, so forgotten screenshot windows do not pile up. The idle counter resets whenever the editor window has focus, and the watchdog runs as the transient `screenshot-autoclose` systemd user service.
+
+**Usage:** `screenshot [--idle <seconds>] [--poll <seconds>] [--startup <seconds>] [--no-autoclose]`
+
+| Argument / Flag | Description |
+|---|---|
+| `--idle <seconds>` | Unfocused time before the editor is closed. Defaults to `300`. |
+| `--poll <seconds>` | Interval between focus checks. Defaults to `15`. |
+| `--startup <seconds>` | How long to wait for the editor window to appear after the capture before giving up on the watchdog. Defaults to `120`. |
+| `--no-autoclose` | Take the screenshot without starting the watchdog. |
+| `--close` | Close a running editor right away (quit via DBus, `flatpak kill` as fallback) and exit. |
+| `--watch` | Run only the watchdog against an already running editor; used internally by the systemd user service. |
+| `-h, --help` | Show the usage message. |
+
+Environment: `SCREENSHOT_APP_ID` (Flatpak app ID, defaults to `be.alexandervanhee.gradia`), `SCREENSHOT_IDLE`, `SCREENSHOT_POLL` and `SCREENSHOT_STARTUP` set the same values as the corresponding flags.
+
+If the Flatpak document mount is unavailable, the launcher reports the error and shows a desktop notification when `notify-send` is installed. Restart the user document portal with `systemctl --user restart xdg-document-portal.service`, then try Print Screen again.
+
+**Examples:**
+```bash
+screenshot
+screenshot --idle 60
+screenshot --no-autoclose
+screenshot --close
+```
+
+### `xorwayland`
+Prints whether the current desktop session is running under X11 (`x`) or Wayland (`wayland`), based on session environment variables.
+
+**Usage:** `xorwayland`
+
+Takes no arguments.
+
+**Examples:**
+```bash
+xorwayland
+if [ "$(xorwayland)" = "wayland" ]; then echo "on Wayland"; fi
+```

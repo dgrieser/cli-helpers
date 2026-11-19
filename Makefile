@@ -1,0 +1,410 @@
+PREFIX ?= /usr/local
+DESTDIR ?=
+
+BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib/cli-helpers
+PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
+# a .pth file in the system site-packages puts $(PYTHONDIR) on sys.path for every
+# python3 process (also under sudo, cron and systemd, which PYTHONPATH from a
+# login shell never reaches); python3 reads it at startup
+PTHFILE ?= /usr/lib/python3/dist-packages/usr-local-python3.pth
+COMPLETIONSDIR ?= $(PREFIX)/share/bash-completion/completions
+# the distribution's completions folder: a command with a completion there keeps
+# it, and setup-dirs makes it group-writable too, so completions can be added
+# there without root
+SYSTEM_COMPLETIONSDIR ?= /usr/share/bash-completion/completions
+# the group that may install without root: the invoking user's primary group
+INSTALL_GROUP ?= $(shell id -gn "$${SUDO_USER:-$$(id -un)}")
+COMPLETION := bash_completion/cli-helpers
+# desktop entries are per-user, like the GNOME extension
+DESKTOPDIR ?= $(HOME)/.local/share/applications
+DESKTOPSRCDIR := desktop
+DESKTOPS := browser-router.desktop ssh-terminal.desktop launcher-terminal.desktop
+# Chrome policy so Chrome never asks to become the default browser (browser-router is)
+# written by browser-router --set-default, removed by uninstall
+CHROME_POLICY_DIR ?= /etc/opt/chrome/policies/managed
+# GNOME extension steps are skipped automatically when no GNOME Shell is
+# present; set ENABLE_GNOME_EXTENSION=1 to force them anyway
+HAVE_GNOME := $(shell command -v gnome-extensions >/dev/null 2>&1 && command -v gnome-shell >/dev/null 2>&1 && echo 1 || echo 0)
+ENABLE_GNOME_EXTENSION ?= $(HAVE_GNOME)
+# setup.sh's sudo fallback installs these separately as the invoking user.
+INSTALL_USER_ASSETS ?= 1
+UPDATE_ARGS ?=
+
+EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
+EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
+EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
+SHAREDDIR := lib/cli-helpers
+SHARED := lib-desktop lib-clipboard gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge local-config pip-packages chrome-profile browser-audio-record.js \
+	terminal-cell-size ptyxis-window
+# the app definitions of app-shortcut, one YAML file per app
+APPSHORTCUTS := $(notdir $(wildcard $(SHAREDDIR)/app-shortcuts/*.yaml))
+# the data folders: the Ptyxis and Terminator files of launcher-terminal, and what
+# updater installs,
+# the configs merged into the user's config dirs (yazi with its local plugins,
+# powerline-shell, claude, codex, opencode, zed, terminator, gradia, gimp, vim,
+# rquickshare, cam-settings, screen-color, git, streamdown, mimeapps, zoom,
+# teamviewer, spotify, himalaya, wireplumber, glow, sublime-text, jq, qwen), the dconf
+# settings of extensions and apps, the Chrome settings and search engines,
+# systemd user units, a cron file and the Files extension of gnome-apply-settings
+CONFIGDIRS := launcher yazi powerline-shell claude codex opencode zed terminator gradia gimp vim rquickshare \
+	cam-settings screen-color git streamdown mimeapps zoom teamviewer spotify spotify-user himalaya \
+	wireplumber wireplumber-radeon glow sublime-text jq qwen dconf chrome systemd-user cron nautilus-python
+# a shell pipe, not a list: config file names can hold spaces (Sublime Text's)
+CONFIGFILES := (cd $(SHAREDDIR) && find $(CONFIGDIRS) -type f -not -path '*/__pycache__/*' | sort)
+# commands that are also importable Python modules: they get installed a second
+# time as <name>.py into $(PYTHONDIR), so other tools can import them instead of
+# piping through them
+MODULES := toage prompt
+# setup.sh sets up a new machine from the repo, it is no command
+SCRIPTS := $(shell find . -maxdepth 1 -type f -perm /111 -not -name setup.sh -printf '%f\n' | sort)
+LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
+# the systemd user timer that keeps the index of agent-session current, installed
+# for the user running make (also under sudo) by install and install-links
+AGENT_SESSION_UNITS := agent-session-index.service agent-session-index.timer
+AGENT_SESSION_TIMER := agent-session-index.timer
+
+REPO_DIR := $(CURDIR)
+
+.PHONY: list check-dirs setup-dirs update install install-links extension-zip install-gnome-extension install-completions install-completions-links install-desktop install-desktop-links install-agent-session-timer uninstall-agent-session-timer bind-shortcuts gnome-settings set-default-browser default-browser-hint install-pth uninstall list-install
+
+list:
+	@printf 'Available targets:\n'
+	@printf '  make list                     Show this help and available commands\n'
+	@printf '  make list-install             Show install destinations and installed files\n'
+	@printf '  sudo make setup-dirs          Create the install folders as root:$(INSTALL_GROUP), group-writable (once)\n'
+	@printf '  make extension-zip            Package the GNOME extension\n'
+	@printf '  make update                   Run updater (pass options with UPDATE_ARGS="...")\n'
+	@printf '  make install-gnome-extension  Install the packaged GNOME extension (skipped without GNOME)\n'
+	@printf '  sudo make install-completions Install bash completion for all commands\n'
+	@printf '  sudo make install-desktop     Install desktop entries (URL handlers, launcher-terminal)\n'
+	@printf '  make set-default-browser      Make browser-router the default browser, stop Chrome asking (as your user)\n'
+	@printf '  make gnome-settings           Apply the personal GNOME settings of gnome-apply-settings (as your user)\n'
+	@printf '  make bind-shortcuts           Bind every app-shortcut binding as a GNOME custom shortcut (as your user)\n'
+	@printf '  sudo make install-pth         Put the Python module dir on sys.path (part of install/install-links)\n'
+	@printf '  make install-agent-session-timer  Keep the agent-session index current (part of install/install-links)\n'
+	@printf '  sudo make install             Install commands, shared helpers, and GNOME extension\n'
+	@printf '  sudo make install-links       Install as symlinks back to this repo (no file copy)\n'
+	@printf '  sudo make uninstall           Remove installed files\n'
+	@printf '\nAvailable commands:\n'
+	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
+
+# run once as root: creates the install folders as root:$(INSTALL_GROUP) and
+# group-writable, so install-links (and install) work afterwards without sudo
+# runs before install/install-links: as a user, fail early with a hint instead of
+# halfway through, when a folder (or the parent it would be created in) is not writable
+check-dirs:
+	@[ "$$(id -u)" -eq 0 ] && exit 0; \
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)"; do \
+		existing="$$dir"; \
+		while [ ! -e "$$existing" ]; do existing="$$(dirname "$$existing")"; done; \
+		if [ ! -w "$$existing" ]; then \
+			echo "ERROR: $$existing is not writable for $$(id -un), cannot install into $$dir" 1>&2; \
+			echo "HINT: run once: sudo make setup-dirs$(if $(strip $(MAKEOVERRIDES)), $(MAKEOVERRIDES))  (then install without sudo), or install with sudo" 1>&2; \
+			exit 1; \
+		fi; \
+	done
+
+setup-dirs:
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "ERROR: setup-dirs needs root, run: sudo make setup-dirs" 1>&2; \
+		exit 1; \
+	fi
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(COMPLETIONSDIR)" "$(DESTDIR)$(SYSTEM_COMPLETIONSDIR)"; do \
+		mkdir -p "$$dir" && chown root:"$(INSTALL_GROUP)" "$$dir" && chmod g+w "$$dir" || exit 1; \
+	done
+
+update:
+	./updater $(UPDATE_ARGS)
+
+install: check-dirs
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
+		[ -d "$$dir" ] || mkdir -p "$$dir"; \
+	done
+	for script in $(SCRIPTS); do \
+		install -m 0755 "$$script" "$(DESTDIR)$(BINDIR)/$$script"; \
+		sed -i 's#/usr/local/lib/cli-helpers#$(LIBDIR)#g' "$(DESTDIR)$(BINDIR)/$$script"; \
+	done
+	for shared in $(SHARED); do \
+		install -m 0755 "$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	[ -d "$(DESTDIR)$(LIBDIR)/app-shortcuts" ] || mkdir -p "$(DESTDIR)$(LIBDIR)/app-shortcuts"
+	for app in $(APPSHORTCUTS); do \
+		install -m 0644 "$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
+	$(CONFIGFILES) | while IFS= read -r file; do \
+		install -D -m 0644 "$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
+	done
+	for module in $(MODULES); do \
+		install -m 0644 "$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
+	done
+	$(MAKE) --no-print-directory install-pth
+	sed -i 's#/usr/local/share/gnome-shell/extensions#$(HOME)/.local/share/gnome-shell/extensions#g' "$(DESTDIR)$(LIBDIR)/gnome-window-bridge"
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
+	$(MAKE) install-completions
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop)
+	$(MAKE) --no-print-directory install-agent-session-timer
+	for link in $(LINKS); do \
+		target="$$(readlink "$$link")"; \
+		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
+	done
+	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+		if command -v gnome-extensions >/dev/null 2>&1; then \
+			gnome-extensions enable "$(EXTENSION_UUID)" || \
+				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
+		else \
+			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUID) manually after install." 1>&2; \
+		fi; \
+	else \
+		echo "Skipping GNOME extension enable step."; \
+	fi
+	$(MAKE) --no-print-directory default-browser-hint
+
+install-links: check-dirs
+	for dir in "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(PYTHONDIR)"; do \
+		[ -d "$$dir" ] || mkdir -p "$$dir"; \
+	done
+	for script in $(SCRIPTS); do \
+		ln -sfn "$(REPO_DIR)/$$script" "$(DESTDIR)$(BINDIR)/$$script"; \
+	done
+	for shared in $(SHARED); do \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$shared" "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	[ -d "$(DESTDIR)$(LIBDIR)/app-shortcuts" ] || mkdir -p "$(DESTDIR)$(LIBDIR)/app-shortcuts"
+	for app in $(APPSHORTCUTS); do \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/app-shortcuts/$$app" "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
+	$(CONFIGFILES) | while IFS= read -r file; do \
+		mkdir -p "$$(dirname "$(DESTDIR)$(LIBDIR)/$$file")"; \
+		ln -sfn "$(REPO_DIR)/$(SHAREDDIR)/$$file" "$(DESTDIR)$(LIBDIR)/$$file"; \
+	done
+	for module in $(MODULES); do \
+		ln -sfn "$(REPO_DIR)/$$module" "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
+	done
+	$(MAKE) --no-print-directory install-pth
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping per-user assets.",$(MAKE) install-gnome-extension)
+	$(MAKE) install-completions-links
+	$(if $(filter 0,$(INSTALL_USER_ASSETS)),@echo "Skipping desktop entries.",$(MAKE) install-desktop-links)
+	$(MAKE) --no-print-directory install-agent-session-timer
+	for link in $(LINKS); do \
+		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
+	done
+	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+		if command -v gnome-extensions >/dev/null 2>&1; then \
+			gnome-extensions enable "$(EXTENSION_UUID)" || \
+				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
+		else \
+			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUID) manually after install." 1>&2; \
+		fi; \
+	else \
+		echo "Skipping GNOME extension enable step."; \
+	fi
+	$(MAKE) --no-print-directory default-browser-hint
+
+extension-zip:
+	rm -f "$(EXTENSION_ZIP)"
+	cd "$(EXTENSION_DIR)" && zip -r "$(EXTENSION_ZIP)" .
+
+# the zip is only built when the extension is actually going to be installed,
+# so non-GNOME systems need neither gnome-extensions nor zip
+install-gnome-extension: $(if $(filter 0,$(ENABLE_GNOME_EXTENSION)),,extension-zip)
+	if [ "$(ENABLE_GNOME_EXTENSION)" = "0" ]; then \
+		echo "Skipping GNOME extension install."; \
+	else \
+		gnome-extensions install --force "$(EXTENSION_ZIP)"; \
+		status=$$?; \
+		rm -f "$(EXTENSION_ZIP)"; \
+		exit $$status; \
+	fi
+
+install-completions:
+	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
+	install -m 0644 "$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
+	for name in $(SCRIPTS) $(LINKS); do \
+		if [ -e "$(SYSTEM_COMPLETIONSDIR)/$$name" ]; then \
+			echo "Skipping completion for $$name (system completion exists)"; \
+			continue; \
+		fi; \
+		ln -sfn cli-helpers "$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
+	done
+
+install-completions-links:
+	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
+	ln -sfn "$(REPO_DIR)/$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
+	for name in $(SCRIPTS) $(LINKS); do \
+		if [ -e "$(SYSTEM_COMPLETIONSDIR)/$$name" ]; then \
+			echo "Skipping completion for $$name (system completion exists)"; \
+			continue; \
+		fi; \
+		ln -sfn "$(REPO_DIR)/$(COMPLETION)" "$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
+	done
+
+install-desktop:
+	[ -d "$(DESTDIR)$(DESKTOPDIR)" ] || mkdir -p "$(DESTDIR)$(DESKTOPDIR)"
+	for entry in $(DESKTOPS); do \
+		install -m 0644 "$(DESKTOPSRCDIR)/$$entry" "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+		sed -i 's#/usr/local/bin#$(BINDIR)#g' "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
+
+install-desktop-links:
+	[ -d "$(DESTDIR)$(DESKTOPDIR)" ] || mkdir -p "$(DESTDIR)$(DESKTOPDIR)"
+	for entry in $(DESKTOPS); do \
+		ln -sfn "$(REPO_DIR)/$(DESKTOPSRCDIR)/$$entry" "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
+
+# The timer is the user's, not root's: under sudo the units go to the home of
+# SUDO_USER and systemctl --user talks to that user's session, as in updater.
+# Its ExecStart names $(BINDIR), so the units are copied, also by install-links.
+# Without a session bus (no login) the units are installed and enabled at the
+# next login by hand; a staged install (DESTDIR) or INSTALL_USER_ASSETS=0 skips it.
+install-agent-session-timer:
+	@if [ -n "$(DESTDIR)" ] || [ "$(INSTALL_USER_ASSETS)" = "0" ]; then \
+		echo "Skipping the agent-session index timer."; exit 0; \
+	fi; \
+	if ! command -v systemctl >/dev/null 2>&1; then \
+		echo "Skipping the agent-session index timer (no systemctl)."; exit 0; \
+	fi; \
+	user="$${SUDO_USER:-$$(id -un)}"; uid="$$(id -u "$$user")"; \
+	if [ "$$uid" -eq 0 ]; then \
+		echo "Skipping the agent-session index timer (no user to install it for)."; exit 0; \
+	fi; \
+	home="$$(getent passwd "$$user" | cut -d: -f6)"; dir="$$home/.config/systemd/user"; \
+	as_user=""; [ "$$(id -u)" -eq 0 ] && as_user="sudo -u $$user"; \
+	$$as_user mkdir -p "$$dir" || exit 1; \
+	for unit in $(AGENT_SESSION_UNITS); do \
+		sed 's#/usr/local/bin#$(BINDIR)#g' "$(SHAREDDIR)/systemd-user/$$unit" \
+			| $$as_user tee "$$dir/$$unit" >/dev/null || exit 1; \
+	done; \
+	bus="/run/user/$$uid/bus"; \
+	if [ ! -S "$$bus" ]; then \
+		echo "WARNING: no session of $$user to enable the timer in; run as $$user: systemctl --user enable --now $(AGENT_SESSION_TIMER)" 1>&2; \
+		exit 0; \
+	fi; \
+	session="env XDG_RUNTIME_DIR=/run/user/$$uid DBUS_SESSION_BUS_ADDRESS=unix:path=$$bus"; \
+	$$as_user $$session systemctl --user daemon-reload \
+		&& $$as_user $$session systemctl --user enable --now $(AGENT_SESSION_TIMER) \
+		&& echo "Enabled $(AGENT_SESSION_TIMER) for $$user" \
+		|| echo "WARNING: could not enable $(AGENT_SESSION_TIMER); run as $$user: systemctl --user enable --now $(AGENT_SESSION_TIMER)" 1>&2
+
+uninstall-agent-session-timer:
+	@[ -z "$(DESTDIR)" ] || exit 0; \
+	command -v systemctl >/dev/null 2>&1 || exit 0; \
+	user="$${SUDO_USER:-$$(id -un)}"; uid="$$(id -u "$$user")"; \
+	home="$$(getent passwd "$$user" | cut -d: -f6)"; dir="$$home/.config/systemd/user"; \
+	as_user=""; [ "$$(id -u)" -eq 0 ] && as_user="sudo -u $$user"; \
+	bus="/run/user/$$uid/bus"; \
+	session="env XDG_RUNTIME_DIR=/run/user/$$uid DBUS_SESSION_BUS_ADDRESS=unix:path=$$bus"; \
+	[ -S "$$bus" ] && $$as_user $$session systemctl --user disable --now $(AGENT_SESSION_TIMER) 2>/dev/null; \
+	for unit in $(AGENT_SESSION_UNITS); do $$as_user rm -f "$$dir/$$unit"; done; \
+	[ -S "$$bus" ] && $$as_user $$session systemctl --user daemon-reload; \
+	true
+
+# the default browser is a per-user setting (~/.config/mimeapps.list), so it is
+# never changed by install, which usually runs as root
+# GNOME custom shortcuts for every app-shortcut binding (replaces only its own ones)
+bind-shortcuts:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		echo "ERROR: run make bind-shortcuts as your user, not as root" 1>&2; \
+		exit 1; \
+	fi
+	./app-shortcut --bind
+
+# personal GNOME settings of the current user, so never as root (see set-default-browser)
+gnome-settings:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		echo "ERROR: run make gnome-settings as your user, not as root" 1>&2; \
+		exit 1; \
+	fi
+	./gnome-apply-settings
+
+set-default-browser:
+	./browser-router --set-default
+
+default-browser-hint:
+	@if [ -z "$(DESTDIR)" ] && command -v xdg-settings >/dev/null 2>&1 && \
+		{ [ "$$(id -u)" -eq 0 ] || [ "$$(xdg-settings get default-web-browser 2>/dev/null)" != "browser-router.desktop" ]; }; then \
+		echo; \
+		echo "HINT: to route URLs through browser-router, run as your user: make set-default-browser"; \
+	fi
+
+# the system site-packages is root's, while install-links also runs as a user with
+# a group-writable $(PREFIX): an up to date .pth is left alone, one that cannot be
+# written only warns instead of failing the whole install
+install-pth:
+	@pth="$(DESTDIR)$(PTHFILE)"; \
+	if [ "$$(cat "$$pth" 2>/dev/null)" = "$(PYTHONDIR)" ]; then \
+		echo "$$pth is up to date"; \
+	elif { [ -d "$$(dirname "$$pth")" ] || mkdir -p "$$(dirname "$$pth")"; } 2>/dev/null \
+		&& printf '%s\n' "$(PYTHONDIR)" 2>/dev/null > "$$pth" && chmod 0644 "$$pth"; then \
+		echo "Wrote $$pth"; \
+	else \
+		echo "WARNING: cannot write $$pth, so $(PYTHONDIR) is not on sys.path; run: sudo make install-pth" 1>&2; \
+	fi
+
+uninstall: uninstall-agent-session-timer
+	for script in $(SCRIPTS) $(LINKS); do \
+		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
+	done
+	for shared in $(SHARED); do \
+		rm -f "$(DESTDIR)$(LIBDIR)/$$shared"; \
+	done
+	for app in $(APPSHORTCUTS); do \
+		rm -f "$(DESTDIR)$(LIBDIR)/app-shortcuts/$$app"; \
+	done
+	rmdir "$(DESTDIR)$(LIBDIR)/app-shortcuts" 2>/dev/null || true
+	$(CONFIGFILES) | while IFS= read -r file; do \
+		rm -f "$(DESTDIR)$(LIBDIR)/$$file"; \
+	done
+	for dir in $(CONFIGDIRS); do \
+		[ ! -d "$(DESTDIR)$(LIBDIR)/$$dir" ] || find "$(DESTDIR)$(LIBDIR)/$$dir" -depth -type d -empty -delete; \
+	done
+	rmdir "$(DESTDIR)$(LIBDIR)" 2>/dev/null || true
+	for module in $(MODULES); do \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/$$module.py"; \
+		rm -f "$(DESTDIR)$(PYTHONDIR)/__pycache__/$$module".*.pyc; \
+	done
+	rm -f "$(DESTDIR)$(PTHFILE)"
+	for name in $(SCRIPTS) $(LINKS); do \
+		target="$(DESTDIR)$(COMPLETIONSDIR)/$$name"; \
+		case "$$([ -L "$$target" ] && readlink "$$target")" in \
+			*cli-helpers) rm -f "$$target";; \
+		esac; \
+	done
+	rm -f "$(DESTDIR)$(COMPLETIONSDIR)/cli-helpers"
+	for entry in $(DESKTOPS); do \
+		rm -f "$(DESTDIR)$(DESKTOPDIR)/$$entry"; \
+	done
+	rm -f "$(DESTDIR)$(CHROME_POLICY_DIR)/default-browser.json"
+	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database "$(DESKTOPDIR)" || true; \
+	fi
+	if [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
+		gnome-extensions uninstall "$(EXTENSION_UUID)" || true; \
+	fi
+
+list-install:
+	@printf 'Scripts -> %s\n' "$(DESTDIR)$(BINDIR)"
+	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
+	@printf 'Shared -> %s\n' "$(DESTDIR)$(LIBDIR)"
+	@printf '%s\n' $(SHARED) | sed 's#^#  $(SHAREDDIR)/#'
+	@printf 'Python modules -> %s (on sys.path via %s)\n' "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(PTHFILE)"
+	@printf '%s\n' $(MODULES) | sed 's#^#  #;s#$$#.py#'
+ifeq ($(ENABLE_GNOME_EXTENSION),0)
+	@printf 'GNOME extension -> skipped\n'
+else
+	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
+endif
+	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
+	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"
+	@printf 'agent-session index timer -> ~/.config/systemd/user of the installing user\n'
+	@printf '%s\n' $(AGENT_SESSION_UNITS) | sed 's#^#  $(SHAREDDIR)/systemd-user/#'
+	@printf 'Desktop entries -> %s\n' "$(DESTDIR)$(DESKTOPDIR)"
+	@printf '%s\n' $(DESKTOPS) | sed 's#^#  $(DESKTOPSRCDIR)/#'

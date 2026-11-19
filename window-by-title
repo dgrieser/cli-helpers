@@ -1,0 +1,35 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $(basename "${0}") <title>"
+    exit 1
+fi
+
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    windows_json="$(cli_helpers_gnome_window_bridge list)" || exit 1
+    python3 -c '
+import json
+import sys
+
+needle = sys.argv[1]
+windows = json.load(sys.stdin)
+if not isinstance(windows, list):
+    sys.exit("ERROR: window bridge returned invalid window list")
+for window in windows:
+    if not isinstance(window, dict):
+        continue
+    if window.get("title", "") == needle:
+        print(window.get("id", ""))
+' "${1}" <<<"${windows_json}"
+else
+    wmctrl -xl | awk '$5 == "'"${1}"'"' | awk '{print $1}'
+fi

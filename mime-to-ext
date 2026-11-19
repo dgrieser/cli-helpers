@@ -1,0 +1,17 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") <mime-type>" 1>&2
+    exit 1
+}
+
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+exts="$(grep -wF -m 1 "${1}" "/etc/mime.types" | sed 's/^[^\t]\{1,\}\t\{1,\}\(.\{1,\}\)$/\1/')"
+if [ -z "${exts}" ]; then
+    echo "ERROR: Unknown mime-type ${1}" 2>&1
+    exit 1
+fi
+echo "${exts}" | tr ' ' '\n'

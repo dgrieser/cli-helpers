@@ -1,0 +1,141 @@
+#!/usr/bin/python3
+"""Find the Ptyxis window containing a process's terminal, selecting its tab on focus."""
+
+import fcntl
+import os
+import subprocess
+import sys
+import time
+import uuid
+import warnings
+from pathlib import Path
+
+try:
+    import gi
+    gi.require_version('Atspi', '2.0')
+    from gi.repository import Atspi, GLib
+except (ImportError, ValueError):
+    sys.exit('ERROR: Ptyxis tab focus requires python3-gi and gir1.2-atspi-2.0')
+
+
+def tab_view(widget):
+    if widget.get_accessible_id() == 'tab_view':
+        return widget
+    for child in widget:
+        view = tab_view(child)
+        if view is not None:
+            return view
+
+
+def selected_page(view):
+    # AdwTabView exposes all page titles, but only the selected page has a widget child.
+    return next((page for page in view if page.get_child_count()), None)
+
+
+def select_page(frame, view, target):
+    for _ in range(view.get_child_count()):
+        current = selected_page(view)
+        if current == target:
+            return
+        if current is None:
+            break
+        action = ('page.next' if current.get_index_in_parent() < target.get_index_in_parent()
+                  else 'page.previous')
+        index = next((i for i in range(frame.get_n_actions())
+                      if frame.get_action_name(i) == action), None)
+        if index is None or not frame.do_action(index):
+            break
+        deadline = time.monotonic() + 0.5
+        while selected_page(view) == current and time.monotonic() < deadline:
+            time.sleep(0.01)
+    raise ValueError('Ptyxis could not select the session tab')
+
+
+def mark(tty, marker):
+    tty.write(f'\x1b]2;{marker}\x1b\\'.encode())
+
+
+def marked_page(views, tty, marker):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        mark(tty, marker)
+        time.sleep(0.01)
+        for frame, view, title in views:
+            for page in view:
+                if marker in page.get_name():
+                    return frame, view, title, page
+    raise ValueError('Could not identify the Ptyxis tab from its terminal title')
+
+
+def marked_window(tty, marker, list_command):
+    # A busy session can rewrite its title while the tab is being selected.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        mark(tty, marker)
+        time.sleep(0.01)
+        rows = subprocess.check_output([list_command], text=True).splitlines()
+        for row in rows:
+            parts = row.split(None, 4)
+            if len(parts) == 5 and marker in parts[4]:
+                return parts[0]
+    raise ValueError('Could not identify the selected Ptyxis window')
+
+
+def window_id(shell_pid, owner_pid, print_only, list_command):
+    windows = [line.split('\t', 2) for line in sys.stdin.read().splitlines() if line]
+    owned = [wid for wid, pid, _ in windows if int(pid) == owner_pid]
+    if print_only and len(owned) == 1:
+        return owned[0]
+
+    # The child of ptyxis-agent owns the controlling terminal even if the agent
+    # redirects stdin or runs inside a tmux pane with a different TTY.
+    fields = Path(f'/proc/{shell_pid}/stat').read_text().rsplit(') ', 1)[1].split()
+    device = int(fields[4])
+    path = Path(f'/dev/pts/{os.minor(device)}')
+    app = next((app for app in Atspi.get_desktop(0) if app.get_process_id() == owner_pid), None)
+    if app is None:
+        raise ValueError('Ptyxis is unavailable on the accessibility bus')
+    views = []
+    for frame in app:
+        view = tab_view(frame)
+        if view is not None:
+            views.append((frame, view, frame.get_name()))
+
+    if len(owned) == 1 and len(views) == 1 and views[0][1].get_child_count() == 1:
+        return owned[0]
+
+    # VTE saves/restores the title. A per-call marker also works for duplicate
+    # tab titles and sessions whose title bears no relation to the command.
+    marker = 'agent-session-' + uuid.uuid4().hex
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_NOCTTY), 'wb', buffering=0) as tty:
+        if os.fstat(tty.fileno()).st_rdev != device or not tty.isatty():
+            raise ValueError('Ptyxis controlling terminal changed')
+        fcntl.flock(tty, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        tty.write(b'\x1b[22;2t')
+        try:
+            frame, view, title, page = marked_page(views, tty, marker)
+            if print_only:
+                matches = [wid for wid, pid, name in windows
+                           if int(pid) in (0, owner_pid) and name == title]
+                if len(matches) == 1:
+                    return matches[0]
+                if selected_page(view) != page:
+                    raise ValueError('Cannot distinguish Ptyxis windows with the same title')
+            else:
+                select_page(frame, view, page)
+            if len(owned) == 1:
+                return owned[0]
+            return marked_window(tty, marker, list_command)
+        finally:
+            tty.write(b'\x1b[23;2t')
+
+
+if __name__ == '__main__':
+    # Gtk action identifiers are stable across locales. AT-SPI's alternative
+    # to get_action_name() returns a translated display name.
+    warnings.filterwarnings('ignore', message='Atspi.Action.get_action_name is deprecated',
+                            category=DeprecationWarning)
+    try:
+        print(window_id(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == '1', sys.argv[4]))
+    except (OSError, ValueError, GLib.Error, subprocess.CalledProcessError) as exc:
+        sys.exit(f'ERROR: {exc}')

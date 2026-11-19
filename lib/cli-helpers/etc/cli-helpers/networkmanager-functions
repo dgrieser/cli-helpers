@@ -1,0 +1,5 @@
+# NetworkManager runs dispatchers as root. This file and its settings are root-owned.
+dispatcher_value() {
+    awk -v key="${1}" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' \
+        /etc/cli-helpers/networkmanager.conf
+}

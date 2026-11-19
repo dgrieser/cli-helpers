@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+import os
+import re
+import shutil
+import sys
+import argparse
+import argcomplete
+
+# This script converts a color/style specification into ANSI escape codes for Bash.
+#
+# Usage:
+#
+# 1) color-parse "<color_spec>"
+#    Prints the ANSI escape codes for the given spec and nothing else.
+#
+# 2) color-parse "<color_spec>" "Some text"
+#    Prints the ANSI escape codes for the given spec, followed by the text, and then a reset code at the end.
+#
+# 3) color-parse end
+#    Prints the ANSI reset code, useful to end any styling currently in effect.
+#
+# Additionally, if you pipe text into color-parse without providing a 'text' argument,
+# the script will apply the given color spec to the piped text.
+#
+# Examples:
+#   ./color-parse "gray:italic"
+#   ./color-parse "fg=white:bold:underline" "Hello World"
+#   ./color-parse "fg=yellow:bg=red:bold" "Error message"
+#   ./color-parse "#c0ffee" "Colored text"
+#   ./color-parse end
+#
+#   echo -e "hi\n\n" | ./color-parse red
+#
+# If called via a symlink, e.g. "color-text-muted", the script:
+#   - Derives an environment variable name from the symlink name (e.g. "COLOR_TEXT_MUTED")
+#   - Uses the value of that environment variable as the color_spec.
+#   - Prints the color code plus optional text arguments. If no arguments are given and text is piped in,
+#     it will apply the color to the piped text.
+# If called via a symlink starting with "print-", e.g. "print-text-muted", the script:
+#   - Uses the same environment variable lookup as the matching "color-" symlink (e.g. "COLOR_TEXT_MUTED")
+#   - Behaves the same as symlink mode, but always appends a newline.
+#
+# Use `--help` to display this usage message.
+
+RESET = "\033[0m"
+
+STYLES = {
+    'bold': '1',
+    'b': '1',
+    'fuzzy': '2',      # faint
+    'italic': '3',
+    'i': '3',
+    'underline': '4',
+    'u': '4',
+    'blink': '5',
+    'fastblink': '6',
+    'reverse': '7',
+    'invert': '7',
+    'concealed': '8',
+    'hidden': '8',
+    'invisible': '8',
+    'strikethrough': '9',
+}
+
+COLOR_MAP = {
+    # Normal colors
+    'black': 30,
+    'red': 31,
+    'green': 32,
+    'brown': 33,
+    'yellow': 33,  # alias to brown
+    'blue': 34,
+    'magenta': 35,
+    'purple': 35,  # alias to magenta
+    'cyan': 36,
+    'white': 37,
+    'grey': 37,
+    'gray': 37,
+
+    # Dark and light variations
+    'darkgray': 90,
+    'darkgrey': 90,
+    'hiblack': 90,
+    'lightblack': 90,
+
+    'lightred': 91,
+    'hired': 91,
+
+    'lightgreen': 92,
+    'higreen': 92,
+    'lime': 92,
+
+    'lightyellow': 93,
+    'hiyellow': 93,
+    'hibrown': 93,
+    'lightbrown': 93,
+    'gold': 93,
+
+    'lightblue': 94,
+    'hiblue': 94,
+
+    'lightmagenta': 95,
+    'himagenta': 95,
+    'lightpurple': 95,
+    'hipurple': 95,
+
+    'lightcyan': 96,
+    'hicyan': 96,
+
+    'lightwhite': 97,
+    'hiwhite': 97,
+}
+
+
+def fg_codes_from_value(value):
+    # Named color
+    if value in COLOR_MAP:
+        return [str(COLOR_MAP[value])]
+
+    # 256-color
+    if re.match(r'^\d{1,3}$', value):
+        num = int(value)
+        if 0 <= num <= 255:
+            return [f"38;5;{num}"]
+
+    # Hex colors
+    hex_match = re.match(r'^(?:#|0x)?([0-9a-f]{3}|[0-9a-f]{6})$', value, re.IGNORECASE)
+    if hex_match:
+        hex_val = hex_match.group(1)
+        if len(hex_val) == 3:
+            r, g, b = hex_val[0], hex_val[1], hex_val[2]
+            r = r * 2
+            g = g * 2
+            b = b * 2
+        else:
+            r = hex_val[0:2]
+            g = hex_val[2:4]
+            b = hex_val[4:6]
+        R = int(r,16)
+        G = int(g,16)
+        B = int(b,16)
+        return [f"38;2;{R};{G};{B}"]
+
+    # rgb(...) format
+    rgb_match = re.match(r'^rgb\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$', value, re.IGNORECASE)
+    if rgb_match:
+        R = int(rgb_match.group(1))
+        G = int(rgb_match.group(2))
+        B = int(rgb_match.group(3))
+        # Clip values
+        R = max(0, min(255, R))
+        G = max(0, min(255, G))
+        B = max(0, min(255, B))
+        return [f"38;2;{R};{G};{B}"]
+
+    # Maybe it's a style?
+    if value in STYLES:
+        return [STYLES[value]]
+
+    # Unknown
+    return []
+
+
+def bg_codes_from_value(value):
+    if value in COLOR_MAP:
+        code = COLOR_MAP[value]
+        # convert fg code to bg code
+        if 30 <= code <= 37:
+            return [str(code - 30 + 40)]
+        elif 90 <= code <= 97:
+            return [str(code - 90 + 100)]
+
+    # 256-color
+    if re.match(r'^\d{1,3}$', value):
+        num = int(value)
+        if 0 <= num <= 255:
+            return [f"48;5;{num}"]
+
+    # hex colors
+    hex_match = re.match(r'^(?:#|0x)?([0-9a-f]{3}|[0-9a-f]{6})$', value, re.IGNORECASE)
+    if hex_match:
+        hex_val = hex_match.group(1)
+        if len(hex_val) == 3:
+            r, g, b = hex_val[0], hex_val[1], hex_val[2]
+            r = r*2
+            g = g*2
+            b = b*2
+        else:
+            r = hex_val[0:2]
+            g = hex_val[2:4]
+            b = hex_val[4:6]
+        R = int(r,16)
+        G = int(g,16)
+        B = int(b,16)
+        return [f"48;2;{R};{G};{B}"]
+
+    # rgb(...) format
+    rgb_match = re.match(r'^rgb\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$', value, re.IGNORECASE)
+    if rgb_match:
+        R = int(rgb_match.group(1))
+        G = int(rgb_match.group(2))
+        B = int(rgb_match.group(3))
+        R = max(0, min(255, R))
+        G = max(0, min(255, G))
+        B = max(0, min(255, B))
+        return [f"48;2;{R};{G};{B}"]
+
+    # Maybe style?
+    if value in STYLES:
+        return [STYLES[value]]
+
+    return []
+
+
+def style_codes_from_value(value):
+    value = value.strip().lower()
+    return [STYLES[value]] if value in STYLES else []
+
+
+def parse_color_token(token):
+    token = token.strip().lower()
+    if not token:
+        return []
+
+    # Check if it's a raw(...) code
+    if token.startswith('raw(') and token.endswith(')'):
+        inner = token[4:-1].strip()
+        return [inner]
+
+    # Check if it matches fg= or bg=
+    if '=' in token:
+        key, value = token.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key in ('fg', 'foreground'):
+            return fg_codes_from_value(value)
+        elif key in ('bg', 'background'):
+            return bg_codes_from_value(value)
+        else:
+            # If unknown key, try as style
+            return style_codes_from_value(token)
+    else:
+        # Could be a style or a color
+        if token in STYLES:
+            return [STYLES[token]]
+        else:
+            # Consider it a foreground color
+            return fg_codes_from_value(token)
+
+
+def parse_spec(spec):
+    parts = [p.strip() for p in spec.split(':')]
+    codes = []
+    for p in parts:
+        codes.extend(parse_color_token(p))
+    return codes
+
+
+def build_ansi(codes):
+    if not codes:
+        return ""
+    return "\033[" + ";".join(codes) + "m"
+
+
+def main():
+    newline_flags = ('-n', '--newline')
+
+    # Detect if the script was called by a symlink
+    script_name = os.path.basename(sys.argv[0])
+    if script_name != 'color-parse':
+        # Symlink mode
+        # Convert script_name to env var name.
+        # e.g. color-text-muted -> COLOR_TEXT_MUTED
+        #      print-text-muted -> COLOR_TEXT_MUTED
+        lookup_name = script_name
+        force_newline = False
+        if script_name.startswith('print-'):
+            lookup_name = f"color-{script_name[len('print-'):]}"
+            force_newline = True
+
+        env_var = lookup_name.upper().replace('-', '_')
+        color_spec = os.environ.get(env_var)
+
+        if color_spec is None:
+            # No environment variable set for this symlink
+            print(f"Environment variable {env_var} not set.", file=sys.stderr)
+            sys.exit(1)
+
+        # The rest of the arguments are treated as text, except newline flags.
+        text_args = []
+        for arg in sys.argv[1:]:
+            if arg in newline_flags:
+                force_newline = True
+            else:
+                text_args.append(arg)
+        if text_args:
+            text = " ".join(text_args)
+        else:
+            # If no arguments, try to read from stdin
+            if not sys.stdin.isatty():
+                text = sys.stdin.read()
+            else:
+                text = None
+
+        codes = parse_spec(color_spec)
+        ansi_start = build_ansi(codes)
+
+        if text is None or text == '':
+            # Just print the ANSI start codes
+            print(ansi_start, end='\n' if force_newline else '')
+        else:
+            # Print ANSI start, text, and reset
+            print(f"{ansi_start}{text}{RESET}", end='\n' if force_newline else '')
+
+        sys.exit(0)
+
+    # Normal mode (script called as color-parse)
+    parser = argparse.ArgumentParser(
+        description='Convert a color/style specification into ANSI escape codes for Bash.'
+    )
+    parser.add_argument(
+        '-n', '--newline',
+        action='store_true',
+        help='Always print a newline at the end.'
+    )
+    parser.add_argument(
+        'color_spec_or_end',
+        nargs='?',
+        help='Color specification (e.g., "fg=red:bold") or "end" to print ANSI reset code.'
+    )
+    parser.add_argument(
+        'text',
+        nargs='*',
+        help='Optional text to print after applying the ANSI codes.'
+    )
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    # If no args provided, print help and exit
+    if args.color_spec_or_end is None:
+        parser.print_help()
+        sys.exit(1)
+
+    # Handle 'end'
+    if args.color_spec_or_end.lower() == 'end':
+        # Just print RESET
+        print(RESET, end='\n' if args.newline else '')
+        sys.exit(0)
+
+    color_spec = args.color_spec_or_end
+    codes = parse_spec(color_spec)
+    ansi_start = build_ansi(codes)
+
+    text = " ".join(args.text) if args.text else None
+
+    # If no text was provided as args, try to read from stdin
+    if (not text or text.strip() == '') and not sys.stdin.isatty():
+        sys.stdout.write(ansi_start)
+        sys.stdout.flush()
+        shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)
+        sys.stdout.write(RESET)
+        if args.newline:
+            sys.stdout.write('\n')
+        sys.stdout.flush()
+    elif text is None or text == '':
+        # Just print the ANSI start codes
+        print(ansi_start, end='\n' if args.newline else '')
+    else:
+        # Print ANSI start, text, and reset
+        print(f"{ansi_start}{text}{RESET}", end='\n' if args.newline else '')
+
+
+if __name__ == "__main__":
+    main()

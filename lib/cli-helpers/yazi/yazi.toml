@@ -1,0 +1,48 @@
+[mgr]
+show_hidden  = true
+sort_by      = "natural"
+sort_reverse = false
+linemode     = "size_and_mtime"
+
+[preview]
+image        = true
+
+# which-key popup: candidates shown after a prefix key (g, c, m, t, ,)
+[which]
+sort_by        = "key"
+sort_sensitive = false
+sort_reverse   = false
+
+[plugin]
+prepend_previewers = [
+  { url = "*.7z",      run = 'piper -- 7z l "$1"' },
+  { url = "*.apk",     run = 'piper -- 7z l "$1"' },
+  { url = "*.ar",      run = 'piper -- 7z l "$1"' },
+  { url = "*.tar.bz2", run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tar.gz",  run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tar.xz",  run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tar.zst", run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tbz2",    run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tgz",     run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.txz",     run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.tzst",    run = 'piper -- 7z x -so "$1" | 7z l -ttar -si' },
+  { url = "*.bz2",     run = 'piper -- 7z l "$1"' },
+  { url = "*.cab",     run = 'piper -- 7z l "$1"' },
+  { url = "*.deb",     run = 'piper -- 7z l "$1"' },
+  { url = "*.gz",      run = 'piper -- 7z l "$1"' },
+  { url = "*.iso",     run = 'piper -- 7z l "$1"' },
+  { url = "*.jar",     run = 'piper -- 7z l "$1"' },
+  { url = "*.rar",     run = 'piper -- 7z l "$1"' },
+  { url = "*.rpm",     run = 'piper -- 7z l "$1"' },
+  { url = "*.tar",     run = 'piper -- 7z l "$1"' },
+  { url = "*.xz",      run = 'piper -- 7z l "$1"' },
+  { url = "*.zip",     run = 'piper -- 7z l "$1"' },
+  { url = "*.zst",     run = 'piper -- 7z l "$1"' },
+  { url = "*.md", run = 'piper -- CLICOLOR_FORCE=1 glow -w=$w -s=dark "$1"' },
+]
+
+
+prepend_fetchers = [
+  { group = "git", url = "*", run = "git" },
+  { group = "git", url = "*/", run = "git" },
+]

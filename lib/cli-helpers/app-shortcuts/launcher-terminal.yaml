@@ -1,0 +1,7 @@
+# launcher in the default terminal
+description: Terminal launcher
+bindings: ['<Shift><Control>l', 'AudioMedia']
+focus:
+  title: Launcher-Terminal
+launch:
+  desktop: launcher-terminal

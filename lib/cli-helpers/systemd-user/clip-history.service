@@ -1,0 +1,14 @@
+[Unit]
+Description=Clipboard history of clip-history
+# the text copied in GNOME comes from the cli-helpers GNOME extension
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/clip-history watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

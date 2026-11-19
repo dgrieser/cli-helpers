@@ -1,0 +1,24 @@
+// Documentation at https://www.sublimetext.com/docs/themes.html
+{
+	"variables":
+	{
+		"ui_bg": "color(var(base_hue) l(30%))",
+		"button_bg": "color(var(base_hue) l(40%))",
+	},
+	"rules":
+	[
+		{
+			"class": "title_bar",
+			"style": "light"
+		},
+		{
+        	"class": "tab_label",
+        	"font.size": 13,
+        	"font.face": "Ubuntu Bold",
+		},
+		{
+    		"class": "tabset_control",
+    		"tab_height": 42
+		}
+	]
+}

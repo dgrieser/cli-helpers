@@ -1,0 +1,4 @@
+interface:
+  display_name: "Short German Review Comments"
+  short_description: "German inline comments with fixes and approval"
+  default_prompt: "Use $post-comments to prepare extremely short German inline review comments with applicable code suggestions for the current branch's PR/MR. Keep the conversation and approval prompts in English; only review comment prose is German. Show only comment prose and locations for approval, without previewing suggestion code; include applicable suggestions when posting."

@@ -1,0 +1,77 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-h|--help] [--id] [--id-name] [--home]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+name=1
+id=0
+home=0
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --id)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            id=1
+            name=0
+            ;;
+        --id-name)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            id=1
+            name=1
+            ;;
+        --home)
+            [ ${id} -eq 1 ] && usage
+            [ ${home} -eq 1 ] && usage
+            [ ${name} -eq 0 ] && usage
+            home=1
+            name=0
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+# the user of the graphical session
+user=""
+command -v w >/dev/null 2>&1 && user="$(w -hu | grep -m 1 'session' | awk '{print $1}')"
+# without one, e.g. on a Raspberry Pi reached by SSH, the user running this, or
+# the one who ran it with sudo; SUDO_USER only when it names a user, as a caller
+# may have reused the variable
+if [ -z "${user}" ]; then
+    if [ "${EUID}" -ne 0 ]; then
+        user="$(id -un)"
+    elif [ -n "${SUDO_USER}" ] && [ "${SUDO_USER}" != "root" ] && id -u -- "${SUDO_USER}" >/dev/null 2>&1; then
+        user="${SUDO_USER}"
+    fi
+fi
+[ -z "${user}" ] && fail "no user logged in"
+home_dir="$(awk -F: -v user="${user}" '$1 == user { print $6; exit }' /etc/passwd)"
+[ ${home} -eq 1 ] && [ -z "${home_dir}" ] && fail "no home directory found for user ${user}"
+
+output=()
+[ ${id} -eq 1 ] && output+=( "$(id -u "${user}")" )
+[ ${name} -eq 1 ] && output+=( "${user}" )
+[ ${home} -eq 1 ] && output+=( "${home_dir}" )
+
+echo "${output[@]}" | tr ' ' ':'
+
+exit 0

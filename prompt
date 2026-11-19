@@ -1,0 +1,1878 @@
+#!/usr/bin/env python3
+"""Read input from the terminal: lines, a secret, a confirmation or a choice of a list.
+
+This file is installed twice: as the `prompt` command (with its aliases such as
+`prompt-input` and `prompt-select`) and, under the name `prompt.py`, into a
+directory on sys.path (see MODULES in the Makefile). Python tools can therefore
+ask in-process with `input_line()`, `multiline()`, `password()`, `confirm()`,
+`select()` and `complete()`, or with `run()` for any other option, instead of
+running the command.
+"""
+
+import io
+import os
+import sys
+import re
+import argparse
+import codecs
+import getpass
+import math
+import select as select_syscall
+import shutil
+import termios
+import time
+import tty
+
+RESET = '\033[0m'
+HIDE_CURSOR = '\033[?25l'
+SHOW_CURSOR = '\033[?25h'
+CLEAR_TO_END = '\033[J'
+POINTER = '❯'
+ELLIPSIS = '…'
+TAB_WIDTH = 4
+SEPARATOR = ' · '
+ESCAPE_TIMEOUT = 0.05
+# CSI sequences, the only escapes a caller is likely to hand in with a prompt
+ANSI_PATTERN = re.compile(r'\033\[[0-9;:?]*[ -/]*[@-~]')
+# A quoted (or backticked) span inside a prompt reads as an inline code snippet.
+# The quote has to open after a space or an opening bracket and close before a
+# space or punctuation, so an apostrophe in "the user's file" is left alone.
+CODE_PATTERN = re.compile(r'(?<![^\s([{<])(["\'`])(?!\s)((?:(?!\1).)+?)(?<!\s)\1(?![^\s)\]}>,.;:!?])')
+
+STYLES = {
+    'bold': '1',
+    'b': '1',
+    'fuzzy': '2',
+    'faint': '2',
+    'dim': '2',
+    'italic': '3',
+    'i': '3',
+    'underline': '4',
+    'u': '4',
+    'blink': '5',
+    'reverse': '7',
+    'invert': '7',
+    'hidden': '8',
+    'strikethrough': '9',
+}
+
+COLOR_MAP = {
+    'black': 30,
+    'red': 31,
+    'green': 32,
+    'brown': 33,
+    'yellow': 33,
+    'blue': 34,
+    'magenta': 35,
+    'purple': 35,
+    'cyan': 36,
+    'white': 37,
+    'grey': 37,
+    'gray': 37,
+    'darkgray': 90,
+    'darkgrey': 90,
+    'lightred': 91,
+    'lightgreen': 92,
+    'lightyellow': 93,
+    'lightblue': 94,
+    'lightmagenta': 95,
+    'lightcyan': 96,
+    'lightwhite': 97,
+}
+
+# Fallbacks used when the matching COLOR_* environment variable is unset,
+# so the interactive modes still look sane outside a themed shell.
+THEME_DEFAULTS = {
+    'COLOR_TEXT_DEFAULT': '255',
+    'COLOR_TEXT_BOLD': '255:bold',
+    'COLOR_TEXT_MUTED': '183:italic',
+    'COLOR_TEXT_MUTED_FADED': '245:italic',
+    'COLOR_TEXT_FADED': '245',
+    'COLOR_TEXT_INFO': '141',
+    'COLOR_TEXT_NUMERIC': '245',
+    'COLOR_TEXT_SUCCESS': '40',
+    'COLOR_TEXT_ERROR': '160:bold',
+    # glow renders `code` in 203 on 236, padded with a space on either side
+    'COLOR_TEXT_CODE': '203:bg=236',
+    'COLOR_TABLE_HEADER': '250:bold',
+    'COLOR_SELECTION_BACKGROUND': '0',
+}
+
+CSI_KEYS = {
+    'A': 'up',
+    'B': 'down',
+    'C': 'right',
+    'D': 'left',
+    'H': 'home',
+    'F': 'end',
+    'Z': 'backtab',
+    '1~': 'home',
+    '2~': 'insert',
+    '3~': 'delete',
+    '4~': 'end',
+    '5~': 'pageup',
+    '6~': 'pagedown',
+    '7~': 'home',
+    '8~': 'end',
+}
+
+CTRL_KEYS = {
+    '\x01': 'home',
+    '\x02': 'left',
+    '\x03': 'ctrl-c',
+    '\x04': 'ctrl-d',
+    '\x05': 'end',
+    '\x06': 'right',
+    '\x08': 'backspace',
+    '\x09': 'tab',
+    '\x0a': 'enter',
+    '\x0b': 'ctrl-k',
+    '\x0d': 'enter',
+    '\x0e': 'down',
+    '\x10': 'up',
+    '\x15': 'ctrl-u',
+    '\x17': 'ctrl-w',
+    '\x7f': 'backspace',
+}
+
+
+def color_codes(value, background=False):
+    offset = 10 if background else 0
+    base = '48' if background else '38'
+    low = value.lower()
+    if low in COLOR_MAP:
+        return [str(COLOR_MAP[low] + offset)]
+    if re.fullmatch(r'\d{1,3}', value) and int(value) <= 255:
+        return [base, '5', value]
+    hex_match = re.fullmatch(r'#?([0-9a-fA-F]{6})', value)
+    if hex_match:
+        digits = hex_match.group(1)
+        return [base, '2', str(int(digits[0:2], 16)), str(int(digits[2:4], 16)), str(int(digits[4:6], 16))]
+    return []
+
+
+def ansi(spec):
+    if not spec:
+        return ''
+    codes = []
+    for token in str(spec).split(':'):
+        token = token.strip()
+        if not token:
+            continue
+        low = token.lower()
+        if low in STYLES:
+            codes.append(STYLES[low])
+            continue
+        background = False
+        if low.startswith('fg='):
+            token = token[3:]
+        elif low.startswith('bg='):
+            token = token[3:]
+            background = True
+        codes.extend(color_codes(token, background))
+    if not codes:
+        return ''
+    return '\033[' + ';'.join(codes) + 'm'
+
+
+def strip_ansi(text):
+    return ANSI_PATTERN.sub('', text)
+
+
+def visible_length(text):
+    # escape sequences take up no columns, so the cursor math and the layout
+    # have to measure what ends up on screen, not what is in the string
+    return len(strip_ansi(text))
+
+
+def pad(text, width):
+    return text + ' ' * max(0, width - visible_length(text))
+
+
+def truncate(text, width):
+    if width <= 0:
+        return ''
+    if visible_length(text) <= width:
+        return text
+    if width == 1:
+        return ELLIPSIS
+    if '\033' not in text:
+        return text[:width - 1] + ELLIPSIS
+    # spend the budget on the visible characters only and close the styling
+    # off where the text is cut, so no half escape sequence survives
+    limit = width - 1
+    result = ''
+    visible = 0
+    index = 0
+    while index < len(text) and visible < limit:
+        match = ANSI_PATTERN.match(text, index)
+        if match:
+            result += match.group(0)
+            index = match.end()
+            continue
+        result += text[index]
+        visible += 1
+        index += 1
+    return result + RESET + ELLIPSIS
+
+
+def colors_enabled(stream):
+    if os.environ.get('NO_COLOR') is not None:
+        return False
+    if os.environ.get('TERM', '') in ('', 'dumb'):
+        return False
+    try:
+        return stream is not None and stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+class Theme:
+    # Named roles, resolved from the same COLOR_* variables the color-parse
+    # symlink family uses, so prompts match the rest of the tools.
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        selection = self.spec('COLOR_SELECTION_BACKGROUND')
+        highlight = self.combine(self.spec('COLOR_TEXT_INFO'), 'bold')
+        self.roles = {
+            # the question itself carries the accent color, the answer stays
+            # unstyled so it reads like ordinary terminal input
+            'title': highlight,
+            'header': self.spec('COLOR_TABLE_HEADER'),
+            'item': self.spec('COLOR_TEXT_DEFAULT'),
+            'number': self.spec('COLOR_TEXT_NUMERIC'),
+            'key': self.spec('COLOR_TEXT_MUTED'),
+            'hint': self.spec('COLOR_TEXT_FADED'),
+            'ghost': self.spec('COLOR_TEXT_FADED'),
+            'result': self.spec('COLOR_TEXT_SUCCESS'),
+            'error': self.spec('COLOR_TEXT_ERROR'),
+            'code': self.spec('COLOR_TEXT_CODE'),
+            'pointer': highlight,
+            'selected': self.combine(highlight, 'bg=' + selection if selection else ''),
+        }
+
+    def spec(self, name):
+        value = os.environ.get(name)
+        if not value:
+            value = THEME_DEFAULTS.get(name, '')
+        return value
+
+    def combine(self, *specs):
+        return ':'.join([spec for spec in specs if spec])
+
+    def paint(self, role, text):
+        if not self.enabled or not text:
+            return text
+        code = ansi(self.roles.get(role, ''))
+        if not code:
+            return text
+        return code + text + RESET
+
+
+class Terminal:
+    def __init__(self):
+        self.in_fd = None
+        self.out = None
+        self.reader = None
+        self._in_file = None
+        self._out_file = None
+
+    def open(self):
+        if sys.stdin is not None and sys.stdin.isatty():
+            self.in_fd = sys.stdin.fileno()
+        else:
+            try:
+                self._in_file = open('/dev/tty', 'rb', buffering=0)
+            except OSError:
+                return False
+            self.in_fd = self._in_file.fileno()
+        if sys.stderr is not None and sys.stderr.isatty():
+            self.out = sys.stderr
+        else:
+            try:
+                self._out_file = open('/dev/tty', 'w')
+                self.out = self._out_file
+            except OSError:
+                return False
+        self.reader = KeyReader(self.in_fd)
+        return True
+
+    def close(self):
+        for handle in (self._in_file, self._out_file):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    def supports_color(self):
+        return colors_enabled(self.out)
+
+    def size(self):
+        try:
+            size = os.get_terminal_size(self.out.fileno())
+            return size.columns, size.lines
+        except (OSError, ValueError, AttributeError):
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            return size.columns, size.lines
+
+    def write(self, text):
+        self.out.write(text)
+
+    def flush(self):
+        self.out.flush()
+
+    def read_key(self):
+        return self.reader.read()
+
+    def input_pending(self):
+        return self.reader.pending()
+
+    def wait_input(self, timeout):
+        return self.reader.wait(timeout)
+
+
+class KeyReader:
+    def __init__(self, fd):
+        self.fd = fd
+        self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self.buffer = ''
+
+    def _fill(self, timeout=None):
+        if timeout is not None:
+            try:
+                ready, _, _ = select_syscall.select([self.fd], [], [], timeout)
+            except OSError:
+                return False
+            if not ready:
+                return False
+        try:
+            data = os.read(self.fd, 128)
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.buffer += self.decoder.decode(data)
+        return True
+
+    def _next_char(self, timeout=None):
+        while not self.buffer:
+            if not self._fill(timeout):
+                return ''
+        char = self.buffer[0]
+        self.buffer = self.buffer[1:]
+        return char
+
+    def _read_escape(self):
+        lead = self._next_char(ESCAPE_TIMEOUT)
+        if not lead:
+            return ('esc', '')
+        if lead not in ('[', 'O'):
+            return ('alt', lead)
+        sequence = ''
+        while True:
+            char = self._next_char(ESCAPE_TIMEOUT)
+            if not char:
+                break
+            sequence += char
+            if char == '~' or char.isalpha():
+                break
+        name = CSI_KEYS.get(sequence)
+        if name is None and sequence:
+            final = sequence[-1]
+            if final == '~':
+                digits = re.match(r'(\d+)', sequence)
+                if digits:
+                    name = CSI_KEYS.get(digits.group(1) + '~')
+            else:
+                name = CSI_KEYS.get(final)
+        if name:
+            return (name, '')
+        return ('unknown', '\033' + lead + sequence)
+
+    def pending(self):
+        # already decoded input, or bytes waiting to be read right now
+        return bool(self.buffer) or self._fill(0)
+
+    def wait(self, timeout):
+        # like pending, but waits up to timeout seconds for the bytes to arrive
+        return bool(self.buffer) or self._fill(timeout)
+
+    def read(self):
+        char = self._next_char()
+        if not char:
+            return ('eof', '')
+        if char == '\033':
+            return self._read_escape()
+        if char == '\r':
+            # a pasted CRLF is one line break, not two: drop the trailing LF
+            if not self.buffer:
+                self._fill(0)
+            if self.buffer[:1] == '\n':
+                self.buffer = self.buffer[1:]
+            return ('enter', '')
+        if char in CTRL_KEYS:
+            return (CTRL_KEYS[char], '')
+        if char < ' ':
+            return ('unknown', char)
+        return ('char', char)
+
+
+class Renderer:
+    # Draws a block of lines and redraws it in place. The cursor is kept on a
+    # known row so the next frame can move back to the top of the block.
+    def __init__(self, term):
+        self.term = term
+        self.active = False
+        self.cursor_row = 0
+
+    def _to_block_start(self):
+        if not self.active:
+            return
+        if self.cursor_row > 0:
+            self.term.write('\033[' + str(self.cursor_row) + 'A')
+        self.term.write('\r')
+
+    def draw(self, lines, cursor_line=None, cursor_col=0):
+        self._to_block_start()
+        self.term.write(CLEAR_TO_END)
+        self.term.write('\r\n'.join(lines))
+        row = len(lines) - 1
+        if cursor_line is not None:
+            up = row - cursor_line
+            if up > 0:
+                self.term.write('\033[' + str(up) + 'A')
+            self.term.write('\r')
+            if cursor_col > 0:
+                self.term.write('\033[' + str(cursor_col) + 'C')
+            row = cursor_line
+        self.cursor_row = row
+        self.active = True
+        self.term.flush()
+
+    def clear(self):
+        if not self.active:
+            return
+        self._to_block_start()
+        self.term.write(CLEAR_TO_END)
+        self.active = False
+        self.cursor_row = 0
+        self.term.flush()
+
+
+def raw_mode(fd):
+    old_settings = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return old_settings
+
+
+def restore_mode(fd, old_settings):
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def parse_items(entries, delimiter, split_pattern=None, key_pattern=None):
+    items = []
+    for entry in entries:
+        key = entry
+        title = entry
+        if key_pattern is not None:
+            # the key is extracted, the whole entry stays the title
+            match = key_pattern.search(entry)
+            if match:
+                found = match.group(1) if match.lastindex else match.group(0)
+                key = found.strip() or entry
+        else:
+            match = split_pattern.search(entry) if split_pattern is not None else None
+            if match is not None and match.end() > match.start():
+                key = entry[:match.start()]
+                title = entry[match.end():]
+            elif split_pattern is None and delimiter and delimiter in entry:
+                key, title = entry.split(delimiter, 1)
+            else:
+                items.append((key, title))
+                continue
+            key = key.strip()
+            title = title.strip()
+            if not key:
+                key = title
+            if not title:
+                title = key
+        items.append((key, title))
+    return items
+
+
+def split_prompt(prompt):
+    # "Do it? [y/N]:" -> text "Do it?", separator " ", options "[y/N]", tail ":"
+    body = prompt
+    tail = ''
+    while body and body[-1] in ' \t:':
+        tail = body[-1] + tail
+        body = body[:-1]
+    options = ''
+    if body.endswith(']'):
+        start = body.rfind('[')
+        if start >= 0:
+            options = body[start:]
+            body = body[:start]
+    text = body.rstrip()
+    separator = body[len(text):]
+    return text, separator, options, tail
+
+
+def paint_options(theme, options):
+    # the brackets and the alternatives stay muted, the default one (spelled
+    # in upper case, as in "[y/N]") is highlighted
+    result = ''
+    buffer = ''
+    buffer_role = None
+    for char in options:
+        role = 'item' if char.isalpha() and char.isupper() else 'hint'
+        if role == buffer_role:
+            buffer += char
+            continue
+        result += theme.paint(buffer_role, buffer) if buffer else ''
+        buffer = char
+        buffer_role = role
+    if buffer:
+        result += theme.paint(buffer_role, buffer)
+    return result
+
+
+def paint_code_spans(theme, role, text):
+    # Quoted spans are drawn like glow draws `code`: the quotes themselves become
+    # the space padding of the snippet, so the prompt keeps the width of the text
+    # the caller handed in and the cursor math downstream stays correct.
+    if not theme.enabled or not text:
+        return theme.paint(role, text)
+    code = ansi(theme.roles.get('code', ''))
+    if not code:
+        return theme.paint(role, text)
+    result = ''
+    position = 0
+    for match in CODE_PATTERN.finditer(text):
+        result += theme.paint(role, text[position:match.start()])
+        result += code + ' ' + match.group(2) + ' ' + RESET
+        position = match.end()
+    if not position:
+        return theme.paint(role, text)
+    return result + theme.paint(role, text[position:])
+
+
+def paint_prompt(theme, prompt, default=''):
+    # only the question itself is emphasized; the "[y/N]" options, the
+    # "(default)" hint and the trailing colon stay muted
+    text, separator, options, tail = split_prompt(prompt)
+    if default and not tail:
+        tail = ':'
+    parts = []
+    if text:
+        # a fully parenthesized prompt is an instruction, not a question, e.g.
+        # the multi-line mode's "(Press Ctrl-D when done)"
+        role = 'hint' if text.startswith('(') and text.endswith(')') else 'title'
+        parts.append(paint_code_spans(theme, role, text))
+    if default:
+        parts.append(' ' + theme.paint('hint', '(' + default + ')'))
+    if options:
+        parts.append(separator + paint_options(theme, options))
+    if tail:
+        parts.append(theme.paint('hint', tail))
+    return ''.join(parts)
+
+
+def paint_prompt_char(theme, prompt_char):
+    stripped = prompt_char.rstrip()
+    if not stripped:
+        return prompt_char
+    return theme.paint('pointer', stripped) + prompt_char[len(stripped):]
+
+
+def build_head(theme, prompt, prompt_display, prompt_char):
+    # What the terminal actually shows in front of the input, and how wide that
+    # is. The width is measured on the painted prompt, not on the string the
+    # caller handed in: the "(default)" hint only sits in the painted one, so
+    # measuring the other string moves the cursor away from the text. A prompt
+    # that already ends in a space brings its own separator.
+    head = ''
+    if prompt:
+        head = prompt_display
+        if not strip_ansi(prompt_display).endswith(' '):
+            head += ' '
+    head += paint_prompt_char(theme, prompt_char)
+    return head, visible_length(head)
+
+
+def compile_pattern(pattern, option):
+    if pattern is None:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as error:
+        print('ERROR: ' + option + ' is not a valid regular expression: ' + str(error), file=sys.stderr)
+        sys.exit(1)
+
+
+def unique(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def path_label(candidate):
+    # only the component being completed is shown in the menu, the shared
+    # directory prefix would just be truncated away
+    trimmed = candidate[:-1] if candidate.endswith('/') else candidate
+    name = trimmed.rsplit('/', 1)[-1]
+    return name + '/' if candidate.endswith('/') else name
+
+
+def path_candidates(text, dirs_only=False, limit=1000):
+    # Completes one path component at a time: directories come back with a
+    # trailing slash, so the next completion descends into them.
+    separator = text.rfind('/')
+    if separator < 0:
+        base = ''
+        partial = text
+    else:
+        base = text[:separator + 1]
+        partial = text[separator + 1:]
+    directory = os.path.expanduser(base) if base else '.'
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    candidates = []
+    for name in names:
+        if partial:
+            if not name.startswith(partial):
+                continue
+        elif name.startswith('.'):
+            # hidden entries only show up once a dot was typed
+            continue
+        is_dir = os.path.isdir(os.path.join(directory, name))
+        if dirs_only and not is_dir:
+            continue
+        candidates.append(base + name + ('/' if is_dir else ''))
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def match_candidates(text, candidates, ignore_case=False, substring=False):
+    if not text:
+        return list(candidates)
+    needle = text.lower() if ignore_case else text
+    matches = []
+    for candidate in candidates:
+        haystack = candidate.lower() if ignore_case else candidate
+        if substring:
+            if needle in haystack:
+                matches.append(candidate)
+        elif haystack.startswith(needle):
+            matches.append(candidate)
+    return matches
+
+
+def common_prefix(values):
+    if not values:
+        return ''
+    prefix = values[0]
+    for value in values[1:]:
+        limit = min(len(prefix), len(value))
+        index = 0
+        while index < limit and prefix[index] == value[index]:
+            index += 1
+        prefix = prefix[:index]
+        if not prefix:
+            break
+    return prefix
+
+
+def visible_window(index, count, view):
+    offset = 0
+    if index >= view:
+        offset = index - view + 1
+    offset = max(0, min(offset, max(0, count - view)))
+    return offset
+
+
+def render_select(theme, width, prompt, header, items, pointer, index, offset, view, show_keys, cycling=False,
+                  numbers=None, total=None, query=None, checked=None):
+    lines = []
+    if prompt:
+        lines.append(paint_prompt(theme, truncate(prompt, width)))
+    # what has been typed to filter by: the label faded, the text itself plain
+    if query:
+        lines.append(theme.paint('hint', 'filter: ') + truncate(query, width - len('filter: ')))
+    count = len(items)
+    # a filtered list keeps the numbers the items have in the whole list, so a
+    # row does not change its number while the filter is typed
+    number_width = len(str(total if total is not None else count))
+    marker_width = visible_length(pointer) + 1
+    # in multi mode every row has a checkbox in front of its title
+    box_width = 4 if checked is not None else 0
+    # indent the header so its columns line up with the item titles below it
+    header_indent = ' ' * (marker_width + number_width + 2 + box_width)
+    for line in header:
+        lines.append(header_indent + theme.paint('header', truncate(line, width - len(header_indent))))
+    for position in range(offset, min(offset + view, count)):
+        key, title = items[position]
+        selected = position == index
+        marker = (pointer + ' ') if selected else ' ' * marker_width
+        number = str((numbers[position] if numbers else position) + 1).rjust(number_width)
+        suffix = '  (' + key + ')' if show_keys and key != title else ''
+        box = ('[x] ' if position in checked else '[ ] ') if checked is not None else ''
+        available = width - marker_width - number_width - 2 - box_width
+        text = truncate(title, available - len(suffix))
+        if selected:
+            row = marker + number + '  ' + box + text + suffix
+            lines.append(theme.paint('selected', pad(row, width)))
+        else:
+            box = theme.paint('result' if position in checked else 'hint', box) if checked is not None else ''
+            row = marker + theme.paint('number', number) + '  ' + box + theme.paint('item', text)
+            if suffix:
+                row += theme.paint('key', suffix)
+            lines.append(row)
+    if query is not None and not count:
+        lines.append(theme.paint('hint', '(nothing matches)'))
+    hints = ['↑/↓ move']
+    if query is not None:
+        hints.append('type to filter')
+    elif count > 1:
+        hints.append('1-9 jump')
+    if cycling:
+        hints.append('tab cycle')
+    if checked is not None:
+        hints.append('space toggle')
+        hints.append('a all')
+        hints.append(str(len(checked)) + ' checked')
+        hints.append('enter confirm')
+    else:
+        hints.append('enter select')
+    hints.append('esc clear' if query else 'esc abort')
+    hint = SEPARATOR.join(hints)
+    if count > view:
+        hint = hint + SEPARATOR + str(index + 1) + '/' + str(count)
+    lines.append(theme.paint('hint', truncate(hint, width)))
+    return lines
+
+
+# The rows the cursor walks through are not the items themselves: a cycle group
+# collapses several items into one row, which shows the one it is currently on.
+# selection says which that is per row, and tab moves it.
+def matching_variants(items, row, query):
+    # Every word must match the same item, rather than separate cycle variants.
+    words = query.lower().split()
+    matches = []
+    for variant, member in enumerate(row):
+        text = (items[member][0] + ' ' + items[member][1]).lower()
+        if all(word in text for word in words):
+            matches.append(variant)
+    return matches
+
+
+# With `filtering`, typed characters narrow the list down instead of being
+# shortcuts (j/k, g/G, q and the digits), so they can be part of the filter.
+# The cursor then walks the rows that match; what is returned is always the
+# position of the row in the whole list.
+def run_select(term, theme, prompt, header, items, rows, selection, pointer, index, show_keys, max_height,
+               filtering=False, checked=None):
+    renderer = Renderer(term)
+    total = len(rows)
+    cycling = any(len(row) > 1 for row in rows)
+    query = '' if filtering else None
+    visible = list(range(total))
+    variants = [list(range(len(row))) for row in rows]
+    term.write(HIDE_CURSOR)
+    try:
+        while True:
+            count = len(visible)
+            width, screen_rows = term.size()
+            width = max(20, width - 1)
+            reserved = 3 + len(header) + (1 if query else 0) + (1 if query is not None and not count else 0)
+            view = max_height if max_height > 0 else max(1, screen_rows - reserved)
+            view = max(1, min(view, max(count, 1)))
+            offset = visible_window(index, count, view)
+            shown = [items[rows[position][selection[position]]] for position in visible]
+            renderer.draw(render_select(theme, width, prompt, header, shown, pointer, index, offset, view, show_keys,
+                                        cycling, numbers=visible, total=total, query=query, checked=checked))
+            key, char = term.read_key()
+            if key == 'ctrl-c':
+                renderer.clear()
+                raise KeyboardInterrupt
+            if filtering and key in ('char', 'backspace', 'ctrl-u', 'ctrl-w', 'esc') and (query or key == 'char'):
+                if key == 'char':
+                    query += char
+                elif key == 'backspace':
+                    query = query[:-1]
+                elif key == 'ctrl-w':
+                    query = re.sub(r'\S*\s*$', '', query.rstrip())
+                else:
+                    query = ''
+                # stay on the row the cursor was on, as long as it still matches
+                current = visible[index] if visible else None
+                variants = [matching_variants(items, row, query) for row in rows]
+                visible = [position for position in range(total) if variants[position]]
+                for position in visible:
+                    if selection[position] not in variants[position]:
+                        selection[position] = variants[position][0]
+                index = visible.index(current) if current in visible else 0
+                continue
+            if key in ('esc', 'eof', 'ctrl-d') or (key == 'char' and char == 'q'):
+                renderer.clear()
+                return None
+            if not count:
+                continue
+            if key == 'enter':
+                renderer.clear()
+                # multi mode has no filter and no cycle rows: a position is an item
+                return sorted(checked) if checked is not None else visible[index]
+            if checked is not None and key == 'char' and char in (' ', 'a'):
+                if char == ' ':
+                    checked ^= {visible[index]}
+                elif len(checked) == total:
+                    checked.clear()
+                else:
+                    checked.update(range(total))
+                continue
+            if key in ('tab', 'backtab') and len(rows[visible[index]]) > 1:
+                step = 1 if key == 'tab' else -1
+                row = visible[index]
+                matches = variants[row]
+                current_variant = matches.index(selection[row])
+                selection[row] = matches[(current_variant + step) % len(matches)]
+            elif key == 'up' or (key == 'char' and char == 'k'):
+                index = (index - 1) % count
+            elif key == 'down' or (key == 'char' and char == 'j'):
+                index = (index + 1) % count
+            elif key == 'pageup':
+                index = max(0, index - view)
+            elif key == 'pagedown':
+                index = min(count - 1, index + view)
+            elif key == 'home' or (key == 'char' and char == 'g'):
+                index = 0
+            elif key == 'end' or (key == 'char' and char == 'G'):
+                index = count - 1
+            elif key == 'char' and char.isdigit():
+                target = 9 if char == '0' else int(char) - 1
+                if target < count:
+                    index = target
+    finally:
+        term.write(SHOW_CURSOR)
+        term.flush()
+
+
+def scroll_line(text, cursor, available):
+    # keep the cursor inside the visible part of an over-long line
+    start = 0
+    if cursor > available - 1:
+        start = cursor - (available - 1)
+    return text[start:start + available], cursor - start
+
+
+def render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset, view):
+    frame = []
+    if prompt:
+        frame.append(paint_prompt(theme, truncate(prompt, width)))
+    char_display = paint_prompt_char(theme, prompt_char)
+    char_width = visible_length(prompt_char)
+    available = max(1, width - char_width)
+    cursor_line = len(frame)
+    cursor_col = char_width
+    for index in range(offset, min(offset + view, len(lines))):
+        # tabs are kept in the buffer but drawn expanded, so the column math
+        # matches what the terminal shows
+        expanded = lines[index].expandtabs(TAB_WIDTH)
+        if index == row:
+            cursor_line = len(frame)
+            visible, cursor_offset = scroll_line(expanded, len(lines[index][:col].expandtabs(TAB_WIDTH)), available)
+            cursor_col = char_width + cursor_offset
+        else:
+            visible = truncate(expanded, available)
+        frame.append(char_display + visible)
+    if len(lines) > view:
+        frame.append(theme.paint('hint', truncate(str(row + 1) + '/' + str(len(lines)), width)))
+    return frame, cursor_line, cursor_col
+
+
+def run_multiline(term, theme, prompt, prompt_char, max_height, prefill=''):
+    renderer = Renderer(term)
+    lines = prefill.split('\n') if prefill else ['']
+    row = len(lines) - 1
+    col = len(lines[row])
+    desired_col = col
+    while True:
+        width, rows = term.size()
+        width = max(20, width - 1)
+        view = max_height if max_height > 0 else max(1, rows - 2)
+        view = max(1, min(view, len(lines)))
+        offset = visible_window(row, len(lines), view)
+        # a paste arrives as a burst of keys; drawing every intermediate state
+        # would only flicker, so redraw once the burst is through
+        if not term.input_pending():
+            frame, cursor_line, cursor_col = render_multiline(theme, width, prompt, prompt_char, lines, row, col, offset, view)
+            renderer.draw(frame, cursor_line=cursor_line, cursor_col=cursor_col)
+        key, char = term.read_key()
+
+        if key == 'ctrl-c':
+            renderer.clear()
+            raise KeyboardInterrupt
+        if key in ('ctrl-d', 'eof'):
+            renderer.clear()
+            return lines
+
+        if key == 'enter':
+            tail = lines[row][col:]
+            lines[row] = lines[row][:col]
+            lines.insert(row + 1, tail)
+            row += 1
+            col = 0
+        elif key == 'char':
+            lines[row] = lines[row][:col] + char + lines[row][col:]
+            col += 1
+        elif key == 'tab':
+            lines[row] = lines[row][:col] + '\t' + lines[row][col:]
+            col += 1
+        elif key == 'backspace':
+            if col > 0:
+                lines[row] = lines[row][:col - 1] + lines[row][col:]
+                col -= 1
+            elif row > 0:
+                col = len(lines[row - 1])
+                lines[row - 1] += lines[row]
+                del lines[row]
+                row -= 1
+        elif key == 'delete':
+            if col < len(lines[row]):
+                lines[row] = lines[row][:col] + lines[row][col + 1:]
+            elif row < len(lines) - 1:
+                lines[row] += lines[row + 1]
+                del lines[row + 1]
+        elif key == 'left':
+            if col > 0:
+                col -= 1
+            elif row > 0:
+                row -= 1
+                col = len(lines[row])
+        elif key == 'right':
+            if col < len(lines[row]):
+                col += 1
+            elif row < len(lines) - 1:
+                row += 1
+                col = 0
+        elif key in ('up', 'down', 'pageup', 'pagedown'):
+            step = {'up': -1, 'down': 1, 'pageup': -view, 'pagedown': view}[key]
+            target = min(max(row + step, 0), len(lines) - 1)
+            if target == row:
+                col = 0 if step < 0 else len(lines[row])
+            else:
+                row = target
+                col = min(desired_col, len(lines[row]))
+        elif key == 'home':
+            col = 0
+        elif key == 'end':
+            col = len(lines[row])
+        elif key == 'ctrl-u':
+            lines[row] = lines[row][col:]
+            col = 0
+        elif key == 'ctrl-k':
+            lines[row] = lines[row][:col]
+        elif key == 'ctrl-w':
+            head = lines[row][:col].rstrip()
+            position = max(head.rfind(' '), head.rfind('\t')) + 1
+            lines[row] = lines[row][:position] + lines[row][col:]
+            col = position
+
+        if key not in ('up', 'down', 'pageup', 'pagedown'):
+            desired_col = col
+
+
+def render_complete(theme, width, head, head_width, text, cursor, ghost, menu_labels, menu_index, view):
+    available = max(1, width - head_width)
+    start = 0
+    if len(text) + len(ghost) > available:
+        ghost = ''
+        if cursor > available - 1:
+            start = cursor - (available - 1)
+    visible = text[start:start + available]
+    if len(visible) + len(ghost) > available:
+        ghost = ghost[:max(0, available - len(visible))]
+    lines = [head + visible + (theme.paint('ghost', ghost) if ghost else '')]
+    cursor_col = head_width + (cursor - start)
+    if menu_labels:
+        count = len(menu_labels)
+        view = max(1, min(view, count))
+        offset = visible_window(menu_index, count, view)
+        marker_width = len(POINTER) + 1
+        for position in range(offset, min(offset + view, count)):
+            selected = position == menu_index
+            marker = (POINTER + ' ') if selected else ' ' * marker_width
+            candidate = truncate(menu_labels[position], width - marker_width)
+            if selected:
+                lines.append(theme.paint('selected', pad(marker + candidate, width)))
+            else:
+                lines.append(marker + theme.paint('item', candidate))
+        hint = SEPARATOR.join(['↑/↓ choose', 'tab next', 'enter accept', 'esc close'])
+        if count > view:
+            hint = hint + SEPARATOR + str(menu_index + 1) + '/' + str(count)
+        lines.append(theme.paint('hint', truncate(hint, width)))
+    return lines, cursor_col
+
+
+class PromptTimeout(Exception):
+    # the --timeout countdown ran out before a key was pressed; carries the
+    # input as it stood, which is accepted like Enter
+    def __init__(self, text):
+        super().__init__(text)
+        self.text = text
+
+
+def run_complete(term, theme, prompt, prompt_display, prompt_char, provider, prefill, ignore_case, substring, max_height, label=None, esc_aborts=True,
+                 timeout=None, timeout_label='(default in {}s)'):
+    renderer = Renderer(term)
+    # the countdown only runs until the first key, the user answers in peace then
+    deadline = time.monotonic() + timeout if timeout else None
+    head, head_width = build_head(theme, prompt, prompt_display, prompt_char)
+    text = prefill
+    cursor = len(text)
+    menu = None
+    menu_index = 0
+    menu_base = ''
+
+    def matches_for(value):
+        # the provider may look up candidates for the current input, which is
+        # what lets path completion descend into directories
+        return match_candidates(value, provider(value), ignore_case, substring)
+
+    def ghost_for(value):
+        if substring or menu or not value or cursor != len(value):
+            return ''
+        found = matches_for(value)
+        if not found:
+            return ''
+        prefix = common_prefix(found)
+        if len(prefix) <= len(value):
+            return ''
+        if prefix[:len(value)] != value:
+            return ''
+        return prefix[len(value):]
+
+    while True:
+        width, rows = term.size()
+        width = max(20, width - 1)
+        view = max_height if max_height > 0 else max(1, rows - 3)
+        if not term.input_pending():
+            menu_labels = [label(entry) for entry in menu] if (menu and label) else menu
+            lines, cursor_col = render_complete(theme, width, head, head_width, text, cursor, ghost_for(text), menu_labels, menu_index, view)
+            while deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    renderer.clear()
+                    raise PromptTimeout(text)
+                countdown = (' ' if text else '') + timeout_label.format(math.ceil(remaining))
+                line = lines[0]
+                if visible_length(line) + len(countdown) <= width:
+                    line += theme.paint('hint', countdown)
+                renderer.draw([line] + lines[1:], cursor_line=0, cursor_col=cursor_col)
+                # wake up when the shown seconds change
+                if term.wait_input(remaining - math.floor(remaining) or 1.0):
+                    deadline = None
+            renderer.draw(lines, cursor_line=0, cursor_col=cursor_col)
+        deadline = None
+        key, char = term.read_key()
+
+        if key == 'ctrl-c':
+            renderer.clear()
+            raise KeyboardInterrupt
+        if key == 'enter':
+            renderer.clear()
+            return text
+        if key == 'esc':
+            if menu:
+                text = menu_base
+                cursor = len(text)
+                menu = None
+            elif esc_aborts:
+                renderer.clear()
+                return None
+            continue
+        if key == 'eof' or (key == 'ctrl-d' and not text):
+            renderer.clear()
+            return None
+
+        if key in ('tab', 'backtab'):
+            if menu:
+                step = 1 if key == 'tab' else -1
+                menu_index = (menu_index + step) % len(menu)
+                text = menu[menu_index]
+                cursor = len(text)
+                continue
+            found = matches_for(text)
+            if not found:
+                continue
+            if len(found) == 1:
+                text = found[0]
+                cursor = len(text)
+                continue
+            prefix = common_prefix(found)
+            if len(prefix) > len(text) and prefix[:len(text)] == text:
+                text = prefix
+                cursor = len(text)
+                continue
+            menu_base = text
+            menu = found
+            menu_index = 0
+            text = menu[menu_index]
+            cursor = len(text)
+            continue
+
+        if key in ('up', 'down'):
+            if menu:
+                step = -1 if key == 'up' else 1
+                menu_index = (menu_index + step) % len(menu)
+                text = menu[menu_index]
+                cursor = len(text)
+                continue
+            found = matches_for(text)
+            if not found:
+                continue
+            menu_base = text
+            menu = found
+            menu_index = len(menu) - 1 if key == 'up' else 0
+            text = menu[menu_index]
+            cursor = len(text)
+            continue
+
+        if menu and key in ('char', 'backspace', 'delete', 'left', 'right', 'home', 'end', 'ctrl-u', 'ctrl-k', 'ctrl-w', 'ctrl-d'):
+            menu = None
+
+        if key == 'char':
+            text = text[:cursor] + char + text[cursor:]
+            cursor += 1
+        elif key == 'backspace':
+            if cursor > 0:
+                text = text[:cursor - 1] + text[cursor:]
+                cursor -= 1
+        elif key in ('delete', 'ctrl-d'):
+            if cursor < len(text):
+                text = text[:cursor] + text[cursor + 1:]
+        elif key == 'left':
+            cursor = max(0, cursor - 1)
+        elif key == 'right':
+            if cursor < len(text):
+                cursor += 1
+            else:
+                ghost = ghost_for(text)
+                if ghost:
+                    text += ghost
+                    cursor = len(text)
+        elif key == 'home':
+            cursor = 0
+        elif key == 'end':
+            cursor = len(text)
+        elif key == 'ctrl-u':
+            text = text[cursor:]
+            cursor = 0
+        elif key == 'ctrl-k':
+            text = text[:cursor]
+        elif key == 'ctrl-w':
+            head_text = text[:cursor].rstrip()
+            position = max(head_text.rfind(' '), head_text.rfind('/'))
+            text = text[:position + 1] + text[cursor:]
+            cursor = position + 1
+
+
+# run() turns this off for the module functions, which hand in their items
+# themselves: the stdin of the calling tool is not theirs to read
+READ_STDIN_ITEMS = True
+
+
+def read_entries(arguments):
+    entries = list(arguments)
+    if READ_STDIN_ITEMS and sys.stdin is not None and not sys.stdin.isatty():
+        try:
+            entries.extend(sys.stdin.read().splitlines())
+        except (OSError, UnicodeDecodeError):
+            pass
+    return [entry for entry in entries if entry.strip()]
+
+
+def default_index(items, default):
+    for position, (key, title) in enumerate(items):
+        if default == key or default == title:
+            return position
+    if re.fullmatch(r'\d+', default):
+        number = int(default)
+        if 1 <= number <= len(items):
+            return number - 1
+    return None
+
+
+# The items of a --cycle group share one row: it sits where the first of them
+# was, so the list keeps the order it was given in, and returns whichever of them
+# it currently shows. Everything else stays a row of its own.
+def cycle_rows(items, specs):
+    grouped = {}
+    for spec in specs or []:
+        members = []
+        for name in [part.strip() for part in spec.split('|')]:
+            if not name:
+                continue
+            position = default_index(items, name)
+            if position is None:
+                print('ERROR: --cycle "' + spec + '" names no item: ' + name, file=sys.stderr)
+                sys.exit(1)
+            if position in grouped or position in members:
+                print('ERROR: --cycle "' + spec + '" uses the item "' + name + '" twice.', file=sys.stderr)
+                sys.exit(1)
+            members.append(position)
+        if len(members) < 2:
+            print('ERROR: --cycle "' + spec + '" needs at least two items.', file=sys.stderr)
+            sys.exit(1)
+        for position in members:
+            grouped[position] = members
+    rows = []
+    for position in range(len(items)):
+        members = grouped.get(position)
+        if members is None:
+            rows.append([position])
+        elif members[0] == position:
+            rows.append(members)
+    return rows
+
+
+def input_with_default(default=''):
+    result = input()
+    if not result:
+        result = default
+    return result
+
+
+def is_interactive():
+    return sys.__stdin__.isatty() and sys.__stdout__.isatty()
+
+
+def run_single_line_mode(args, prompt, prompt_base, prompt_char, default, exit_code_pattern):
+    term = Terminal()
+    if not term.open():
+        # no terminal to edit on, the plain line reader takes over
+        return
+    theme = Theme(term.supports_color() and not args.no_color)
+    prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
+    old_settings = raw_mode(term.in_fd)
+    line = None
+    interrupted = False
+    timed_out = False
+    try:
+        # no candidates, so Tab and the arrow keys have nothing to offer; Esc is
+        # ignored here instead of aborting
+        line = run_complete(term, theme, prompt, prompt_display, prompt_char, lambda text: [],
+                            args.prefill, False, False, 0, None, False, args.timeout, args.timeout_label)
+    except PromptTimeout as timeout:
+        line = timeout.text
+        timed_out = True
+    except KeyboardInterrupt:
+        interrupted = True
+        term.write('\r\n')
+        term.flush()
+    finally:
+        restore_mode(term.in_fd, old_settings)
+
+    if interrupted:
+        term.close()
+        sys.exit(130)
+
+    head, _ = build_head(theme, prompt, prompt_display, prompt_char)
+    if line is None:
+        # Ctrl-D on an empty line
+        if not args.no_abort_message:
+            term.write(theme.paint('hint', 'Abort.') + '\r\n')
+            term.flush()
+        term.close()
+        sys.exit(1)
+    if not line:
+        line = default
+    # the line notes that nobody answered, the answer was the default
+    term.write(head + line + (theme.paint('hint', (' ' if line else '') + '(timed out)') if timed_out else '') + '\r\n')
+    term.flush()
+    term.close()
+    if exit_code_pattern:
+        sys.exit(0 if re.match(exit_code_pattern, line) else 1)
+    print(line, end='')
+    sys.exit(0)
+
+
+def run_multiline_mode(args, prompt, prompt_char):
+    term = Terminal()
+    if not term.open():
+        # no terminal to edit on, the plain line reader takes over
+        return
+    theme = Theme(term.supports_color() and not args.no_color)
+    old_settings = raw_mode(term.in_fd)
+    lines = None
+    interrupted = False
+    try:
+        lines = run_multiline(term, theme, prompt, prompt_char, args.height if args.height else 0, args.prefill)
+    except KeyboardInterrupt:
+        interrupted = True
+        term.write('\r\n')
+        term.flush()
+    finally:
+        restore_mode(term.in_fd, old_settings)
+
+    if interrupted:
+        term.close()
+        sys.exit(130)
+
+    # the empty line the cursor sits on after the last Enter is an artifact
+    if len(lines) > 1 and not lines[-1]:
+        lines = lines[:-1]
+    # nothing left in the buffer falls back to the default, as in the other modes
+    if args.default and not any(lines):
+        lines = args.default.split('\n')
+    if prompt:
+        term.write(paint_prompt(theme, prompt) + '\r\n')
+    char_display = paint_prompt_char(theme, prompt_char)
+    for line in lines:
+        term.write(char_display + line.expandtabs(TAB_WIDTH) + '\r\n')
+    term.flush()
+    term.close()
+    print('\n'.join(lines))
+    sys.exit(0)
+
+
+# what select mode prints for the item at position chosen
+def select_result(returns, items, chosen):
+    key, title = items[chosen]
+    if returns == 'title':
+        return title
+    if returns == 'index':
+        return str(chosen)
+    if returns == 'number':
+        return str(chosen + 1)
+    return key
+
+
+def run_interactive_mode(args, prompt, prompt_base, prompt_char, select_mode, entries):
+    term = Terminal()
+    if not term.open():
+        print('ERROR: No terminal available for interactive input.', file=sys.stderr)
+        sys.exit(1)
+    theme = Theme(term.supports_color() and not args.no_color)
+    height = args.height if args.height else 0
+
+    if select_mode:
+        delimiter = codecs.decode(args.delimiter, 'unicode_escape') if args.delimiter is not None else '='
+        split_pattern = compile_pattern(args.delimiter_regex, '--delimiter-regex')
+        key_pattern = compile_pattern(args.key_regex, '--key-regex')
+        header_lines = args.header_lines
+        if header_lines and len(entries) <= header_lines:
+            print('ERROR: --header-lines ' + str(header_lines) + ' leaves no items to select from.', file=sys.stderr)
+            sys.exit(1)
+        # the header goes through the same parsing, so its columns keep lining
+        # up with the titles below it
+        header = [title for _, title in parse_items(entries[:header_lines], delimiter, split_pattern, key_pattern)]
+        if not args.no_header_uppercase:
+            header = [line.upper() for line in header]
+        items = parse_items(entries[header_lines:], delimiter, split_pattern, key_pattern)
+        if not items:
+            print('ERROR: No items to select from.', file=sys.stderr)
+            sys.exit(1)
+        rows = cycle_rows(items, args.cycle)
+        selection = [0] * len(rows)
+        index = 0
+        checked = None
+        if args.multi:
+            checked = set()
+            for name in args.checked:
+                position = default_index(items, name)
+                if position is None:
+                    print('ERROR: --checked "' + name + '" matches no item.', file=sys.stderr)
+                    sys.exit(1)
+                checked.add(position)
+        if args.default:
+            position = default_index(items, args.default)
+            if position is None:
+                print('ERROR: --default "' + args.default + '" matches no item.', file=sys.stderr)
+                sys.exit(1)
+            # the row of the default starts on it, a cycling one included
+            index = next(row for row, members in enumerate(rows) if position in members)
+            selection[index] = rows[index].index(position)
+    elif args.files or args.dirs:
+        dirs_only = args.dirs
+        provider = lambda text: path_candidates(text, dirs_only)
+        menu_label = path_label
+    else:
+        candidates = unique(entries)
+        provider = lambda text: candidates
+        menu_label = None
+
+    old_settings = raw_mode(term.in_fd)
+    result = None
+    interrupted = False
+    try:
+        if select_mode:
+            choice = run_select(term, theme, prompt, header, items, rows, selection, prompt_char, index, args.show_keys, height,
+                                args.filter, checked)
+            if choice is None:
+                if not args.no_abort_message:
+                    term.write(theme.paint('hint', 'Abort.') + '\r\n')
+                    term.flush()
+                sys.exit(1)
+        if select_mode and checked is not None:
+            if prompt:
+                term.write(paint_prompt(theme, prompt) + ' ')
+            titles = [items[chosen][1] for chosen in choice]
+            term.write((theme.paint('result', ', '.join(titles)) if titles else theme.paint('hint', '(none)')) + '\r\n')
+            term.flush()
+            result = ''.join(select_result(args.returns, items, chosen) + '\n' for chosen in choice)
+        elif select_mode:
+            chosen = rows[choice][selection[choice]]
+            key, title = items[chosen]
+            display = title + ('  (' + key + ')' if args.show_keys and key != title else '')
+            if prompt:
+                term.write(paint_prompt(theme, prompt) + ' ')
+            term.write(theme.paint('result', display) + '\r\n')
+            term.flush()
+            result = select_result(args.returns, items, chosen)
+        else:
+            prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
+            line = run_complete(term, theme, prompt, prompt_display, prompt_char, provider, args.prefill, args.ignore_case, args.substring, height, menu_label)
+            if line is None:
+                if not args.no_abort_message:
+                    term.write(theme.paint('hint', 'Abort.') + '\r\n')
+                    term.flush()
+                sys.exit(1)
+            if not line:
+                line = args.default
+            head, _ = build_head(theme, prompt, prompt_display, prompt_char)
+            term.write(head + line + '\r\n')
+            term.flush()
+            result = line
+    except KeyboardInterrupt:
+        interrupted = True
+        term.write('\r\n')
+        term.flush()
+    finally:
+        restore_mode(term.in_fd, old_settings)
+
+    term.close()
+    if interrupted:
+        sys.exit(130)
+    print(result, end='')
+    sys.exit(0)
+
+def main():
+    bin_name = os.path.basename(sys.argv[0])
+    exit_code_binaries = {
+        'prompt-continue',
+        'prompt-continue-yes',
+        'prompt-yes-no',
+        'prompt-no-yes',
+        'prompt-continue-timeout',
+    }
+    if bin_name in exit_code_binaries:
+        description = 'Prompt for confirmation and return the result as an exit code'
+        epilog = 'Exit status: 0 for "yes", 1 otherwise. Ctrl-C exits with 130.'
+    else:
+        description = 'Read multiple lines from stdin'
+        epilog = (
+            'Special invocations prompt-continue, prompt-continue-yes, '
+            'prompt-yes-no, prompt-no-yes and prompt-continue-timeout return '
+            'status 0 for "yes" and 1 otherwise instead of printing the answer; '
+            'prompt-continue-timeout answers "yes" by itself after --timeout '
+            'seconds (default 60). '
+            'prompt-select implies --select, prompt-multiselect implies --select '
+            '--multi, prompt-complete implies --complete; '
+            'in these two modes the positional arguments are the list items or '
+            'completion candidates (also read from stdin when piped) and both '
+            'exit with status 1 when aborted with Esc.'
+        )
+
+    parser = argparse.ArgumentParser(description=description, epilog=epilog)
+    parser.add_argument('--prompt', '-p', type=str, help='Custom prompt, defaults to "(Press Ctrl-D when done)" for multiple line mode, "Enter input:" for a single line mode and "Choose:" in select mode (no prompt when --header-lines is given); an empty value shows no prompt at all')
+    parser.add_argument('--prompt-char', '-c', type=str, help='Custom prompt character, defaults to "> " for multiple line mode, "" for a single line mode and "' + POINTER + '" (the pointer) in select mode')
+    parser.add_argument('--single-line', '-s', action='store_true', help='Read a single line from stdin, without the prompt char')
+    parser.add_argument('--protected', '-P', action='store_true', help='Prompt for a secret')
+    parser.add_argument('--default', '-d', type=str, default='', help='Default value, in select mode the key, title or number of the entry to start on, in multiple line mode and the --files and --dirs modes also the pre-filled text')
+    parser.add_argument('--select', '-l', action='store_true', help='Select one entry from a colored list of items (arrow keys, digits, Enter selects, Esc aborts); items come from the positional arguments and stdin')
+    parser.add_argument('--complete', '-a', action='store_true', help='Read a single line with completion against the given candidates (Tab completes what is unambiguous and opens a navigable menu otherwise); candidates come from the positional arguments and stdin')
+    parser.add_argument('--delimiter', type=str, help='Delimiter splitting each select mode item into "<key><delimiter><title>" (default: "="); escape sequences like "\\t" are honored, an empty value disables key parsing')
+    parser.add_argument('--delimiter-regex', dest='delimiter_regex', type=str, help='Like --delimiter, but the split point is the first match of this regular expression, e.g. "\\s{2,}" for at least two spaces; the matched text belongs to neither key nor title')
+    parser.add_argument('--key-regex', dest='key_regex', type=str, help='Take the item key from the first match of this regular expression (capture group 1 when there is one) and keep the whole item as the title, e.g. "^\\S+" to return the first column of a table row')
+    parser.add_argument('--return', dest='returns', choices=['key', 'title', 'index', 'number'], default='key', help='What select mode prints: the item key (default), its title, its 0-based index or its 1-based number')
+    parser.add_argument('--show-keys', action='store_true', help='Show the item keys next to the titles in select mode')
+    parser.add_argument('--filter', action='store_true', help='Select mode only: typing filters the list (every word has to appear in an item, in any order, ignoring case) instead of the j/k, g/G, q and digit shortcuts; Backspace/Ctrl-W/Ctrl-U edit the filter, Esc clears it and aborts once it is empty')
+    parser.add_argument('--cycle', action='append', default=[], metavar='KEY|KEY[|KEY...]', help='Select mode only: collapse the named items into one row that Tab (Shift-Tab backwards) cycles through, so a set of variants stays one line long; the row sits where the first of its items was and selecting it returns the one it currently shows. Items are named by key, title or number; repeatable for several groups')
+    parser.add_argument('--multi', '-m', action='store_true', help='Select mode only: check any number of items (Space toggles the one under the cursor, a toggles all) and print the checked ones, one per line, on Enter; nothing checked prints nothing. Not with --filter or --cycle')
+    parser.add_argument('--checked', action='append', default=[], metavar='ITEM', help='With --multi: start with this item checked, named by key, title or number; repeatable')
+    parser.add_argument('--header-lines', dest='header_lines', type=int, default=0, help='Select mode only: treat the first n items as a header, printed above the list, aligned with the item titles and not selectable; suppresses the default prompt')
+    parser.add_argument('--no-header-uppercase', dest='no_header_uppercase', action='store_true', help='Keep the header lines as they are instead of upper-casing them')
+    parser.add_argument('--ignore-case', action='store_true', help='Match completion candidates case-insensitively')
+    parser.add_argument('--substring', action='store_true', help='Match completion candidates anywhere instead of at the start')
+    parser.add_argument('--files', action='store_true', help='Complete against file and directory names instead of a candidate list; completing a directory appends a slash, so the next completion descends into it')
+    parser.add_argument('--dirs', action='store_true', help='Like --files, but offers directories only')
+    parser.add_argument('--prefill', type=str, default='', help='Pre-filled editable text for completion mode and multiple line mode (defaults to the current directory in the --files and --dirs modes)')
+    parser.add_argument('--height', type=int, help='Maximum number of list rows shown at once (default: fit the terminal)')
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--timeout', type=int, help='Single-line mode only: accept the input (or the default) after this many seconds without a key press, with a countdown next to the input; the first key stops the countdown')
+    parser.add_argument('--no-abort-message', dest='no_abort_message', action='store_true', help='Leave the terminal as it was when the prompt is aborted, instead of noting the abort on a line of its own; for a caller that asks the next question in its place')
+    parser.add_argument('prompt_fallback', nargs='*', type=str, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    #alias prompt-continue='prompt -s -p '\''Continue [y/N]:'\'' | grep -q '\''^[yY]$'\'''
+    #alias prompt-input='prompt --single-line '
+    #alias prompt-multiline='prompt --prompt '
+    #alias prompt-password='prompt --single-line --protected --prompt "Password: "'
+
+    prompt = args.prompt
+    prompt_char = args.prompt_char
+    prompt_single_line = args.single_line
+    prompt_protected = args.protected
+    prompt_default = args.default
+    prompt_select = args.select
+    prompt_complete = args.complete
+    prompt_exit_code_pattern = None
+    args.timeout_label = '(default in {}s)'
+
+    # check the name of the binary
+    if bin_name == 'prompt-continue':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        else:
+            prompt = 'Continue [y/N]:'
+        prompt_exit_code_pattern = r'^[yY]$'
+    if bin_name == 'prompt-continue-yes':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        else:
+            prompt = 'Continue [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+    elif bin_name == 'prompt-yes-no':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+            prompt = prompt + ' [Y/n]:'
+        else:
+            prompt = 'Do it? [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+    elif bin_name == 'prompt-no-yes':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+            prompt = prompt + ' [y/N]:'
+        else:
+            prompt = 'Do it? [y/N]:'
+        prompt_exit_code_pattern = r'^[yY]$'
+    elif bin_name == 'prompt-continue-timeout':
+        # prompt-yes-no that goes on by itself, for a run nobody may be watching
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback) + ' [Y/n]:'
+        else:
+            prompt = 'Continue? [Y/n]:'
+        prompt_exit_code_pattern = r'^[yY]?$'
+        if args.timeout is None:
+            args.timeout = 60
+        args.timeout_label = '(continuing in {}s)'
+    elif bin_name == 'prompt-input':
+        prompt_single_line = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+    elif bin_name == 'prompt-multiline':
+        prompt_single_line = False
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+    elif bin_name == 'prompt-password':
+        prompt_single_line = True
+        prompt_protected = True
+        prompt = 'Password:'
+    elif bin_name == 'prompt-select':
+        # the positional arguments are the items, so the prompt stays as given
+        prompt_select = True
+    elif bin_name == 'prompt-multiselect':
+        # prompt-select with --multi
+        prompt_select = True
+        args.multi = True
+    elif bin_name == 'prompt-complete':
+        # the positional arguments are the candidates, so the prompt stays as given
+        prompt_complete = True
+    elif bin_name == 'prompt-file':
+        prompt_complete = True
+        args.files = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        elif prompt is None:
+            prompt = 'Enter file:'
+    elif bin_name == 'prompt-folder':
+        prompt_complete = True
+        args.dirs = True
+        if args.prompt_fallback:
+            prompt = ' '.join(args.prompt_fallback)
+        elif prompt is None:
+            prompt = 'Enter directory:'
+
+    if prompt_select and prompt_complete:
+        print('ERROR: --select and --complete are mutually exclusive.', file=sys.stderr)
+        sys.exit(1)
+    if (prompt_select or prompt_complete) and (prompt_protected or args.single_line):
+        print('ERROR: --select and --complete cannot be combined with --protected or --single-line.', file=sys.stderr)
+        sys.exit(1)
+    if not prompt_select and (args.delimiter is not None or args.delimiter_regex is not None or args.key_regex is not None or args.show_keys or args.returns != 'key' or args.header_lines or args.no_header_uppercase or args.cycle):
+        print('ERROR: --delimiter, --delimiter-regex, --key-regex, --show-keys, --return, --header-lines, --no-header-uppercase and --cycle can only be used in select mode.', file=sys.stderr)
+        sys.exit(1)
+    if (args.multi or args.checked) and not prompt_select:
+        print('ERROR: --multi and --checked can only be used in select mode.', file=sys.stderr)
+        sys.exit(1)
+    if args.checked and not args.multi:
+        print('ERROR: --checked needs --multi.', file=sys.stderr)
+        sys.exit(1)
+    if args.multi and (args.filter or args.cycle):
+        print('ERROR: --multi cannot be combined with --filter or --cycle.', file=sys.stderr)
+        sys.exit(1)
+    if len([option for option in (args.delimiter, args.delimiter_regex, args.key_regex) if option is not None]) > 1:
+        print('ERROR: --delimiter, --delimiter-regex and --key-regex are mutually exclusive.', file=sys.stderr)
+        sys.exit(1)
+    if args.timeout is not None:
+        if args.timeout < 1:
+            print('ERROR: --timeout must be a positive number.', file=sys.stderr)
+            sys.exit(1)
+        if not prompt_single_line or prompt_protected or prompt_select or prompt_complete:
+            print('ERROR: --timeout can only be used in single-line mode, not with --protected.', file=sys.stderr)
+            sys.exit(1)
+    if args.header_lines < 0:
+        print('ERROR: --header-lines must not be negative.', file=sys.stderr)
+        sys.exit(1)
+    multiline_mode = not (prompt_single_line or prompt_select or prompt_complete or prompt_protected)
+    if not prompt_complete and (args.ignore_case or args.substring or args.files or args.dirs):
+        print('ERROR: --ignore-case, --substring, --files and --dirs can only be used in completion mode.', file=sys.stderr)
+        sys.exit(1)
+    if args.prefill and prompt_protected:
+        print('ERROR: --prefill cannot be used with --protected.', file=sys.stderr)
+        sys.exit(1)
+    if args.prefill and prompt_select:
+        print('ERROR: --prefill cannot be used in select mode.', file=sys.stderr)
+        sys.exit(1)
+    if args.files and args.dirs:
+        print('ERROR: --files and --dirs are mutually exclusive.', file=sys.stderr)
+        sys.exit(1)
+    if (args.files or args.dirs) and not args.prefill:
+        # a default path doubles as the starting point, so Enter accepts it and
+        # editing it stays possible; without one, start in the current directory
+        # so completion has somewhere to descend from
+        args.prefill = args.default if args.default else os.getcwd().rstrip('/') + '/'
+    if args.height is not None and args.height < 1:
+        print('ERROR: --height must be a positive number.', file=sys.stderr)
+        sys.exit(1)
+    if prompt_default and prompt_protected:
+        print('ERROR: --default cannot be used with --protected.', file=sys.stderr)
+        sys.exit(1)
+    if (multiline_mode or prompt_single_line) and prompt_default and not args.prefill and not prompt_protected:
+        # the default text is edited in place, so Enter (or Ctrl-D) accepts it
+        args.prefill = prompt_default
+
+    # an explicitly empty --prompt asks for no prompt at all, only a missing one
+    # falls back to the default
+    if prompt is None:
+        if prompt_select:
+            # a header already labels the list, so it needs no prompt on top
+            prompt = '' if args.header_lines else 'Choose:'
+        elif prompt_single_line or prompt_complete:
+            prompt = 'Enter input:'
+        else:
+            prompt = '(Press Ctrl-D when done)'
+    if not prompt_char:
+        if prompt_select:
+            prompt_char = POINTER
+        elif prompt_single_line or prompt_complete:
+            prompt_char = ''
+        else:
+            prompt_char = '> '
+
+    end = ' ' if prompt_single_line else '\n'
+
+    prompt_base = prompt
+    # a default that is already sitting in the input line needs no "(default)"
+    # hint next to the prompt
+    args.default_hint = '' if prompt_default and args.prefill == prompt_default else prompt_default
+    if args.default_hint and prompt and not prompt_select:
+        prompt = prompt.rstrip()
+        if prompt[-1] == ':': prompt = prompt[:-1]
+        prompt = prompt + ' (' + args.default_hint + '):'
+
+    if prompt_select or prompt_complete:
+        entries = read_entries(args.prompt_fallback)
+        run_interactive_mode(args, prompt, prompt_base, prompt_char, prompt_select, entries)
+
+    theme = Theme(colors_enabled(sys.stderr) and not args.no_color)
+    prompt_display = paint_prompt(theme, prompt_base, args.default_hint)
+    prompt_char_display = paint_prompt_char(theme, prompt_char)
+
+    # on a terminal both input modes get a real editor, piped input and secrets
+    # keep using the plain line reader below
+    if not prompt_protected and sys.stdin is not None and sys.stdin.isatty():
+        if prompt_single_line:
+            run_single_line_mode(args, prompt, prompt_base, prompt_char, prompt_default, prompt_exit_code_pattern)
+        else:
+            run_multiline_mode(args, prompt, prompt_char)
+
+    if prompt and not (prompt_protected and prompt_single_line):
+        print(prompt_display, end=end, file=sys.stderr)
+        sys.stderr.flush()
+
+    if prompt_single_line:
+        try:
+            print(prompt_char_display, end='', file=sys.stderr)
+            sys.stderr.flush()
+            if prompt_protected:
+                line = getpass.getpass(prompt=prompt_display + end)
+            else:
+                line = input_with_default(prompt_default)
+        except KeyboardInterrupt:
+            print('')
+            sys.exit(130)
+        except EOFError:
+            if prompt_protected:
+                # Ctrl-D at a secret aborts, it has no default to fall back to
+                print('', file=sys.stderr)
+                sys.exit(1)
+            # nothing on stdin at all still honors the default
+            line = prompt_default
+        if prompt_exit_code_pattern:
+            if not line:
+                line = ''
+            if re.match(prompt_exit_code_pattern, line): sys.exit(0)
+            else: sys.exit(1)
+        print(line, end='')
+    else:
+        lines = []
+        while True:
+            try:
+                if not prompt_protected:
+                    print(prompt_char_display, end='', file=sys.stderr)
+                    sys.stderr.flush()
+                if prompt_protected:
+                    line = getpass.getpass(prompt=prompt_char_display)
+                else:
+                    line = input_with_default(prompt_default)
+                    # use default only once
+                    prompt_default = ''
+            except KeyboardInterrupt:
+                print('')
+                sys.exit(130)
+            except EOFError:
+                break
+            lines.append(line)
+
+        # args.default survives the loop blanking prompt_default after the
+        # first read, and keeps the piped path in line with the editor above
+        if args.default and not any(lines):
+            lines = args.default.split('\n')
+
+        print('\r' + ' ' * visible_length(prompt_char) + '\r', end='', file=sys.stderr)
+        print('\n'.join(lines))
+
+# ---------- use as a module ----------
+
+def run(arguments, name='prompt', stdin_items=True):
+    """Run prompt as if called as NAME ARGUMENTS, e.g. run(['Delete?'],
+    'prompt-yes-no'): the exit status and what it printed (the answer). The
+    prompt itself is drawn on the terminal as usual. Ctrl-C (status 130) raises
+    KeyboardInterrupt. stdin_items=False keeps a piped stdin from adding list
+    items or completion candidates."""
+    global READ_STDIN_ITEMS
+    saved_argv, saved_stdout, saved_read = sys.argv, sys.stdout, READ_STDIN_ITEMS
+    sys.argv = [name, *arguments]
+    sys.stdout = io.StringIO()
+    READ_STDIN_ITEMS = stdin_items
+    status = 0
+    try:
+        main()
+    except SystemExit as stop:
+        status = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+    finally:
+        output = sys.stdout.getvalue()
+        sys.stdout, sys.argv, READ_STDIN_ITEMS = saved_stdout, saved_argv, saved_read
+    if status == 130:
+        raise KeyboardInterrupt
+    return status, output
+
+
+def input_line(question, default=''):
+    """A line of input, pre-filled with default; None when aborted (Ctrl-D)."""
+    status, output = run(['--single-line', '--prompt', question, '--default', default])
+    return output if status == 0 else None
+
+
+def multiline(question=None, default=''):
+    """Lines of input until Ctrl-D, pre-filled with default; None when aborted."""
+    arguments = ['--default', default]
+    if question is not None:
+        arguments += ['--prompt', question]
+    status, output = run(arguments)
+    return output.rstrip('\n') if status == 0 else None
+
+
+def password(question='Password:'):
+    """A secret, typed without echo; None when aborted (Ctrl-D)."""
+    status, output = run(['--single-line', '--protected', '--prompt', question])
+    return output if status == 0 else None
+
+
+def confirm(question, default=False):
+    """True for "yes", False for "no", None when aborted (Ctrl-D): question gets
+    " [Y/n]:" (default True) or " [y/N]:" appended. y/yes and n/no in any case,
+    an empty answer is the default; anything else asks again."""
+    while True:
+        status, output = run(['--single-line', '--prompt', question + (' [Y/n]:' if default else ' [y/N]:')])
+        if status != 0:
+            return None
+        answer = output.strip().lower()
+        if not answer:
+            return default
+        if answer in ('y', 'yes'):
+            return True
+        if answer in ('n', 'no'):
+            return False
+
+
+def select(question, items, default=None, filter=False, returns='key', header_lines=0):
+    """The item chosen, None when aborted (Esc). items are (key, title) pairs or
+    plain strings (key and title in one, e.g. table rows after header_lines
+    header rows); default names the item the cursor starts on by key, title or
+    number; filter lets typing filter the list; returns is 'key', 'title',
+    'index' (an int, 0-based) or 'number' (an int, 1-based)."""
+    entries = [item if isinstance(item, str) else f'{item[0]}\t{item[1]}' for item in items]
+    arguments = ['--prompt', question, '--delimiter', '\\t', '--return', returns]
+    if default is not None:
+        arguments += ['--default', str(default)]
+    if filter:
+        arguments.append('--filter')
+    if header_lines:
+        arguments += ['--header-lines', str(header_lines)]
+    # after "--", an item that starts with "-" stays an item
+    status, output = run(arguments + ['--'] + entries, 'prompt-select', stdin_items=False)
+    if status != 0:
+        return None
+    return int(output) if returns in ('index', 'number') else output
+
+
+def complete(question, candidates, default='', ignore_case=False, substring=False):
+    """A line of input with Tab completion against the candidates; None when aborted (Esc)."""
+    arguments = ['--prompt', question, '--default', default]
+    if ignore_case:
+        arguments.append('--ignore-case')
+    if substring:
+        arguments.append('--substring')
+    status, output = run(arguments + ['--'] + list(candidates), 'prompt-complete', stdin_items=False)
+    return output if status == 0 else None
+
+
+if __name__ == '__main__':
+    main()

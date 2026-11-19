@@ -1,0 +1,54 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    echo "usage: ${APP_NAME} [-h|--help] [-p|--primary|-c|--clipboard]" 1>&2
+    exit 1
+}
+
+clipboard="clipboard"
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--primary)
+            clipboard="primary"
+            shift
+            ;;
+        -c|--clipboard)
+            clipboard="clipboard"
+            shift
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+while true; do
+    if cli_helpers_is_wayland; then
+        if ! content="$(cli_helpers_clipboard_get_text "${clipboard}")"; then
+            cli_helpers_require_command wl-paste wl-clipboard || exit 1
+            if [ "${clipboard}" = "primary" ]; then
+                content=$(wl-paste --primary 2>/dev/null)
+            else
+                content=$(wl-paste 2>/dev/null)
+            fi
+        fi
+    else
+        content=$(DISPLAY=$(xdisplay) xclip -o -sel "${clipboard}")
+    fi
+    [ -n "${content}" ] && break
+    sleep 1
+done
+echo -n "${content}"

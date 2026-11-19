@@ -1,0 +1,20 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+if cli_helpers_is_wayland; then
+    echo "ERROR: remapkeys is X11-only. On GNOME Wayland, use GNOME Settings/Input Sources for layout changes and ydotool for one-off synthetic input." 1>&2
+    exit 1
+fi
+
+setxkbmap -layout de && \
+xkbset m && \
+xkbset exp =m && \
+xmodmap -e "keycode 135 = Pointer_Button2" && \
+echo "Successfully remapped keys"

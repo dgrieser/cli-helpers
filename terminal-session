@@ -1,0 +1,2 @@
+#!/bin/bash
+ssh -t ${USER}@${HOSTNAME} bash -ilc 'declare -p' 2>/dev/null

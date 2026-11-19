@@ -1,0 +1,21 @@
+#!/bin/bash
+
+usage () {
+    echo "usage: $(basename "${0}") <url>" 1>&2
+    exit 1
+}
+
+# check if starts with http
+if [ "${#}" -ne 1 ] || [[ ! "${1}" =~ ^http ]]; then
+    usage
+fi
+
+url="${1}"
+extension="${url##*.}"
+tmpfile="$(mktemp /tmp/XXXXXX.${extension})"
+curl -s -S -L -o "${tmpfile}" "${url}" 1>&2
+if [ "${?}" -ne 0 ]; then
+    rm -f "${tmpfile}"
+    exit 1
+fi
+echo "${tmpfile}"

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Terminal Launcher
+Comment=Quick-launch window in the default terminal that closes when idle
+Exec=/usr/local/bin/launcher-terminal
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=false
+X-GNOME-SingleWindow=true

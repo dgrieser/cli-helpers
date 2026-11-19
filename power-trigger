@@ -1,0 +1,231 @@
+#!/usr/bin/python3 -u
+from pydbus import SessionBus, SystemBus
+from gi.repository import GLib
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER=600 #1800
+SECONDS_DELAY_BETWEEN_SUSPENDS=60
+# give logind time to send PrepareForSleep(false) itself before NetworkManager is checked
+SECONDS_DELAY_NETWORK_WAKE_CHECK=15
+NM_STATE_ASLEEP=10
+# let the lock screen draw before the screens go off, so turning them on shows no desktop
+SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK=2
+MUTTER_POWER_SAVE_ON=0
+MUTTER_POWER_SAVE_OFF=3
+
+def get_cifs_mountpoints():
+    mounts = []
+    with open("/proc/self/mounts", encoding="utf-8") as f:  # like /proc/mounts
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == "cifs":  # fs type
+                mounts.append(Path(parts[1]))
+    # sort reverse so deeper mountpoints are unmounted first
+    mounts.sort(key=lambda p: len(p.as_posix()), reverse=True)
+    return mounts  # list[Path]
+
+def umount_cifs(force=False, lazy=False):
+    opts = []
+    if force:
+        opts.append("-f")
+    if lazy:
+        opts.append("-l")
+
+    for mp in get_cifs_mountpoints():
+        cmd = ["umount", *opts, str(mp)]
+        subprocess.run(cmd, check=False)
+
+def on_lid_opened_event(on_battery):
+    global is_lid_open
+    is_lid_open=True
+    print(f'Detected lid open')
+    set_screens_on(True)
+    schedule_network_wake_check()
+
+def on_lid_closed_event(on_battery):
+    global is_lid_open
+    is_lid_open=False
+    print(f'Detected lid close')
+    lock_screen()
+    GLib.timeout_add_seconds(SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK, turn_screens_off_if_lid_closed)
+
+def on_lid_closed_for_a_while_event(on_battery):
+    print(f'Detected lid closed for {SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER} seconds while on {"battery" if on_battery else "AC"}')
+    if on_battery:
+        suspend_laptop()
+
+def on_battery_event(on_battery):
+    print(f'Detected change to {"battery" if on_battery else "AC"} power')
+    if on_battery and not is_lid_open:
+        print('Now on battery and lid closed, starting lid closed timer')
+        start_lid_closed_timer()
+
+def on_prepare_for_sleep(suspending):
+    if suspending:
+        on_suspend()
+    else:
+        on_resume()
+
+def on_suspend():
+    print(f'Detected system suspend')
+
+def on_resume():
+    print(f'Detected system resume with lid {"open" if is_lid_open else "closed"}')
+    schedule_network_wake_check()
+    if not is_lid_open and is_on_battery:
+        print('Lid still closed and on battery, suspending again')
+        suspend_laptop()
+
+# A resume can kill systemd-logind (systemd watchdog, 2026-11-15) before it sends
+# PrepareForSleep(false). NetworkManager then stays asleep and the wifi stays off.
+# Wake it when logind is not preparing for sleep. NM_STATE_ASLEEP also means that
+# networking is disabled by hand, so NetworkingEnabled must still be true.
+# Calling Sleep needs org.freedesktop.NetworkManager.sleep-wake, see
+# lib/cli-helpers/etc/polkit-1/rules.d/50-cli-helpers-nm-sleep-wake.rules
+def wake_network_if_stuck_asleep():
+    try:
+        nm = bus.get('org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager')
+        if nm.State != NM_STATE_ASLEEP or not nm.NetworkingEnabled:
+            return False
+        logind = bus.get('org.freedesktop.login1', '/org/freedesktop/login1')
+        if logind.PreparingForSleep:
+            return False
+        print('NetworkManager is asleep but the system is not suspending, waking it up')
+        nm.Sleep(False)
+        notify('Network woken up', 'NetworkManager was still asleep after a resume.')
+    except Exception as e:
+        print(f'Could not check or wake NetworkManager: {e}')
+    return False  # a GLib timeout callback, do not repeat
+
+def schedule_network_wake_check(delay=SECONDS_DELAY_NETWORK_WAKE_CHECK):
+    GLib.timeout_add_seconds(delay, wake_network_if_stuck_asleep)
+
+def on_logind_owner_changed(name, old_owner, new_owner):
+    if not new_owner:
+        print('systemd-logind left the bus')
+        return
+    # logind is up before this user service starts, so a new owner is a restart
+    print('systemd-logind restarted, sessions lost their devices and NetworkManager may still be asleep')
+    schedule_network_wake_check()
+    notify('systemd-logind restarted',
+           'If keyboard or mouse do not respond anymore, log out and in again.', urgency='critical')
+
+def notify(summary, body, urgency='normal'):
+    try:
+        subprocess.run(['notify-send', f'--urgency={urgency}', '--app-name=power-trigger', summary, body], check=False)
+    except OSError as e:
+        print(f'Could not send notification: {e}')
+
+# all screens through Mutter, the external ones too; any input turns them on again
+def set_screens_on(on):
+    try:
+        display = SessionBus().get('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig')
+        mode = MUTTER_POWER_SAVE_ON if on else MUTTER_POWER_SAVE_OFF
+        if display.PowerSaveMode != mode:
+            print(f'Turning screens {"on" if on else "off"}')
+            display.PowerSaveMode = mode
+    except Exception as e:
+        print(f'Could not turn screens {"on" if on else "off"}: {e}')
+
+def turn_screens_off_if_lid_closed():
+    if not is_lid_open:
+        set_screens_on(False)
+    return False  # a GLib timeout callback, do not repeat
+
+def lock_screen():
+    print('Locking screen')
+    subprocess.run(['loginctl', 'lock-session'])
+
+def suspend_laptop():
+    global last_suspend_timestamp
+    now = time.time()
+    if now - last_suspend_timestamp < SECONDS_DELAY_BETWEEN_SUSPENDS:
+        print(f'Last suspend call was less than {SECONDS_DELAY_BETWEEN_SUSPENDS} seconds ago, starting lid closed timer instead')
+        start_lid_closed_timer()
+        return
+    last_suspend_timestamp = now
+    print('Unmounting cifs')
+    umount_cifs(force=True)
+    print('Suspending laptop')
+    subprocess.run(['systemctl', 'suspend'])
+
+def on_lid_closed_timer_trigger():
+    cancel_lid_closed_timer()
+    on_lid_closed_for_a_while_event(is_on_battery)
+
+def start_lid_closed_timer():
+    cancel_lid_closed_timer()
+    global lid_closed_timer
+    if SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER > 0:
+        lid_closed_timer = threading.Timer(SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER, on_lid_closed_timer_trigger)
+        lid_closed_timer.start()
+
+def cancel_lid_closed_timer():
+    global lid_closed_timer
+    if lid_closed_timer is not None:
+        lid_closed_timer.cancel()
+        lid_closed_timer = None
+
+def on_battery(on_battery):
+    global is_on_battery
+    is_on_battery = on_battery
+    on_battery_event(is_on_battery)
+
+def on_upower_properties_changed(*args):
+    properties = args[1]
+    
+    if 'LidIsClosed' in properties:
+        if properties['LidIsClosed']:
+            on_lid_closed_event(is_on_battery)
+            start_lid_closed_timer()
+        else:
+            on_lid_opened_event(is_on_battery)
+            cancel_lid_closed_timer()
+    
+    if 'OnBattery' in properties:
+        on_battery(properties['OnBattery'])
+
+def get_on_battery():
+    power_supply_dir = "/sys/class/power_supply"
+    for supply in os.listdir(power_supply_dir):
+        path = os.path.join(power_supply_dir, supply)
+        if os.path.exists(os.path.join(path, "type")):
+            with open(os.path.join(path, "type")) as f:
+                if f.read().strip() == "Mains":
+                    with open(os.path.join(path, "online")) as f:
+                        if f.read().strip() == "1":
+                            return False
+    return True
+
+is_lid_open = True
+is_on_battery = get_on_battery()
+last_suspend_timestamp = 0
+lid_closed_timer = None
+bus = SystemBus()
+
+upower = bus.get('org.freedesktop.UPower', '/org/freedesktop/UPower')
+upower.PropertiesChanged.connect(on_upower_properties_changed)
+bus.subscribe(
+    iface='org.freedesktop.login1.Manager',
+    signal='PrepareForSleep',
+    object='/org/freedesktop/login1',
+    signal_fired=lambda sender, object, iface, signal, params: on_prepare_for_sleep(params[0])
+)
+bus.subscribe(
+    sender='org.freedesktop.DBus',
+    iface='org.freedesktop.DBus',
+    signal='NameOwnerChanged',
+    object='/org/freedesktop/DBus',
+    arg0='org.freedesktop.login1',
+    signal_fired=lambda sender, object, iface, signal, params: on_logind_owner_changed(*params)
+)
+
+
+print('Starting power trigger...')
+print(f'Currently running on {"battery" if is_on_battery else "AC"} power')
+loop = GLib.MainLoop()
+loop.run()

@@ -1,0 +1,100 @@
+#!/bin/bash
+
+usage()
+{
+    echo "Usage: $(basename "${0}"): <video|audio> <target-mp3> [--bitrate <bitrate, default: 160>] [--sample-rate <sample-rate, default: 48000>] [--channels <channels, default: 2>] [--strip-metadata] [--title <title>] [--artist <artist>] [--album <album>]" 1>&2
+    exit 1
+}
+
+src=""
+dst=""
+bitrate=160
+sample_rate=48000
+channels=2
+strip_metadata=0
+title=""
+artist=""
+album=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --bitrate)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            bitrate="${1}"
+            ;;
+        --sample-rate)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            sample_rate="${1}"
+            ;;
+        --channels)
+            shift
+            [[ ! "${1}" =~ ^[0-9]+$ ]] && usage
+            channels="${1}"
+            ;;
+        --strip-metadata)
+            strip_metadata=1
+            ;;
+        --title)
+            shift
+            [[ -z "${1}" ]] && usage
+            title="${1}"
+            ;;
+        --artist)
+            shift
+            [[ -z "${1}" ]] && usage
+            artist="${1}"
+            ;;
+        --album)
+            shift
+            [[ -z "${1}" ]] && usage
+            album="${1}"
+            ;;
+        *)
+            if [ -z "${src}" ]; then
+                src="${1}"
+            elif [ -z "${dst}" ]; then
+                dst="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${src}" ]; then
+    usage
+fi
+
+if [ ! -r "${src}" ]; then
+    echo "ERROR: File not found or not readable ${src}" 1>&2
+    usage
+fi
+
+if [ -z "${dst}" ]; then
+    name_without_ext="${src%.*}"
+    dst="${name_without_ext}.mp3"
+    counter=0
+    while [ -f "${dst}" ]; do
+        counter=$((counter + 1))
+        dst="${name_without_ext}-${counter}.mp3"
+    done
+fi
+
+if ! touch "${dst}"; then
+    echo "ERROR: Can't write to ${dst}" 1>&2
+    usage
+fi
+
+extra_args=""
+[ "${strip_metadata}" -eq 1 ] && extra_args="${extra_args} -map_metadata -1"
+[ -n "${title}" ] && extra_args="${extra_args} -metadata title=${title}"
+[ -n "${artist}" ] && extra_args="${extra_args} -metadata artist=${artist}"
+[ -n "${album}" ] && extra_args="${extra_args} -metadata album=${album}"
+
+ffmpeg -y -v quiet -hide_banner -stats -i "${src}" -vn \
+       -acodec libmp3lame -ac ${channels} -ab ${bitrate}k -ar ${sample_rate} ${extra_args} \
+        "${dst}" 1>&2
+echo "${dst}"

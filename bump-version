@@ -1,0 +1,103 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") <version> [--no-semver]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+semver=1
+version=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --no-semver)
+            semver=0
+            ;;
+        *)
+            if [ -z "${version}" ]; then
+                version="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${version}" ] && usage
+if [ "${semver}" -eq 1 ] && ! bump build test "${version}" &>/dev/null; then
+    fail "'${version}' is not a valid semver version."
+fi
+
+increment_number_part() {
+    local increment_part="${1}"
+
+    local increment_part_length="${#increment_part}"
+    local increment_part_first_char="${increment_part:0:1}"
+    # remove leading zeros to be able to increment
+    local increment=$((10#${increment_part}))
+    local new_increment=$((increment + 1))
+    local new_increment_length="${#new_increment}"
+    local diff_length=$((increment_part_length - new_increment_length))
+
+    if [ "${increment_part_first_char}" == "0" ] && [ ${diff_length} -gt 0 ]; then
+        # prepend $diff_length * 0 to $new_increment
+        new_increment="$(printf "%0.s0" $(seq 1 ${diff_length}))${new_increment}"
+    fi
+
+    echo "${new_increment}"
+}
+
+increment_patchbuild() {
+    local version="${1}"
+    local version_splitter="${2}"
+
+    main_part="${version%%${version_splitter}*}"
+    version_part="${version#*${version_splitter}}"
+
+    if [[ "${version_part}" =~ ([0-9]+)$ ]]; then
+        increment_part="${BASH_REMATCH[1]}"
+        prefix_part="${version_part%$increment_part}"
+
+        new_increment="$(increment_number_part "${increment_part}")"
+        new_version_part="${prefix_part}${new_increment}"
+
+        echo "${main_part}${version_splitter}${new_version_part}"
+        return 0
+    fi
+
+    return 1
+}
+
+new_version=""
+if [[ "${version}" == *+* ]]; then
+    new_version="$(increment_patchbuild "${version}" "+")"
+fi
+if [ -z "${new_version}" ] && [[ "${version}" == *-* ]]; then
+    # remove "+build" from version
+    version="${version%%+*}"
+    new_version="$(increment_patchbuild "${version}" "-")"
+fi
+if [ -z "${new_version}" ] && [[ "${version}" =~ ^(v)?([0-9]+)$ ]]; then
+    prefix="${BASH_REMATCH[1]}"
+    version_part="${BASH_REMATCH[2]}"
+    new_version="${prefix}$(increment_number_part "${version_part}")"
+fi
+
+
+if [ -z "${new_version}" ]; then
+    new_version="$(bump patch "${version}")"
+fi
+
+echo "${new_version}"

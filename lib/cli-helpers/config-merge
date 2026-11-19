@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""Merge a shipped config directory, e.g. of yazi, into a user's config directory.
+
+A config file that does not exist yet is copied as is. An existing one is
+merged, so everything else the user has in it is kept. @HOME@ in a shipped file
+stands for the user's home. @CODEX_REVIEW_MODEL@ and @CODEX_REVIEW_DEEP_MODEL@
+expand to model and reasoning arguments from the shipped Codex review profiles.
+
+- *.toml: the shipped keys are set, tables are merged recursively, and the
+  entries of arrays of tables (prepend_keymap, prepend_previewers, ...) are
+  updated or appended, matched by their identifying keys (on, url, mime, ...)
+- *.json, *.jsonc (comments and trailing commas allowed, e.g. of Zed) and
+  *.config holding JSON (screen-color): the
+  shipped keys are set, objects are merged recursively, and the entries of
+  lists (the segments of powerline-shell, a Zed keymap) are merged or inserted
+  after the entry they follow in the shipped list, matched by their type and
+  command, or by context and bindings/unbind; a plain "cwd" is the same entry
+  as {"type": "cwd"}. A merged file is written as plain JSON, so it loses its
+  comments; a created one is copied as is
+- config and config_* without an extension (Terminator's ConfigObj files): the
+  shipped keys are set and the [sections] merged recursively, e.g. the user's
+  own profiles and layouts are kept; values are compared as written
+- *.lua in the top directory: the top-level statements are matched by what they define (function
+  NAME, variable NAME, require("NAME")) and replaced or appended
+- keyfile (GLib's keyfile settings backend, e.g. of a Flatpak app in
+  ~/.var/app/ID/config/glib-2.0/settings), mimeapps.list and zoomus.conf: the
+  shipped keys are set in their [groups], every other line stays as it is
+- one setting per line: git's ignore matched by the whole pattern, gitk's
+  "set NAME ..." by NAME, and the KEY=VALUE lines of Spotify's prefs,
+  TeamViewer's client.conf and *.preset (cam-settings) by KEY; a changed line
+  is replaced, a missing one appended
+- gimprc and shortcutsrc (GIMP's S-expressions): the top-level forms are
+  matched by their name, an (action "NAME" ...) by its action, and replaced or
+  added before the closing "# end of" comment
+- .vimrc and vimrc: the top-level statements, blocks (augroup, if, function,
+  the vim-plug block) and continued lines included, are matched by what they
+  define (:set of one option, :let, a mapping or abbreviation by its mode and
+  keys, :command, :highlight, :function, :augroup), others by their comment or
+  text, and replaced, or added with their comment after the statement they
+  follow in the shipped file, without one first
+- rules/default.rules: replace the repo-managed block of Codex rules, preserving
+  everything outside it, including approvals saved by Codex
+- everything else (plugins, segments) is ours as a whole, so the file is
+  replaced when it differs
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+
+# only needed to merge TOML, so a JSON-only config works without it
+try:
+    import tomlkit
+    from tomlkit.exceptions import TOMLKitError
+    from tomlkit.items import AoT, Array, InlineTable, Table
+except ImportError as exc:
+    tomlkit = None
+    TOMLKIT_ERROR = exc
+    AoT = Array = InlineTable = Table = ()
+
+
+# the keys that identify an entry of an array of tables, e.g. a keymap entry by
+# its key, a previewer by its url or mime, a fetcher by its group and url
+ENTRY_ID_KEYS = ("on", "for", "name", "group", "id", "url", "mime", "use")
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def plain(value):
+    return value.unwrap() if hasattr(value, "unwrap") else value
+
+
+def is_table(value):
+    return isinstance(value, (Table, InlineTable, dict))
+
+
+def is_entry_list(value):
+    return isinstance(value, (AoT, Array, list)) and len(value) > 0 and all(is_table(item) for item in value)
+
+
+def entry_id(entry):
+    ident = []
+    for key in ENTRY_ID_KEYS:
+        if key in entry:
+            value = plain(entry[key])
+            # "<Esc>" and ["<Esc>"] are the same key
+            if isinstance(value, str) and key == "on":
+                value = [value]
+            ident.append((key, repr(value)))
+    return tuple(ident) or repr(plain(entry))
+
+
+def merge_entries(dst, src, path, changes):
+    for entry in src:
+        ident = entry_id(entry)
+        for index, existing in enumerate(dst):
+            if is_table(existing) and entry_id(existing) == ident:
+                if plain(existing) != plain(entry):
+                    dst[index] = entry
+                    changes.append(f"update {path} entry {describe_entry(entry)}")
+                break
+        else:
+            dst.append(entry)
+            changes.append(f"add {path} entry {describe_entry(entry)}")
+
+
+def describe_entry(entry):
+    for key in ENTRY_ID_KEYS:
+        if key in entry:
+            return f"{key}={plain(entry[key])!r}"
+    return repr(plain(entry))
+
+
+def merge_table(dst, src, path, changes):
+    for key, value in src.items():
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = value
+            changes.append(f"add {key_path}")
+        elif is_table(value) and is_table(dst[key]):
+            merge_table(dst[key], value, key_path, changes)
+        elif is_entry_list(value) and isinstance(dst[key], (AoT, Array, list)):
+            merge_entries(dst[key], value, key_path, changes)
+        elif plain(dst[key]) != plain(value):
+            dst[key] = value
+            changes.append(f"set {key_path}")
+
+
+def merge_toml(dst_text, src_text):
+    if tomlkit is None:
+        fail(f"python3-tomlkit is required to merge TOML: {TOMLKIT_ERROR}")
+    dst = tomlkit.parse(dst_text)
+    src = tomlkit.parse(src_text)
+    changes = []
+    merge_table(dst, src, "", changes)
+    return tomlkit.dumps(dst), changes
+
+
+# the keys that identify an entry of a JSON list, e.g. a powerline-shell segment
+# by type and command, a Zed keymap block by its context
+JSON_ID_KEYS = ("type", "command", "context")
+# a Zed keymap block binds or unbinds keys in its context, which are two blocks
+JSON_SECTION_KEYS = ("bindings", "unbind")
+
+
+def json_entry_id(entry):
+    if isinstance(entry, dict):
+        ident = tuple((key, json.dumps(entry[key], sort_keys=True)) for key in JSON_ID_KEYS if key in entry)
+        sections = tuple(key for key in JSON_SECTION_KEYS if key in entry)
+        if sections:
+            ident += (("sections", sections),)
+        return ident or json.dumps(entry, sort_keys=True)
+    # a plain "cwd" segment is {"type": "cwd"} without settings
+    return (("type", json.dumps(entry)),)
+
+
+def is_json_entry_list(value):
+    return isinstance(value, list) and all(isinstance(item, (str, dict)) for item in value)
+
+
+def merge_json_entries(dst, src, path, changes):
+    # a missing entry goes after the one it follows in the shipped list, so the
+    # order of e.g. the prompt segments is kept; without one, first
+    anchor = -1
+    for entry in src:
+        ident = json_entry_id(entry)
+        index = next((i for i, existing in enumerate(dst) if json_entry_id(existing) == ident), None)
+        if index is None:
+            anchor += 1
+            dst.insert(anchor, entry)
+            changes.append(f"add {path} entry {json.dumps(entry)[:70]}")
+            continue
+        if isinstance(dst[index], dict) and isinstance(entry, dict):
+            # e.g. the user's own bindings in the same keymap block are kept
+            merge_json_value(dst[index], entry, f"{path}[{index}]", changes)
+        elif dst[index] != entry:
+            dst[index] = entry
+            changes.append(f"update {path} entry {json.dumps(entry)[:70]}")
+        anchor = index
+
+
+def merge_json_value(dst, src, path, changes):
+    for key, value in src.items():
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = value
+            changes.append(f"add {key_path}")
+        elif isinstance(value, dict) and isinstance(dst[key], dict):
+            merge_json_value(dst[key], value, key_path, changes)
+        elif is_json_entry_list(value) and is_json_entry_list(dst[key]):
+            merge_json_entries(dst[key], value, key_path, changes)
+        elif dst[key] != value:
+            dst[key] = value
+            changes.append(f"set {key_path}")
+
+
+def strip_jsonc(text):
+    """JSON from JSONC: drops // and /* */ comments and trailing commas, but
+    not inside strings."""
+    out = []
+    index = 0
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\":
+                out.append(text[index + 1:index + 2])
+                index += 1
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif text.startswith("//", index):
+            index = text.find("\n", index)
+            if index < 0:
+                break
+            continue
+        elif text.startswith("/*", index):
+            index = text.find("*/", index)
+            if index < 0:
+                break
+            index += 2
+            continue
+        else:
+            if char in "}]":
+                # a trailing comma before the closing bracket
+                end = len(out) - 1
+                while end >= 0 and out[end].isspace():
+                    end -= 1
+                if end >= 0 and out[end] == ",":
+                    del out[end]
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def load_json(text, what):
+    try:
+        return json.loads(strip_jsonc(text))
+    except ValueError as exc:
+        fail(f"cannot merge {what}, it is no valid JSON: {exc}")
+
+
+def merge_json(dst_text, src_text):
+    dst = load_json(dst_text, "into the existing file")
+    src = load_json(src_text, "the shipped file")
+    changes = []
+    if isinstance(dst, dict) and isinstance(src, dict):
+        merge_json_value(dst, src, "", changes)
+    elif is_json_entry_list(dst) and is_json_entry_list(src):
+        merge_json_entries(dst, src, "", changes)
+    elif dst != src:
+        dst = src
+        changes.append("replace")
+    if not changes:
+        return dst_text, changes
+    return json.dumps(dst, indent=2, ensure_ascii=False) + "\n", changes
+
+
+def is_configobj(rel):
+    name = os.path.basename(rel)
+    return "." not in name and (name == "config" or name.startswith("config_"))
+
+
+def merge_configobj_section(dst, src, path, changes):
+    for key in src.scalars:
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = src[key]
+            changes.append(f"add {key_path}")
+        elif dst[key] != src[key]:
+            dst[key] = src[key]
+            changes.append(f"set {key_path}")
+    for key in src.sections:
+        key_path = f"{path}.{key}" if path else key
+        if key not in dst:
+            dst[key] = src[key].dict()
+            changes.append(f"add [{key_path}]")
+        else:
+            merge_configobj_section(dst[key], src[key], key_path, changes)
+
+
+def merge_configobj(dst_text, src_text):
+    try:
+        import configobj
+    except ImportError as exc:
+        fail(f"python3-configobj is required to merge Terminator's config: {exc}")
+    # list_values=False keeps every value as written, quotes and commas included
+    options = {"interpolation": False, "list_values": False}
+    try:
+        dst = configobj.ConfigObj(dst_text.splitlines(), **options)
+        src = configobj.ConfigObj(src_text.splitlines(), **options)
+    except configobj.ConfigObjError as exc:
+        fail(f"cannot merge the config: {exc}")
+    changes = []
+    merge_configobj_section(dst, src, "", changes)
+    if not changes:
+        return dst_text, changes
+    return "\n".join(dst.write()) + "\n", changes
+
+
+# a statement starts at column 0; indented lines and closing lines belong to the
+# statement before them
+LUA_CONTINUATION = re.compile(r"^(\s|end\b|else\b|elseif\b|until\b|[}\])])")
+LUA_FUNCTION = re.compile(r"^(?:local\s+)?function\s+([\w.:]+)")
+LUA_REQUIRE = re.compile(r"""^require\s*\(?\s*["']([^"']+)["']""")
+LUA_VARIABLE = re.compile(r"^(?:local\s+)?([\w.]+(?:\[[^\]]+\])*)\s*=(?!=)")
+
+
+def lua_chunks(text):
+    """Split into top-level statements, each with its leading comment lines and
+    the range of its statement lines."""
+    chunks = []
+    comment = []
+    current = None
+    # blank lines inside a statement, e.g. in a function body, belong to it only
+    # when the statement goes on after them
+    blanks = []
+    gap = False
+    for index, line in enumerate(text.splitlines()):
+        if not line.strip():
+            if current is not None:
+                blanks.append(line)
+            else:
+                comment = []
+                gap = True
+            continue
+        if current is not None and LUA_CONTINUATION.match(line):
+            current["lines"].extend(blanks + [line])
+            blanks = []
+            continue
+        if current is not None:
+            chunks.append(current)
+            current = None
+            comment = []
+        if blanks:
+            blanks = []
+            comment = []
+            gap = True
+        if line.startswith("--"):
+            comment.append(line)
+        else:
+            current = {"comment": comment, "lines": [line], "start": index, "gap": gap}
+            comment = []
+            gap = False
+    if current is not None:
+        chunks.append(current)
+    for chunk in chunks:
+        chunk["end"] = chunk["start"] + len(chunk["lines"])
+        chunk["key"] = lua_key(chunk)
+    return chunks
+
+
+def lua_key(chunk):
+    first = chunk["lines"][0]
+    for kind, pattern in (("function", LUA_FUNCTION), ("require", LUA_REQUIRE), ("variable", LUA_VARIABLE)):
+        match = pattern.match(first)
+        if match:
+            return f"{kind} {match.group(1)}"
+    # an anonymous statement, e.g. Header:children_add(...): its comment names
+    # it, otherwise it is only found again when it is unchanged
+    if chunk["comment"]:
+        return "comment " + " ".join(" ".join(chunk["comment"]).split())
+    return "statement " + " ".join(" ".join(chunk["lines"]).split())
+
+
+def merge_lua(dst_text, src_text):
+    lines = dst_text.splitlines()
+    changes = []
+    replacements = {}
+    # a missing statement goes after the one it follows in the shipped file, so
+    # it keeps its place, e.g. after the table it fills; without one, at the end
+    inserts = {}
+    dst_chunks = {}
+    for chunk in lua_chunks(dst_text):
+        dst_chunks.setdefault(chunk["key"], chunk)
+
+    anchor = len(lines)
+    for chunk in lua_chunks(src_text):
+        existing = dst_chunks.get(chunk["key"])
+        if existing is None:
+            inserts.setdefault(anchor, []).append(chunk)
+            changes.append(f"add {chunk['key'][:70]}")
+            continue
+        if existing["lines"] != chunk["lines"]:
+            replacements[existing["start"]] = (existing["end"], chunk["lines"])
+            changes.append(f"update {chunk['key'][:70]}")
+        anchor = existing["end"]
+
+    if not changes:
+        return dst_text, changes
+
+    merged = []
+    index = 0
+    while index <= len(lines):
+        for position, chunk in enumerate(inserts.get(index, [])):
+            # what is appended is set apart from the user's own statements
+            gap = chunk["gap"] or (index == len(lines) and position == 0)
+            if merged and merged[-1].strip() and gap:
+                merged.append("")
+            merged.extend(chunk["comment"] + chunk["lines"])
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, new_lines = replacements[index]
+            merged.extend(new_lines)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
+# GLib key files, and the like: the default apps of mimeapps.list, Zoom's QSettings
+KEYFILES = ("keyfile", "mimeapps.list", "zoomus.conf")
+
+
+def is_keyfile(rel):
+    return os.path.basename(rel) in KEYFILES
+
+
+def keyfile_groups(lines):
+    """[group] -> its keys (key -> line index) and the index of its last line."""
+    groups = {}
+    group = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            group = groups.setdefault(stripped, {"keys": {}, "end": index})
+        elif group is not None and "=" in stripped and not stripped.startswith("#"):
+            group["keys"].setdefault(stripped.split("=", 1)[0].strip(), index)
+        if group is not None and stripped:
+            group["end"] = index
+    return groups
+
+
+def merge_keyfile(dst_text, src_text):
+    lines = dst_text.splitlines()
+    src_lines = src_text.splitlines()
+    dst = keyfile_groups(lines)
+    changes = []
+    # a missing key goes to the end of its group, a missing group to the end
+    inserts = {}
+    appended = []
+    for name, group in keyfile_groups(src_lines).items():
+        entries = [(key, src_lines[index].strip()) for key, index in group["keys"].items()]
+        if name not in dst:
+            appended += ([""] if lines or appended else []) + [name] + [line for _, line in entries]
+            changes.append(f"add {name}")
+            continue
+        for key, line in entries:
+            index = dst[name]["keys"].get(key)
+            if index is None:
+                inserts.setdefault(dst[name]["end"], []).append(line)
+                changes.append(f"add {name} {key}")
+            elif lines[index].strip() != line:
+                lines[index] = line
+                changes.append(f"set {name} {key}")
+    if not changes:
+        return dst_text, changes
+    merged = []
+    for index, line in enumerate(lines):
+        merged.append(line)
+        merged.extend(inserts.get(index, []))
+    return "\n".join(merged + appended) + "\n", changes
+
+
+def assignment_key(line):
+    return line.split("=", 1)[0].strip() if "=" in line else None
+
+
+# files of one setting per line, and what identifies a line
+LINE_SETTINGS = {
+    "ignore": lambda line: line.strip(),
+    "gitk": lambda line: line.split()[1] if line.startswith("set ") else None,
+    "prefs": assignment_key,
+    "client.conf": assignment_key,
+}
+
+
+def line_settings_key(rel):
+    name = os.path.basename(rel)
+    if name.endswith(".preset"):
+        return assignment_key
+    return LINE_SETTINGS.get(name)
+
+
+def merge_line_settings(dst_text, src_text, key):
+    def line_key(line):
+        if not line.strip() or line.lstrip().startswith("#"):
+            return None
+        return key(line)
+
+    lines = dst_text.splitlines()
+    dst = {}
+    for index, line in enumerate(lines):
+        dst.setdefault(line_key(line), index)
+    changes = []
+    appended = []
+    for line in src_text.splitlines():
+        ident = line_key(line)
+        if ident is None:
+            continue
+        index = dst.get(ident)
+        if index is None:
+            appended.append(line)
+            changes.append(f"add {ident}")
+        elif lines[index] != line:
+            lines[index] = line
+            changes.append(f"set {ident}")
+    if not changes:
+        return dst_text, changes
+    return "\n".join(lines + appended) + "\n", changes
+
+
+GIMP_RC = ("gimprc", "shortcutsrc")
+# forms that repeat, told apart by their first argument
+GIMP_RC_ENTRIES = ("action",)
+GIMP_RC_FORM = re.compile(r'^\(\s*([^\s()"]+)(?:\s+"((?:[^"\\]|\\.)*)")?')
+
+
+def is_gimp_rc(rel):
+    return os.path.basename(rel) in GIMP_RC
+
+
+def paren_depth(line, in_string):
+    """The change of the parenthesis depth over LINE, outside of strings."""
+    depth = 0
+    escaped = False
+    for char in line:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+    return depth, in_string
+
+
+def gimp_rc_forms(lines):
+    """The top-level forms: key -> (index of the first line, index after the last)."""
+    forms = {}
+    start = None
+    depth = 0
+    in_string = False
+    for index, line in enumerate(lines):
+        if start is None:
+            if not line.startswith("("):
+                continue
+            start = index
+        change, in_string = paren_depth(line, in_string)
+        depth += change
+        if depth <= 0:
+            match = GIMP_RC_FORM.match(lines[start])
+            key = lines[start].strip()
+            if match:
+                key = match.group(1)
+                if key in GIMP_RC_ENTRIES and match.group(2) is not None:
+                    key = f'{key} "{match.group(2)}"'
+            forms.setdefault(key, (start, index + 1))
+            start = None
+            depth = 0
+            in_string = False
+    return forms
+
+
+def merge_gimp_rc(dst_text, src_text):
+    lines = dst_text.splitlines()
+    src_lines = src_text.splitlines()
+    dst = gimp_rc_forms(lines)
+    changes = []
+    replacements = {}
+    added = []
+    for key, (start, end) in gimp_rc_forms(src_lines).items():
+        form = src_lines[start:end]
+        if key not in dst:
+            added.extend(form)
+            changes.append(f"add {key}")
+        elif lines[dst[key][0]:dst[key][1]] != form:
+            replacements[dst[key][0]] = (dst[key][1], form)
+            changes.append(f"set {key}")
+    if not changes:
+        return dst_text, changes
+    # GIMP closes the file with "# end of gimprc"
+    closing = next((index for index in range(len(lines) - 1, -1, -1) if lines[index].startswith("# end of")), len(lines))
+    merged = []
+    index = 0
+    while index <= len(lines):
+        if index == closing and added:
+            if merged and merged[-1].strip():
+                merged.append("")
+            merged.extend(added + ([""] if closing < len(lines) else []))
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, form = replacements[index]
+            merged.extend(form)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
+VIM_RC = (".vimrc", "vimrc")
+# what a top-level statement is matched by: a :set of one option by the option
+# ("set encoding=utf-8", "set nowrap"; a "set ts=4 sw=4" by its text), a :let
+# by its variable, a mapping or abbreviation by its mode and keys, a :command,
+# :highlight, :function and :augroup by their name, the vim-plug block as one
+VIM_KEYS = (
+    ("augroup", re.compile(r"^\s*aug(?:roup)?\s+(?!END\b)(\S+)")),
+    ("plug", re.compile(r"^\s*call\s+(plug)#begin\(")),
+    ("function", re.compile(r"^\s*(?:fu(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?|def)!?\s+([\w:#.<>]+)")),
+    ("set", re.compile(r'^\s*se(?:t)?\s+(?:no|inv)?(\w+)(?:[!&]|[-+^]?=(?:\\.|\S)*)?\s*(?:".*)?$')),
+    ("let", re.compile(r"^\s*let\s+([\w:#.]+)\s*[-+.]?=")),
+    ("map", re.compile(r"^\s*([nvxsoilct]?)(?:nore)?map(!?)\s+(?:<(?:buffer|nowait|silent|special|script|expr|unique)>\s*)*(\S+)")),
+    ("abbrev", re.compile(r"^\s*([ci]?)(?:nore)?ab\w*\s+(?:<(?:buffer|expr)>\s*)*(\S+)")),
+    ("command", re.compile(r"^\s*com(?:m(?:a(?:n(?:d)?)?)?)?!?\s+(?:-\S+\s+)*([A-Z]\w*)")),
+    ("highlight", re.compile(r"^\s*hi(?:g(?:h(?:l(?:i(?:g(?:h(?:t)?)?)?)?)?)?)?!?\s+(?:default\s+)?(?:link\s+)?(\w+)")),
+)
+# the statements that take more lines, up to their closing one: the opening and
+# closing patterns
+VIM_BLOCKS = (
+    (re.compile(r"^\s*if\b"), re.compile(r"^\s*en(?:d(?:i(?:f)?)?)?\b")),
+    (re.compile(r"^\s*for\b"), re.compile(r"^\s*endfo\w*\b")),
+    (re.compile(r"^\s*wh(?:i(?:l(?:e)?)?)?\b"), re.compile(r"^\s*endw\w*\b")),
+    (re.compile(r"^\s*try\b"), re.compile(r"^\s*endt\w*\b")),
+    (re.compile(r"^\s*fu\w*!?\s"), re.compile(r"^\s*endf(?:u\w*)?\s*$")),
+    (re.compile(r"^\s*def!?\s"), re.compile(r"^\s*enddef\b")),
+    (re.compile(r"^\s*aug(?:roup)?\s+(?!END\b)\S"), re.compile(r"^\s*aug(?:roup)?\s+END\b")),
+    (re.compile(r"^\s*call\s+plug#begin\("), re.compile(r"^\s*call\s+plug#end\(")),
+)
+# a continuation line starts with a backslash
+VIM_CONTINUATION = re.compile(r"^\s*\\")
+
+
+def is_vimrc(rel):
+    return os.path.basename(rel) in VIM_RC
+
+
+def vim_block(line, closers):
+    """Keep track of the open blocks: CLOSERS are the closing patterns still
+    expected, the innermost last."""
+    if closers and closers[-1].match(line):
+        closers.pop()
+        return
+    for opener, closer in VIM_BLOCKS:
+        if opener.match(line):
+            # a block on one line, e.g. if x | y | endif
+            if "|" not in line or not closer.match(line.rsplit("|", 1)[1]):
+                closers.append(closer)
+            return
+
+
+def vim_key(chunk):
+    first = chunk["lines"][0]
+    for kind, pattern in VIM_KEYS:
+        match = pattern.match(first)
+        if not match:
+            continue
+        if kind == "map":
+            return f"{match.group(1)}map{match.group(2)} {match.group(3)}"
+        if kind == "abbrev":
+            return f"{match.group(1)}abbrev {match.group(2)}"
+        if kind == "highlight":
+            return f"highlight {match.group(1).lower()}"
+        if kind == "plug":
+            return "vim-plug block"
+        return f"{kind} {match.group(1)}"
+    # anything else, e.g. an autocmd or an if block: its comment names it,
+    # otherwise it is only found again when it is unchanged
+    if chunk["comment"]:
+        return "comment " + " ".join(" ".join(chunk["comment"]).split())
+    return "statement " + " ".join(" ".join(chunk["lines"]).split())
+
+
+def vim_chunks(text):
+    """Split into top-level statements, each with its key, the comment lines
+    right before it and the range of its lines; a block and the continuation
+    lines belong to the statement they start in."""
+    chunks = []
+    comment = []
+    gap = False
+    current = None
+    closers = []
+    for index, line in enumerate(text.splitlines()):
+        if current is not None and (closers or VIM_CONTINUATION.match(line)):
+            current["lines"].append(line)
+            current["end"] = index + 1
+            vim_block(line, closers)
+            continue
+        current = None
+        if not line.strip():
+            comment = []
+            gap = True
+            continue
+        if line.lstrip().startswith('"'):
+            comment.append(line)
+            continue
+        current = {"comment": comment, "lines": [line], "start": index, "end": index + 1, "gap": gap}
+        chunks.append(current)
+        vim_block(line, closers)
+        comment = []
+        gap = False
+    for chunk in chunks:
+        chunk["key"] = vim_key(chunk)
+    return chunks
+
+
+def merge_vimrc(dst_text, src_text):
+    lines = dst_text.splitlines()
+    # the last of the same, e.g. of two definitions of a command, is the one vim uses
+    dst = {chunk["key"]: chunk for chunk in vim_chunks(dst_text)}
+    changes = []
+    replacements = {}
+    # a missing statement goes after the one it follows in the shipped file;
+    # without one, first, as e.g. 'encoding' is set before anything reads text
+    inserts = {}
+    anchor = 0
+    for chunk in vim_chunks(src_text):
+        existing = dst.get(chunk["key"])
+        if existing is None:
+            inserts.setdefault(anchor, []).append(chunk)
+            changes.append(f"add {chunk['key'][:70]}")
+            continue
+        if lines[existing["start"]:existing["end"]] != chunk["lines"]:
+            replacements[existing["start"]] = (existing["end"], chunk["lines"])
+            changes.append(f"update {chunk['key'][:70]}")
+        anchor = existing["end"]
+    if not changes:
+        return dst_text, changes
+    merged = []
+    index = 0
+    while index <= len(lines):
+        added = inserts.get(index, [])
+        for position, chunk in enumerate(added):
+            # set apart as in the shipped file, and from the user's lines above
+            gap = chunk["gap"] or (index == len(lines) and position == 0)
+            if merged and merged[-1].strip() and gap:
+                merged.append("")
+            merged.extend(chunk["comment"] + chunk["lines"])
+        # what goes first is set apart from the user's own lines
+        if added and index == 0 and lines and lines[0].strip():
+            merged.append("")
+        if index == len(lines):
+            break
+        if index in replacements:
+            end, new_lines = replacements[index]
+            merged.extend(new_lines)
+            index = end
+        else:
+            merged.append(lines[index])
+            index += 1
+    return "\n".join(merged) + "\n", changes
+
+
+def expand_codex_review_presets(src, src_text):
+    for placeholder, filename in (
+        ("@CODEX_REVIEW_MODEL@", "review.config.toml"),
+        ("@CODEX_REVIEW_DEEP_MODEL@", "review-deep.config.toml"),
+    ):
+        if placeholder not in src_text:
+            continue
+        if tomlkit is None:
+            fail(f"python3-tomlkit is required to read the Codex review profile: {TOMLKIT_ERROR}")
+        profile = os.path.join(os.path.dirname(os.path.realpath(src)), filename)
+        try:
+            with open(profile, encoding="utf-8") as handle:
+                config = tomlkit.parse(handle.read())
+        except (OSError, TOMLKitError) as exc:
+            fail(f"Could not read {profile}: {exc}")
+        for key in ("model", "model_reasoning_effort"):
+            value = config.get(key)
+            if not isinstance(value, str) or not value.strip():
+                fail(f"Missing or invalid {key} in {profile}")
+        arguments = f"{config['model']} --reasoning={config['model_reasoning_effort']}"
+        src_text = src_text.replace(placeholder, tomlkit.string(arguments).as_string()[1:-1])
+    return src_text
+
+
+CODEX_DEFAULT_RULES = os.path.join("rules", "default.rules")
+CODEX_LEGACY_RULES = os.path.join("rules", "cli-helpers.rules")
+# Shipped versions of cli-helpers.rules. Leave customized copies active.
+CODEX_LEGACY_DIGESTS = {
+    "8bd84159bd31d8d5af31f740e24d287b65dc9e4d2c9aa676569490ff2e075df1",
+    "dc53f286319ebb5e2f35be28009faf10b7f521bda8877c01fbe1c43915000cf4",
+    "fb57e158eafdb5d25490537aaa02790a8a6c238342885a6aa651e51e521ae966",
+}
+CODEX_RULES_BEGIN = "# BEGIN cli-helpers managed rules"
+CODEX_RULES_END = "# END cli-helpers managed rules"
+
+
+def merge_codex_rules(dst_text, src_text):
+    markers = list(re.finditer(
+        rf"^(?:{re.escape(CODEX_RULES_BEGIN)}|{re.escape(CODEX_RULES_END)})$",
+        dst_text, re.MULTILINE,
+    ))
+    if not markers:
+        separator = "" if not dst_text or dst_text.endswith("\n") else "\n"
+        return dst_text + separator + src_text, ["add managed rules"]
+    if [marker.group() for marker in markers] != [CODEX_RULES_BEGIN, CODEX_RULES_END]:
+        fail("cannot merge rules/default.rules: expected one matching pair of cli-helpers markers")
+    begin, end = markers
+    return dst_text[:begin.start()] + src_text.rstrip("\n") + dst_text[end.end():], ["update managed rules"]
+
+
+def write_codex_rules(dst, text):
+    # Replace a complete file so Codex cannot read a partially written policy.
+    dst = os.path.realpath(dst)
+    mode = stat.S_IMODE(os.stat(dst).st_mode) if os.path.exists(dst) else 0o600
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(dst), delete=False) as handle:
+        tmp = handle.name
+        try:
+            handle.write(text)
+            handle.close()
+            os.chmod(tmp, mode)
+            os.replace(tmp, dst)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+def archive_legacy_codex_rules(target, dry_run):
+    legacy = os.path.join(target, CODEX_LEGACY_RULES)
+    if os.path.isfile(legacy):
+        with open(legacy, "rb") as handle:
+            if hashlib.sha256(handle.read()).hexdigest() not in CODEX_LEGACY_DIGESTS:
+                return False
+    elif not (os.path.islink(legacy) and os.path.realpath(legacy).endswith(
+        os.sep + os.path.join("lib", "cli-helpers", "codex", CODEX_LEGACY_RULES)
+    )):
+        return False
+
+    backup = legacy + ".before-default"
+    if dry_run:
+        print(f"Would archive {legacy}", file=sys.stderr)
+        return True
+    if os.path.lexists(backup):
+        fd, backup = tempfile.mkstemp(prefix=os.path.basename(backup) + "-", dir=os.path.dirname(legacy))
+        os.close(fd)
+    os.replace(legacy, backup)
+    print(f"Archived {legacy} to {backup}", file=sys.stderr)
+    return True
+
+
+def merge_file(src, dst, rel):
+    """Return the new content of dst and the list of changes, or None, []."""
+    with open(src, encoding="utf-8") as handle:
+        # @HOME@ stands for the user's home, e.g. in a path the tool keys its state by
+        src_text = handle.read().replace("@HOME@", os.path.expanduser("~"))
+    src_text = expand_codex_review_presets(src, src_text)
+    if not os.path.exists(dst):
+        return src_text, ["create"]
+    with open(dst, encoding="utf-8") as handle:
+        dst_text = handle.read()
+    if rel == CODEX_DEFAULT_RULES:
+        new_text, changes = merge_codex_rules(dst_text, src_text)
+    elif src.endswith(".toml"):
+        new_text, changes = merge_toml(dst_text, src_text)
+    elif src.endswith((".json", ".jsonc")) or (src.endswith(".config") and src_text.lstrip().startswith("{")):
+        new_text, changes = merge_json(dst_text, src_text)
+    elif is_configobj(rel):
+        new_text, changes = merge_configobj(dst_text, src_text)
+    elif rel.endswith(".lua") and os.sep not in rel:
+        new_text, changes = merge_lua(dst_text, src_text)
+    elif is_keyfile(rel):
+        new_text, changes = merge_keyfile(dst_text, src_text)
+    elif is_gimp_rc(rel):
+        new_text, changes = merge_gimp_rc(dst_text, src_text)
+    elif is_vimrc(rel):
+        new_text, changes = merge_vimrc(dst_text, src_text)
+    elif line_settings_key(rel) is not None:
+        new_text, changes = merge_line_settings(dst_text, src_text, line_settings_key(rel))
+    else:
+        new_text, changes = src_text, ([] if src_text == dst_text else ["replace"])
+    if new_text == dst_text:
+        return None, []
+    return new_text, changes
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Merge a shipped config directory into a user's config directory.")
+    parser.add_argument("source", help="the shipped config directory")
+    parser.add_argument("target", help="the config directory, e.g. ~/.config/yazi")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would change")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.source):
+        fail(f"Config not found in {args.source}")
+
+    has_codex_rules = os.path.isfile(os.path.join(args.source, CODEX_DEFAULT_RULES))
+    changed = False
+    for root, dirs, files in os.walk(args.source, followlinks=True):
+        dirs.sort()
+        for name in sorted(files):
+            src = os.path.join(root, name)
+            if "__pycache__" in src.split(os.sep):
+                continue
+            rel = os.path.relpath(src, args.source)
+            if has_codex_rules and rel == CODEX_LEGACY_RULES:
+                continue
+            dst = os.path.join(args.target, rel)
+            new_text, changes = merge_file(src, dst, rel)
+            if new_text is None:
+                continue
+            changed = True
+            verb = "Would update" if args.dry_run else "Updating"
+            print(f"{verb} {dst}:", file=sys.stderr)
+            for change in changes:
+                print(f"  {change}", file=sys.stderr)
+            if args.dry_run:
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if rel == CODEX_DEFAULT_RULES:
+                write_codex_rules(dst, new_text)
+            else:
+                with open(dst, "w", encoding="utf-8") as handle:
+                    handle.write(new_text)
+
+    if has_codex_rules and archive_legacy_codex_rules(args.target, args.dry_run):
+        changed = True
+
+    if not changed:
+        print(f"{args.target} is up to date", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

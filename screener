@@ -1,0 +1,74 @@
+#!/bin/bash
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+command -v prompt-select &>/dev/null || fail "'prompt-select' is required for the menu interface."
+command -v screen &>/dev/null || fail "'screen' is not installed."
+
+get_sessions() {
+    # screen -ls prints tab separated fields, the status is always the last one
+    # ("<id>.<name>", optionally a timestamp, then "(Detached)"/"(Attached)")
+    screen -ls | grep -E '^[[:space:]]+[0-9]+\.' | awk -F'\t' '{print $2, $NF}'
+}
+
+while true; do
+    MENU_OPTIONS=()
+
+    while read -r session_id status; do
+        # Clean up parentheses around status, e.g., (Attached) -> Attached
+        clean_status=$(echo "$status" | tr -d '()')
+
+        if [ -n "$session_id" ]; then
+            MENU_OPTIONS+=("${session_id}=${session_id} (${clean_status})")
+        fi
+    done < <(get_sessions)
+
+    MENU_OPTIONS+=("NEW=Create a new session...")
+
+    CHOICE=$(prompt-select --prompt "Select a session to resume or create a new one:" \
+                           --default "NEW" \
+                           "${MENU_OPTIONS[@]}")
+
+    if [ $? -ne 0 ]; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    if [ "$CHOICE" == "NEW" ]; then
+        NEW_NAME=$(prompt-input "Enter name for the new session:")
+        if [ $? -eq 0 ] && [ -n "$NEW_NAME" ]; then
+            clear
+            echo "Starting new session: $NEW_NAME"
+            screen -S "$NEW_NAME"
+            exit 0
+        else
+            continue 
+        fi
+    else
+        SESSION_ID="$CHOICE"
+        IS_ATTACHED=$(screen -ls | grep "$SESSION_ID" | grep -i "(Attached)")
+        if [ -n "$IS_ATTACHED" ]; then
+            echo "Session '$SESSION_ID' is currently attached elsewhere."
+            if prompt-no-yes "Force detach it and resume here?"; then
+                clear
+                echo "Force resuming session: $SESSION_ID"
+                screen -rd "$SESSION_ID"
+                exit 0
+            else
+                continue
+            fi
+        else
+            clear
+            echo "Resuming session: $SESSION_ID"
+            screen -r "$SESSION_ID"
+            exit 0
+        fi
+    fi
+done

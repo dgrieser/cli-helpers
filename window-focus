@@ -1,0 +1,21 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib/cli-helpers/lib-desktop"
+elif [ -f "${SCRIPT_DIR}/lib-desktop" ]; then
+    . "${SCRIPT_DIR}/lib-desktop"
+else
+    . "${CLI_HELPERS_LIBDIR:-/usr/local/lib/cli-helpers}/lib-desktop"
+fi
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $(basename "${0}") <id>"
+    exit 1
+fi
+
+if cli_helpers_is_wayland; then
+    cli_helpers_require_command gdbus gdbus || exit 1
+    cli_helpers_gnome_window_bridge focus "${1}"
+else
+    wmctrl -ia ${1}
+fi

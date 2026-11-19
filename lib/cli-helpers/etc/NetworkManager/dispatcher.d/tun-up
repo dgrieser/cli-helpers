@@ -1,0 +1,15 @@
+#!/bin/bash
+
+interface="${1}"
+action="${2}"
+[ -r /etc/cli-helpers/networkmanager.conf ] || exit 0
+. /etc/cli-helpers/networkmanager-functions
+
+profile="$(dispatcher_value vpn_profile)"
+if [ "${action}" = "vpn-up" ] && [[ "${interface}" = tun* ]] &&
+    [ -n "${profile}" ] && [ "${CONNECTION_ID}" = "${profile}" ]; then
+    read -ra domains <<< "${VPN_IP4_DOMAINS}"
+    read -ra configured_domains <<< "$(dispatcher_value vpn_domains)"
+    resolvectl domain "${interface}" ~. "${domains[@]}" "${configured_domains[@]}"
+    /usr/local/bin/set-slack-profile
+fi

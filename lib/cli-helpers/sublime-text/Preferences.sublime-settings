@@ -1,0 +1,15 @@
+{
+	"ignored_packages":
+	[
+		"ActionScript",
+		"Codeium",
+		"Vintage",
+	],
+	"color_scheme": "Mariana.sublime-color-scheme",
+	"theme": "Default Dark.sublime-theme",
+	"font_size": 11,
+	"index_files": true,
+	"dark_theme": "Adaptive.sublime-theme",
+	"light_theme": "Default Dark.sublime-theme",
+	"dictionary": "Dictionaries/de_DE.dic",
+}

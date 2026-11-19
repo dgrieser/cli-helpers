@@ -1,0 +1,1597 @@
+#!/bin/bash
+# Sets up a new machine from this repo, restoring from a backup of setup-backup
+# that it asks for once: the keyring with its SSH
+# keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the IKEv2 VPN home, the work VPN
+# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS and build cache limit of docker
+# and wifi power save off), the 6 GHz fix for the MediaTek MT7922,
+# the base software, gh and glab with their logins (glab to the configured GitLab host and,
+# if you like, gitlab.com), the configured SSH host key, the keys of
+# ~/.ssh/authorized_keys that may log in over SSH, the dotfiles of
+# bash_aliases.d (asking for missing SSH keys and history backups), the reminders
+# of reminder, the lists of the configured Kubernetes directory, the Downloads folder, the session of Sublime Text, the profile of
+# Google Chrome with the key of its passwords and cookies, the desktop entries of the apps
+# installed in Chrome with the links they open, the sessions and histories of
+# Claude Code, Codex and opencode from a backup, the git repos of the workspace
+# with what only they held (changes, stashes, local branches, worktrees), the categories of updater
+# the user picks, the logins of Claude Code and Codex, the k-ctx shell shorthands, netbox-cli and a kubeconfig per
+# NetBox cluster when the kubectl-helpers are installed, TLS 1.0/1.1 in Firefox with certificate exceptions for
+# the old servers of LEGACY_TLS_HOSTS in the keyring, browser-router as the default browser and, on GNOME, the
+# settings and app shortcuts. Run it as your user from a terminal, it asks for sudo.
+# setup.sh --list lists its steps, setup.sh STEP... runs only those. On a headless
+# system (see headless) it leaves out what only a desktop needs: the steps of
+# GUI_STEPS unless they are named, the gui software of updater, the GNOME
+# extension, the desktop entries and the GNOME part of the VPN plugin.
+
+# the step functions are called by their name in STEPS
+# shellcheck disable=SC2329
+APP_NAME="$(basename "${0}")"
+REPO_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${REPO_DIR}/lib/cli-helpers/local-config"
+LOCAL_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}"
+SETUP_CONFIG="${LOCAL_CONFIG_DIR}/cli-helpers/setup.conf"
+setup_value() { local_config_value "${SETUP_CONFIG}" "${1}"; }
+load_setup_config() {
+    WORK_GITLAB="$(setup_value gitlab_host)"
+    VPN_NAME="$(setup_value vpn_name)"
+    HOME_VPN_NAME="$(setup_value home_vpn_name)"
+}
+selected_openvpn_package() {
+    local package
+    if [ "${HEADLESS}" -eq 1 ]; then
+        package="$(setup_value openvpn_package)"
+        printf '%s\n' "${package:-network-manager-openvpn}"
+    else
+        package="$(setup_value openvpn_desktop_package)"
+        printf '%s\n' "${package:-network-manager-openvpn-gnome}"
+    fi
+}
+load_setup_config
+
+# the categories asked for after base, in this order, with what they are about;
+# every group of updater has to be here or in SPECIAL_GROUPS
+CATEGORIES=(dev k8s mw agents media comms desktop personal)
+declare -A CATEGORY_DESCRIPTIONS=(
+    [dev]="development tools, languages, containers and AI Git messages and branch names"
+    [k8s]="Kubernetes tools"
+    [mw]="work tools (need the glab login to the configured GitLab host)"
+    [agents]="AI coding agents and AI Git messages and branch names"
+    [media]="audio, video and image apps"
+    [comms]="chat, mail and video calls"
+    [desktop]="desktop apps"
+    [personal]="your own tools and automations"
+)
+# gui is no category, it marks the software of the others that only a desktop needs
+SPECIAL_GROUPS=(base gnome gnome-extensions gui)
+WORK_LINK="${REPO_DIR}/work-link"
+# the IKEv2 VPN home with a pre-shared key; its gateway, the home
+# network routed through it, the DNS search domains for it, the identity and the
+# key are in the keyring as type=vpn-home name=host / network / dns-search /
+# ipsec-id / ipsec-key
+HOME_VPN_FIELDS=(host network dns-search ipsec-id ipsec-key)
+CHARON_NM_PATCH="/usr/local/sbin/charon-nm-psk-patch"
+# the shorthands of k-ctx: c switches the cluster, s goes to an identifier, n
+# switches the namespace, "for" loops over clusters and bm is the baremetal parent
+K_CTX_SHELL_INIT=(--alias-env c --alias-go s --alias-ns n --alias-netbox-loop-prefix for
+    --alias-evileye-loop-prefix for --alias-netbox-env-parent bm)
+# the steps in the order of a full run, as NAME FUNCTION BACKUP DESCRIPTION; BACKUP
+# is "backup" for a step that restores from the backup; setup.sh STEP... runs
+# only these, still in this order
+STEPS=(
+    "local-config  restore_local_config  backup private component configuration"
+    "keyring       setup_keyring         backup the keyring files of the backup, then the SSH keys, SSH config, network connections and API key of Codeium in the keyring"
+    "cli-helpers   setup_cli_helpers     -      the install folders and cli-helpers itself"
+    "bin           restore_bin           backup your own scripts of ~/bin"
+    "vpn           setup_vpn             -      the OpenVPN plugin of NetworkManager and the configured profile"
+    "vpn-home      setup_vpn_home        -      the strongSwan plugin of NetworkManager, patched for short keys, and the configured IKEv2 connection (settings from the keyring)"
+    # before the VPN is dialed for the glab login: tun-up gives it the internal names
+    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker, and wifi power save off"
+    # after etc, so the reconnect applies its power save setting, and before the
+    # VPN is dialed for the glab login, as the driver reload drops the wifi
+    "wifi          fix_wifi              -      migrate the old Wi-Fi rule, fix MT7922 6 GHz, and apply the configured AX210 5 GHz profile"
+    "gh-glab       install_gh_glab       -      gh and glab with their logins"
+    "ssh-host      store_work_ssh_key     -      the configured work SSH host key"
+    "ssh           restore_ssh           backup the keys of ~/.ssh/authorized_keys, which may log in to this machine over SSH"
+    "sublime       restore_sublime       backup the session of Sublime Text"
+    "chrome        restore_chrome        backup the profile of Google Chrome with the key of its passwords and cookies"
+    "chrome-apps   setup_chrome_apps     -      the desktop entries of the apps installed in Chrome, with their icons and the links they open"
+    "base          install_base          -      the base software (updater base)"
+    "keys-history  restore_keys_history  backup the Keys folder of the documents folder and the shell histories"
+    "dotfiles      install_dotfiles      -      the dotfiles of bash_aliases.d, asking for missing SSH keys and history backups"
+    "reminders     restore_reminders     backup the reminders of reminder"
+    "kube-lists    restore_kube_lists    backup the configured Kubernetes lists"
+    "downloads     restore_downloads     backup the Downloads folder"
+    "agents        restore_agents        backup the sessions, histories, memories and settings of Claude Code, Codex and opencode"
+    "git           restore_git           backup the git repos of the workspace with what only they held"
+    "categories    install_categories    -      the categories of updater you pick"
+    "agent-logins  login_agents          -      the logins of Claude Code and Codex"
+    "k-ctx         setup_k_ctx_shell     -      the shell shorthands of k-ctx"
+    "kubeconfigs   setup_kubeconfigs     -      netbox-cli and a kubeconfig per NetBox cluster"
+    # after gh-glab, which dials the VPN that the legacy TLS hosts are behind
+    "firefox       setup_firefox_legacy  -      TLS 1.0/1.1 in Firefox and certificate exceptions for the legacy TLS hosts (from the keyring)"
+    "browser       set_default_browser   -      browser-router as the default browser"
+    "gnome         gnome_settings        -      the GNOME settings and app shortcuts"
+)
+# the steps only a desktop needs, left out of a full run on a headless system
+GUI_STEPS=(sublime chrome chrome-apps firefox browser gnome)
+# the old servers Firefox has to reach with TLS 1.0/1.1 (e.g. an old FreeIPA), as
+# HOST or HOST:PORT separated by spaces; internal names, so they are in the
+# keyring as type=dotfile-secret name=LEGACY_TLS_HOSTS, not in this public repo
+LEGACY_TLS_SECRET="LEGACY_TLS_HOSTS"
+# the preferences that let Firefox speak TLS 1.0/1.1 with the RSA key exchange
+# ciphers of such a server; they apply to every site, but a server that
+# supports TLS 1.2 or 1.3 still gets it
+FIREFOX_LEGACY_TLS_PREFS=(
+    'security.tls.version.enable-deprecated true'
+    'security.tls.version.min 1'
+    'security.ssl3.rsa_aes_128_sha true'
+    'security.ssl3.rsa_aes_256_sha true'
+)
+
+failed=()
+
+info() {
+    echo 1>&2
+    echo -e "\033[1m${1}\033[0m" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    echo "ERROR: ${1}" 1>&2
+    exit 1
+}
+
+# Ctrl-C aborts the whole setup, also in a prompt: the prompts read it as a key
+# in raw mode and exit with 130, so the shell itself gets no SIGINT
+abort() {
+    trap - INT
+    echo 1>&2
+    warning "Aborted"
+    exit 130
+}
+
+# interrupted STATUS: a status of 130 aborts the setup, also from a command
+# substitution, which signals this shell; any other status is returned
+interrupted() {
+    [ "${1}" -eq 130 ] || return "${1}"
+    kill -INT "$$"
+    exit 130
+}
+
+# the prompts of the repo, as cli-helpers is not installed yet at the start
+prompt_run() {
+    "${REPO_DIR}/${1}" "${@:2}"
+    interrupted "${?}"
+}
+
+ask() {
+    prompt_run prompt-yes-no "${1}"
+}
+
+run() {
+    echo "+ ${*}" 1>&2
+    "${@}"
+    interrupted "${?}"
+}
+
+run_updater() {
+    # the installed one, so a copy install uses its rewritten paths
+    run /usr/local/bin/updater "${@}" && return 0
+    failed+=("updater ${*}")
+    info "updater ${*} failed, see the errors above and /var/log/updater.log"
+    ask "Continue with the setup anyway?" || finish
+}
+
+# the summary of what failed, then the end
+finish() {
+    if [ "${#failed[@]}" -gt 0 ]; then
+        info "Done, but these failed or were skipped, see /var/log/updater.log:"
+        printf '  %s\n' "${failed[@]}" 1>&2
+        exit 1
+    fi
+    info "Done"
+    exit 0
+}
+
+bootstrap() {
+    local packages=()
+    command -v make > /dev/null 2>&1 || packages+=(make)
+    command -v zip > /dev/null 2>&1 || packages+=(zip)
+    command -v git > /dev/null 2>&1 || packages+=(git)
+    # updater downloads with curl before base installs it
+    command -v curl > /dev/null 2>&1 || packages+=(curl)
+    [ "${#packages[@]}" -eq 0 ] && return 0
+    info "Installing what the Makefile and updater need: ${packages[*]}"
+    run sudo apt-get update -q && run sudo apt-get install -y -- "${packages[@]}" \
+        || fail "Failed to install ${packages[*]}"
+}
+
+# the backup of setup-backup, asked for once: the ones on the attached drives
+# and media (setup-backup --find), or any other folder; every restore step
+# finds its part in it by the layout of setup-backup and skips a missing one
+choose_backup() {
+    local other="(another folder)" none="(no backup)" dir choice found
+    local -a items=()
+    info "Backup: restore from a backup of the old machine (setup-backup there)"
+    while IFS= read -r dir; do
+        items+=("${dir}"$'\t'"${dir}")
+    done < <("${REPO_DIR}/setup-backup" --find)
+    items+=("${other}"$'\t'"${other}" "${none}"$'\t'"${none}")
+    [ "${#items[@]}" -eq 2 ] && echo "No backups on the attached drives and media" 1>&2
+    choice="$(prompt_run prompt-select --delimiter $'\t' -p "Backup to restore from:" "${items[@]}")"
+    [ -z "${choice}" ] || [ "${choice}" = "${none}" ] && return 0
+    if [ "${choice}" = "${other}" ]; then
+        choice="$(prompt_run prompt-folder "Backup folder (setup-backup-<host>-<date>):")"
+        choice="${choice/#\~/${HOME}}"
+        [ -z "${choice}" ] && return 0
+    fi
+    choice="${choice%/}"
+    if [ ! -d "${choice}" ]; then
+        warning "No such folder: ${choice}, restoring nothing"
+        failed+=("backup ${choice}")
+        return 0
+    fi
+    found=0
+    for dir in local-config keyrings reminder history Keys ssh bin kube-lists "$(setup_value legacy_kube_backup)" sublime-text chrome downloads agents git; do
+        [ -n "${dir}" ] || continue
+        [ -d "${choice}/${dir}" ] && found=1
+    done
+    if [ "${found}" -eq 0 ]; then
+        warning "${choice} is no backup of setup-backup, restoring nothing"
+        failed+=("backup ${choice}")
+        return 0
+    fi
+    BACKUP_DIR="${choice}"
+    echo "Restoring from ${BACKUP_DIR}" 1>&2
+}
+
+# restore_part PART TARGET: the files of PART of the backup into the folder
+# TARGET, with their subfolders; a file that is there already is kept
+restore_part() {
+    local src="${BACKUP_DIR}/${1}" dst="${2}" file rel count=0 kept=0
+    while IFS= read -r -d '' file; do
+        rel="${file#"${src}/"}"
+        if [ -e "${dst}/${rel}" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        mkdir -p "$(dirname "${dst}/${rel}")" && cp -P -p "${file}" "${dst}/${rel}" \
+            && count=$((count + 1)) || failed+=("restore ${1}/${rel}")
+    done < <(find "${src}" \( -type f -o -type l \) -print0)
+    echo "${1}: restored ${count} files to ${dst}$([ "${kept}" -gt 0 ] && echo ", kept ${kept} that were there")" 1>&2
+}
+
+# has_part PART: whether the backup has PART; says so when not
+has_part() {
+    [ -z "${BACKUP_DIR}" ] && return 1
+    [ -d "${BACKUP_DIR}/${1}" ] && return 0
+    echo "No ${1}/ in the backup" 1>&2
+    return 1
+}
+
+restore_local_config() {
+    has_part local-config || return 0
+    local file src dst
+    for file in "${CLI_HELPERS_CONFIG_FILES[@]}"; do
+        src="${BACKUP_DIR}/local-config/${file}"
+        dst="${LOCAL_CONFIG_DIR}/${file}"
+        [ -f "${src}" ] && [ ! -L "${src}" ] || continue
+        [ ! -e "${dst}" ] && [ ! -L "${dst}" ] || continue
+        (umask 077; mkdir -p "$(dirname "${dst}")" && set -C && cat < "${src}" > "${dst}") \
+            || failed+=("restore local-config/${file}")
+    done
+    load_setup_config
+}
+
+# the keyring of the old machine: the keyring files of the backup are imported into
+# the login keyring, early, so the logins and tokens in it are there for the
+# later steps; then the SSH keys, the SSH config, the network connections (e.g.
+# the work wifi and VPN) and the API key of Codeium stored in the keyring
+# with keyring-cli are restored
+setup_keyring() {
+    local keyring_cli="${REPO_DIR}/keyring-cli"
+    local codeium_config="${XDG_DATA_HOME:-${HOME}}/.codeium/config.json"
+    local codeium_sublime_key="${HOME}/.codeium/sublime/codeium-api-key.txt"
+    local packages=() package file name type openvpn_package
+    openvpn_package="$(selected_openvpn_package)"
+    local -a files=() names
+    info "Keyring: import the old keyring files of the backup (keyrings/), then restore the SSH keys, the SSH config, the network connections and the API key of Codeium stored in the keyring"
+    if ! busctl --user status org.freedesktop.secrets > /dev/null 2>&1; then
+        warning "No keyring service running, skipping the keyring"
+        failed+=("keyring")
+        return 0
+    fi
+    for package in libsecret-tools jq python3-gi gir1.2-secret-1 python3-cryptography; do
+        dpkg -s "${package}" > /dev/null 2>&1 || packages+=("${package}")
+    done
+    if [ "${#packages[@]}" -gt 0 ]; then
+        if ! { run sudo apt-get update -q && run sudo apt-get install -y -- "${packages[@]}"; }; then
+            failed+=("apt-get install ${packages[*]}")
+            return 0
+        fi
+    fi
+
+    if [ -n "${BACKUP_DIR}" ]; then
+        mapfile -t files < <(find "${BACKUP_DIR}/keyrings" -maxdepth 1 -type f -name '*.keyring' 2>/dev/null | sort)
+        [ "${#files[@]}" -eq 0 ] && echo "No keyring files in the backup" 1>&2
+        for file in "${files[@]}"; do
+            run "${keyring_cli}" import "${file}" || failed+=("keyring-cli import ${file}")
+        done
+    fi
+
+    mapfile -t names < <("${keyring_cli}" ssh-list 2>/dev/null | tail -n +2 | awk '{ print $1 }')
+    if [ "${#names[@]}" -gt 0 ] && ask "Restore the SSH keys of the keyring (${names[*]}) to ~/.ssh?"; then
+        for name in "${names[@]}"; do
+            if [ -e "${HOME}/.ssh/${name}" ]; then
+                echo "Kept ${HOME}/.ssh/${name}" 1>&2
+                continue
+            fi
+            run "${keyring_cli}" ssh-restore "${name}" || failed+=("keyring-cli ssh-restore ${name}")
+        done
+    fi
+
+    # the SSH config is not in this public repo: it names internal hosts
+    if secret-tool lookup type ssh-config name config > /dev/null 2>&1; then
+        if [ -e "${HOME}/.ssh/config" ]; then
+            echo "Kept ${HOME}/.ssh/config" 1>&2
+        elif ask "Restore the SSH config of the keyring to ~/.ssh/config?"; then
+            run "${keyring_cli}" ssh-config-restore || failed+=("keyring-cli ssh-config-restore")
+        fi
+    fi
+
+    # the API key of Codeium, which its Vim plugin reads from its config (else
+    # it asks for :Codeium Auth) and its Sublime Text plugin from a key file of
+    # its own (else it asks for Codeium: Sign In); a key that is there is kept
+    if secret-tool lookup type codeium name api-key > /dev/null 2>&1; then
+        if [ -n "$(jq -r '.apiKey // empty' "${codeium_config}" 2>/dev/null)" ] && [ -s "${codeium_sublime_key}" ]; then
+            echo "Kept the API key of Codeium in ${codeium_config} and ${codeium_sublime_key}" 1>&2
+        elif ask "Restore the API key of Codeium of the keyring for its plugins of Vim and Sublime Text?"; then
+            run "${keyring_cli}" codeium-restore || failed+=("keyring-cli codeium-restore")
+        fi
+    fi
+
+    # nm-list is a display table: connection names may themselves contain spaces.
+    mapfile -t names < <(secret-tool search --all --unlock type nm-connection part keyfile 2>&1 > /dev/null \
+        | sed -n 's/^attribute\.name = //p' | sort -u)
+    if [ "${#names[@]}" -gt 0 ] && ask "Restore the network connections of the keyring (${names[*]})?"; then
+        # the VPN connections are OpenVPN ones, their plugin may be missing
+        for name in "${names[@]}"; do
+            type="$(nmcli -g connection.type connection show id "${name}" 2>/dev/null)"
+            if [ -n "${type}" ]; then
+                echo "Kept network connection ${name}" 1>&2
+                continue
+            fi
+            type="$(secret-tool lookup type nm-connection name "${name}" part keyfile \
+                | base64 -d | sed -n 's/^service-type=//p' | head -n 1)"
+            if [ "${type}" = org.freedesktop.NetworkManager.openvpn ] && ! dpkg -s -- "${openvpn_package}" > /dev/null 2>&1; then
+                run sudo apt-get install -y -- "${openvpn_package}" || failed+=("apt-get install ${openvpn_package}")
+            fi
+            run "${keyring_cli}" nm-restore "${name}" || failed+=("keyring-cli nm-restore ${name}")
+        done
+    fi
+}
+
+setup_dirs() {
+    if make -s -C "${REPO_DIR}" check-dirs > /dev/null 2>&1; then
+        info "The install folders are writable for $(id -un)"
+        return 0
+    fi
+    info "The install folders under /usr/local are not writable for $(id -un)"
+    if ask "Create them and make them group-writable for the group $(id -gn) (sudo make setup-dirs)?"; then
+        run sudo make -C "${REPO_DIR}" setup-dirs || fail "Failed to set up the install folders"
+        return 0
+    fi
+    warning "Installing with sudo instead"
+    MAKE_SUDO="sudo"
+}
+
+install_cli_helpers() {
+    local target="install"
+    local desktop_target="install-desktop"
+    local -a make_args=()
+    info "Installing cli-helpers"
+    if ask "Install as symlinks back to this repo (for working on it; no installs copies)?"; then
+        target="install-links"
+        desktop_target="install-desktop-links"
+    fi
+    # no GNOME extension and no desktop entries without a desktop
+    [ "${HEADLESS}" -eq 1 ] && make_args+=(INSTALL_USER_ASSETS=0)
+    if [ -n "${MAKE_SUDO}" ]; then
+        # Root installs the system files, but the bridge must point at our HOME.
+        run sudo make -C "${REPO_DIR}" "${target}" "HOME=${HOME}" INSTALL_USER_ASSETS=0 \
+            || fail "Failed to run make ${target}"
+        if [ "${HEADLESS}" -eq 0 ]; then
+            run make -C "${REPO_DIR}" install-gnome-extension "${desktop_target}" \
+                || fail "Failed to install the per-user assets"
+        fi
+        if command -v gnome-shell > /dev/null 2>&1 && command -v gnome-extensions > /dev/null 2>&1; then
+            run gnome-extensions enable cli-helpers-window-bridge@dgrieser.de \
+                || warning "Could not enable the GNOME extension; log out and back in, then enable it"
+        fi
+    else
+        run make -C "${REPO_DIR}" "${target}" "${make_args[@]}" || fail "Failed to run make ${target}"
+    fi
+    # without sudo the .pth file in the system's site-packages is only warned about
+    if [ "$(cat /usr/lib/python3/dist-packages/usr-local-python3.pth 2>/dev/null)" != "/usr/local/lib/python3/dist-packages" ]; then
+        run sudo make -C "${REPO_DIR}" install-pth || failed+=("sudo make install-pth")
+    fi
+    hash -r
+}
+
+login_github() {
+    while ! gh auth status --hostname github.com > /dev/null 2>&1; do
+        info "gh is not logged in to github.com, it is needed for the releases on GitHub"
+        if ! ask "Log in now (gh auth login)?"; then
+            warning "Not logged in to github.com, the software from GitHub will fail"
+            failed+=("gh auth login")
+            return 0
+        fi
+        gh auth login
+    done
+    echo "Logged in to github.com" 1>&2
+}
+
+# the keys that may log in over SSH from ssh/authorized_keys of the backup,
+# added to ~/.ssh/authorized_keys without the ones it has already, as a fresh
+# install may have an empty one
+restore_ssh() {
+    local src="${BACKUP_DIR}/ssh/authorized_keys" dst="${HOME}/.ssh/authorized_keys" key count=0
+    has_part ssh || return 0
+    if [ ! -f "${src}" ]; then
+        echo "No ssh/authorized_keys in the backup" 1>&2
+        return 0
+    fi
+    info "SSH: add the keys of authorized_keys from the backup"
+    if ! { { [ -d "${HOME}/.ssh" ] || mkdir -m 700 "${HOME}/.ssh"; } && touch "${dst}" && chmod 600 "${dst}"; }; then
+        failed+=("restore ssh/authorized_keys")
+        return 0
+    fi
+    # a last line without a newline would run into the first added key
+    [ -s "${dst}" ] && [ -n "$(tail -c 1 "${dst}")" ] && echo >> "${dst}"
+    while IFS= read -r key || [ -n "${key}" ]; do
+        [[ "${key}" =~ ^[[:space:]]*(#|$) ]] && continue
+        grep -qxF -- "${key}" "${dst}" && continue
+        if ! printf '%s\n' "${key}" >> "${dst}"; then
+            failed+=("restore ssh/authorized_keys")
+            return 0
+        fi
+        count=$((count + 1))
+    done < "${src}"
+    echo "ssh: added ${count} keys to ${dst}" 1>&2
+}
+
+# the own scripts of ~/bin from bin/ of the backup, before setting up the VPN
+restore_bin() {
+    has_part bin || return 0
+    info "~/bin: restore your own scripts from the backup"
+    restore_part bin "${HOME}/bin"
+}
+
+# the VPN of work, fully set up before the glab login to the configured GitLab host:
+# the OpenVPN plugin of NetworkManager with its GNOME part (not on a headless
+# system), the connection loaded
+# (from the keyring when the keyring step did not restore it)
+setup_vpn() {
+    [ -n "${VPN_NAME}" ] || { info "VPN: no profile configured"; return 0; }
+    local packages=() package openvpn_package
+    openvpn_package="$(selected_openvpn_package)"
+    info "VPN: the OpenVPN plugin of NetworkManager and the ${VPN_NAME} profile"
+    for package in "${openvpn_package}" python3-gi gir1.2-nm-1.0 iw; do
+        dpkg -s "${package}" > /dev/null 2>&1 || packages+=("${package}")
+    done
+    if [ "${#packages[@]}" -gt 0 ]; then
+        if run sudo apt-get install -y -- "${packages[@]}"; then
+            # the connections of a plugin that was missing are read again
+            run sudo nmcli connection reload || failed+=("nmcli connection reload")
+        else
+            failed+=("apt-get install ${packages[*]}")
+        fi
+    fi
+
+    if [ "$(nmcli -g connection.type connection show id "${VPN_NAME}" 2>/dev/null)" = vpn ]; then
+        echo "VPN connection ${VPN_NAME} is loaded" 1>&2
+    elif secret-tool lookup type nm-connection name "${VPN_NAME}" part keyfile > /dev/null 2>&1; then
+        run "${REPO_DIR}/keyring-cli" nm-restore "${VPN_NAME}" || failed+=("keyring-cli nm-restore ${VPN_NAME}")
+    else
+        warning "No VPN connection ${VPN_NAME}, neither in NetworkManager nor in the keyring"
+        failed+=("VPN connection ${VPN_NAME}")
+    fi
+
+}
+
+# the IKEv2 VPN home with a pre-shared key: the strongSwan plugin
+# of NetworkManager, its charon-nm patched to take a key shorter than 20
+# characters and to accept with remote-identity=%any the identity the gateway
+# sends, e.g. its WAN IPv6 address that changes with the prefix of the
+# provider (see lib/cli-helpers/charon-nm-psk-patch, installed as root to
+# ${CHARON_NM_PATCH} with a DPkg::Post-Invoke hook that patches again after every
+# upgrade), and the connection as a keyfile of NetworkManager, written with the
+# settings of the keyring (type=vpn-home name=host / network / dns-search /
+# ipsec-id / ipsec-key), so the key is in no command line; a split tunnel: only the
+# home network and the names of the DNS search domains (~domain for routing only)
+# go through it, as /etc/strongswan.d/charon-nm-no-routes.conf keeps charon-nm
+# from routing everything; a keyfile that differs is only replaced when you say so
+setup_vpn_home() {
+    [ -n "${HOME_VPN_NAME}" ] || { info "IKEv2 VPN: no profile configured"; return 0; }
+    local package="network-manager-strongswan" hook="/etc/apt/apt.conf.d/99charon-nm-psk-patch"
+    local routes_conf="/etc/strongswan.d/charon-nm-no-routes.conf"
+    local -A vpn=()
+    local field missing=() uuid dst tmp
+    dst="/etc/NetworkManager/system-connections/${HOME_VPN_NAME}.nmconnection"
+    info "VPN home: the strongSwan plugin of NetworkManager, patched for short keys, and the ${HOME_VPN_NAME} connection (IKEv2 PSK, settings from the keyring)"
+    if ! dpkg -s "${package}" > /dev/null 2>&1; then
+        if run sudo apt-get install -y "${package}"; then
+            run sudo nmcli connection reload || failed+=("nmcli connection reload")
+        else
+            failed+=("apt-get install ${package}")
+            return 0
+        fi
+    fi
+
+    # a copy owned by root, as apt runs it as root
+    run sudo install -D -m 755 -o root -g root "${REPO_DIR}/lib/cli-helpers/charon-nm-psk-patch" "${CHARON_NM_PATCH}" \
+        || failed+=("install ${CHARON_NM_PATCH}")
+    tmp="$(mktemp)"
+    echo "DPkg::Post-Invoke { \"if [ -x ${CHARON_NM_PATCH} ]; then ${CHARON_NM_PATCH} || true; fi\"; };" > "${tmp}"
+    if ! sudo cmp -s "${tmp}" "${hook}"; then
+        run sudo install -m 644 -o root -g root "${tmp}" "${hook}" || failed+=("install ${hook}")
+    fi
+    rm -f "${tmp}"
+    run sudo "${CHARON_NM_PATCH}" || failed+=("charon-nm-psk-patch")
+
+    # charon-nm routes all the traffic selectors of the gateway (all of IPv4)
+    # through the tunnel in its own routing table, which overrides never-default
+    # and the routes of NetworkManager; without, NetworkManager routes only the
+    # home network through it. A running charon-nm reads it when it starts again.
+    tmp="$(mktemp)"
+    printf '%s\n' "# setup.sh vpn-home: the routes of a VPN come from NetworkManager only" \
+        "charon-nm {" "    plugins {" "        kernel-netlink {" "            install_routes_xfrmi = no" \
+        "        }" "    }" "}" > "${tmp}"
+    if ! sudo cmp -s "${tmp}" "${routes_conf}"; then
+        if run sudo install -m 644 -o root -g root "${tmp}" "${routes_conf}"; then
+            # NetworkManager starts it again for the next connection
+            if pgrep -x charon-nm > /dev/null; then
+                if nmcli -g GENERAL.STATE connection show id "${HOME_VPN_NAME}" 2>/dev/null | grep -q .; then
+                    warning "charon-nm routes all traffic through the VPN ${HOME_VPN_NAME} until it starts again: disconnect the VPN, then run sudo pkill -x charon-nm"
+                else
+                    run sudo pkill -x charon-nm || failed+=("pkill charon-nm")
+                fi
+            fi
+        else
+            failed+=("install ${routes_conf}")
+        fi
+    fi
+    rm -f "${tmp}"
+
+    for field in "${HOME_VPN_FIELDS[@]}"; do
+        vpn[${field}]="$(secret-tool lookup type vpn-home name "${field}" 2>/dev/null)"
+        [ -n "${vpn[${field}]}" ] || missing+=("${field}")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warning "Missing in the keyring for the VPN ${HOME_VPN_NAME}: ${missing[*]} (store each: secret-tool store --label=\"VPN home NAME\" type vpn-home name NAME)"
+        failed+=("VPN connection ${HOME_VPN_NAME}, ${missing[*]} missing in the keyring")
+        return 0
+    fi
+
+    # the UUID of a loaded connection is kept, so NetworkManager sees the same one
+    uuid="$(nmcli -g connection.uuid connection show id "${HOME_VPN_NAME}" 2>/dev/null | head -n 1)"
+    [ -n "${uuid}" ] || uuid="$(cat /proc/sys/kernel/random/uuid)"
+    tmp="$(mktemp)"
+    cat > "${tmp}" <<EOF
+[connection]
+id=${HOME_VPN_NAME}
+uuid=${uuid}
+type=vpn
+autoconnect=false
+
+[vpn]
+service-type=org.freedesktop.NetworkManager.strongswan
+address=${vpn[host]}
+method=psk
+local-identity=${vpn[ipsec-id]}
+remote-identity=%any
+virtual=yes
+encap=no
+ipcomp=no
+proposal=no
+password-flags=0
+
+[vpn-secrets]
+password=${vpn[ipsec-key]}
+
+[ipv4]
+dns-search=${vpn[dns-search]%;};
+method=auto
+never-default=true
+route1=${vpn[network]}
+
+[ipv6]
+addr-gen-mode=default
+method=auto
+never-default=true
+EOF
+    if sudo cmp -s "${tmp}" "${dst}"; then
+        echo "VPN connection ${HOME_VPN_NAME} is up to date" 1>&2
+        rm -f "${tmp}"
+        return 0
+    fi
+    # no diff, the keyfile holds the secrets
+    if sudo test -e "${dst}" && ! ask "Replace the ${HOME_VPN_NAME} connection ${dst}, it differs from the one of the keyring?"; then
+        echo "Kept ${dst}" 1>&2
+        rm -f "${tmp}"
+        return 0
+    fi
+    if run sudo install -D -m 600 -o root -g root "${tmp}" "${dst}"; then
+        run sudo nmcli connection load "${dst}" || failed+=("nmcli connection load ${dst}")
+    else
+        failed+=("install ${dst}")
+    fi
+    rm -f "${tmp}"
+}
+
+# Install root-owned NetworkManager settings before enabling their dispatchers.
+install_etc_files() {
+    local src_dir="${REPO_DIR}/lib/cli-helpers/etc" src dst mode
+    local source_config="${LOCAL_CONFIG_DIR}/cli-helpers/networkmanager.conf"
+    local helper="${src_dir}/cli-helpers/networkmanager-functions"
+    local -a files=() changed=() restart=()
+    info "/etc: NetworkManager dispatchers, Wi-Fi power saving, Docker DNS and the resume policy"
+    mapfile -d '' -t files < <(find "${src_dir}" -type f ! -path "${helper}" -print0 | sort -z)
+    files=("${helper}" "${source_config}" "${files[@]}")
+    for src in "${files[@]}"; do
+        mode=644
+        if [ "${src}" = "${source_config}" ]; then
+            [ -f "${src}" ] || continue
+            dst=/etc/cli-helpers/networkmanager.conf
+            mode=600
+        else
+            dst="/etc/${src#"${src_dir}/"}"
+            [ ! -x "${src}" ] || mode=755
+        fi
+        if sudo cmp -s "${src}" "${dst}" && [ "$(sudo stat -c '%a:%u:%g' "${dst}")" = "${mode}:0:0" ]; then
+            echo "${dst} is up to date" >&2
+            continue
+        fi
+        if sudo test -e "${dst}"; then
+            case "${dst}" in
+                /etc/cli-helpers/networkmanager.conf|*/dispatcher.d/tun-up) ;;
+                *) sudo diff -u "${dst}" "${src}" >&2 ;;
+            esac
+            if ! ask "Replace ${dst} with the new configuration?"; then
+                echo "Kept ${dst}" >&2
+                continue
+            fi
+        fi
+        if run sudo install -D -m "${mode}" -o root -g root "${src}" "${dst}"; then
+            changed+=("${dst}")
+        else
+            failed+=("install ${dst}")
+            [[ "${src}" != "${source_config}" && "${src}" != "${helper}" ]] || return 0
+        fi
+    done
+    retire_legacy_wifi_dispatcher
+
+    # the dispatcher scripts run on the next connection, the services read their
+    # files when they start; docker reads it on its first start when not running
+    printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/resolved\.conf\.d/' && restart+=(systemd-resolved)
+    printf '%s\n' "${changed[@]}" | grep -q '^/etc/docker/' && systemctl is-active --quiet docker && restart+=(docker)
+    # NetworkManager reads conf.d again on a reload, a setting there applies from
+    # the next connection on
+    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/NetworkManager/conf\.d/'; then
+        run sudo systemctl reload NetworkManager || failed+=("systemctl reload NetworkManager")
+    fi
+    [ "${#restart[@]}" -eq 0 ] && return 0
+    # these are no unit files, but the units installed before (apt, snaps) make
+    # every restart warn about a missing daemon-reload
+    run sudo systemctl daemon-reload || failed+=("systemctl daemon-reload")
+    run sudo systemctl restart "${restart[@]}" || failed+=("systemctl restart ${restart[*]}")
+}
+
+# Disable only the legacy dispatcher whose fingerprint was recorded during migration.
+retire_legacy_wifi_dispatcher() {
+    local legacy expected actual dir=/etc/NetworkManager/dispatcher.d
+    legacy="$(setup_value legacy_wifi_dispatcher)"
+    expected="$(setup_value legacy_wifi_dispatcher_sha256)"
+    [[ "${legacy}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && "${expected}" =~ ^[0-9a-f]{64}$ ]] || return 0
+    [ "${legacy}" != wifi-status-up ] || return 0
+    sudo test -f "${dir}/${legacy}" || return 0
+    if ! sudo cmp -s "${REPO_DIR}/lib/cli-helpers/etc/NetworkManager/dispatcher.d/wifi-status-up" "${dir}/wifi-status-up" ||
+        ! sudo test -f /etc/cli-helpers/networkmanager.conf; then
+        return 0
+    fi
+    actual="$(sudo sha256sum -- "${dir}/${legacy}")" || return 0
+    if [ "${actual%% *}" != "${expected}" ]; then
+        warning "Review ${dir}/${legacy}; the legacy dispatcher has local changes."
+        return 0
+    fi
+    run sudo mv -n -- "${dir}/${legacy}" "/etc/cli-helpers/legacy-${legacy}" || failed+=("migrate legacy Wi-Fi dispatcher")
+    if sudo test -e "${dir}/${legacy}"; then
+        warning "The legacy dispatcher is still active. Check for a previous backup under /etc/cli-helpers."
+    fi
+}
+
+# Migrate legacy configuration on any adapter. Wait for Wi-Fi on the MT7922,
+# where the fix can reload the driver.
+fix_wifi() {
+    info "Wi-Fi: migrate the old rule and apply the 6 GHz fix on MediaTek MT7922"
+    if run "${REPO_DIR}/fix-mt7922-6ghz-roaming"; then
+        if grep -qx '0x0616' /sys/bus/pci/drivers/mt7921e/*/device 2>/dev/null; then
+            run nm-online -q -t 60 || warning "No network connection 60 s after the driver reload"
+        fi
+    else
+        failed+=("fix-mt7922-6ghz-roaming, see ~/.local/state/fix-mt7922-6ghz-roaming.log")
+    fi
+
+    # The office 6 GHz path returned an untrusted Sophos certificate for
+    # internal HTTPS. On the AX210, the same profile reached GitLab on 5 GHz.
+    grep -qx '0x2725' /sys/bus/pci/drivers/iwlwifi/*/device 2>/dev/null || return 0
+    local profile band
+    profile="$(setup_value ax210_5ghz_profile)"
+    [ -n "${profile}" ] || return 0
+    [ "$(nmcli -g connection.type connection show id "${profile}" 2>/dev/null)" = 802-11-wireless ] || return 0
+    band="$(nmcli -g 802-11-wireless.band connection show id "${profile}")" || return 1
+    [ -z "${band}" ] || return 0
+    info "Wi-Fi: use 5 GHz for ${profile} on the Intel AX210 from the next activation"
+    if ! run nmcli connection modify id "${profile}" 802-11-wireless.band a; then
+        failed+=("set the ${profile} Wi-Fi profile to 5 GHz")
+    fi
+}
+
+# the configured GitLab host is only reachable through the VPN (or from the office)
+dial_vpn() {
+    local host="${1}"
+    # any HTTP answer will do, only no connection at all means no VPN
+    while ! curl -sS -o /dev/null --connect-timeout 5 --max-time 10 "https://${host}" 2> /dev/null; do
+        info "${host} is not reachable: dial the ${VPN_NAME} VPN now"
+        if [ -r "${XDG_CONFIG_HOME:-${HOME}/.config}/work-link/config.toml" ] && ask "Dial it with work-link?"; then
+            run "${WORK_LINK}" connect && continue
+        fi
+        echo "Connect the ${VPN_NAME} VPN from GNOME or use work-link connect --ask" 1>&2
+        ask "Try ${host} again?" || return 1
+    done
+}
+
+# login_gitlab HOST [optional]: glab logged in to HOST; the login to
+# the configured GitLab host is needed for the work tools, an optional one (gitlab.com)
+# is only offered, and declining it is no failure
+login_gitlab() {
+    local host="${1}" optional="${2:-}"
+    while ! glab auth status --hostname "${host}" > /dev/null 2>&1; do
+        if [ -n "${optional}" ]; then
+            info "glab is not logged in to ${host}"
+            ask "Log in to ${host} (glab auth login --hostname ${host})?" || return 0
+        else
+            info "glab is not logged in to ${host}, it is needed for the work tools"
+            if ! ask "Log in now (glab auth login --hostname ${host})?"; then
+                warning "Not logged in to ${host}, the work tools will fail"
+                failed+=("glab auth login --hostname ${host}")
+                return 0
+            fi
+        fi
+        if [ "${host}" = "${WORK_GITLAB}" ] && ! dial_vpn "${host}"; then
+            warning "No VPN, not logged in to ${host}, the work tools will fail"
+            failed+=("VPN for glab auth login --hostname ${host}")
+            return 0
+        fi
+        glab auth login --hostname "${host}"
+    done
+    echo "Logged in to ${host}" 1>&2
+}
+
+install_gh_glab() {
+    info "Installing gh and glab, most software comes from their releases"
+    run_updater gh glab
+    hash -r
+    command -v gh > /dev/null 2>&1 && login_github
+    [ -n "${WORK_GITLAB}" ] && command -v glab > /dev/null 2>&1 && login_gitlab "${WORK_GITLAB}"
+    command -v glab > /dev/null 2>&1 && login_gitlab gitlab.com optional
+    # after the logins, as glab auth configure-docker only sets up their hosts
+    command -v glab > /dev/null 2>&1 && run_updater glab-docker
+}
+
+# Ensure the configured SSH host key is available for noninteractive logins.
+store_work_ssh_key() {
+    local host
+    host="$(setup_value ssh_host)"
+    [ -n "${host}" ] || return 0
+    info "${host}: store its host key in ~/.ssh/known_hosts"
+    if ssh-keygen -F "${host}" > /dev/null 2>&1; then
+        echo "Kept the host key of ${host} in ${HOME}/.ssh/known_hosts" >&2
+        return 0
+    fi
+    if [ -n "${WORK_GITLAB}" ] && ! dial_vpn "${WORK_GITLAB}"; then
+        failed+=("VPN for ssh-keyscan ${host}")
+        return 0
+    fi
+    ssh-keyscan -H -- "${host}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null || failed+=("ssh-keyscan ${host}")
+}
+
+# the Keys folder of the documents folder and the shell histories from Keys/
+# and history/ of the backup, before the dotfiles: install-home of
+# bash_aliases.d then links the SSH keys from there and asks for nothing
+restore_keys_history() {
+    local keys_dir
+    if has_part Keys; then
+        keys_dir="$(xdg-user-dir DOCUMENTS 2>/dev/null || echo "${HOME}/Documents")/Keys"
+        info "Keys: restore the Keys folder of the documents folder from the backup"
+        restore_part Keys "${keys_dir}"
+    fi
+    if has_part history; then
+        info "Shell histories: restore them from the backup"
+        restore_part history "${HOME}"
+    fi
+}
+
+# the dotfiles of bash_aliases.d once more, now with a terminal: updater installed
+# them without one, so it skipped the questions for a missing SSH key in the
+# documents folder and for the backups of the shell histories (the ones the
+# backup did not have)
+install_dotfiles() {
+    local dir="${HOME}/workspace/dgrieser/bash_aliases.d"
+    if [ ! -f "${dir}/Makefile" ]; then
+        warning "No ${dir}, skipping its dotfiles"
+        failed+=("bash_aliases.d dotfiles")
+        return
+    fi
+    info "Dotfiles: restore missing SSH keys and shell histories"
+    run make -s -C "${dir}" install || failed+=("make -C ${dir} install")
+    export_dotfile_secrets
+}
+
+# this shell started before the dotfiles, so it lacks the keys and tokens their
+# .bashrc exports (e.g. the Git AI API key, which the installer of
+# the updater reads); the ones the keyring holds are exported here for this run
+export_dotfile_secrets() {
+    local block="${HOME}/workspace/dgrieser/bash_aliases.d/home/blocks/.bashrc"
+    local var name value
+    [ -f "${block}" ] || return 0
+    while read -r var name; do
+        [ -n "${!var:-}" ] && continue
+        value="$(secret-tool lookup type dotfile-secret name "${name}" 2>/dev/null)"
+        [ -n "${value}" ] && export "${var}=${value}"
+    done < <(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)="@@SECRET?\{0,1\}:\([A-Za-z0-9_]*\)@@"$/\1 \2/p' "${block}")
+}
+
+# the reminders of the reminder tool from reminder/ of the backup, with the
+# done ones and their display order
+restore_reminders() {
+    has_part reminder || return 0
+    info "Reminders: restore them from the backup"
+    restore_part reminder "${HOME}/.cache/reminder"
+}
+
+restore_kube_lists() {
+    local lists part=kube-lists
+    lists="$(setup_value kube_lists_path)"
+    [ -n "${lists}" ] || return 0
+    if [ -n "${BACKUP_DIR}" ] && [ ! -d "${BACKUP_DIR}/${part}" ]; then
+        part="$(setup_value legacy_kube_backup)"
+    fi
+    [ -n "${part}" ] && has_part "${part}" || return 0
+    restore_part "${part}" "${HOME}/${lists}"
+}
+
+# the Downloads folder from downloads/ of the backup; a file that is there
+# already is kept
+restore_downloads() {
+    has_part downloads || return 0
+    info "Downloads: restore the Downloads folder from the backup"
+    restore_part downloads "$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "${HOME}/Downloads")"
+}
+
+# the session of Sublime Text from sublime-text/ of the backup: the windows and
+# tabs it had open, with their unsaved text; before updater installs it, so
+# its first start opens them; a session that is here already (a Sublime Text
+# that started once writes a new, empty one) is asked about and moved aside to
+# Local.before-restore-DATE, not deleted, as a kept one would hide the backup's;
+# a running one would write its own session over it
+restore_sublime() {
+    local dir="${HOME}/.config/sublime-text/Local" moved
+    has_part sublime-text || return 0
+    info "Sublime Text: restore its session (the open files and their unsaved text) from the backup"
+    if diff -rq "${BACKUP_DIR}/sublime-text" "${dir}" > /dev/null 2>&1; then
+        echo "sublime-text: ${dir} has the session of the backup already" 1>&2
+        return 0
+    fi
+    if [ -e "${dir}" ] && ! ask "Replace the Sublime Text session here with the one of the backup (it is moved aside)?"; then
+        echo "Kept ${dir}" 1>&2
+        return 0
+    fi
+    if pgrep -x sublime_text > /dev/null 2>&1; then
+        warning "Sublime Text is running and would write its session over the restored one"
+        while pgrep -x sublime_text > /dev/null 2>&1; do
+            if ! ask "Close Sublime Text now, then continue (no: skip its session)?"; then
+                failed+=("sublime-text, it was running")
+                return 0
+            fi
+        done
+    fi
+    if [ -e "${dir}" ]; then
+        moved="${dir}.before-restore-$(date +%Y%m%d-%H%M%S)"
+        run mv "${dir}" "${moved}" || { failed+=("sublime-text, cannot move ${dir} aside"); return 0; }
+    fi
+    restore_part sublime-text "${dir}"
+}
+
+# the profile of Google Chrome from chrome/ of the backup, with its key from the
+# keyring file there: Chrome encrypts its passwords and cookies with it, so the
+# key of a Chrome that ran here already is replaced (keyring-cli import
+# --overwrite of only that item); a profile that is here is asked about and
+# moved aside to google-chrome.before-restore-DATE, not deleted; before updater
+# installs Chrome
+restore_chrome() {
+    local dir="${HOME}/.config/google-chrome" archive file moved
+    local -a files=()
+    has_part chrome || return 0
+    archive="${BACKUP_DIR}/chrome/google-chrome.tar.gz"
+    [ -f "${archive}" ] || { echo "No google-chrome.tar.gz in chrome/ of the backup" 1>&2; return 0; }
+    info "Chrome: restore its profile (bookmarks, history, passwords, cookies, extensions, settings) and the key of its passwords and cookies from the backup"
+    if [ -e "${dir}" ] && ! ask "Replace the Chrome profile here with the one of the backup (it is moved aside, its passwords and cookies cannot be read any more)?"; then
+        echo "Kept ${dir}" 1>&2
+        return 0
+    fi
+    while pgrep -x chrome > /dev/null 2>&1; do
+        if ! ask "Close Chrome now, then continue (no: skip its profile)?"; then
+            failed+=("chrome, it was running")
+            return 0
+        fi
+    done
+
+    mapfile -t files < <(find "${BACKUP_DIR}/chrome" -maxdepth 1 -type f -name '*.keyring' | sort)
+    [ "${#files[@]}" -eq 0 ] && warning "No keyring file in chrome/ of the backup, Chrome cannot read the passwords and cookies"
+    for file in "${files[@]}"; do
+        # it asks for the password of the old keyring, the old login password
+        run "${REPO_DIR}/keyring-cli" import --match application=chrome --overwrite "${file}" \
+            || failed+=("chrome key: keyring-cli import --match application=chrome --overwrite ${file}, before Chrome starts")
+    done
+
+    if [ -e "${dir}" ]; then
+        moved="${dir}.before-restore-$(date +%Y%m%d-%H%M%S)"
+        run mv "${dir}" "${moved}" || { failed+=("chrome, cannot move ${dir} aside"); return 0; }
+    fi
+    run tar -xzf "${archive}" -C "${HOME}" || failed+=("chrome profile")
+}
+
+# the desktop entries of the apps installed in Chrome (chrome-<id>-<profile>.desktop),
+# which Chrome keeps outside its profile, so a restored profile has its apps
+# without them: written again from its web app database, with their icons, jump
+# lists and the links they open (e.g. mailto, web+msteams), which become the
+# default where no default of your own is set; for any profile here, restored
+# or not, also before Chrome is installed; then a reminder to load the
+# extension chrome-link-router, which opens links clicked in Chrome in these
+# apps: Chrome only loads it by hand, a restored profile keeps it while the
+# repo is at the same path
+setup_chrome_apps() {
+    local extension="${REPO_DIR}/chrome-link-router"
+    local preferences="${HOME}/.config/google-chrome/Default/Preferences"
+    info "Chrome apps: write the desktop entries of the apps installed in Chrome, with their icons and the links they open"
+    run "${REPO_DIR}/lib/cli-helpers/chrome-web-apps" || failed+=("chrome-apps: lib/cli-helpers/chrome-web-apps")
+    [ -f "${preferences}" ] || return 0
+    grep -qF "\"path\":\"${extension}\"" "${preferences}" && return 0
+    warning "The Chrome extension chrome-link-router is not loaded, so links clicked in Chrome do not open in their apps: open chrome://extensions, turn on Developer mode, Load unpacked: ${extension}"
+}
+
+# the sessions, histories, memories and settings of Claude Code, Codex and
+# opencode from agents/ of the backup, one NAME.tar.gz each; before updater
+# installs them, so it merges the shipped settings into the restored ones; a
+# file that is here already is kept; the logins are not in the backup,
+# login_agents asks for them
+restore_agents() {
+    local archive count=0
+    has_part agents || return 0
+    info "Agents: restore the sessions, histories, memories and settings of Claude Code, Codex and opencode from the backup"
+    for archive in "${BACKUP_DIR}/agents"/*.tar.gz; do
+        [ -f "${archive}" ] || continue
+        echo "Restoring $(basename "${archive}" .tar.gz)" 1>&2
+        if tar -xzf "${archive}" -C "${HOME}" --skip-old-files; then
+            count=$((count + 1))
+        else
+            failed+=("agents $(basename "${archive}")")
+        fi
+    done
+    echo "agents: restored ${count} to ${HOME}" 1>&2
+}
+
+# restore_git_repo DIR: the repo of DIR of git/ of the backup to its path under
+# ~: cloned from its remotes when it is not there, then what only it held on the
+# old machine from repo.bundle: the branches (one that went another way in a repo
+# that was here is kept and the old one restored as NAME-setup-backup), the tags,
+# the stashes and the worktrees at their old commits with their uncommitted and
+# untracked files; changes that do not fit the worktree as it is here become a
+# stash instead
+restore_git_repo() {
+    local src="${1}" rel dst line kind a b c d e f sha cur wt path fresh=0 checked_out at_old
+    local -a remotes=() branches=() tags=() stashes=() worktrees=()
+    rel="${src#"${BACKUP_DIR}/git/"}"
+    dst="${HOME}/${rel}"
+    # the fields are kept apart by \x1f, as read joins tabs in a row and loses
+    # an empty field
+    while IFS= read -r line; do
+        IFS=$'\x1f' read -r kind line <<< "${line//$'\t'/$'\x1f'}"
+        case "${kind}" in
+            remote)   remotes+=("${line}") ;;
+            branch)   branches+=("${line}") ;;
+            tag)      tags+=("${line}") ;;
+            stash)    stashes+=("${line}") ;;
+            worktree) worktrees+=("${line}") ;;
+        esac
+    done < "${src}/manifest"
+
+    echo "${rel}" 1>&2
+    if [ ! -e "${dst}/.git" ]; then
+        if [ "${#remotes[@]}" -gt 0 ]; then
+            # from origin, or the first remote; the others are added after the clone
+            IFS=$'\x1f' read -r a b <<< "${remotes[0]}"
+            for line in "${remotes[@]}"; do
+                [ "${line%%$'\x1f'*}" = origin ] && IFS=$'\x1f' read -r a b <<< "${line}"
+            done
+            run git clone -q -o "${a}" "${b}" "${dst}" || { failed+=("git clone ${b} ${dst}"); return 0; }
+        else
+            run git init -q "${dst}" || { failed+=("git init ${dst}"); return 0; }
+        fi
+        fresh=1
+    fi
+    for line in "${remotes[@]}"; do
+        IFS=$'\x1f' read -r a b <<< "${line}"
+        git -C "${dst}" remote get-url "${a}" > /dev/null 2>&1 && continue
+        git -C "${dst}" remote add "${a}" "${b}" && git -C "${dst}" fetch -q "${a}" \
+            || failed+=("git remote add ${a} ${b} in ${dst}")
+    done
+
+    if [ -f "${src}/repo.bundle" ]; then
+        # the bundle builds on the commits of the remotes, which an old clone may lack
+        git -C "${dst}" bundle verify -q "${src}/repo.bundle" > /dev/null 2>&1 \
+            || git -C "${dst}" fetch -q --all
+        if ! git -C "${dst}" fetch -q --no-tags "${src}/repo.bundle" '+refs/*:refs/setup-backup/*'; then
+            failed+=("git ${rel}, the commits of the remotes it builds on are gone")
+            return 0
+        fi
+    fi
+
+    for line in "${branches[@]}"; do
+        IFS=$'\x1f' read -r a b <<< "${line}"
+        sha="$(git -C "${dst}" rev-parse "refs/setup-backup/heads/${a}")"
+        # a fresh clone holds nothing of its own, its branch is the one of the
+        # old machine; the checkout of the main worktree below makes its files
+        # fit when it is the one checked out
+        if [ "${fresh}" -eq 1 ] || ! cur="$(git -C "${dst}" rev-parse -q --verify "refs/heads/${a}")"; then
+            git -C "${dst}" update-ref "refs/heads/${a}" "${sha}"
+        elif [ "${cur}" = "${sha}" ]; then
+            :
+        elif git -C "${dst}" merge-base --is-ancestor "${cur}" "${sha}"; then
+            checked_out="$(git -C "${dst}" worktree list --porcelain \
+                | awk -v ref="branch refs/heads/${a}" '/^worktree / { wt = substr($0, 10) } $0 == ref { print wt }')"
+            if [ -n "${checked_out}" ]; then
+                git -C "${checked_out}" merge -q --ff-only "${sha}" \
+                    || failed+=("git ${rel}: fast-forward of ${a} in ${checked_out}")
+            else
+                git -C "${dst}" update-ref "refs/heads/${a}" "${sha}" "${cur}"
+            fi
+        else
+            warning "${rel}: ${a} went another way here, the old one is ${a}-setup-backup"
+            git -C "${dst}" update-ref "refs/heads/${a}-setup-backup" "${sha}"
+        fi
+        if [ -n "${b}" ] && git -C "${dst}" rev-parse -q --verify "refs/remotes/${b}" > /dev/null; then
+            git -C "${dst}" branch -q --set-upstream-to="${b}" "${a}"
+        fi
+    done
+    for a in "${tags[@]}"; do
+        git -C "${dst}" rev-parse -q --verify "refs/tags/${a}" > /dev/null && continue
+        git -C "${dst}" update-ref "refs/tags/${a}" "$(git -C "${dst}" rev-parse "refs/setup-backup/tags/${a}")"
+    done
+    # the oldest first, so they keep their order
+    for (( c = ${#stashes[@]} - 1; c >= 0; c-- )); do
+        IFS=$'\x1f' read -r a b <<< "${stashes[${c}]}"
+        sha="$(git -C "${dst}" rev-parse "refs/setup-backup/backup/stash/${a}")"
+        git -C "${dst}" stash list --format='%H' | grep -qx "${sha}" && continue
+        git -C "${dst}" stash store -m "${b}" "${sha}" || failed+=("git ${rel}: stash ${b}")
+    done
+
+    for wt in "${worktrees[@]}"; do
+        IFS=$'\x1f' read -r a path b c d e <<< "${wt}"
+        path="${HOME}/${path}"
+        # older backups wrote heads/NAME for a branch that shares its name with a tag
+        [[ "${b}" == heads/* ]] && git -C "${dst}" rev-parse -q --verify "refs/tags/${b#heads/}" > /dev/null \
+            && b="${b#heads/}"
+        # the branch to check out is put at the commit of the old machine when it
+        # is not here (its remote deleted it, e.g. merged) or, in a fresh clone,
+        # the uncommitted changes were made on that commit; else it stays where
+        # its remote moved on to, as it held no commits of its own then
+        at_old=0
+        if [ -n "${b}" ] && git -C "${dst}" cat-file -e "${c}^{commit}" 2> /dev/null \
+            && { ! git -C "${dst}" rev-parse -q --verify "refs/heads/${b}" > /dev/null \
+                || { [ "${fresh}" -eq 1 ] && [ -n "${d}" ]; }; }; then
+            at_old=1
+        fi
+        if [ "${a}" -eq 0 ]; then
+            path="${dst}"
+            # forced, as a fresh clone has nothing to lose and the branches above
+            # may have moved the branch it has checked out
+            if [ "${fresh}" -eq 1 ]; then
+                if [ -z "${b}" ]; then
+                    git -C "${dst}" checkout -q -f --detach "${c}"
+                elif [ "${at_old}" -eq 1 ]; then
+                    git -C "${dst}" checkout -q -f -B "${b}" "${c}"
+                else
+                    git -C "${dst}" checkout -q -f "${b}"
+                fi || failed+=("git ${rel}: checkout ${b:-${c}}")
+            else
+                at_old=0
+            fi
+        elif [ ! -e "${path}" ]; then
+            if [ -z "${b}" ]; then
+                run git -C "${dst}" worktree add -q --detach "${path}" "${c}"
+            elif [ "${at_old}" -eq 1 ]; then
+                run git -C "${dst}" worktree add -q -B "${b}" "${path}" "${c}"
+            else
+                run git -C "${dst}" worktree add -q "${path}" "${b}"
+            fi || { failed+=("git ${rel}: worktree ${path}"); continue; }
+        elif [ "$(git -C "${path}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+            != "$(git -C "${dst}" rev-parse --path-format=absolute --git-common-dir)" ]; then
+            warning "${path} is there but no worktree of ${dst}, its changes are not restored"
+            failed+=("git worktree ${path}")
+            continue
+        else
+            at_old=0
+        fi
+        # a branch put at a commit tracks the branch of its name of a remote,
+        # origin first, as a checkout of a remote branch does
+        if [ "${at_old}" -eq 1 ] && ! git -C "${dst}" rev-parse -q --verify "${b}@{upstream}" > /dev/null 2>&1; then
+            for line in origin $(git -C "${dst}" remote); do
+                git -C "${dst}" rev-parse -q --verify "refs/remotes/${line}/${b}" > /dev/null || continue
+                git -C "${dst}" branch -q --set-upstream-to="${line}/${b}" "${b}"
+                break
+            done
+        fi
+        # changes that are there already or a stash already (a second run) are
+        # left alone
+        sha="$(git -C "${path}" stash create 2>/dev/null)"
+        if [ -n "${d}" ] && { git -C "${dst}" stash list --format='%H' | grep -qx "${d}" \
+            || { [ -n "${sha}" ] \
+                && [ "$(git -C "${path}" rev-parse "${sha}^{tree}")" = "$(git -C "${path}" rev-parse "${d}^{tree}")" ]; }; }; then
+            d=""
+        fi
+        if [ -n "${d}" ]; then
+            # onto the commit they were made on, into a clean worktree, else a stash
+            if [ "$(git -C "${path}" rev-parse HEAD)" = "${c}" ] \
+                && [ -z "$(git -C "${path}" status --porcelain --untracked-files=no)" ] \
+                && git -C "${path}" stash apply -q --index "${d}" > /dev/null 2>&1; then
+                :
+            else
+                warning "${path}: the uncommitted changes of the old machine are a stash now"
+                git -C "${dst}" stash store -m "setup-backup changes of ${path#"${HOME}/"}" "${d}" \
+                    || failed+=("git ${rel}: changes of ${path}")
+            fi
+        fi
+        if [ "${e}" = 1 ]; then
+            tar -xf "${src}/untracked-${a}.tar" -C "${path}" --skip-old-files \
+                || failed+=("git ${rel}: untracked files of ${path}")
+        fi
+    done
+
+    git -C "${dst}" for-each-ref --format='delete %(refname)' refs/setup-backup \
+        | git -C "${dst}" update-ref --stdin
+}
+
+# the git repos of the workspace from git/ of the backup (see restore_git_repo);
+# after the logins and SSH keys, as the missing ones are cloned
+restore_git() {
+    local manifest
+    local -a dirs=()
+    has_part git || return 0
+    while IFS= read -r manifest; do
+        dirs+=("$(dirname "${manifest}")")
+    done < <(find "${BACKUP_DIR}/git" -name manifest | sort)
+    [ "${#dirs[@]}" -eq 0 ] && return 0
+    info "Git repos: restore what only they held (uncommitted changes, stashes, local branches, worktrees), the missing ones are cloned"
+    printf '  %s\n' "${dirs[@]#"${BACKUP_DIR}/git/"}" 1>&2
+    ask "Restore these ${#dirs[@]} git repos?" || return 0
+    [ -n "${WORK_GITLAB}" ] && grep -qsF "${WORK_GITLAB}" "${dirs[@]/%//manifest}" && ! dial_vpn "${WORK_GITLAB}" \
+        && warning "No VPN, the repos of ${WORK_GITLAB} cannot be cloned"
+    for manifest in "${dirs[@]}"; do
+        restore_git_repo "${manifest}"
+    done
+}
+
+# agent_cmd NAME: the installed command, also when the PATH of this shell does
+# not have it yet: claude lives in ~/.local/bin, codex in the bin of nvm's node
+agent_cmd() {
+    local cmd
+    cmd="$(command -v "${1}" 2>/dev/null)" && { echo "${cmd}"; return 0; }
+    for cmd in "${HOME}/.local/bin/${1}" "${HOME}"/.nvm/versions/node/*/bin/"${1}"; do
+        [ -x "${cmd}" ] && { echo "${cmd}"; return 0; }
+    done
+    return 1
+}
+
+# the logins of Claude Code and Codex, which setup-backup leaves out of the
+# backup; one that is logged in already is not asked for
+login_agents() {
+    local claude codex
+    if claude="$(agent_cmd claude)"; then
+        if "${claude}" auth status --json 2>/dev/null | grep -q '"loggedIn": *true'; then
+            echo "Claude Code is logged in" 1>&2
+        else
+            info "Claude Code: log in to your Anthropic account"
+            if ask "Log in to Claude Code (claude auth login)?"; then
+                run "${claude}" auth login || failed+=("claude auth login")
+            fi
+        fi
+    fi
+    if codex="$(agent_cmd codex)"; then
+        if "${codex}" login status > /dev/null 2>&1; then
+            echo "Codex is logged in" 1>&2
+        else
+            info "Codex: log in with ChatGPT or an API key"
+            if ask "Log in to Codex (codex login)?"; then
+                run "${codex}" login || failed+=("codex login")
+            fi
+        fi
+    fi
+}
+
+check_categories() {
+    local group
+    local known
+    while IFS=$'\t' read -r group _; do
+        for known in "${CATEGORIES[@]}" "${SPECIAL_GROUPS[@]}"; do
+            [ "${known}" = "${group}" ] && continue 2
+        done
+        warning "updater group ${group} is not asked for by ${APP_NAME}"
+        CATEGORIES+=("${group}")
+    done < <(/usr/local/bin/updater --list)
+}
+
+# members GROUP: the software of GROUP, without the gui software on a headless
+# system, as updater skips it there
+members() {
+    /usr/local/bin/updater --list | awk -F '\t' -v group="${1}" -v headless="${HEADLESS}" '
+        $1 == "gui" && headless == 1 { split($2, list, " "); for (i in list) gui[list[i]] = 1 }
+        $1 == group { wanted = $2 }
+        END {
+            n = split(wanted, list, " ")
+            out = ""
+            for (i = 1; i <= n; i++) {
+                if (list[i] in gui) continue
+                out = out (out == "" ? "" : ", ") list[i]
+            }
+            print out
+        }'
+}
+
+select_categories() {
+    local category
+    local description
+    local list
+    selected=()
+    if command -v gnome-shell > /dev/null 2>&1; then
+        info "GNOME extensions: $(members gnome-extensions)"
+        ask "Install the GNOME extensions?" && selected+=(gnome-extensions)
+    fi
+    for category in "${CATEGORIES[@]}"; do
+        description="${CATEGORY_DESCRIPTIONS[${category}]:-}"
+        list="$(members "${category}")"
+        # on a headless system a category of desktop apps only has nothing to install
+        if [ -z "${list}" ]; then
+            echo "Skipping ${category}${description:+ (${description})}: nothing in it for a headless system" 1>&2
+            continue
+        fi
+        info "${category}${description:+: ${description}}"
+        echo "${list}" 1>&2
+        ask "Install ${category}?" && selected+=("${category}")
+    done
+}
+
+# the shell shorthands of k-ctx, which .kube_aliases of bash_aliases.d sources;
+# the file is generated, so it is written again rather than kept
+setup_k_ctx_shell() {
+    command -v k-ctx > /dev/null 2>&1 || return 0
+    info "k-ctx shell shorthands: ${K_CTX_SHELL_INIT[*]}"
+    run k-ctx shell-init "${K_CTX_SHELL_INIT[@]}" || failed+=("k-ctx shell-init")
+}
+
+# netbox-cli reads NETBOX_URL and NETBOX_TOKEN from the environment, which the
+# .bashrc of bash_aliases.d exports with the token from the keyring; a shell
+# started before the dotfiles has neither, so they are set here for this run
+setup_netbox() {
+    local block="${HOME}/workspace/dgrieser/bash_aliases.d/home/blocks/.bashrc"
+    local url token
+    netbox-cli get clusters -oname > /dev/null 2>&1 && return 0
+    info "netbox-cli is not set up, it names the clusters and fetches their kubeconfigs"
+    ask "Set up netbox-cli now (NETBOX_URL and NETBOX_TOKEN)?" || return 1
+
+    url="${NETBOX_URL}"
+    [ -z "${url}" ] && [ -f "${block}" ] \
+        && url="$(sed -n 's/^export NETBOX_URL="\(.*\)"$/\1/p' "${block}" | head -n 1)"
+    url="$(prompt_run prompt-input --prompt "NetBox URL:" --default "${url}")"
+    [ -z "${url}" ] && return 1
+
+    token="$(secret-tool lookup type dotfile-secret name NETBOX_TOKEN 2>/dev/null)"
+    if [ -z "${token}" ]; then
+        token="$(prompt_run prompt-input --protected --prompt "NetBox API token:")"
+        [ -z "${token}" ] && return 1
+        # stored where the dotfiles look for it, so the next shell has it too
+        if printf '%s' "${token}" | secret-tool store --label="dotfile NETBOX_TOKEN" \
+            type dotfile-secret name NETBOX_TOKEN; then
+            install_dotfiles
+        else
+            warning "Could not store NETBOX_TOKEN in the keyring, it is only set for this run"
+        fi
+    fi
+
+    export NETBOX_URL="${url}" NETBOX_TOKEN="${token}"
+    # its error stays visible: a missing VPN or CA shows up as an SSL error
+    netbox-cli get clusters -oname > /dev/null && return 0
+    warning "netbox-cli still cannot reach ${url}"
+    return 1
+}
+
+# a kubeconfig for every cluster k-ctx of kubectl-helpers can fetch one for
+# (k-ctx list --remote: the NetBox clusters with what a kubeconfig needs, not an
+# F5 pair or a planned one), through k-ctx add; a cluster with a kubeconfig in
+# ~/.kube already is kept
+setup_kubeconfigs() {
+    local tool cluster
+    local -a existing
+    local -a missing=() clusters=()
+    for tool in k-ctx kubectl kubelogin yq jq netbox-cli; do
+        command -v "${tool}" > /dev/null 2>&1 || missing+=("${tool}")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        # only worth saying when the kubectl-helpers are there at all
+        command -v k-ctx > /dev/null 2>&1 \
+            && warning "Skipping the kubeconfigs, missing: ${missing[*]} (the k8s and mw categories)"
+        return 0
+    fi
+    info "Kubeconfigs: fetch one for every cluster that has one in NetBox (k-ctx add)"
+    if ! setup_netbox; then
+        failed+=("netbox-cli setup, no kubeconfigs")
+        return 0
+    fi
+
+    while IFS= read -r cluster; do
+        [ -z "${cluster}" ] && continue
+        existing=("${HOME}/.kube/${cluster,,}-m3-"*.config)
+        [ -e "${existing[0]}" ] && continue
+        clusters+=("${cluster}")
+    done < <(k-ctx list --remote 2>/dev/null | tail -n +2 | awk '{ print $1 }' | sort -u)
+    if [ "${#clusters[@]}" -eq 0 ]; then
+        echo "Every cluster has a kubeconfig in ${HOME}/.kube" 1>&2
+        return 0
+    fi
+
+    echo "${clusters[*]}" 1>&2
+    ask "Fetch the kubeconfigs of these ${#clusters[@]} clusters?" || return 0
+    for cluster in "${clusters[@]}"; do
+        run k-ctx add --yes "${cluster}" || failed+=("k-ctx add ${cluster}")
+    done
+}
+
+# the profile folder of the default Firefox profile, of the snap or of the deb,
+# from its profiles.ini; empty when Firefox never ran here
+firefox_profile_dir() {
+    local base ini
+    for base in "${HOME}/snap/firefox/common/.mozilla/firefox" "${HOME}/.mozilla/firefox"; do
+        ini="${base}/profiles.ini"
+        [ -f "${ini}" ] || continue
+        # the profile of [Install...] Default= is the one Firefox opens, else the
+        # one marked Default=1
+        awk -F= -v base="${base}" '
+            /^\[/ { install = ($0 ~ /^\[Install/); path = ""; rel = 1; def = 0; next }
+            install && $1 == "Default" { print base "/" $2; found = 1; exit }
+            $1 == "Path" { path = $2 }
+            $1 == "IsRelative" { rel = $2 }
+            $1 == "Default" && $2 == "1" { def = 1 }
+            path != "" && def && !candidate { candidate = (rel == 1 ? base "/" path : path) }
+            END { if (!found && candidate) print candidate }
+        ' "${ini}" | head -n 1
+        return 0
+    done
+}
+
+# TLS 1.0/1.1 in Firefox for the old servers of LEGACY_TLS_HOSTS in the keyring:
+# the preferences of FIREFOX_LEGACY_TLS_PREFS in user.js of the default profile,
+# which Firefox reads at every start, and for every host a certificate exception
+# in cert_override.txt for the certificate it presents now (fetched with
+# openssl, so the VPN has to be up), as these servers have a self-signed CA;
+# a renewed certificate needs this step again
+setup_firefox_legacy() {
+    local hosts profile user_js overrides pref name value target host port fingerprint tmp
+    local -a fingerprints=()
+    command -v firefox > /dev/null 2>&1 || { echo "Firefox is not installed, no legacy TLS for it" 1>&2; return 0; }
+    hosts="$(secret-tool lookup type dotfile-secret name "${LEGACY_TLS_SECRET}" 2>/dev/null)"
+    if [ -z "${hosts}" ]; then
+        echo "No ${LEGACY_TLS_SECRET} in the keyring, no legacy TLS for Firefox (store it: secret-tool store --label=\"dotfile ${LEGACY_TLS_SECRET}\" type dotfile-secret name ${LEGACY_TLS_SECRET})" 1>&2
+        return 0
+    fi
+    info "Firefox: TLS 1.0/1.1 and certificate exceptions for ${hosts}"
+    profile="$(firefox_profile_dir)"
+    if [ -z "${profile}" ] || [ ! -d "${profile}" ]; then
+        warning "Firefox has no profile yet: start it once, close it, then run ${APP_NAME} firefox"
+        failed+=("firefox, no profile yet")
+        return 0
+    fi
+    # Firefox writes cert_override.txt over the new one when its exceptions change
+    while pgrep -x firefox > /dev/null 2>&1; do
+        if ! ask "Close Firefox now, then continue (no: skip its legacy TLS)?"; then
+            failed+=("firefox, it was running")
+            return 0
+        fi
+    done
+
+    user_js="${profile}/user.js"
+    touch "${user_js}"
+    for pref in "${FIREFOX_LEGACY_TLS_PREFS[@]}"; do
+        read -r name value <<< "${pref}"
+        grep -qF "user_pref(\"${name}\", ${value});" "${user_js}" && continue
+        # a line of the same preference with another value is replaced
+        sed -i "/^user_pref(\"${name//./\\.}\",/d" "${user_js}"
+        echo "user_pref(\"${name}\", ${value});" >> "${user_js}"
+        echo "${user_js}: ${name} = ${value}" 1>&2
+    done
+
+    overrides="${profile}/cert_override.txt"
+    tmp="$(mktemp)"
+    if [ -f "${overrides}" ]; then
+        cp "${overrides}" "${tmp}"
+    else
+        printf '# PRIVATE FILE\n# This is a generated file!  Do not edit.\n' > "${tmp}"
+    fi
+    for target in ${hosts}; do
+        host="${target%%:*}"
+        port="${target#"${host}"}"
+        port="${port#:}"
+        port="${port:-443}"
+        # SECLEVEL=0, as the TLS of OpenSSL refuses these old servers otherwise
+        mapfile -t fingerprints < <(timeout 10 openssl s_client -connect "${host}:${port}" -servername "${host}" \
+                -cipher 'ALL:@SECLEVEL=0' < /dev/null 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')
+        fingerprint="${fingerprints[0]:-}"
+        if [ -z "${fingerprint}" ]; then
+            warning "No certificate from ${host}:${port}, is the VPN up?"
+            failed+=("firefox certificate exception for ${host}:${port}, unreachable")
+            continue
+        fi
+        if grep -qF "${host}:${port}:	OID.2.16.840.1.101.3.4.2.1	${fingerprint}	" "${tmp}"; then
+            echo "Firefox trusts the certificate of ${host}:${port} already" 1>&2
+            continue
+        fi
+        sed -i "/^${host//./\\.}:${port}:	/d" "${tmp}"
+        printf '%s:%s:\tOID.2.16.840.1.101.3.4.2.1\t%s\t\n' "${host}" "${port}" "${fingerprint}" >> "${tmp}"
+        echo "Firefox trusts the certificate of ${host}:${port} (SHA-256 ${fingerprint})" 1>&2
+    done
+    cmp -s "${tmp}" "${overrides}" || install -m 600 "${tmp}" "${overrides}" || failed+=("firefox: write ${overrides}")
+    rm -f "${tmp}"
+}
+
+set_default_browser() {
+    command -v xdg-settings > /dev/null 2>&1 || return 0
+    [ "$(xdg-settings get default-web-browser 2>/dev/null)" = "browser-router.desktop" ] && return 0
+    info "browser-router opens authentication URLs in a small window above the others, every other URL in google-chrome"
+    command -v google-chrome > /dev/null 2>&1 || warning "google-chrome is not installed, it is in the dev category (updater chrome)"
+    if ask "Make browser-router the default browser?"; then
+        run browser-router --set-default || failed+=("browser-router --set-default")
+    fi
+}
+
+gnome_settings() {
+    command -v gnome-shell > /dev/null 2>&1 || return 0
+    info "GNOME settings: keyboard, appearance, dock, power, Files, Ptyxis and extensions (gnome-apply-settings)"
+    if ask "Apply the GNOME settings?"; then
+        run gnome-apply-settings || failed+=("gnome-apply-settings")
+    fi
+    info "App shortcuts: $(app-shortcut --list 2>/dev/null | awk '{ print $1 }' | paste -sd ' ')"
+    if ask "Bind the app shortcuts as GNOME custom shortcuts (app-shortcut --bind)?"; then
+        run app-shortcut --bind || failed+=("app-shortcut --bind")
+    fi
+}
+
+# the install folders, then cli-helpers into them, with sudo when they are not
+# writable
+setup_cli_helpers() {
+    setup_dirs
+    install_cli_helpers
+}
+
+install_base() {
+    info "Installing base"
+    # firmware updates are not part of setting up the software
+    run_updater base --exclude firmware
+}
+
+install_categories() {
+    check_categories
+    select_categories
+    [ "${#selected[@]}" -eq 0 ] && return 0
+    info "Installing ${selected[*]}"
+    run_updater "${selected[@]}"
+}
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [-h] [-l] [STEP...]
+
+Set up this machine from this repo, restoring from a backup of setup-backup.
+Without STEP it runs every step, with STEP... only those, in the order of
+--list. A step that restores from the backup asks for the backup first. Run it
+as your user from a terminal, it asks for sudo.
+
+Options:
+  -l, --list    List the steps in the order of a full run and exit
+  -h, --help    Show this help message and exit
+EOF
+    exit 1
+}
+
+list_steps() {
+    local step name func backup description
+    for step in "${STEPS[@]}"; do
+        read -r name func backup description <<< "${step}"
+        printf '%-14s %s%s\n' "${name}" "${description}" "$([ "${backup}" = backup ] && echo " (from the backup)")"
+    done
+}
+
+trap abort INT
+wanted=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -l|--list) list_steps; exit 0 ;;
+        -h|--help) usage ;;
+        -*)        echo "ERROR: Unknown option ${1}" 1>&2; usage ;;
+        *)
+            list_steps | awk '{ print $1 }' | grep -qxF -- "${1}" || fail "Unknown step ${1}, see ${APP_NAME} --list"
+            wanted+=("${1}")
+            ;;
+    esac
+    shift
+done
+[ "$(id -u)" -eq 0 ] && fail "Run ${APP_NAME} as your user, it asks for sudo itself"
+[ -t 0 ] || fail "Run ${APP_NAME} in a terminal, it asks questions"
+command -v python3 > /dev/null 2>&1 || fail "python3 is required for the prompts"
+
+# no desktop installed, e.g. a server or a Raspberry Pi OS Lite
+HEADLESS=0
+"${REPO_DIR}/headless" && HEADLESS=1
+
+# the steps to run, all of them without STEP; on a headless system not the
+# GUI_STEPS, unless they are named
+steps=() functions=() skipped=()
+needs_backup=0
+for step in "${STEPS[@]}"; do
+    read -r name func backup _ <<< "${step}"
+    [ "${#wanted[@]}" -gt 0 ] && ! printf '%s\n' "${wanted[@]}" | grep -qxF -- "${name}" && continue
+    if [ "${HEADLESS}" -eq 1 ] && [ "${#wanted[@]}" -eq 0 ] && printf '%s\n' "${GUI_STEPS[@]}" | grep -qxF -- "${name}"; then
+        skipped+=("${name}")
+        continue
+    fi
+    steps+=("${name}")
+    functions+=("${func}")
+    [ "${backup}" = backup ] && needs_backup=1
+done
+
+MAKE_SUDO=""
+BACKUP_DIR=""
+if [ "${#wanted[@]}" -gt 0 ]; then
+    info "Setting up this machine from ${REPO_DIR}, only: ${steps[*]}"
+else
+    info "Setting up this machine from ${REPO_DIR}"
+fi
+[ "${#skipped[@]}" -gt 0 ] && info "This system is headless, skipping: ${skipped[*]}"
+bootstrap
+[ "${needs_backup}" -eq 1 ] && choose_backup
+for func in "${functions[@]}"; do
+    hash -r
+    "${func}"
+done
+
+# new GNOME extensions and group memberships (docker) only apply to a new session
+if printf '%s\n' "${steps[@]}" | grep -qxE 'base|categories'; then
+    if [ "${HEADLESS}" -eq 1 ]; then
+        info "Log out and back in, so new groups take effect"
+    else
+        info "Log out and back in, so new GNOME extensions and groups take effect"
+    fi
+fi
+finish

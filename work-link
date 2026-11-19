@@ -1,0 +1,611 @@
+#!/usr/bin/python3
+"""Keep a NetworkManager uplink and verified internal HTTPS available."""
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+from getpass import getpass
+import os
+from pathlib import Path
+import pwd
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from urllib.parse import urlsplit
+
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import Gio, GLib, NM
+
+NAME = "work-link"
+UNIT = f"{NAME}.service"
+AUTH_LIMIT = 2
+ALERT_DELAY = 60
+OPENVPN = "org.freedesktop.NetworkManager.openvpn"
+WIFI = "802-11-wireless"
+
+
+def user_path(variable, default):
+    return Path(os.environ.get(variable) or Path.home() / default) / NAME
+
+
+@dataclass(frozen=True)
+class Config:
+    vpn_profile: str
+    probe_url: str
+    wifi_profiles: list[str]
+    credential_command: list[str]
+
+    @classmethod
+    def load(cls, path):
+        try:
+            data = tomllib.loads(path.read_text())
+            config = cls(**data)
+            url = urlsplit(config.probe_url)
+            if url.scheme != "https" or not url.hostname or url.username or url.password:
+                raise ValueError
+            if not isinstance(config.vpn_profile, str) or not config.vpn_profile:
+                raise ValueError
+            for values in (config.wifi_profiles, config.credential_command):
+                if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+                    raise ValueError
+            return config
+        except FileNotFoundError:
+            raise ValueError(f"Create the configuration at {path}.") from None
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("Invalid configuration. See the work-link README example.") from None
+
+
+class AuthBudget:
+    """Serialize CLI and service jobs and persist reservations before activation."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.state = directory / "auth-attempts"
+
+    @contextmanager
+    def lock(self):
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (self.directory / "lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+
+    def used(self):
+        try:
+            count = self.state.read_text().strip()
+        except FileNotFoundError:
+            return 0
+        if count not in {"0", "1", "2"}:
+            raise ValueError("Invalid authentication state. Review it before running reset-auth.")
+        return int(count)
+
+    def write(self, count):
+        # File and directory flushes keep a reservation across crashes and restarts.
+        with tempfile.NamedTemporaryFile(mode="w", dir=self.directory, delete=False) as pending:
+            path = Path(pending.name)
+            try:
+                pending.write(f"{count}\n")
+                pending.flush()
+                os.fsync(pending.fileno())
+                path.replace(self.state)
+                directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                path.unlink(missing_ok=True)
+
+
+class Reporter:
+    def __init__(self, quiet=False):
+        self.quiet = quiet
+        self.last = None
+        self.color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+    def __call__(self, label, message):
+        if not self.quiet and (label, message) != self.last:
+            colors = {"Wi-Fi": "36", "VPN": "35", "Ready": "32", "Waiting": "33", "Blocked": "31"}
+            field = f"{label:>7}"
+            if self.color:
+                field = f"\033[1;{colors.get(label, '37')}m{field}\033[0m"
+            print(f"{field}  {message}", flush=True)
+            self.last = label, message
+
+
+def notify_failure(message):
+    try:
+        subprocess.run(
+            ["notify-send", f"--app-name={NAME}", "--icon=network-error", "--",
+             "Work connection unavailable", message],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # Progress remains available in the service log.
+
+
+class OneUseAgent(NM.SecretAgentOld):
+    """Supply only one OpenVPN password, only to the selected profile."""
+
+    __gtype_name__ = "WorkLinkOneUseAgent"
+
+    def __init__(self, uuid, password):
+        # No VPN_HINTS capability makes NM use the plugin's non-interactive
+        # Connect method, which terminates on ordinary password rejection.
+        super().__init__(identifier=f"{NAME}-{os.getpid()}", auto_register=False,
+                         capabilities=NM.SecretAgentCapabilities.NONE)
+        self.uuid = uuid
+        self.password = password
+
+    def start(self):
+        if not self.init(None):
+            raise ValueError("Could not initialize the NetworkManager credential agent.")
+        loop = GLib.MainLoop()
+        cancellable = Gio.Cancellable()
+        registered = False
+
+        def ready(agent, result):
+            nonlocal registered
+            try:
+                registered = agent.register_finish(result)
+            except GLib.Error:
+                pass
+            loop.quit()
+
+        def expire():
+            cancellable.cancel()
+            loop.quit()
+            return GLib.SOURCE_CONTINUE
+
+        timer = GLib.timeout_add_seconds(5, expire)
+        try:
+            self.register_async(cancellable, ready)
+            loop.run()
+        finally:
+            GLib.source_remove(timer)
+        if not registered:
+            raise ValueError("Could not register the one-use NetworkManager credential agent.")
+
+    def do_get_secrets(self, connection, path, setting, hints, flags, callback, user_data):
+        if (connection.get_uuid() == self.uuid and setting == "vpn" and self.password
+                and flags & NM.SecretAgentGetSecretsFlags.ALLOW_INTERACTION
+                and not flags & NM.SecretAgentGetSecretsFlags.REQUEST_NEW):
+            password, self.password = self.password, None
+            secrets = GLib.Variant("a{sa{sv}}", {"vpn": {
+                "secrets": GLib.Variant("a{ss}", {"password": password}),
+            }})
+            callback(self, connection, secrets, None)
+        else:
+            error = GLib.Error.new_literal(NM.secret_agent_error_quark(), "No credentials available",
+                                           NM.SecretAgentError.NOSECRETS)
+            callback(self, connection, None, error)
+
+    def do_cancel_get_secrets(self, path, setting):
+        pass
+
+    def do_save_secrets(self, connection, path, callback, user_data):
+        callback(self, connection, None)
+
+    do_delete_secrets = do_save_secrets
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    uplink: str = ""
+    wifi: str = ""
+    vpn: str = ""
+    portal: bool = False
+    choices: tuple = ()
+    offline_by_choice: bool = False
+
+
+def matches(profile, name):
+    return name in (profile.get_id(), profile.get_uuid())
+
+
+class Network:
+    def client(self):
+        client = NM.Client.new(None)
+        if not client.get_nm_running():
+            raise ValueError("NetworkManager is unavailable.")
+        return client
+
+    def snapshot(self, config):
+        client = self.client()
+        active = client.get_active_connections()
+        wifi = next((c.get_id() for c in active if c.get_connection_type() == WIFI
+                     and c.get_state() == NM.ActiveConnectionState.ACTIVATED), "")
+        vpn = next((c.get_state().value_nick for c in active if c.get_vpn()
+                    and matches(c, config.vpn_profile)), "")
+        primary = self.uplink(client)
+        wifi_enabled = client.networking_get_enabled() and client.wireless_get_enabled()
+        choices = []
+        if not wifi and wifi_enabled:
+            for name in config.wifi_profiles:
+                for device in client.get_devices():
+                    if (device.get_device_type() != NM.DeviceType.WIFI
+                            or device.get_state() != NM.DeviceState.DISCONNECTED):
+                        continue
+                    for profile in device.get_available_connections():
+                        if matches(profile, name):
+                            choice = (profile.get_uuid(), device.get_iface(), profile.get_id())
+                            if choice not in choices:
+                                choices.append(choice)
+        return Snapshot(
+            primary.get_path() if primary else "", wifi, vpn,
+            client.get_connectivity() == NM.ConnectivityState.PORTAL, tuple(choices),
+            offline_by_choice=not primary and not wifi_enabled,
+        )
+
+    def wait(self):
+        """Wake early on NetworkManager changes and periodically recheck HTTPS."""
+        client = self.client()
+        loop = GLib.MainLoop()
+        def wake(*_args):
+            loop.quit()
+            return GLib.SOURCE_CONTINUE
+
+        handlers = [
+            client.connect(f"notify::{prop}", wake)
+            for prop in ("active-connections", "state", "wireless-enabled", "connectivity")
+        ]
+        timer = GLib.timeout_add_seconds(12, wake)
+        try:
+            loop.run()
+        finally:
+            GLib.source_remove(timer)
+            for handler in handlers:
+                client.disconnect(handler)
+
+    @staticmethod
+    def uplink(client):
+        active = [c for c in client.get_active_connections()
+                  if c.get_state() == NM.ActiveConnectionState.ACTIVATED]
+        for default in ("get_default", "get_default6"):
+            for connection in active:
+                if not connection.get_vpn() and getattr(connection, default)():
+                    return connection
+        # A full-tunnel VPN can own the default route. Its device still has
+        # the underlying Wi-Fi or wired connection.
+        for connection in active:
+            if connection.get_vpn() and (connection.get_default() or connection.get_default6()):
+                for device in connection.get_devices():
+                    base = device.get_active_connection()
+                    if base and not base.get_vpn():
+                        return base
+        return None
+
+    def wifi_up(self, uuid, iface=None):
+        cmd = ["nmcli", "--wait", "12", "connection", "up", "uuid", uuid]
+        if iface:
+            cmd += ["ifname", iface]
+        try:
+            return subprocess.run(cmd, capture_output=True, timeout=14).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def choose_wifi(self, name):
+        profiles = [p for p in self.client().get_connections() if matches(p, name)
+                    and p.get_connection_type() == WIFI]
+        if len(profiles) != 1:
+            raise ValueError("Specify a unique saved Wi-Fi profile name or UUID.")
+        return self.wifi_up(profiles[0].get_uuid())
+
+    def probe(self, url):
+        try:
+            result = subprocess.run(
+                ["curl", "-q", "--noproxy", "*", "--proto", "=https", "--head",
+                 "--silent", "--output", "/dev/null", "--connect-timeout", "4",
+                 "--max-time", "6", "--write-out", "%{http_code}", "--", url],
+                capture_output=True, timeout=7,
+            )
+            return result.returncode == 0 and (
+                result.stdout.startswith((b"2", b"3")) or result.stdout == b"401"
+            )
+        except subprocess.TimeoutExpired:
+            return False
+
+    def vpn_up(self, profile_name, uplink, password, reserve):
+        client = self.client()
+        profiles = [p for p in client.get_connections() if matches(p, profile_name)]
+        if len(profiles) != 1:
+            raise ValueError("Specify a unique NetworkManager VPN profile name or UUID.")
+        profile = profiles[0]
+        vpn = profile.get_setting_vpn()
+        if (not vpn or vpn.get_service_type() != OPENVPN or vpn.get_persistent()
+                or vpn.get_data_item("connection-type") not in {"password", "password-tls"}
+                or vpn.get_data_item("password-flags") != "2"):
+            raise ValueError("Use a non-persistent OpenVPN password profile with password-flags=2.")
+        primary = self.uplink(client)
+        if not primary or primary.get_path() != uplink or any(
+            matches(c, profile_name) for c in client.get_active_connections()
+        ):
+            return "network changed before dialling"
+
+        agent = OneUseAgent(profile.get_uuid(), password)
+        try:
+            agent.start()
+            reserve()
+            return self.activate_vpn(client, profile, uplink)
+        finally:
+            agent.password = None
+            agent.destroy()
+
+    @staticmethod
+    def activate_vpn(client, profile, uplink):
+        loop = GLib.MainLoop()
+        cancellable = Gio.Cancellable()
+        active = None
+        handler = None
+        outcome = "activation timed out"
+
+        def changed(connection, state, reason):
+            nonlocal outcome
+            if state == NM.VpnConnectionState.ACTIVATED:
+                outcome = "connected"
+            elif state in (NM.VpnConnectionState.FAILED, NM.VpnConnectionState.DISCONNECTED):
+                outcome = ("authentication rejected" if reason == NM.VpnConnectionStateReason.LOGIN_FAILED
+                           else "activation failed")
+            else:
+                return
+            loop.quit()
+
+        def activated(source, result):
+            nonlocal active, handler, outcome
+            try:
+                active = source.activate_connection_finish(result)
+            except GLib.Error:
+                outcome = "activation rejected by NetworkManager"
+                loop.quit()
+                return
+            handler = active.connect("vpn-state-changed", changed)
+            changed(active, active.get_vpn_state(), NM.VpnConnectionStateReason.UNKNOWN)
+
+        def expired():
+            cancellable.cancel()
+            loop.quit()
+            return GLib.SOURCE_CONTINUE
+
+        timeout = GLib.timeout_add_seconds(35, expired)
+        try:
+            client.activate_connection_async(profile, None, uplink, cancellable, activated)
+            loop.run()
+        finally:
+            GLib.source_remove(timeout)
+            if active and handler:
+                active.disconnect(handler)
+            if outcome == "activation timed out" and active:
+                # Request teardown before unregistering the one-use agent.
+                try:
+                    client.deactivate_connection(active, None)
+                except GLib.Error:
+                    pass
+        return outcome
+
+
+def credentials(config, ask):
+    if ask:
+        if not sys.stdin.isatty():
+            raise ValueError("--ask requires a terminal.")
+        password = getpass("VPN password: ")
+        code = getpass("One-time code: ")
+        if not password or not code:
+            return None
+        password += code
+    elif config.credential_command:
+        try:
+            result = subprocess.run(config.credential_command, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=10, check=True)
+            password = result.stdout.decode().rstrip("\r\n")
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            return None
+    else:
+        return None
+    if not password or any(c in password for c in "\r\n\x00") or len(password) > 4096:
+        return None
+    return password
+
+
+class Keeper:
+    def __init__(self, config, network, budget, report, credential_source=credentials,
+                 clock=time.monotonic, background=False, notify=notify_failure):
+        self.config = config
+        self.network = network
+        self.budget = budget
+        self.report = report
+        self.credential_source = credential_source
+        self.clock = clock
+        self.uplink = ""
+        self.retry_at = 0
+        self.delay = 15
+        self.wifi_retry_at = 0
+        self.background = background
+        self.failed_check = False
+        self.notify = notify
+        self.clear_alert()
+
+    def clear_alert(self):
+        self.failure_since = None
+        self.alert_sent = False
+        self.lockout_alert_sent = False
+
+    def unavailable(self, message, *, locked=False):
+        if self.background:
+            now = self.clock()
+            if self.failure_since is None:
+                self.failure_since = now
+            if locked and not self.lockout_alert_sent:
+                self.notify(message)
+                self.lockout_alert_sent = self.alert_sent = True
+            elif not self.alert_sent and now - self.failure_since >= ALERT_DELAY:
+                self.notify(message)
+                self.alert_sent = True
+        return False
+
+    def blocked(self):
+        self.report("Blocked", "VPN paused after two attempts. Check credentials, then run work-link reset-auth.")
+        return self.unavailable("VPN paused after two attempts. Check credentials and run work-link reset-auth.",
+                                locked=True)
+
+    def defer(self):
+        self.retry_at = self.clock() + self.delay
+        self.delay = min(self.delay * 2, 120)
+
+    def step(self, ask=False):
+        snapshot = self.network.snapshot(self.config)
+        if not snapshot.wifi and snapshot.choices and self.clock() >= self.wifi_retry_at:
+            for choice in snapshot.choices:
+                # GNOME or NetworkManager may have started a connection meanwhile.
+                current = self.network.snapshot(self.config)
+                if current.wifi or choice not in current.choices:
+                    break
+                uuid, iface, name = choice
+                self.report("Wi-Fi", f"Connecting to {name}…")
+                if self.network.wifi_up(uuid, iface):
+                    break
+            self.wifi_retry_at = self.clock() + 30
+            snapshot = self.network.snapshot(self.config)
+
+        if snapshot.uplink != self.uplink:
+            self.uplink = snapshot.uplink
+            self.retry_at = 0
+            self.delay = 15
+            self.failed_check = False
+        if not snapshot.uplink:
+            self.report("Waiting", "No network uplink.")
+            if snapshot.offline_by_choice:
+                self.clear_alert()
+                return False
+            return self.unavailable("No usable network connection. Trying to reconnect.")
+        if snapshot.vpn == "activated" and self.budget.used():
+            self.budget.write(0)
+        if self.clock() < self.retry_at and not ask:
+            return False
+        if self.network.probe(self.config.probe_url):
+            self.delay = 15
+            self.failed_check = False
+            self.clear_alert()
+            self.report("Ready", f"{snapshot.wifi or 'Network'} · internal HTTPS"
+                        + (" through VPN" if snapshot.vpn == "activated" else " reachable"))
+            return True
+        if snapshot.vpn:
+            self.report("Waiting", "VPN is active or starting. Internal HTTPS is unavailable.")
+            return self.unavailable("The VPN is active or starting, but internal HTTPS is unavailable.")
+        if snapshot.portal:
+            self.report("Waiting", "Sign in to the Wi-Fi portal in GNOME.")
+            self.clear_alert()
+            return False
+        if self.background and not self.failed_check:
+            # DNS and enterprise network policy can lag Wi-Fi activation.
+            self.failed_check = True
+            self.retry_at = self.clock() + 4
+            self.report("Waiting", "Internal HTTPS unavailable. Checking again before dialling.")
+            return self.unavailable("Internal HTTPS is unreachable. Trying to reconnect.")
+
+        used = self.budget.used()
+        if used >= AUTH_LIMIT:
+            return self.blocked()
+        self.report("VPN", "Getting credentials…")
+        password = self.credential_source(self.config, ask)
+        if not password:
+            self.report("Waiting", "VPN credentials are unavailable. No authentication attempted.")
+            self.defer()
+            return self.unavailable("VPN credentials are unavailable. Retrying in the background.")
+
+        def reserve():
+            self.budget.write(used + 1)
+            self.report("VPN", f"Connecting · attempt {used + 1}/{AUTH_LIMIT}…")
+
+        outcome = self.network.vpn_up(self.config.vpn_profile, snapshot.uplink, password, reserve)
+        if outcome == "connected":
+            self.budget.write(0)
+            self.delay = 15
+            if self.network.probe(self.config.probe_url):
+                self.clear_alert()
+                self.report("Ready", "Internal HTTPS reachable through VPN.")
+                return True
+            self.report("Waiting", "VPN connected. Waiting for internal HTTPS.")
+            return self.unavailable("The VPN is connected, but internal HTTPS is unavailable.")
+        self.report("VPN", outcome.capitalize() + ".")
+        self.defer()
+        if self.budget.used() >= AUTH_LIMIT:
+            return self.blocked()
+        return self.unavailable("VPN activation did not complete. Trying to reconnect.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", default="connect",
+                        choices=("connect", "watch", "status", "reset-auth"))
+    parser.add_argument("--wifi", metavar="PROFILE", help="switch to a saved Wi-Fi profile before connecting")
+    parser.add_argument("--ask", action="store_true", help="prompt for VPN password and one-time code")
+    status_mode = parser.add_mutually_exclusive_group()
+    status_mode.add_argument("-f", "--follow", action="store_true", help="follow the background service log with status")
+    status_mode.add_argument("-q", "--quiet", action="store_true", help="report status via exit code only")
+    args = parser.parse_args()
+    if args.command != "connect" and (args.wifi or args.ask):
+        parser.error("--wifi and --ask require connect")
+    if args.command != "status" and (args.follow or args.quiet):
+        parser.error("--follow and --quiet require status")
+
+    # Both callers must always use the same budget, even with different XDG environments.
+    budget = AuthBudget(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state" / NAME)
+    report = Reporter(quiet=args.quiet)
+    try:
+        if args.follow:
+            return subprocess.run(
+                ["journalctl", "--user", "--unit", UNIT, "--follow", "--output=cat", "--lines=10", "--no-pager"]
+            ).returncode
+        if args.command == "reset-auth":
+            with budget.lock():
+                budget.write(0)
+            report("VPN", "Authentication attempts reset.")
+            return 0
+        config = Config.load(user_path("XDG_CONFIG_HOME", ".config") / "config.toml")
+        network = Network()
+        if args.command == "status":
+            snapshot = network.snapshot(config)
+            report("Wi-Fi", snapshot.wifi or "Disconnected")
+            report("VPN", f"{snapshot.vpn or 'disconnected'} · {budget.used()}/{AUTH_LIMIT} attempts used")
+            healthy = bool(snapshot.uplink and network.probe(config.probe_url))
+            report("Ready" if healthy else "Waiting",
+                   f"Internal HTTPS {'reachable' if healthy else 'unavailable'}.")
+            return 0 if healthy else 1
+        keeper = Keeper(config, network, budget, report, background=args.command == "watch")
+        if args.command == "connect":
+            with budget.lock():
+                if args.wifi:
+                    report("Wi-Fi", f"Connecting to {args.wifi}…")
+                    if not network.choose_wifi(args.wifi):
+                        raise ValueError("Wi-Fi activation failed.")
+                return 0 if keeper.step(ask=args.ask) else 1
+        while True:
+            try:
+                with budget.lock():
+                    keeper.step()
+            except BlockingIOError:
+                pass  # a foreground command owns the policy and authentication budget
+            except (GLib.Error, OSError, ValueError) as error:
+                report("Waiting", str(error))
+                keeper.unavailable("The background service could not check the connection. See work-link status --follow.")
+            try:
+                network.wait()
+            except (GLib.Error, ValueError):
+                time.sleep(12)
+    except BlockingIOError:
+        report("Waiting", "Another work-link operation is running.")
+        return 1
+    except (GLib.Error, OSError, ValueError) as error:
+        report("Blocked", str(error))
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

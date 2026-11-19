@@ -1,0 +1,20 @@
+#!/bin/bash
+
+function usage {
+    echo "usage: $(basename "${0}") <file>"
+    exit 1
+}
+
+if [ -z "${1}" ]; then
+    usage
+fi
+
+file="${1}"
+normalized="${file}_normalized.mp3"
+
+
+volume="$(ffmpeg -i "${file}" -af "volumedetect" -vn -sn -dn -f null /dev/null 2>&1 | egrep -o 'max_volume:.+$' | awk '{print $2}')"
+new_volume="$(echo "${volume} * -1" | bc)"
+echo "Detected: ${volume}, will set ${new_volume}"
+ffmpeg -y -v quiet -hide_banner -i "${file}" -af "volume=${new_volume}dB" -vn -acodec libmp3lame -ac 2 -ab 160k -ar 48000 "${normalized}"
+echo "${normalized}"

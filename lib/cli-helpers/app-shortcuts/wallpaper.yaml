@@ -1,0 +1,5 @@
+# asks the Random Wallpaper extension for a new wallpaper
+description: Random wallpaper
+bindings: ['<Control><Alt>w']
+launch:
+  command: [dconf, write, /org/gnome/shell/extensions/space-iflow-randomwallpaper/backend-connection/request-new-wallpaper, 'true']

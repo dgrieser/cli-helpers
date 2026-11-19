@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep internal work services reachable
+PartOf=graphical-session.target
+ConditionPathExists=%E/work-link/config.toml
+
+[Service]
+ExecStart=/usr/local/bin/work-link watch
+Restart=on-failure
+RestartSec=10
+UMask=0077
+LimitCORE=0
+
+[Install]
+WantedBy=graphical-session.target

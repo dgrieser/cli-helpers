@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the agent-session index current
+
+[Timer]
+OnStartupSec=1min
+OnUnitInactiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

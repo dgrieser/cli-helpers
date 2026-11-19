@@ -1,0 +1,15 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "condition": {
+      "regexFilter": "^https://teams\\.(microsoft\\.com|cloud\\.microsoft)/(l|meet)/(.*)$",
+      "resourceTypes": ["main_frame"],
+      "excludedInitiatorDomains": ["teams.microsoft.com", "teams.cloud.microsoft"]
+    },
+    "action": {
+      "type": "redirect",
+      "redirect": {"regexSubstitution": "web+msteams:/\\2/\\3"}
+    }
+  }
+]

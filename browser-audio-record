@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Record the audio output of a dedicated Chrome session."""
+
+import argparse
+from collections import deque
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+
+ROOT = Path(__file__).resolve().parent
+OVERLAY = "browser-audio-record.js"
+WORLD = "browser-audio-record"
+BINDING = "browserAudioControl"
+
+
+def ask(question):
+    prompt = ROOT / "prompt"
+    if not prompt.is_file():
+        prompt = "prompt"
+    result = subprocess.run(
+        [prompt, "--single-line", "--prompt", question],
+        stdout=subprocess.PIPE, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+@contextmanager
+def audio_sink(name):
+    props = (
+        f'node.name={name} node.description="Browser Audio Recorder" '
+        'media.class=Audio/Sink node.virtual=true priority.session=0'
+    )
+    process = subprocess.Popen(
+        ["pw-loopback", "-n", name, "-i", props],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            info = subprocess.run(
+                ["pw-cli", "info", name], capture_output=True, text=True, timeout=2,
+            )
+            if info.returncode == 0 and f'node.name = "{name}"' in info.stdout:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Could not create an audio sink. Check your PipeWire session.")
+        yield process
+    finally:
+        stop_process(process)
+
+
+class Recording:
+    def __init__(self, output, monitor):
+        self.output = output
+        self.monitor = monitor
+        self.process = None
+        self.temporary = None
+
+    def start(self):
+        fd, filename = tempfile.mkstemp(prefix=".browser-audio-", dir=self.output.parent)
+        os.close(fd)
+        self.temporary = Path(filename)
+        try:
+            self.process = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-abort_on", "empty_output", "-f", "pulse", "-i", self.monitor,
+                 "-c:a", "libmp3lame", "-q:a", "2", "-flush_packets", "1", "-f", "mp3", filename],
+                stdin=subprocess.PIPE, start_new_session=True,
+            )
+            deadline = time.monotonic() + 5
+            while self.process.poll() is None and time.monotonic() < deadline:
+                if self.temporary.stat().st_size:
+                    return
+                time.sleep(0.025)
+            raise RuntimeError("FFmpeg did not start capturing browser audio.")
+        except (OSError, RuntimeError):
+            if self.process is not None:
+                stop_process(self.process)
+                self.process.stdin.close()
+            self.temporary.unlink()
+            self.process = self.temporary = None
+            raise
+
+    def finish(self):
+        process = self.process
+        temporary = self.temporary
+        self.process = self.temporary = None
+        try:
+            try:
+                process.communicate(b"q\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("FFmpeg timed out while saving the recording.") from None
+            if process.returncode != 0:
+                raise RuntimeError("FFmpeg could not save the recording.")
+            output = self.output
+            take = 2
+            while True:
+                try:
+                    os.link(temporary, output)
+                    break
+                except FileExistsError:
+                    output = self.output.with_name(f"{self.output.stem}-{take}.mp3")
+                    take += 1
+            print(output, flush=True)
+            return output
+        finally:
+            stop_process(process)
+            temporary.unlink(missing_ok=True)
+
+
+class DevTools:
+    """Chrome uses NUL-delimited JSON on the two debugging pipes."""
+
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.buffer = bytearray()
+        self.events = deque()
+        self.sequence = 0
+        self.session = None
+
+    def send(self, method, params=None, session=None):
+        self.sequence += 1
+        message = {"id": self.sequence, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
+        self.writer.write(json.dumps(message).encode() + b"\0")
+        self.writer.flush()
+        return self.sequence
+
+    def receive(self, timeout):
+        deadline = time.monotonic() + timeout
+        while (end := self.buffer.find(0)) == -1:
+            remaining = max(0, deadline - time.monotonic())
+            if not select.select([self.reader], [], [], remaining)[0]:
+                return None
+            chunk = os.read(self.reader.fileno(), 65536)
+            if not chunk:
+                raise EOFError("Chrome closed its debugging pipe.")
+            self.buffer.extend(chunk)
+        message = json.loads(self.buffer[:end])
+        del self.buffer[:end + 1]
+        return message
+
+    def call(self, method, params=None, session=None):
+        request = self.send(method, params, session)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            message = self.receive(deadline - time.monotonic())
+            if message is None:
+                break
+            if message.get("id") == request:
+                if "error" in message:
+                    raise RuntimeError(f'{method}: {message["error"]["message"]}')
+                return message["result"]
+            if "method" in message:
+                self.events.append(message)
+        raise RuntimeError(f"Chrome did not respond to {method}.")
+
+    def prepare_page(self, script):
+        targets = self.call("Target.getTargets")["targetInfos"]
+        page = next((target for target in targets if target["type"] == "page"), None)
+        if page is None:
+            raise RuntimeError("Chrome did not open a tab.")
+        self.session = self.call("Target.attachToTarget", {
+            "targetId": page["targetId"], "flatten": True,
+        })["sessionId"]
+        # Page events must be enabled for the new-document script to run.
+        self.call("Page.enable", session=self.session)
+        self.call("Runtime.enable", session=self.session)
+        self.call("Runtime.addBinding", {
+            "name": BINDING, "executionContextName": WORLD,
+        }, self.session)
+        self.call("Page.addScriptToEvaluateOnNewDocument", {
+            "source": script, "worldName": WORLD,
+        }, self.session)
+
+    def status(self, context, active, message):
+        state = json.dumps([active, message])
+        self.send("Runtime.evaluate", {
+            "contextId": context,
+            "expression": f"globalThis.setBrowserAudioStatus(...{state})",
+        }, self.session)
+
+
+@contextmanager
+def chrome_session(chrome, profile, sink):
+    # Chrome expects its read pipe on FD 3 and its write pipe on FD 4.
+    with debugging_pipes() as (reader, writer, child_read, child_write), tempfile.TemporaryFile() as log:
+        process = subprocess.Popen(
+            ["/bin/bash", "-c",
+             'read_fd=$1 write_fd=$2; shift 2; '
+             'exec 3<&"$read_fd" 4>&"$write_fd"; '
+             'if (( read_fd > 4 )); then exec {read_fd}<&-; fi; '
+             'if (( write_fd > 4 )); then exec {write_fd}>&-; fi; '
+             'exec "$@"',
+             "chrome", str(child_read.fileno()), str(child_write.fileno()), chrome,
+             f"--user-data-dir={profile}", "--remote-debugging-pipe",
+             "--no-first-run", "--no-default-browser-check", "--new-window", "about:blank"],
+            pass_fds=(child_read.fileno(), child_write.fileno()),
+            env={**os.environ, "PULSE_SINK": sink},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+            start_new_session=True,
+        )
+        child_read.close()
+        child_write.close()
+        devtools = DevTools(reader, writer)
+        try:
+            yield devtools
+        except (EOFError, BrokenPipeError):
+            log.seek(0)
+            sys.stderr.write(log.read().decode(errors="replace"))
+            raise
+        finally:
+            if process.poll() is None:
+                try:
+                    devtools.send("Browser.close")
+                    process.wait(timeout=3)
+                except (OSError, subprocess.TimeoutExpired):
+                    stop_process(process)
+
+
+@contextmanager
+def debugging_pipes():
+    child_read, parent_write = os.pipe()
+    parent_read, child_write = os.pipe()
+    with (
+        os.fdopen(parent_read, "rb", buffering=0) as reader,
+        os.fdopen(parent_write, "wb") as writer,
+        os.fdopen(child_read, "rb") as child_input,
+        os.fdopen(child_write, "wb") as child_output,
+    ):
+        yield reader, writer, child_input, child_output
+
+
+def run_page(devtools, recording, sink_process):
+    notice = ""
+    context = None
+    while sink_process.poll() is None:
+        if recording.process is not None and recording.process.poll() is not None:
+            try:
+                notice = f"Saved {recording.finish().name}"
+            except (OSError, RuntimeError) as error:
+                notice = str(error)
+                print(notice, file=sys.stderr)
+            if context is not None:
+                devtools.status(context, False, notice)
+        event = devtools.events.popleft() if devtools.events else devtools.receive(0.2)
+        if event is None:
+            continue
+        params = event.get("params", {})
+        if (event.get("method") == "Target.detachedFromTarget"
+                and params.get("sessionId") == devtools.session):
+            return
+        if (event.get("method") != "Runtime.bindingCalled"
+                or event.get("sessionId") != devtools.session
+                or params["name"] != BINDING):
+            continue
+        context = params["executionContextId"]
+        if params["payload"] == "toggle":
+            try:
+                if recording.process is None:
+                    recording.start()
+                    notice = ""
+                else:
+                    notice = f"Saved {recording.finish().name}"
+            except (OSError, RuntimeError) as error:
+                notice = str(error)
+                print(notice, file=sys.stderr)
+        devtools.status(context, recording.process is not None, notice)
+    raise RuntimeError("The PipeWire audio sink stopped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-u", "--url", help="HTTP(S) URL to open (prompted if omitted)")
+    parser.add_argument("-n", "--name", help="output path or MP3 basename (prompted if omitted)")
+    parser.add_argument("-a", "--auto-start", action="store_true",
+                        help="start recording before opening the URL")
+    args = parser.parse_args()
+    url = args.url if args.url is not None else ask("URL to open:")
+    if not url and args.url is None:
+        return 1
+    try:
+        target = urlsplit(url)
+        if target.scheme not in ("http", "https") or not target.hostname:
+            raise ValueError
+    except ValueError:
+        parser.error("provide an HTTP or HTTPS URL")
+    name = args.name if args.name is not None else ask("Save recording as:")
+    if not name:
+        return 1
+    output = Path(name).expanduser().absolute()
+    if output.suffix.lower() != ".mp3":
+        output = output.with_name(output.name + ".mp3")
+    if not output.parent.is_dir():
+        parser.error(f"output directory does not exist: {output.parent}")
+
+    chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    missing = [tool for tool in ("pw-loopback", "pw-cli", "ffmpeg") if not shutil.which(tool)]
+    if chrome is None:
+        missing.insert(0, "Google Chrome")
+    if missing:
+        parser.error("missing dependencies: " + ", ".join(missing))
+
+    overlay = ROOT / "lib" / "cli-helpers" / OVERLAY
+    if not overlay.is_file():
+        overlay = Path("/usr/local/lib/cli-helpers") / OVERLAY
+    script = overlay.read_text()
+    with tempfile.TemporaryDirectory(prefix="browser-audio-") as profile:
+        sink = Path(profile).name
+        recording = Recording(output, f"{sink}.monitor")
+        with audio_sink(sink) as sink_process, chrome_session(chrome, profile, sink) as devtools:
+            devtools.prepare_page(script)
+            try:
+                if args.auto_start:
+                    recording.start()
+                result = devtools.call("Page.navigate", {"url": url}, devtools.session)
+                if result.get("errorText"):
+                    raise RuntimeError(f'Chrome could not open the URL: {result["errorText"]}')
+                run_page(devtools, recording, sink_process)
+            except (EOFError, BrokenPipeError):
+                pass
+            finally:
+                if recording.process is not None:
+                    recording.finish()
+    return 0
+
+
+def interrupt(_signal, _frame):
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, RuntimeError, EOFError, subprocess.TimeoutExpired) as error:
+        print(f"browser-audio-record: {error}", file=sys.stderr)
+        sys.exit(1)

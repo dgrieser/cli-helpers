@@ -1,0 +1,15 @@
+# Local settings use literal key=value lines. Never source a settings file.
+local_config_value() {
+    local file="${1}" key="${2}"
+    [ -r "${file}" ] || return 0
+    awk -v key="${key}" '
+        index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+    ' "${file}"
+}
+
+CLI_HELPERS_CONFIG_FILES=(
+    cli-helpers/setup.conf cli-helpers/setup-backup.conf cli-helpers/wifi.conf cli-helpers/networkmanager.conf
+    cli-helpers/set-slack-profile.json cli-helpers/ssh.conf cli-helpers/gnome.conf
+    cli-helpers/updater.conf cli-helpers/browser-router.conf
+    cli-helpers/chrome-search-engines.json cli-helpers/opencode.json work-link/config.toml
+)

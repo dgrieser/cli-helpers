@@ -1,0 +1,59 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") <lines> <command>" 1>&2
+    exit 1
+}
+
+lines_per_chunk=""
+cmd=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${lines_per_chunk}" ]; then
+                [[ ! "${1}" =~ ^[0-9]+$ ]] && echo "ERROR: ${1} is not a number" 1>&2 && usage
+                [[ "${1}" -eq 0 ]] && echo "ERROR: ${1} must be greater than 0" 1>&2 && usage
+                lines_per_chunk="${1}"
+            elif [ -z "${cmd}" ]; then
+                cmd="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${lines_per_chunk}" ] && usage
+[ -z "${cmd}" ] && usage
+
+chunk=()
+count=0
+total_count=0
+
+exec 3</dev/tty
+
+while IFS= read -r line; do
+    chunk+=("${line}")
+    ((count++))
+    ((total_count++))
+    if ((count == lines_per_chunk)); then
+        printf "%s\n" "${chunk[@]}" | eval "${cmd}"
+        read -u 3 -p "Piped lines $((total_count - lines_per_chunk + 1)) to ${total_count} into ${cmd}. Continue? [Y/n]: " -r
+        [[ ${REPLY} =~ ^[Nn]$ ]] && echo "Abort." 1>&2 && exit 1
+        chunk=()
+        count=0
+    fi
+done
+
+if ((count > 0)); then
+    remainer_count=$(echo "${chunk[@]}" | wc -l)
+    printf "%s\n" "${chunk[@]}" | eval "${cmd}"
+    echo -n "Piped lines $((total_count - remainer_count)) to ${total_count} into ${cmd}. "
+fi
+
+echo "Done"

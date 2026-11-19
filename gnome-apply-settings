@@ -1,0 +1,204 @@
+#!/bin/bash
+
+usage()
+{
+    echo "Usage: gnome-apply-settings [-h|--help]"
+    echo
+    echo "Applies personal GNOME settings (keyboard, shortcuts, appearance, dock, power,"
+    echo "Files, Ptyxis, extensions, apps) for the current user with gsettings/dconf."
+    exit "${1:-1}"
+}
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage 0
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+# gsettings writes the settings of the user running it, so under sudo it would
+# change root's settings instead of yours
+if [ "$(id -u)" -eq 0 ]; then
+    echo "ERROR: run gnome-apply-settings as your user, not as root" 1>&2
+    exit 1
+fi
+
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-up "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-down "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "['']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left "['']"
+# Super+Space and Super+` stay free (no input source or window group switching),
+# show desktop only on Super+D
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-group "@as []"
+gsettings set org.gnome.desktop.wm.keybindings switch-group-backward "@as []"
+gsettings set org.gnome.desktop.wm.keybindings show-desktop "['<Super>d']"
+# screenshots: Print belongs to app-shortcut screenshot, Shift+Print records the screen
+gsettings set org.gnome.shell.keybindings screenshot "@as []"
+gsettings set org.gnome.shell.keybindings screenshot-window "@as []"
+gsettings set org.gnome.shell.keybindings show-screen-recording-ui "['<Shift>Print']"
+gsettings set org.gnome.shell disable-extension-version-validation true
+gsettings set org.gnome.desktop.remote-desktop.rdp screen-share-mode extend
+gsettings set org.gnome.shell.extensions.dash-to-dock show-icons-emblems false
+gsettings set org.gnome.shell.extensions.dash-to-dock show-show-apps-button false
+gsettings set org.gnome.mutter attach-modal-dialogs false
+
+
+dconf write /org/gnome/desktop/notifications/application/solaar/enable false
+
+# keyboard: German without dead keys, so ` and ^ type immediately; NumLock on (GNOME
+# keeps its state across logins)
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de+nodeadkeys')]"
+gsettings set org.gnome.desktop.peripherals.keyboard numlock-state true
+
+# appearance
+gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+gsettings set org.gnome.desktop.interface gtk-theme 'Yaru-dark'
+gsettings set org.gnome.desktop.interface icon-theme 'Yaru-dark'
+gsettings set org.gnome.desktop.interface enable-hot-corners true
+gsettings set org.gnome.desktop.interface gtk-enable-primary-paste true
+
+# mouse and touchpad
+gsettings set org.gnome.desktop.peripherals.mouse speed 0.002904647435897436
+gsettings set org.gnome.desktop.peripherals.touchpad click-method 'fingers'
+gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll false
+gsettings set org.gnome.desktop.peripherals.touchpad tap-to-click false
+
+# power: never suspend on AC (the timeout only applies if a type is set again)
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 3600
+gsettings set org.gnome.settings-daemon.plugins.color night-light-schedule-automatic false
+
+# dock
+gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 26
+gsettings set org.gnome.shell.extensions.dash-to-dock multi-monitor true
+gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
+# pin Settings > Displays, keeping whatever else is pinned
+favorite="gnome-display-panel.desktop"
+favorites="$(gsettings get org.gnome.shell favorite-apps)"
+if [[ "${favorites}" != *"'${favorite}'"* ]]; then
+    if [ "${favorites}" = "@as []" ] || [ "${favorites}" = "[]" ]; then
+        gsettings set org.gnome.shell favorite-apps "['${favorite}']"
+    else
+        gsettings set org.gnome.shell favorite-apps "${favorites%]}, '${favorite}']"
+    fi
+fi
+
+# extensions: no desktop icons, and no home folder icon should DING be enabled again;
+# tiling assistant look and popup
+gnome-extensions disable ding@rastersoft.com 2>/dev/null \
+    || gsettings set org.gnome.shell disabled-extensions "['ding@rastersoft.com']"
+gsettings set org.gnome.shell.extensions.ding show-home false
+gsettings set org.gnome.shell.extensions.tiling-assistant focus-hint-color 'rgb(203,67,20)'
+gsettings set org.gnome.shell.extensions.tiling-assistant tiling-popup-all-workspace true
+
+# Ptyxis: no bells, the system's monospace font, new tabs next to the current one; nord
+# palette and unlimited scrollback on the default profile
+gsettings set org.gnome.Ptyxis audible-bell false
+gsettings set org.gnome.Ptyxis visual-bell false
+gsettings set org.gnome.Ptyxis use-system-font true
+gsettings set org.gnome.Ptyxis new-tab-position 'next'
+ptyxis_profile="$(gsettings get org.gnome.Ptyxis default-profile-uuid 2>/dev/null | tr -d "'")"
+if [ -n "${ptyxis_profile}" ]; then
+    label_file="${XDG_CONFIG_HOME:-${HOME}/.config}/cli-helpers/gnome.conf"
+    if [ -r "${label_file}" ]; then
+        label="$(sed -n 's/^terminal_profile_label=//p' "${label_file}" | head -n 1)"
+        [ -z "${label}" ] || gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" label "${label}"
+    fi
+    gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" palette 'nord'
+    gsettings set "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/${ptyxis_profile}/" limit-scrollback false
+fi
+# Reserve Ctrl+Alt for opening, closing and switching tabs and for the tab overview.
+# Disable the bindings below so their keys reach programs in the terminal.
+gsettings set org.gnome.Ptyxis.Shortcuts new-tab '<Control><Alt>Down'
+gsettings set org.gnome.Ptyxis.Shortcuts tab-overview '<Control><Alt>Up'
+gsettings set org.gnome.Ptyxis.Shortcuts close-tab '<Control><Alt>d'
+gsettings set org.gnome.Ptyxis.Shortcuts move-next-tab '<Control><Alt>Right'
+gsettings set org.gnome.Ptyxis.Shortcuts move-previous-tab '<Control><Alt>Left'
+for shortcut in close-window move-tab-left move-tab-right new-window popup-menu preferences tab-menu undo-close-tab; do
+    gsettings set org.gnome.Ptyxis.Shortcuts "${shortcut}" ''
+done
+
+# from the old system: clock and panel
+gsettings set org.gnome.desktop.interface clock-show-seconds true
+gsettings set org.gnome.desktop.interface clock-show-weekday true
+gsettings set org.gnome.desktop.interface show-battery-percentage true
+gsettings set org.gnome.desktop.calendar show-weekdate true
+gsettings set org.gnome.desktop.datetime automatic-timezone true
+# monospace font (nerd-fonts entry of updater): the Mono variant keeps Nerd Font icons one cell wide (prompt, vim)
+gsettings set org.gnome.desktop.interface monospace-font-name 'Agave Nerd Font Mono 14'
+
+# windows and sound; the screen never blanks
+gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,close'
+gsettings set org.gnome.desktop.sound event-sounds false
+gsettings set org.gnome.desktop.sound allow-volume-above-100-percent true
+# system sounds muted: no input feedback sounds (Ubuntu turns them on), and the System
+# Sounds volume of Settings muted; WirePlumber keeps it from the route-settings metadata
+gsettings set org.gnome.desktop.sound input-feedback-sounds false
+if command -v pw-metadata >/dev/null 2>&1; then
+    pw-metadata -n route-settings 0 'restore.stream.Output/Audio.media.role:Notification' \
+        '{"volume":1.0, "mute":true, "volumes":[1.0, 1.0], "channels":["FL", "FR"]}' 'Spa:String:JSON' > /dev/null
+fi
+gsettings set org.gnome.desktop.session idle-delay 'uint32 0'
+
+# power: no dimming, power button suspends, never suspend on battery either
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+gsettings set org.gnome.settings-daemon.plugins.power power-button-action 'suspend'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 1500
+
+# dock behavior, on the laptop screen
+gsettings set org.gnome.shell.extensions.dash-to-dock autohide false
+gsettings set org.gnome.shell.extensions.dash-to-dock scroll-action 'cycle-windows'
+gsettings set org.gnome.shell.extensions.dash-to-dock dance-urgent-applications false
+gsettings set org.gnome.shell.extensions.dash-to-dock apply-custom-theme true
+gsettings set org.gnome.shell.extensions.dash-to-dock shortcut-timeout 5.0
+gsettings set org.gnome.shell.extensions.dash-to-dock preferred-monitor-by-connector 'eDP'
+
+# Files: list view with owner and type, thumbnails also for remote files; icons captioned
+# with type, size and date; the GTK 4 file chooser shows hidden files
+gsettings set org.gnome.nautilus.preferences default-folder-viewer 'list-view'
+gsettings set org.gnome.nautilus.preferences show-image-thumbnails 'always'
+gsettings set org.gnome.nautilus.list-view default-visible-columns "['name', 'owner', 'size', 'date_modified', 'type']"
+gsettings set org.gnome.nautilus.list-view default-column-order "['name', 'permissions', 'owner', 'group', 'size', 'date_modified', 'type', 'mime_type', 'where', 'date_modified_with_time', 'date_accessed', 'date_created', 'recency', 'starred']"
+gsettings set org.gnome.nautilus.icon-view captions "['type', 'size', 'date_modified']"
+gsettings set org.gtk.gtk4.Settings.FileChooser show-hidden true
+# Files: Shift+Delete asks with Cancel focused and then moves to the trash like Delete,
+# which does not ask, and the dialogs that confirm a permanent delete or emptying the
+# trash focus Cancel, not Delete, with Tab going from Cancel straight to Delete; Files
+# has no settings for them, so a nautilus-python extension changes them, which needs
+# python3-nautilus (updater base) and takes effect when Files starts again
+nautilus_extension="safe-delete.py"
+nautilus_extensions="${HOME}/.local/share/nautilus-python/extensions"
+if [ ! -L "${nautilus_extensions}/${nautilus_extension}" ]; then
+    mkdir -p "${nautilus_extensions}"
+    ln -sfn "/usr/local/lib/cli-helpers/nautilus-python/${nautilus_extension}" "${nautilus_extensions}/${nautilus_extension}"
+    echo "Files loads ${nautilus_extension} when it starts again (nautilus -q quits it)" 1>&2
+fi
+if ! dpkg -s python3-nautilus > /dev/null 2>&1; then
+    echo "WARNING: python3-nautilus is not installed, so Files does not load ${nautilus_extension}; run: updater base" 1>&2
+fi
+
+# tiling assistant: no popup, no example layouts
+gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
+gsettings set org.gnome.shell.extensions.tiling-assistant import-layout-examples false
+
+# apps, with dconf so it also works before they are installed: Evolution with a 24-hour
+# clock and reminders without sound or notification, Evince with free zoom and odd pages
+# on the left, Meld, gedit and Drawing dark, Drawing with big icons
+dconf write /org/gnome/evolution/calendar/use-24hour-format true
+dconf write /org/gnome/evolution-data-server/calendar/notify-enable-audio false
+dconf write /org/gnome/evolution-data-server/calendar/notify-enable-display false
+dconf write /org/gnome/evince/default/sizing-mode "'free'"
+dconf write /org/gnome/evince/default/dual-page-odd-left true
+dconf write /org/gnome/meld/prefer-dark-theme true
+dconf write /org/gnome/gedit/preferences/editor/scheme "'Yaru-dark'"
+dconf write /com/github/maoschanz/drawing/dark-theme-variant true
+dconf write /com/github/maoschanz/drawing/big-icons true

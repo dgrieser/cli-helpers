@@ -1,0 +1,4 @@
+#!/bin/bash
+print-text-muted "Restarting audio..." >&2
+systemctl --user restart pipewire.service
+systemctl --user restart wireplumber.service

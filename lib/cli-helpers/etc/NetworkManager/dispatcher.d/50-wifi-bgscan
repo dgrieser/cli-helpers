@@ -1,0 +1,36 @@
+#!/bin/bash
+# NetworkManager has no setting for the wpa_supplicant bgscan parameters: it
+# hardcodes "simple:30:-65:300" for every 802.1X/EAP profile. At desks where the
+# corporate BSSes all sit below -65 dBm that makes wpa_supplicant scan every 30 s
+# and roam back and forth between two equally weak APs. This re-applies calmer
+# parameters on each activation, since NM recreates the network block every time.
+# Apply the tuning on the MT7922 and Intel AX210.
+
+interface="${1}"
+action="${2}"
+
+BGSCAN='simple:60:-75:600'   # short_interval:signal_threshold:long_interval
+# Alternative, scans only the channels this ESS has been seen on:
+# BGSCAN='learn:60:-75:600:/var/lib/wpa_supplicant/bgscan-learn'
+
+[ -r /etc/cli-helpers/networkmanager.conf ] || exit 0
+. /etc/cli-helpers/networkmanager-functions
+profile_pattern="$(dispatcher_value wifi_profile_pattern)"
+if [ "${action}" = "up" ] && [[ "${interface}" = wlp* ]] &&
+    [[ -n "${profile_pattern}" && "${CONNECTION_ID}" = ${profile_pattern} ]]; then
+    device="/sys/class/net/${interface}/device"
+    [[ -r "${device}/vendor" && -r "${device}/device" ]] || exit 0
+    case "$(<"${device}/vendor"):$(<"${device}/device")" in
+        0x14c3:0x0616|0x8086:0x2725) ;;
+        *) exit 0 ;;
+    esac
+
+    id="$(wpa_cli -i "${interface}" list_networks 2>/dev/null \
+          | awk -F'\t' '$4 ~ /CURRENT/ { print $1; exit }')"
+    [ -z "${id}" ] && id=0
+    if [[ "$(wpa_cli -i "${interface}" set_network "${id}" bgscan "\"${BGSCAN}\"" 2>/dev/null)" = OK ]]; then
+        logger -t wifi-bgscan "set bgscan ${BGSCAN} on ${interface} network ${id}"
+    else
+        logger -t wifi-bgscan "failed to set bgscan on ${interface} network ${id}"
+    fi
+fi
