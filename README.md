@@ -805,9 +805,11 @@ Without a target, the review is chosen from the state of the repository:
 When stdin and stdout are a terminal, the commands Codex runs are shown as progress on stderr, and the response is rendered with `glow` when it is installed. Afterwards, a menu offers:
 
 - **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
-- **Prompt** sends a follow-up to the current Codex session (`codex exec resume`).
-- **Repeat** opens a menu with the review detected from the current repository state, the initial review settings, and the remaining modes. Each review starts a new Codex session with the same profile. Follow-up prompts go to the new session.
+- **Prompt** sends a follow-up to the current Codex session (`codex exec resume`) using the initial run's deep setting. It appears as **Deep prompt** when deep mode is on.
+- **Repeat** opens a menu with the review detected from the current repository state, the initial review target, and the remaining modes. Each review starts a new Codex session. Follow-up prompts go to the new session.
 - **Quit** (or Esc).
+
+The startup line begins with `Deep reviewing` when deep mode is on. Press Tab on any option in **Repeat** to switch deep mode for that run. Each option defaults to the initial run's setting.
 
 Otherwise, for example in a pipe, or with `--print`, only the response goes to stdout; the progress stays on stderr.
 

@@ -122,6 +122,9 @@ interrupt_review() {
 # session id and replaces ${answer_file} with the final response. On failure,
 # the previous response stays.
 run_codex() {
+    local deep="${1}"
+    shift
+    local profile="${standard_profile}"
     local events_file="${work_dir}/events.jsonl"
     local new_answer_file="${work_dir}/answer.new.md"
     local status
@@ -129,6 +132,9 @@ run_codex() {
     local worker_pid=""
     local interrupt_status=0
 
+    if [ "${deep}" = on ]; then
+        profile=review-deep
+    fi
     rm -f "${new_answer_file}"
     # A foreground pipeline can delay SIGINT until Codex exits. Use an
     # interruptible wait and a separate process group for the whole pipeline.
@@ -170,14 +176,24 @@ run_codex() {
 }
 
 run_review() {
-    printf 'Reviewing %s (%s)\n' "${description}" "${selection}" >&2
-    run_codex review "${@}" </dev/null
+    local deep="${1}" reviewing=Reviewing
+    shift
+    if [ "${deep}" = on ]; then
+        reviewing="Deep reviewing"
+    fi
+    printf '%s %s (%s)\n' "${reviewing}" "${description}" "${selection}" >&2
+    run_codex "${deep}" review "${@}" </dev/null
 }
 
 # The prompt goes through stdin, so text starting with "-" is no option.
 run_followup() {
     [ -n "${session_id}" ] || { error "No Codex session to continue"; return 1; }
-    run_codex resume "${session_id}" - <<< "${1}"
+    if [ "${initial_deep}" = on ]; then
+        printf 'Sending deep follow-up\n' >&2
+    else
+        printf 'Sending follow-up\n' >&2
+    fi
+    run_codex "${initial_deep}" resume "${session_id}" - <<< "${1}"
 }
 
 # Codex leaves out the final newline of the response.
@@ -194,23 +210,47 @@ show_answer() {
     fi
 }
 
+ask_repeat() {
+    local other_deep=on entry key label
+    local -a cycles=() choices=()
+
+    if [ "${initial_deep}" = on ]; then
+        other_deep=off
+    fi
+    for entry in "${@}"; do
+        key="${entry%%=*}"
+        label="${entry#*=}"
+        cycles+=(--cycle "${key}:${initial_deep}|${key}:${other_deep}")
+        choices+=("${key}:off=${label}" "${key}:on=Deep ${label,}")
+    done
+    prompt-select --prompt "Repeat (Tab toggles deep):" --no-abort-message \
+        "${cycles[@]}" "${choices[@]}" </dev/tty
+}
+
 ask_next() {
+    local label=Prompt
+    if [ "${initial_deep}" = on ]; then
+        label="Deep prompt"
+    fi
     prompt-select --prompt "Next:" --no-abort-message \
         "copy=Copy response" \
-        "followup=Prompt" \
+        "followup=${label}" \
         "review=Repeat" \
-        "quit=Quit" \
-        </dev/tty
+        "quit=Quit" </dev/tty
 }
 
 ask_followup() {
-    prompt --prompt "Follow-up prompt (Ctrl-D sends):" --no-abort-message </dev/tty
+    local label="Follow-up prompt"
+    if [ "${initial_deep}" = on ]; then
+        label="Deep follow-up prompt"
+    fi
+    prompt --prompt "${label} (Ctrl-D sends):" --no-abort-message </dev/tty
 }
 
 review_again() {
     local initial_mode="${mode}" initial_description="${description}"
     local -a initial_args=("${review_args[@]}")
-    local mode="" target="" selection="" description="" action entry
+    local mode="" target="" selection="" description="" action entry deep
     local -a entries=() review_args=()
 
     if detect_mode && resolve_review; then
@@ -228,7 +268,9 @@ review_again() {
         fi
     done
 
-    action="$(prompt-select --prompt "Repeat:" --no-abort-message "${entries[@]}" </dev/tty)" || return 0
+    action="$(ask_repeat "${entries[@]}")" || return 0
+    deep="${action##*:}"
+    action="${action%%:*}"
     case "${action}" in
         auto) ;;
         same)
@@ -253,7 +295,7 @@ review_again() {
         *) return 0 ;;
     esac
 
-    run_review "${review_args[@]}"
+    run_review "${deep}" "${review_args[@]}"
     case $? in
         0) show_answer ;;
         130) ;;
@@ -358,7 +400,12 @@ resolve_review() {
 mode=""
 target=""
 print=0
-profile="${CODEX_REVIEW_PROFILE:-review}"
+standard_profile="${CODEX_REVIEW_PROFILE:-review}"
+initial_deep=off
+if [ "${standard_profile}" = review-deep ]; then
+    standard_profile=review
+    initial_deep=on
+fi
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -368,7 +415,7 @@ while [ "${#}" -gt 0 ]; do
             exit 0
             ;;
         -h|--help) usage ;;
-        --deep) profile="review-deep" ;;
+        --deep) initial_deep=on ;;
         -p|--print) print=1 ;;
         full|base|uncommitted|commit)
             [ -z "${mode}" ] || fail "Choose one review target"
@@ -414,7 +461,7 @@ trap 'rm -rf "${work_dir}"' EXIT
 answer_file="${work_dir}/answer.md"
 session_id=""
 
-run_review "${review_args[@]}" || exit $?
+run_review "${initial_deep}" "${review_args[@]}" || exit $?
 
 if [ "${print}" -eq 1 ]; then
     print_answer

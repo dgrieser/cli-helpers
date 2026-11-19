@@ -1156,72 +1156,127 @@ def agent_processes():
     return found
 
 
-def read_backwards_for(path, markers, chunk=262144):
-    """Which of the markers comes last in a file, read from its end, so a
-    session of megabytes costs the length of its last turn."""
+def reverse_jsonl(path, chunk=262144):
+    """Read newest records first, joining lines that span chunks."""
     try:
         with open(path, 'rb') as handle:
-            handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            longest = max(len(marker) for marker in markers)
-            while position > 0:
+            position = handle.seek(0, os.SEEK_END)
+            suffix = []
+            while position:
                 start = max(0, position - chunk)
                 handle.seek(start)
-                data = handle.read(position - start + longest)
-                best = None
-                best_index = -1
-                for marker in markers:
-                    index = data.rfind(marker)
-                    if index > best_index:
-                        best, best_index = marker, index
-                if best is not None:
-                    return best
+                lines = handle.read(position - start).split(b'\n')
                 position = start
+                if len(lines) == 1:
+                    suffix.append(lines[0])
+                    continue
+                yield b''.join(reversed(suffix + [lines[-1]]))
+                yield from reversed(lines[1:-1])
+                suffix = [lines[0]]
+            yield b''.join(reversed(suffix))
     except OSError:
         pass
-    return None
 
 
-def tail_lines(path, max_bytes=524288, count=50):
+def codex_command_approval(call):
+    name = call.get('name')
+    if call.get('type') == 'custom_tool_call' and name == 'exec':
+        # Code mode wraps exec_command arguments in JavaScript.
+        code = call.get('input')
+        if not isinstance(code, str) or 'tools.exec_command' not in code:
+            return False
+        return bool(re.search(r"""\bsandbox_permissions['"]?\s*:\s*['"]require_escalated['"]""",
+                              code))
+    if name not in ('exec_command', 'shell', 'shell_command', 'unified_exec'):
+        return False
     try:
-        with open(path, 'rb') as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes))
-            data = handle.read()
-    except OSError:
-        return []
-    lines = data.split(b'\n')
-    if size > max_bytes:
-        lines = lines[1:]
-    return [line for line in lines if line.strip()][-count:]
+        arguments = json.loads(call.get('arguments') or '{}')
+    except (TypeError, ValueError):
+        return False
+    return isinstance(arguments, dict) and arguments.get('sandbox_permissions') == 'require_escalated'
 
 
-def codex_pending_prompt(path):
-    """What a working codex turn waits for, where its last call is one that
-    waits: a command that asks to run outside the sandbox, or a question to
-    the user, without any output after it yet."""
-    items = []
-    for line in tail_lines(path):
+def codex_live_status(path, pid):
+    """Use the latest turn and match blocking calls with their own outputs."""
+    completed = False
+    latest_message = None
+    finished_calls = set()
+    pending = set()
+    settings = None
+    for line in reverse_jsonl(path):
         try:
             record = json.loads(line)
         except ValueError:
             continue
-        payload = record.get('payload') if isinstance(record, dict) else None
-        items.append(payload if isinstance(payload, dict) else {})
-    calls = [index for index, item in enumerate(items)
-             if item.get('type') in ('custom_tool_call', 'function_call')]
-    if not calls:
-        return None
-    call = items[calls[-1]]
-    for item in items[calls[-1] + 1:]:
-        if item.get('call_id') == call.get('call_id') and str(item.get('type', '')).endswith('_output'):
-            return None
-    if call.get('name') == 'request_user_input':
-        return 'question'
-    if 'require_escalated' in str(call.get('input') or call.get('arguments') or ''):
-        return 'approval'
-    return None
+        if not isinstance(record, dict) or not isinstance(record.get('payload'), dict):
+            continue
+        kind, payload = record.get('type'), record['payload']
+        item_type = payload.get('type')
+
+        if kind == 'event_msg':
+            if item_type in ('task_started', 'turn_started'):
+                break
+            if item_type in ('turn_aborted', 'task_complete', 'turn_complete'):
+                if completed or item_type == 'turn_aborted':
+                    return 'open', None
+                completed = True
+                pending.clear()
+            if item_type == 'thread_settings_applied' and settings is None:
+                settings = payload.get('thread_settings')
+                if not isinstance(settings, dict):
+                    settings = None
+            if latest_message is None:
+                item = payload.get('item')
+                if item_type == 'item_completed' and isinstance(item, dict):
+                    if item.get('type') == 'AgentMessage' and item.get('phase') == 'final_answer':
+                        latest_message = ('question' if item.get('delivery') == 'async'
+                                          and item.get('questions') else 'final')
+                    elif item.get('type') == 'UserMessage':
+                        latest_message = 'user'
+                elif item_type == 'user_message':
+                    latest_message = 'user'
+        elif kind == 'turn_context' and settings is None:
+            settings = payload
+        elif kind == 'response_item':
+            if latest_message is None and item_type == 'message':
+                if payload.get('role') == 'assistant' and payload.get('phase') == 'final_answer':
+                    latest_message = 'final'
+                elif payload.get('role') == 'user':
+                    text = codex_item_text(payload.get('content'))
+                    if text and not text.startswith(CODEX_SKIP_USER):
+                        latest_message = 'user'
+            call_id = payload.get('call_id')
+            if completed or not isinstance(call_id, str) or not call_id:
+                continue
+            if item_type in ('function_call_output', 'custom_tool_call_output'):
+                finished_calls.add(call_id)
+            elif item_type in ('function_call', 'custom_tool_call') and call_id not in finished_calls:
+                if payload.get('name') == 'request_user_input':
+                    pending.add('question')
+                elif payload.get('name') == 'request_permissions':
+                    pending.add('approval')
+                elif codex_command_approval(payload):
+                    pending.add('command')
+        if completed and latest_message is not None:
+            break
+    else:
+        return 'open', None
+
+    if latest_message == 'question' or 'question' in pending:
+        return 'waiting', 'question'
+    if completed:
+        return 'open', None
+    settings = settings or {}
+    if (settings.get('approval_policy') != 'never'
+            and settings.get('approvals_reviewer') not in ('auto_review', 'guardian_subagent')):
+        if 'approval' in pending:
+            return 'waiting', 'approval'
+        # A command can still lack an output after approval, while it runs.
+        if 'command' in pending and not any(
+                read_text(f'/proc/{child}/comm').strip() not in ('', 'codex-code-mode')
+                for child in process_children(pid)):
+            return 'waiting', 'approval'
+    return 'working', None
 
 
 class Live:
@@ -1288,20 +1343,12 @@ class Live:
                 key = ('codex', codex_id_from_path(target))
                 self.pid[key] = pid
                 self.path[key] = target
-                # an interrupted turn ends with turn_aborted instead
-                last = read_backwards_for(
-                    target, (b'"task_started"', b'"task_complete"', b'"turn_aborted"'))
-                if last != b'"task_started"':
-                    self.state[key] = 'open'
-                    continue
-                self.state[key] = 'working'
-                pending = codex_pending_prompt(target)
-                # once the call runs, its command is a process below codex;
-                # the code mode host is one for as long as codex runs
-                if pending and not any(read_text(f'/proc/{child}/comm').strip() != 'codex-code-mode'
-                                       for child in process_children(pid)):
-                    self.state[key] = 'waiting'
-                    self.detail[key] = pending
+                state, detail = codex_live_status(target, pid)
+                self.state[key] = state
+                if detail:
+                    self.detail[key] = detail
+                else:
+                    self.detail.pop(key, None)
 
     def load_opencode(self, pids):
         """Opencode names its session on the command line where it was given
