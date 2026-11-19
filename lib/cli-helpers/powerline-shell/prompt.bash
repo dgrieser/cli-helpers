@@ -41,6 +41,11 @@ function title()
 
 
 ### prompt settings
-if [[ $TERM != linux && ! $PROMPT_COMMAND =~ _powerline_ps1 ]]; then
-    PROMPT_COMMAND="_powerline_ps1; $PROMPT_COMMAND"
+if [[ $TERM != linux && ! ${PROMPT_COMMAND[*]} =~ _powerline_ps1 ]]; then
+    # VTE reports the directory and can set a title. Let Powerline set the title last.
+    if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+        PROMPT_COMMAND+=(_powerline_ps1)
+    else
+        PROMPT_COMMAND+=$'\n_powerline_ps1'
+    fi
 fi
