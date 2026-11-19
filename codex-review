@@ -188,11 +188,7 @@ run_review() {
 # The prompt goes through stdin, so text starting with "-" is no option.
 run_followup() {
     [ -n "${session_id}" ] || { error "No Codex session to continue"; return 1; }
-    if [ "${initial_deep}" = on ]; then
-        printf 'Sending deep follow-up\n' >&2
-    else
-        printf 'Sending follow-up\n' >&2
-    fi
+    printf 'Sending follow-up\n' >&2
     run_codex "${initial_deep}" resume "${session_id}" - <<< "${1}"
 }
 
@@ -229,9 +225,6 @@ ask_repeat() {
 
 ask_next() {
     local label=Prompt
-    if [ "${initial_deep}" = on ]; then
-        label="Deep prompt"
-    fi
     prompt-select --prompt "Next:" --no-abort-message \
         "copy=Copy response" \
         "followup=${label}" \
@@ -241,9 +234,6 @@ ask_next() {
 
 ask_followup() {
     local label="Follow-up prompt"
-    if [ "${initial_deep}" = on ]; then
-        label="Deep follow-up prompt"
-    fi
     prompt --prompt "${label} (Ctrl-D sends):" --no-abort-message </dev/tty
 }
 
