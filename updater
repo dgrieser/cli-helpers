@@ -3148,12 +3148,45 @@ software-420-qwen@dev@agents() {
 software-430-codex@dev@agents() {
     npm_update @openai/codex || return 1
     tool_ready codex || return $(( $? == 1 ? 0 : 1 ))
+    codex_shorten_launcher || return 1
     completion_update codex codex completion bash || return 1
     needs packages /usr/lib/python3/dist-packages/tomlkit || return $(( $? == 3 ? 0 : 1 ))
     # Link hooks, the review profile and skills. Merge the files
     # Codex writes to so trusted projects and TUI approvals stay local.
     config_link codex "${CURRENT_USER_HOME}/.codex" config.toml rules/default.rules || return 1
     codex_caveman_update
+}
+
+codex_shorten_launcher() {
+    local package_dir launcher
+    local exec_args='process.execve(binaryPath, [binaryPath, ...process.argv.slice(2)], env);'
+    local short_exec='process.execve(binaryPath, ["codex", ...process.argv.slice(2)], env);'
+    local spawn_args='const child = spawn(binaryPath, process.argv.slice(2), {'
+    local short_spawn='const child = spawn(binaryPath, process.argv.slice(2), { argv0: "codex",'
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would shorten the foreground command name shown for Codex in Ptyxis" 1>&2
+        return 0
+    fi
+    package_dir="$(npm-pkg-dir @openai/codex)" || return 1
+    launcher="${package_dir}/bin/codex.js"
+    # Keep npm's binary discovery and environment. Ptyxis displays argv[0],
+    # which the npm launcher normally sets to the full path to the native binary.
+    if ! grep -Fq -- "${exec_args}" "${launcher}" && ! grep -Fq -- "${spawn_args}" "${launcher}"; then
+        if ! grep -Fq -- "${short_exec}" "${launcher}" && ! grep -Fq -- "${short_spawn}" "${launcher}"; then
+            echo "WARNING: Unrecognized Codex npm launcher at ${launcher}. Leaving it as installed." 1>&2
+        fi
+        return 0
+    fi
+    local -a run_as=()
+    if [ -n "${SUDO_USER}" ] && [[ "${package_dir}" == "${CURRENT_USER_HOME}/"* ]]; then
+        run_as=(sudo -n -u "${CURRENT_USER_NAME}")
+    elif [ ! -w "${launcher%/*}" ]; then
+        read -ra run_as <<< "${SUDO}"
+    fi
+    "${run_as[@]}" sed -i \
+        -e '/^[[:space:]]*process\.execve(binaryPath, \[binaryPath, \.\.\.process\.argv\.slice(2)\], env);$/s/\[binaryPath, /["codex", /' \
+        -e '/^const child = spawn(binaryPath, process\.argv\.slice(2), {$/s/{$/{ argv0: "codex",/' \
+        -- "${launcher}"
 }
 
 codex_caveman_update() {
