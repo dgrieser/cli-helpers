@@ -111,6 +111,13 @@ show_progress() {
     fi 1>&2
 }
 
+interrupt_review() {
+    interrupt_status="${1}"
+    if [ -n "${worker_pid}" ]; then
+        kill -TERM -- "-${worker_pid}" 2>/dev/null
+    fi
+}
+
 # Runs codex exec with the given arguments and standard input, records the
 # session id and replaces ${answer_file} with the final response. On failure,
 # the previous response stays.
@@ -119,11 +126,41 @@ run_codex() {
     local new_answer_file="${work_dir}/answer.new.md"
     local status
     local id
+    local worker_pid=""
+    local interrupt_status=0
 
     rm -f "${new_answer_file}"
-    codex exec --profile "${profile}" "${@}" --json --output-last-message "${new_answer_file}" \
-        | tee "${events_file}" | show_progress
-    status="${PIPESTATUS[0]}"
+    # A foreground pipeline can delay SIGINT until Codex exits. Use an
+    # interruptible wait and a separate process group for the whole pipeline.
+    trap 'interrupt_review 130' INT
+    trap 'interrupt_review 143' TERM
+    set -m
+    (
+        set +m
+        # Let the worker shell reap the pipeline after its commands terminate.
+        trap ':' TERM
+        codex exec --profile "${profile}" "${@}" --json --output-last-message "${new_answer_file}" 2>&3 3>&- \
+            | tee "${events_file}" 2>&3 3>&- | show_progress 2>&3 3>&-
+        exit "${PIPESTATUS[0]}"
+    ) <&0 3>&2 2>/dev/null &
+    worker_pid=$!
+    set +m
+
+    if [ "${interrupt_status}" -eq 0 ]; then
+        wait "${worker_pid}"
+        status=$?
+    fi
+    if [ "${interrupt_status}" -ne 0 ]; then
+        trap '' INT TERM
+        kill -TERM -- "-${worker_pid}" 2>/dev/null
+        wait "${worker_pid}" 2>/dev/null
+        if [ "${interrupt_status}" -eq 143 ]; then
+            exit 143
+        fi
+        printf '\nCancelled.\n' >&2
+        status=130
+    fi
+    trap - INT TERM
     [ "${status}" -eq 0 ] || return "${status}"
 
     id="$(jq -r 'select(.type == "thread.started") | .thread_id' "${events_file}" | head -n 1)"
@@ -140,7 +177,7 @@ run_review() {
 # The prompt goes through stdin, so text starting with "-" is no option.
 run_followup() {
     [ -n "${session_id}" ] || { error "No Codex session to continue"; return 1; }
-    printf '%s\n' "${1}" | run_codex resume "${session_id}" -
+    run_codex resume "${session_id}" - <<< "${1}"
 }
 
 # Codex leaves out the final newline of the response.
@@ -216,11 +253,12 @@ review_again() {
         *) return 0 ;;
     esac
 
-    if run_review "${review_args[@]}"; then
-        show_answer
-    else
-        error "Review failed"
-    fi
+    run_review "${review_args[@]}"
+    case $? in
+        0) show_answer ;;
+        130) ;;
+        *) error "Review failed" ;;
+    esac
 }
 
 interactive_loop() {
@@ -237,11 +275,12 @@ interactive_loop() {
             followup)
                 text="$(ask_followup)" || continue
                 [ -n "${text//[[:space:]]/}" ] || continue
-                if run_followup "${text}"; then
-                    show_answer
-                else
-                    error "Follow-up failed"
-                fi
+                run_followup "${text}"
+                case $? in
+                    0) show_answer ;;
+                    130) ;;
+                    *) error "Follow-up failed" ;;
+                esac
                 ;;
             review)
                 review_again
