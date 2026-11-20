@@ -802,11 +802,11 @@ Without a target, the review is chosen from the state of the repository:
 2. On the default branch, as detected by `git-default` from dev-helpers: review the whole repository.
 3. On any other branch: review the changes against the default branch.
 
-When stdin and stdout are a terminal, the commands Codex runs are shown as progress on stderr, and the response is rendered with `glow` when it is installed. Afterwards, a menu offers:
+Reviews and follow-ups show Codex commands, intermediate status messages, and available reasoning summaries on stderr. In a terminal, responses and comment previews use Markdown rendering with `glow` when installed. Afterwards, a menu offers:
 
 - **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
 - **Prompt** sends a follow-up to the current Codex session (`codex exec resume`) using the initial run's deep setting. It appears as **Deep prompt** when deep mode is on.
-- **Draft PR/MR comments** asks the same session to verify findings against the existing open pull or merge request. The preview shows the target, reviewed commit, exact line ranges, short German comments, and full replacement code. Choose **Prompt Codex to revise** or **Edit comment text** to revise the draft, then review it again. **Post as is** publishes the approved comments inline with applicable code suggestions after Codex rechecks the remote diff.
+- **Draft PR/MR comments** asks the same session to verify findings against the existing open pull or merge request. The preview shows the target, reviewed commit, exact line ranges, short German comments, and full replacement code in fenced blocks. Choose **Prompt Codex to revise** or **Edit comment text** to revise the draft, then review it again. **Post as is** publishes the approved comments inline with applicable code suggestions after Codex rechecks the remote diff.
 - **Repeat** opens a menu with the review detected from the current repository state, the initial review target, and the remaining modes. Each review starts a new Codex session. Follow-up prompts go to the new session.
 - **Quit** (or Esc).
 

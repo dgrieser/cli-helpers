@@ -91,21 +91,37 @@ completion() {
     echo "full base uncommitted commit"
 }
 
-# Shows what Codex does while it works: commands it runs and errors.
+# Show commands, reasoning summaries, and intermediate messages on stderr.
 show_progress() {
     local width="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
-    jq --unbuffered -r --argjson width "$(( width - 4 ))" --arg quiet "${quiet_progress:-0}" '
+    jq --unbuffered -nr --argjson width "$(( width - 4 ))" '
         def short: gsub("\\s+"; " ") | if length > $width then .[0:$width - 1] + "…" else . end;
-        if $quiet == "1" then empty
-        elif .type == "item.started" and .item.type == "command_execution" then
-            "  $ " + (.item.command | sub("^/bin/(ba)?sh -lc "; "") | short)
-        elif .type == "item.completed" and .item.type == "reasoning" and (.item.text // "") != "" then
-            "  " + (.item.text | short)
-        elif .type == "error" then
-            "ERROR: " + .message
-        elif .type == "turn.failed" then
-            "ERROR: " + (.error.message // "turn failed")
-        else empty end
+        def lines: split("\n")[] | select(test("\\S")) | "  " + .;
+        def completed($kind): .type == "item.completed" and .item.type == $kind;
+        def more_work: .type == "item.started" or completed("agent_message") or completed("reasoning");
+
+        # Exec gives status and final messages the same type. Hold the last
+        # message until a later item shows that the turn is still working.
+        foreach inputs as $event (
+            {pending: null};
+            .status = (if $event | more_work then .pending else null end) |
+            if $event | completed("agent_message") then .pending = $event.item.text
+            elif $event | more_work or .type == "turn.completed" then .pending = null
+            else . end;
+            (.status // "" | lines),
+            ($event |
+                if .type == "item.started" and .item.type == "command_execution" then
+                    "  $ " + (.item.command | sub("^/bin/(ba)?sh -lc "; "") | short)
+                elif .type == "item.started" and .item.type == "mcp_tool_call" then
+                    "  MCP " + ("\(.item.server)/\(.item.tool)" | short)
+                elif completed("reasoning") then
+                    (.item.text // "" | lines)
+                elif .type == "error" then
+                    "ERROR: " + .message
+                elif .type == "turn.failed" then
+                    "ERROR: " + (.error.message // "turn failed")
+                else empty end)
+        )
     ' 2>/dev/null | if [ -t 2 ]; then
         sed -u "s/^/$(tput dim 2>/dev/null)/; s/\$/$(tput sgr0 2>/dev/null)/"
     else
@@ -147,7 +163,7 @@ run_codex() {
         set +m
         # Let the worker shell reap the pipeline after its commands terminate.
         trap ':' TERM
-        codex exec --profile "${profile}" "${@}" --json --output-last-message "${new_answer_file}" 2>&3 3>&- \
+        codex exec --profile "${profile}" -c 'model_reasoning_summary="auto"' "${@}" --json --output-last-message "${new_answer_file}" 2>&3 3>&- \
             | tee "${events_file}" 2>&3 3>&- | show_progress 2>&3 3>&-
         exit "${PIPESTATUS[0]}"
     ) <&0 3>&2 2>/dev/null &
@@ -364,16 +380,34 @@ valid_comment_draft() {
 }
 
 show_comment_draft() {
-    jq -r '
-        (if .target then "\n\(.target.url)\nReviewed head \(.target.head_sha)" else "\nNo PR/MR selected." end),
+    local preview_file="${work_dir}/comment-preview.md" render=0
+    if [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+        render=1
+    fi
+    jq -r --argjson render "${render}" '
+        def fenced($marker; $info):
+            ($marker * ([2, (scan($marker + "+") | length)] | max + 1)) as $fence |
+            "\($fence)\($info)\n\(.)\n\($fence)";
+
+        "## Draft PR/MR comments\n",
+        (if .target then "[Open PR/MR](<\(.target.url)>)\n\n**Reviewed head** `\(.target.head_sha)`"
+         else "No PR/MR selected." end),
         (.comments | to_entries[] | .value as $c |
-            "\n\(.key + 1). \($c.path):\($c.start_line)" +
+            "\n### \(.key + 1). `\($c.path):\($c.start_line)" +
             (if $c.end_line == $c.start_line then "" else "–\($c.end_line)" end) +
-            " (new side)\n\($c.prose)\n\nSuggested replacement" +
-            (if $c.replacement == "" then " (empty)" else "\n\($c.replacement)" end)),
-        (if .comments == [] then "No comments to post." else empty end),
+            "` (new side)\n\n\($c.prose)\n\n**Suggested replacement" +
+            (if $c.replacement == "" then " (empty)**" else "**" end) + "\n\n" +
+            ($c.replacement | fenced("`"; "suggestion") |
+                # Show the backtick fences literally in the rendered terminal.
+                if $render == 1 then fenced("~"; "") else . end)),
+        (if .comments == [] then "\nNo comments to post." else empty end),
         (.notes[] | "\n" + .)
-    ' <<< "${1}"
+    ' <<< "${1}" > "${preview_file}" || return 1
+    if [ "${render}" -eq 1 ]; then
+        glow --style "${GLOW_STYLE:-auto}" --width 0 "${preview_file}"
+    else
+        cat "${preview_file}"
+    fi
 }
 
 edit_comment_draft() {
@@ -396,7 +430,7 @@ edit_comment_draft() {
 
 draft_comments() {
     local answer_file="${work_dir}/comment-response"
-    local schema_file="${work_dir}/comment-schema.json" quiet_progress=1
+    local schema_file="${work_dir}/comment-schema.json"
     local draft="" revision="" action edited
     local -a choices
 
