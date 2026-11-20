@@ -1327,12 +1327,136 @@ function install_deb() {
         new_version="$(dpkg-deb -f "${artifact}" Version)"
 		current_version="$(LC_ALL=C apt list "${package_name}" --installed 2>/dev/null | tail -1 | head -1 | awk '{print $2}')"
 		print_version_table "${package_name}" "${current_version}" "${new_version}"
+        remove_stale_installs "${artifact}"
         return 0
     else
         echo "Installing '${artifact}' using apt..." 1>&2
         sudo apt install "${artifact}" 1>&2 || return 1
+        # only after the install, so a failed one leaves the old commands
+        remove_stale_installs "${artifact}"
+        check_deb_commands "${artifact}"
     fi
     return 0
+}
+
+# deb_executables DEB: the paths (without the leading ./) of the commands the
+# package installs, in the bin and sbin folders
+function deb_executables() {
+    local artifact="${1}"
+    dpkg-deb --fsys-tarfile "${artifact}" 2>/dev/null | tar -t 2>/dev/null \
+        | sed -n -E 's#^\./##; \#^(usr/(local/)?)?(s?bin|games)/[^/]+$#p'
+}
+
+# stale_bundle_dir PATH: the bundled app folder a symlink in the install path
+# points into, if this script installed it there: a folder under BUNDLE_PATH
+# named like the link (the bundle and its link share the name), that no
+# package owns and no other link in the install path points into
+function stale_bundle_dir() {
+    local path="${1}"
+    local target
+    local bundle_path
+    local relative
+    local bundle_dir
+    local link
+    [ -L "${path}" ] || return 0
+    target="$(readlink -f "${path}")" || return 0
+    bundle_path="$(realpath -m "${BUNDLE_PATH}")"
+    [[ "${target}" == "${bundle_path}/"*/* ]] || return 0
+    relative="${target#"${bundle_path}"/}"
+    [ "${relative%%/*}" = "$(basename "${path}")" ] || return 0
+    bundle_dir="${bundle_path}/${relative%%/*}"
+    is_dpkg_owned "${bundle_dir}" && return 0
+    for link in "$(dirname "${path}")"/*; do
+        [ -L "${link}" ] && [ "${link}" != "${path}" ] || continue
+        [[ "$(readlink -f "${link}")" == "${bundle_dir}/"* ]] && return 0
+    done
+    echo "${bundle_dir}"
+}
+
+# is_dpkg_owned PATH: whether a package owns the file, also when registered by
+# its usrmerge alias (/bin/foo for /usr/bin/foo and back)
+function is_dpkg_owned() {
+    local path="${1}"
+    local alias="/usr${path}"
+    [[ "${path}" == /usr/* ]] && alias="${path#/usr}"
+    dpkg -S "${path}" &> /dev/null || dpkg -S "${alias}" &> /dev/null
+}
+
+# remove_stale_installs DEB: removes the copies of the package's commands that an
+# earlier install from a tar, zip or plain binary left in INSTALL_PATH. They come
+# first in PATH (/usr/local/bin before /usr/bin) and would hide the package's.
+function remove_stale_installs() {
+    local artifact="${1}"
+    local deb_path
+    local name
+    local stale
+    local bundle_dir
+    local sudo
+    local -a stale_paths=()
+    local -a bundle_dirs=()
+
+    while IFS= read -r deb_path; do
+        [ -z "${deb_path}" ] && continue
+        name="$(basename "${deb_path}")"
+        # the folder resolved, so the path is the one dpkg registers files by
+        stale="$(realpath -m "${INSTALL_PATH}")/${name}"
+        [ -e "${stale}" ] || [ -L "${stale}" ] || continue
+        # the package's own file, the same file through a symlink or usrmerge
+        [ "$(realpath -m "${stale}")" = "$(realpath -m "/${deb_path}")" ] && continue
+        # a file of another package is not a leftover of this script
+        is_dpkg_owned "${stale}" && continue
+        stale_paths+=( "${stale}" )
+        bundle_dir="$(stale_bundle_dir "${stale}")"
+        [ -n "${bundle_dir}" ] && bundle_dirs+=( "${bundle_dir}" )
+    done < <(deb_executables "${artifact}")
+
+    if [ -n "${BINARY_NAME}" ] && ! deb_executables "${artifact}" | sed 's#.*/##' | grep -qxF "${BINARY_NAME}"; then
+        echo "The package installs no command named '${BINARY_NAME}', check '${INSTALL_PATH}/${BINARY_NAME}' by hand" 1>&2
+    fi
+
+    [ ${#stale_paths[@]} -eq 0 ] && return 0
+
+    echo 1>&2
+    echo "Found earlier installs outside the package, they would hide its commands:" 1>&2
+    printf ' └─ %s\n' "${stale_paths[@]}" "${bundle_dirs[@]}" 1>&2
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        echo "[dry-run] would remove them" 1>&2
+        return 0
+    fi
+    if [ ${YES} -eq 0 ] && ! prompt-yes-no "Remove them"; then
+        echo "Keeping them, the package's commands may be hidden" 1>&2
+        return 0
+    fi
+    for stale in "${stale_paths[@]}"; do
+        sudo="$(sudo_for_path "$(dirname "${stale}")")"
+        ${sudo} rm -vf "${stale}" 1>&2 || error "Failed to remove '${stale}'"
+    done
+    for bundle_dir in "${bundle_dirs[@]}"; do
+        sudo="$(sudo_for_path "$(dirname "${bundle_dir}")")"
+        if ${sudo} rm -rf "${bundle_dir}"; then
+            echo "removed '${bundle_dir}'" 1>&2
+        else
+            error "Failed to remove '${bundle_dir}'"
+        fi
+    done
+    hash -r
+    return 0
+}
+
+# check_deb_commands DEB: warns about the package's commands that PATH resolves
+# to another file than the package's
+function check_deb_commands() {
+    local artifact="${1}"
+    local deb_path
+    local name
+    local resolved
+    while IFS= read -r deb_path; do
+        [ -z "${deb_path}" ] && continue
+        name="$(basename "${deb_path}")"
+        resolved="$(type -P "${name}")" || continue
+        [ "$(realpath -m "${resolved}")" = "$(realpath -m "/${deb_path}")" ] && continue
+        echo "WARNING: '${name}' resolves to '${resolved}', not to the package's '/${deb_path}'" 1>&2
+    done < <(deb_executables "${artifact}")
 }
 
 function run_post_install() {
