@@ -806,6 +806,7 @@ When stdin and stdout are a terminal, the commands Codex runs are shown as progr
 
 - **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
 - **Prompt** sends a follow-up to the current Codex session (`codex exec resume`) using the initial run's deep setting. It appears as **Deep prompt** when deep mode is on.
+- **Draft PR/MR comments** asks the same session to verify findings against the existing open pull or merge request. The preview shows the target, reviewed commit, exact line ranges, short German comments, and full replacement code. Choose **Prompt Codex to revise** or **Edit comment text** to revise the draft, then review it again. **Post as is** publishes the approved comments inline with applicable code suggestions after Codex rechecks the remote diff.
 - **Repeat** opens a menu with the review detected from the current repository state, the initial review target, and the remaining modes. Each review starts a new Codex session. Follow-up prompts go to the new session.
 - **Quit** (or Esc).
 
