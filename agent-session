@@ -50,6 +50,9 @@ DEFAULT_DAYS = 7
 DAYS_STEPS = (7, 30, 90, 365)
 INITIAL_BATCH = 20
 REFRESH_SECONDS = 5
+# how long a take over waits for the agent to exit after SIGTERM, and after SIGKILL
+TERMINATE_WAIT_SECONDS = 10
+KILL_WAIT_SECONDS = 5
 DIRECTORY_MAX_WIDTH = 35
 FZF_TEXT_MAX_WIDTH = 30
 # without the prompt column the title gets the width the prompt would have used
@@ -196,6 +199,9 @@ Interactive keys:
     ctrl-s              Take that folder from the selected session
     ctrl-a              Walk the agent filter: all, claude, codex, opencode
     ctrl-f              Focus the terminal of a running session, selecting its tab in Ptyxis
+    ctrl-t              Take over a running session: terminate it and resume
+                        it in this terminal, after asking
+    ctrl-x              Terminate a running session (SIGTERM), after asking
     ctrl-r              Refresh sessions
     esc                 Clear an active search, exit without one
     ctrl-c              Exit
@@ -210,6 +216,12 @@ the first one into the picker again:
                         asking to create it when it is missing
     Focus terminal      In place of Resume for a running session: bring the
                         terminal it runs in to the front, the picker stays open
+    Take over           Only for a running session: terminate it, wait for
+                        its agent to exit and resume it in this terminal; still
+                        running after {TERMINATE_WAIT_SECONDS}s, it asks whether to kill it (SIGKILL),
+                        no going back to the question before
+    Terminate           Only for a running session: send its agent SIGTERM,
+                        the picker stays open
     Fork                Continue it, asking for the folder and the agent, and
                         to create the folder when it is missing
     Copy                Copy raw Markdown to the clipboard
@@ -217,7 +229,8 @@ the first one into the picker again:
                         start with the session ID
 
 Copy shares its row with a last message and a session ID variant, Print with
-a last message variant, tab (shift-tab backwards) walking over them."""
+a last message variant, tab (shift-tab backwards) walking over them.
+Take over and Terminate ask first, no going back to the question before."""
 
 verbose_enabled = False
 
@@ -1117,6 +1130,14 @@ def process_start(pid):
     return fields[19] if len(fields) > 19 else None
 
 
+def process_alive(pid, start):
+    """Whether the process with pid started at start still runs: a pid handed
+    out again has another start, a zombie has exited already."""
+    stat = read_text(f'/proc/{pid}/stat')
+    fields = stat.rsplit(') ', 1)[-1].split() if stat else []
+    return len(fields) > 19 and fields[19] == start and fields[0] != 'Z'
+
+
 def process_start_epoch(pid):
     start = process_start(pid)
     if start is None:
@@ -1941,13 +1962,89 @@ def focus_session(agent, key):
         sys.exit(result.returncode)
 
 
+def terminate_session(agent, key, wait=False):
+    """Ends the running agent the regular way, with SIGTERM, so it can save
+    its session and restore the terminal. With wait it waits until the agent
+    is gone, and False tells it was not: asked whether to kill it, no
+    was the answer."""
+    _, _, view = ensured_session(agent, key)
+    live = Live([agent])
+    pid = live.pid.get((agent, view['id']))
+    if not pid:
+        fail('Session is not running')
+    # a codex app-server holds the files of several sessions open: ending it
+    # would end the others too
+    shared = sum(1 for other in live.pid.values() if other == pid)
+    if shared > 1:
+        fail(f'Process {pid} runs {shared} sessions, not terminating it')
+    start = process_start(pid)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        fail('Session is not running')
+    except PermissionError:
+        fail(f'Not allowed to terminate process {pid}')
+    muted(f'Sent SIGTERM to {agent} (PID {pid})')
+    if not wait or wait_exit(pid, start, TERMINATE_WAIT_SECONDS):
+        return True
+    # an agent that ignores SIGTERM is killed only when asked to
+    require('prompt-no-yes')
+    if tty_run(['prompt-no-yes', '--no-abort-message',
+                f'{agent} (PID {pid}) still runs {TERMINATE_WAIT_SECONDS}s after SIGTERM.'
+                ' Kill it (SIGKILL)?'], capture=False) is None:
+        return False
+    if process_alive(pid, start):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            fail(f'Not allowed to kill process {pid}')
+        muted(f'Sent SIGKILL to {agent} (PID {pid})')
+    if not wait_exit(pid, start, KILL_WAIT_SECONDS):
+        fail(f'{agent} (PID {pid}) still runs {KILL_WAIT_SECONDS}s after SIGKILL')
+    return True
+
+
+def take_over(agent, key):
+    """Terminates the running session while the picker is still open, so no
+    to killing it goes back a step; true once it is gone and can be resumed
+    here. A failure waits for a key before the picker is shown again."""
+    try:
+        return terminate_session(agent, key, wait=True)
+    except SystemExit:
+        if sys.stderr.isatty():
+            tty_run(['bash', '-c', 'read -r -s -n 1 -p "Press any key to go back"'],
+                    capture=False)
+        raise
+
+
+def wait_exit(pid, start, seconds):
+    """Whether the process is gone within seconds."""
+    deadline = time.monotonic() + seconds
+    while start is not None and process_alive(pid, start):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def confirm_terminate(agent, key, verb='Terminate'):
+    _, _, view = ensured_session(agent, key)
+    name = single_line(view['title'] or view['id'])
+    require('prompt-no-yes')
+    return tty_run(['prompt-no-yes', '--no-abort-message',
+                    f'{verb} {agent} session "{name}"?'], capture=False) is not None
+
+
 def ask_session_action(running):
     """Copying and printing come in a whole and a last message variant, and
     copying also as the session ID alone, that share a row, tab walking over
     them; a session open in a running agent is
     resumed already, so focusing its terminal takes the place of resuming."""
-    choices = ['focus=Focus terminal' if running else 'resume=Resume', 'fork=Fork',
-               'clipboard=Copy', 'clipboard-last=Copy last message',
+    choices = (['focus=Focus terminal', 'takeover=Take over', 'terminate=Terminate']
+               if running else ['resume=Resume'])
+    choices += ['fork=Fork', 'clipboard=Copy', 'clipboard-last=Copy last message',
                'clipboard-id=Copy session ID',
                'print=Print', 'print-last=Print last message']
     return tty_run(['prompt-select', '--prompt', 'Continue session:', '--no-abort-message',
@@ -2030,9 +2127,23 @@ def session_ask(agent, key, answer_file, current_directory):
                     break
             elif action in ('clipboard', 'clipboard-last', 'clipboard-id'):
                 break
+            elif action == 'takeover':
+                # no to taking over, or to killing an agent that outlives
+                # SIGTERM, asks again
+                if confirm_terminate(agent, key, 'Take over') and take_over(agent, key):
+                    action = 'resume'
+                    break
             elif action == 'focus':
                 # nothing to become: the picker stays where it is
                 session_action('focus', agent, key)
+                return
+            elif action == 'terminate':
+                # no asks again; yes leaves the picker open, loading its list again
+                if not confirm_terminate(agent, key):
+                    continue
+                session_action('terminate', agent, key)
+                with open(answer_file, 'w') as handle:
+                    json.dump({'action': action}, handle)
                 return
             elif action == 'fork':
                 step = 'directory'
@@ -2085,7 +2196,8 @@ def session_run(agent, key, answer_file):
         fail(f'Unknown session action: {action}')
 
 
-def session_action(action, agent, key, answer_file=None, current_directory=None, state_file=None):
+def session_action(action, agent, key, answer_file=None, current_directory=None, state_file=None,
+                   reload_actions=None):
     last_only = action.endswith('-last')
     action = action[:-len('-last')] if last_only else action
     if agent not in ALL_AGENTS:
@@ -2094,7 +2206,12 @@ def session_action(action, agent, key, answer_file=None, current_directory=None,
         session_ask(agent, key, answer_file, current_directory)
     elif action == 'become':
         # an unanswered question leaves the file empty: nothing to become
-        if read_answers(answer_file):
+        answers = read_answers(answer_file)
+        if answers and answers.get('action') == 'terminate':
+            open(answer_file, 'w').close()
+            if reload_actions:
+                sys.stdout.write(reload_actions)
+        elif answers:
             sys.stdout.write('become(' + ' '.join(shlex.quote(part) for part in (
                 SCRIPT_PATH, '--fzf-answers', answer_file, '--fzf-action', 'run', agent, key)) + ')')
     elif action == 'run':
@@ -2125,6 +2242,22 @@ def session_action(action, agent, key, answer_file=None, current_directory=None,
                 tty_run(['bash', '-c', 'read -r -s -n 1 -p "Press any key to go back"'],
                         capture=False)
             raise
+    elif action in ('terminate', 'terminate-ask'):
+        try:
+            if action == 'terminate' or confirm_terminate(agent, key):
+                terminate_session(agent, key)
+        except SystemExit:
+            if sys.stderr.isatty():
+                tty_run(['bash', '-c', 'read -r -s -n 1 -p "Press any key to go back"'],
+                        capture=False)
+            raise
+    elif action == 'takeover-ask':
+        # ctrl-t: terminated here, resumed by the become that follows; no to
+        # either question goes back to the picker
+        open(answer_file, 'w').close()
+        if confirm_terminate(agent, key, 'Take over') and take_over(agent, key):
+            with open(answer_file, 'w') as handle:
+                json.dump({'action': 'resume'}, handle)
     elif action == 'resume':
         resume_session(agent, key)
     else:
@@ -2250,7 +2383,7 @@ def browse(options, query):
         enter_command = (f'{state_command} --fzf-answers {answers} --fzf-enter {reload_quoted}'
                          ' {2} {3}')
         keys = ('/:search,enter:use,tab:open or all,ctrl-o:older,ctrl-space:folders,'
-                'ctrl-d:this folder,ctrl-s:session folder,ctrl-f:focus,ctrl-a:agent,'
+                'ctrl-d:this folder,ctrl-s:session folder,ctrl-f:focus,ctrl-t:take over,ctrl-x:terminate,ctrl-a:agent,'
                 'ctrl-r:refresh,esc:clear search or exit,ctrl-c:exit')
         command = [
             fzf_with_header,
@@ -2281,6 +2414,12 @@ def browse(options, query):
             '--bind', f'esc:transform:{state_command} --fzf-escape {reload_quoted}',
             '--bind', 'ctrl-c:abort',
             '--bind', f'ctrl-f:execute({script} --fzf-action focus {{2}} {{3}})',
+            '--bind', f'ctrl-t:execute({state_command} --fzf-answers {answers}'
+                      f' --fzf-action takeover-ask {{2}} {{3}})'
+                      f'+transform:{state_command} --fzf-answers {answers}'
+                      f' --fzf-action become {{2}} {{3}}',
+            '--bind', f'ctrl-x:execute({script} --fzf-action terminate-ask {{2}} {{3}})'
+                      f'+{reload_actions}',
             '--bind', f'enter:transform:{enter_command}',
         ]
         if query:
@@ -2380,8 +2519,10 @@ def picker_state_action(options, state_file, action, arguments):
         if agent not in ALL_AGENTS:
             return
         base = [SCRIPT_PATH, '--fzf-state', state_file, '--fzf-answers', answer_file, '--fzf-action']
+        become = quoted(SCRIPT_PATH, '--fzf-state', state_file, '--fzf-answers', answer_file,
+                        '--fzf-reload', reload_actions, '--fzf-action', 'become')
         sys.stdout.write(f'execute({quoted(*base, "ask")} {{2}} {{3}})'
-                         f'+transform:{quoted(*base, "become")} {{2}} {{3}}')
+                         f'+transform:{become} {{2}} {{3}}')
 
 
 def picker_output(options, batch=None, track_key=None):
@@ -2738,6 +2879,7 @@ def main(argv):
     watch_port = None
     fzf_batch = None
     track_key = None
+    reload_actions = None
     query = ''
 
     def value(option):
@@ -2776,6 +2918,8 @@ def main(argv):
             state_file = value(argument)
         elif argument == '--fzf-answers':
             answer_file = value(argument)
+        elif argument == '--fzf-reload':
+            reload_actions = value(argument)
         elif argument == '--fzf-watch':
             watch_port = number(argument, value(argument))
         elif argument == '--fzf-query':
@@ -2839,13 +2983,14 @@ def main(argv):
 
     if fzf_action:
         name, agent, key = fzf_action
-        if name in ('ask', 'become', 'run') and not answer_file:
+        if name in ('ask', 'become', 'run', 'takeover-ask') and not answer_file:
             fail('The picker questions require --fzf-answers')
         current_directory = options.current_directory
         if state_file:
             options.read_state(state_file)
             current_directory = options.launch_directory
-        session_action(name, agent, key, answer_file, current_directory, state_file)
+        session_action(name, agent, key, answer_file, current_directory, state_file,
+                       reload_actions)
         return 0
 
     if limit_explicit and days_explicit:
