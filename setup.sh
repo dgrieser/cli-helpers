@@ -2,8 +2,8 @@
 # Sets up a new machine from this repo, restoring from a backup of setup-backup
 # that it asks for once: the keyring with its SSH
 # keys, SSH config, network connections and the API key of Codeium, the install folders, cli-helpers itself, ~/bin from a backup, the IKEv2 VPN home, the work VPN
-# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS and build cache limit of docker
-# and wifi power save off), the 6 GHz fix for the MediaTek MT7922,
+# with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS and build cache limit of docker,
+# wifi power save off and access to Keychron keyboards), the 6 GHz fix for the MediaTek MT7922,
 # the base software, gh and glab with their logins (glab to the configured GitLab host and,
 # if you like, gitlab.com), the configured SSH host key, the keys of
 # ~/.ssh/authorized_keys that may log in over SSH, the dotfiles of
@@ -84,7 +84,7 @@ STEPS=(
     "vpn           setup_vpn             -      the OpenVPN plugin of NetworkManager and the configured profile"
     "vpn-home      setup_vpn_home        -      the strongSwan plugin of NetworkManager, patched for short keys, and the configured IKEv2 connection (settings from the keyring)"
     # before the VPN is dialed for the glab login: tun-up gives it the internal names
-    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker, and wifi power save off"
+    "etc           install_etc_files     -      the files of lib/cli-helpers/etc in /etc: all DNS through the VPN while it is up, also for docker, wifi power save off and access to Keychron keyboards"
     # after etc, so the reconnect applies its power save setting, and before the
     # VPN is dialed for the glab login, as the driver reload drops the wifi
     "wifi          fix_wifi              -      migrate the old Wi-Fi rule, fix MT7922 6 GHz, and apply the configured AX210 5 GHz profile"
@@ -637,7 +637,7 @@ install_etc_files() {
     local source_config="${LOCAL_CONFIG_DIR}/cli-helpers/networkmanager.conf"
     local helper="${src_dir}/cli-helpers/networkmanager-functions"
     local -a files=() changed=() restart=()
-    info "/etc: NetworkManager dispatchers, Wi-Fi power saving, Docker DNS and the resume policy"
+    info "/etc: NetworkManager dispatchers, Wi-Fi power saving, Docker DNS, the resume policy and Keychron access"
     mapfile -d '' -t files < <(find "${src_dir}" -type f ! -path "${helper}" -print0 | sort -z)
     files=("${helper}" "${source_config}" "${files[@]}")
     for src in "${files[@]}"; do
@@ -681,6 +681,12 @@ install_etc_files() {
     # the next connection on
     if printf '%s\n' "${changed[@]}" | grep -q '^/etc/NetworkManager/conf\.d/'; then
         run sudo systemctl reload NetworkManager || failed+=("systemctl reload NetworkManager")
+    fi
+    # a udev rule applies to devices added from now on; a change event applies it
+    # to the connected ones too (the uaccess of the Keychron rule)
+    if printf '%s\n' "${changed[@]}" | grep -q '^/etc/udev/rules\.d/'; then
+        { run sudo udevadm control --reload && run sudo udevadm trigger --action=change --subsystem-match=hidraw; } ||
+            failed+=("udevadm reload")
     fi
     [ "${#restart[@]}" -eq 0 ] && return 0
     # these are no unit files, but the units installed before (apt, snaps) make

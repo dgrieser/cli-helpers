@@ -1,0 +1,4 @@
+# Keychron keyboards: their hidraw devices for the user at the seat (uaccess, so
+# before 73-seat-late.rules), for audio-mic-toggle, which lights the mic key
+# through the raw HID interface of the firmware, and for Keychron Launcher in Chrome
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", TAG+="uaccess"

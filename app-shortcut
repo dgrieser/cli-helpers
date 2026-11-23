@@ -14,7 +14,7 @@ copying its file there and editing it. Keys of a file:
     title: Launcher-Terminal          #   or a window title
   launch:                             # ... otherwise (or without focus) start it
     desktop: slack                    #   gtk-launch <desktop> [args...]
-    command: [amixer-mic-toggle]      #   or run a command as is
+    command: [audio-mic-toggle]       #   or run a command as is
     args: ['~/Downloads']             #   arguments; ~ and $VARS are expanded
   default: terminal                   # instead of focus/launch: whatever terminal is the
                                       #   default (xdg-terminal-exec) when the shortcut runs

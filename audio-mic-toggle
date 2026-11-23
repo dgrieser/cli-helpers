@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Mute or unmute the default microphone (PipeWire, wpctl) and light the mic key
+of every Keychron keyboard connected over USB: red at full brightness while the
+microphone is muted, green at full brightness while it is not.
+
+The key is the one that sends the mic-toggle shortcut (Ctrl+Shift+A, see
+lib/cli-helpers/app-shortcuts/mic-toggle.yaml), looked up in the keyboard's own
+keymap: first in its default layer (Mac or Windows), then in the other layers.
+--key ROW,COL (or AUDIO_MIC_TOGGLE_KEY) names its matrix position instead.
+
+The color goes through the raw HID interface of the Keychron firmware (the one
+Keychron Launcher uses): it sets the per-key color of that key, which shows in
+the per-key RGB lighting mode. It is not saved to the keyboard, so it does not
+wear its flash; a replugged keyboard shows its saved colors until the next
+toggle or --sync. The brightness of the key is capped by the keyboard's overall
+brightness. Reading /dev/hidraw* needs the udev rule of setup.sh etc
+(/etc/udev/rules.d/70-keychron-hidraw.rules).
+
+A keyboard that is not connected is no error; a Keychron keyboard that cannot be
+reached or whose firmware has no per-key RGB is reported on stderr (exit 1), the
+microphone is toggled anyway.
+"""
+
+import fcntl
+import glob
+import os
+import select
+import subprocess
+import sys
+
+KEYCHRON_VENDOR = 0x3434
+# usage page 0xFF60, usage 0x61: the raw HID interface of QMK (VIA, Keychron Launcher)
+RAW_HID_DESCRIPTOR = bytes([0x06, 0x60, 0xFF, 0x09, 0x61])
+REPORT_SIZE = 32
+TIMEOUT = 0.5
+
+# commands of the Keychron firmware (keyboards/keychron/common/keychron_raw_hid.h)
+KC_GET_SUPPORT_FEATURE = 0xA2
+KC_GET_DEFAULT_LAYER = 0xA3
+KC_KEYCHRON_RGB = 0xA8
+FEATURE_KEYCHRON_RGB = 0x80
+RGB_GET_LED_COUNT = 0x05
+RGB_GET_LED_IDX = 0x06
+PER_KEY_RGB_SET_COLOR = 0x0A
+# commands of VIA
+VIA_GET_LAYER_COUNT = 0x11
+VIA_GET_KEYMAP_BUFFER = 0x12
+
+# the keycodes of the mic-toggle shortcut: LCTL(LSFT(KC_A)), also with the right modifiers
+MIC_KEYCODES = {0x0304, 0x1304}
+# QMK hue 0-255, saturation, value
+RED = (0, 255, 255)
+GREEN = (85, 255, 255)
+
+
+class KeyboardError(Exception):
+    pass
+
+
+def mic_muted():
+    out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+                         check=True, capture_output=True, text=True).stdout
+    return "[MUTED]" in out
+
+
+def keychron_raw_hid_devices():
+    """The /dev/hidraw* of the raw HID interfaces of connected Keychron keyboards."""
+    devices = []
+    for sys_dir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(sys_dir, "device/uevent")) as f:
+                uevent = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+            with open(os.path.join(sys_dir, "device/report_descriptor"), "rb") as f:
+                descriptor = f.read()
+        except OSError:
+            continue
+        # HID_ID=BUS:VENDOR:PRODUCT, bus 0003 is USB
+        bus, vendor, _ = (uevent.get("HID_ID", "0:0:0").split(":") + ["0", "0"])[:3]
+        if int(bus, 16) == 3 and int(vendor, 16) == KEYCHRON_VENDOR and descriptor.startswith(RAW_HID_DESCRIPTOR):
+            devices.append(("/dev/" + os.path.basename(sys_dir), uevent.get("HID_NAME", "Keychron")))
+    return devices
+
+
+class RawHid:
+    def __init__(self, path, name):
+        self.path = path
+        self.name = name
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except PermissionError:
+            raise KeyboardError(f"{name}: no access to {path}, install the udev rule with: setup.sh etc")
+        except OSError as e:
+            raise KeyboardError(f"{name}: {path}: {e.strerror}")
+        # answers of an earlier, interrupted run must not be taken for ours
+        while True:
+            try:
+                if not os.read(self.fd, 64):
+                    break
+            except BlockingIOError:
+                break
+            except OSError as e:
+                os.close(self.fd)
+                raise KeyboardError(f"{name}: {path}: {e.strerror}")
+
+    def close(self):
+        os.close(self.fd)
+
+    def request(self, data, match=1):
+        """Send one report and return the answer whose first `match` bytes equal those sent."""
+        packet = bytes(data).ljust(REPORT_SIZE, b"\0")
+        try:
+            os.write(self.fd, b"\0" + packet)  # report ID 0
+        except OSError as e:
+            raise KeyboardError(f"{self.name}: {self.path}: {e.strerror}")
+        while True:
+            ready, _, _ = select.select([self.fd], [], [], TIMEOUT)
+            if not ready:
+                raise KeyboardError(f"{self.name}: no answer to command 0x{packet[0]:02X}")
+            try:
+                answer = os.read(self.fd, 64)
+            except BlockingIOError:
+                continue
+            except OSError as e:
+                raise KeyboardError(f"{self.name}: {self.path}: {e.strerror}")
+            if answer[:match] == packet[:match]:
+                return answer
+            if answer[:1] == b"\xff":  # id_unhandled of VIA
+                raise KeyboardError(f"{self.name}: the firmware does not know command 0x{packet[0]:02X}")
+
+    def rgb(self, command, args=b""):
+        answer = self.request(bytes([KC_KEYCHRON_RGB, command]) + bytes(args), match=2)
+        if answer[2] != 0:
+            raise KeyboardError(f"{self.name}: per-key RGB command 0x{command:02X} failed")
+        return answer
+
+
+def matrix_leds(hid):
+    """The LED index of every key as {(row, col): led}, and the matrix size.
+
+    The firmware does not tell its number of rows (it answers one row past the
+    end with whatever lies behind its LED map), so the rows end where every LED
+    was seen; the columns end at a filler byte the firmware leaves alone."""
+    led_count = hid.rgb(RGB_GET_LED_COUNT)[3]
+    leds = {}
+    cols = 0
+    row = 0
+    while len(set(leds.values())) < led_count:
+        if row >= 32:
+            raise KeyboardError(f"{hid.name}: the LED map does not cover its {led_count} LEDs")
+        args = bytes([row, 0xFF, 0xFF, 0xFF]) + b"\xfe" * (REPORT_SIZE - 6)
+        row_leds = hid.rgb(RGB_GET_LED_IDX, args)[3:]
+        row_cols = next((c for c in range(3, len(row_leds)) if row_leds[c] == 0xFE), len(row_leds))
+        cols = max(cols, row_cols)
+        for col in range(row_cols):
+            if row_leds[col] < led_count:
+                leds[(row, col)] = row_leds[col]
+        row += 1
+    return leds, row, cols
+
+
+def find_mic_key(hid, rows, cols):
+    """The matrix position of the mic-toggle shortcut, default layer first."""
+    layers = hid.request([VIA_GET_LAYER_COUNT])[1]
+    default_layer = hid.request([KC_GET_DEFAULT_LAYER])[1]
+    layer_size = rows * cols * 2
+    keymap = bytearray()
+    total = layers * layer_size
+    while len(keymap) < total:
+        size = min(28, total - len(keymap))
+        offset = len(keymap)
+        answer = hid.request([VIA_GET_KEYMAP_BUFFER, offset >> 8, offset & 0xFF, size], match=4)
+        keymap += answer[4:4 + size]
+    order = [default_layer] + [layer for layer in range(layers) if layer != default_layer]
+    for layer in order:
+        for row in range(rows):
+            for col in range(cols):
+                i = layer * layer_size + (row * cols + col) * 2
+                if (keymap[i] << 8 | keymap[i + 1]) in MIC_KEYCODES:
+                    return row, col
+    return None
+
+
+def parse_key(value):
+    try:
+        row, col = (int(part) for part in value.split(","))
+    except ValueError:
+        raise SystemExit(f"audio-mic-toggle: key must be ROW,COL, not '{value}'")
+    return row, col
+
+
+def light_keyboard(path, name, color, key):
+    hid = RawHid(path, name)
+    try:
+        answer = hid.request([KC_GET_SUPPORT_FEATURE])
+        if not answer[2] & FEATURE_KEYCHRON_RGB:
+            raise KeyboardError(f"{name}: the firmware has no per-key RGB, update it with Keychron Launcher")
+        leds, rows, cols = matrix_leds(hid)
+        if key is None:
+            key = find_mic_key(hid, rows, cols)
+            if key is None:
+                raise KeyboardError(f"{name}: no key sends Ctrl+Shift+A, name it with --key ROW,COL")
+        if key not in leds:
+            raise KeyboardError(f"{name}: key {key[0]},{key[1]} has no LED")
+        hid.rgb(PER_KEY_RGB_SET_COLOR, [leds[key], 1, *color])
+    finally:
+        hid.close()
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Mute or unmute the microphone and light the mic key of Keychron keyboards red (muted) or green.")
+    parser.add_argument("-s", "--sync", action="store_true",
+                        help="only light the key for the current state, do not toggle")
+    parser.add_argument("-k", "--key", metavar="ROW,COL", default=os.environ.get("AUDIO_MIC_TOGGLE_KEY"),
+                        help="matrix position of the mic key (default: the key that sends Ctrl+Shift+A; env AUDIO_MIC_TOGGLE_KEY)")
+    args = parser.parse_args()
+    key = parse_key(args.key) if args.key else None
+
+    # presses in quick succession run one after the other, so the last color
+    # written is the one of the last state
+    lock_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    lock = open(os.path.join(lock_dir, f"audio-mic-toggle-{os.getuid()}.lock"), "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    if not args.sync:
+        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"], check=True)
+    color = RED if mic_muted() else GREEN
+
+    status = 0
+    for path, name in keychron_raw_hid_devices():
+        try:
+            light_keyboard(path, name, color, key)
+        except KeyboardError as e:
+            print(f"audio-mic-toggle: {e}", file=sys.stderr)
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"audio-mic-toggle: {' '.join(e.cmd)} failed (exit {e.returncode})")
+    except FileNotFoundError as e:
+        sys.exit(f"audio-mic-toggle: {e.filename} not found")
