@@ -216,14 +216,17 @@ the first one into the picker again:
                         asking to create it when it is missing
     Focus terminal      In place of Resume for a running session: bring the
                         terminal it runs in to the front, the picker stays open
+    Connect             Only for a running session inside tmux: attach this
+                        terminal to its tmux session, selecting its pane
+                        (switch-client when the picker runs in that tmux)
+    Fork                Continue it, asking for the folder and the agent, and
+                        to create the folder when it is missing
     Take over           Only for a running session: terminate it, wait for
                         its agent to exit and resume it in this terminal; still
                         running after {TERMINATE_WAIT_SECONDS}s, it asks whether to kill it (SIGKILL),
                         no going back to the question before
     Terminate           Only for a running session: send its agent SIGTERM,
                         the picker stays open
-    Fork                Continue it, asking for the folder and the agent, and
-                        to create the folder when it is missing
     Copy                Copy raw Markdown to the clipboard
     Print               Print it, asking for rendered Markdown or raw; both
                         start with the session ID
@@ -1148,6 +1151,57 @@ def process_start_epoch(pid):
     return None
 
 
+def process_parent(pid):
+    stat = read_text(f'/proc/{pid}/stat')
+    fields = stat.rsplit(') ', 1)[-1].split() if stat else []
+    return int(fields[1]) if len(fields) > 1 else None
+
+
+def process_environ(pid):
+    try:
+        with open(f'/proc/{pid}/environ', 'rb') as handle:
+            data = handle.read()
+    except OSError:
+        return {}
+    environ = {}
+    for entry in data.split(b'\0'):
+        name, separator, value = entry.partition(b'=')
+        if separator:
+            environ[name.decode(errors='replace')] = value.decode(errors='replace')
+    return environ
+
+
+def tmux_pane(pid):
+    """The tmux socket and pane a process runs in, as (socket, pane), or None.
+    Its environment names them; the pane counts only while its shell is still
+    an ancestor of the process, since pane IDs are handed out again by a new
+    server on the same socket."""
+    if not pid:
+        return None
+    environ = process_environ(pid)
+    socket = environ.get('TMUX', '').split(',')[0]
+    pane = environ.get('TMUX_PANE', '')
+    if not socket or not pane.startswith('%') or not os.path.exists(socket):
+        return None
+    try:
+        result = subprocess.run(['tmux', '-S', socket, 'display-message', '-p', '-t', pane,
+                                 '#{pane_pid}'], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    try:
+        pane_pid = int(result.stdout.strip()) if result.returncode == 0 else None
+    except ValueError:
+        return None
+    seen = set()
+    while pid and pid > 1 and pid not in seen:
+        if pid == pane_pid:
+            return socket, pane
+        seen.add(pid)
+        pid = process_parent(pid)
+    return None
+
+
 def process_children(pid):
     children = []
     try:
@@ -1846,14 +1900,17 @@ def ask_create_directory(directory):
     return True
 
 
-def exec_on_tty(command, cwd):
+def exec_on_tty(command, cwd=None):
     """Replaces this process with the agent, on the terminal: the picker that
     started it handed its own input and output over to fzf."""
-    muted(f'cd -- {shlex.quote(cwd)} && {shlex.join(command)}')
-    try:
-        os.chdir(cwd)
-    except OSError:
-        fail(f'Cannot enter directory: {cwd}')
+    if cwd is None:
+        muted(shlex.join(command))
+    else:
+        muted(f'cd -- {shlex.quote(cwd)} && {shlex.join(command)}')
+        try:
+            os.chdir(cwd)
+        except OSError:
+            fail(f'Cannot enter directory: {cwd}')
     descriptor = os.open('/dev/tty', os.O_RDWR)
     for target in (0, 1, 2):
         os.dup2(descriptor, target)
@@ -1941,6 +1998,29 @@ def fork_session(agent, key, target_agent, directory):
         if agent == 'opencode' and same_folder:
             exec_on_tty(['opencode', '--session', view['id'], '--fork'], directory)
     continue_with_context(agent, target_agent, key, directory)
+
+
+def connect_session(agent, key):
+    """Attaches this terminal to the tmux session the running agent is in,
+    its window and pane made current first. A picker inside the same tmux
+    server switches its client instead: attaching there would nest tmux."""
+    _, _, view = ensured_session(agent, key)
+    pid = Live([agent]).pid.get((agent, view['id']))
+    if not pid:
+        fail('Session is not running')
+    found = tmux_pane(pid)
+    if not found:
+        fail('Session is not running inside tmux')
+    socket, pane = found
+    tmux = ['tmux', '-S', socket]
+    for command in ('select-window', 'select-pane'):
+        subprocess.run(tmux + [command, '-t', pane], stdout=subprocess.DEVNULL)
+    own = os.environ.get('TMUX', '').split(',')[0]
+    if own and os.path.realpath(own) == os.path.realpath(socket):
+        exec_on_tty(tmux + ['switch-client', '-t', pane])
+    os.environ.pop('TMUX', None)
+    os.environ.pop('TMUX_PANE', None)
+    exec_on_tty(tmux + ['attach-session', '-t', pane])
 
 
 def focus_session(agent, key):
@@ -2037,14 +2117,18 @@ def confirm_terminate(agent, key, verb='Terminate'):
                     f'{verb} {agent} session "{name}"?'], capture=False) is not None
 
 
-def ask_session_action(running):
+def ask_session_action(running, in_tmux=False):
     """Copying and printing come in a whole and a last message variant, and
     copying also as the session ID alone, that share a row, tab walking over
-    them; a session open in a running agent is
-    resumed already, so focusing its terminal takes the place of resuming."""
-    choices = (['focus=Focus terminal', 'takeover=Take over', 'terminate=Terminate']
-               if running else ['resume=Resume'])
-    choices += ['fork=Fork', 'clipboard=Copy', 'clipboard-last=Copy last message',
+    them; a session open in a running agent is resumed already, so focusing
+    its terminal, or connecting to its tmux session, takes the place of
+    resuming."""
+    if not running:
+        choices = ['resume=Resume', 'fork=Fork']
+    else:
+        choices = ['focus=Focus terminal'] + (['connect=Connect'] if in_tmux else [])
+        choices += ['fork=Fork', 'takeover=Take over', 'terminate=Terminate']
+    choices += ['clipboard=Copy', 'clipboard-last=Copy last message',
                'clipboard-id=Copy session ID',
                'print=Print', 'print-last=Print last message']
     return tty_run(['prompt-select', '--prompt', 'Continue session:', '--no-abort-message',
@@ -2114,18 +2198,19 @@ def session_ask(agent, key, answer_file, current_directory):
         require(command)
     open(answer_file, 'w').close()
     _, _, view = ensured_session(agent, key)
-    running = bool(Live([agent]).pid.get((agent, view['id'])))
+    pid = Live([agent]).pid.get((agent, view['id']))
+    in_tmux = bool(pid and tmux_pane(pid))
     step = 'action'
     action = directory = target_agent = print_format = None
     while True:
         if step == 'action':
-            action = ask_session_action(running)
+            action = ask_session_action(bool(pid), in_tmux)
             if action is None:
                 return
             if action == 'resume':
                 if ask_create_directory(view['cwd']):
                     break
-            elif action in ('clipboard', 'clipboard-last', 'clipboard-id'):
+            elif action in ('connect', 'clipboard', 'clipboard-last', 'clipboard-id'):
                 break
             elif action == 'takeover':
                 # no to taking over, or to killing an agent that outlives
@@ -2186,7 +2271,7 @@ def session_run(agent, key, answer_file):
     if not answers:
         return
     action = answers.get('action')
-    if action in ('resume', 'clipboard', 'clipboard-last', 'clipboard-id'):
+    if action in ('resume', 'connect', 'clipboard', 'clipboard-last', 'clipboard-id'):
         session_action(action, agent, key)
     elif action in ('print', 'print-last'):
         session_action(answers.get('format') + action[len('print'):], agent, key)
@@ -2260,6 +2345,8 @@ def session_action(action, agent, key, answer_file=None, current_directory=None,
                 json.dump({'action': 'resume'}, handle)
     elif action == 'resume':
         resume_session(agent, key)
+    elif action == 'connect':
+        connect_session(agent, key)
     else:
         fail(f'Unknown interactive action: {action}')
 

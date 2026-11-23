@@ -98,3 +98,37 @@ def test_code_mode_command_approval_resolves_with_its_own_output(tmp_path):
     assert live_status(tmp_path, records) == ('waiting', 'approval')
     records.append(response('custom_tool_call_output', call_id='shell'))
     assert live_status(tmp_path, records) == ('working', None)
+
+
+def session_choices(running, in_tmux):
+    namespace = Live.load_codex.__globals__
+    asked = []
+    with patch.dict(namespace, {'tty_run': lambda command: asked.append(command)}):
+        namespace['ask_session_action'](running, in_tmux)
+    return [entry.split('=', 1)[1] for entry in asked[0] if '=' in entry]
+
+
+def test_session_actions_order():
+    tail = ['Copy', 'Copy last message', 'Copy session ID', 'Print', 'Print last message']
+    assert session_choices(False, False) == ['Resume', 'Fork'] + tail
+    assert session_choices(True, False) == ['Focus terminal', 'Fork', 'Take over',
+                                            'Terminate'] + tail
+    assert session_choices(True, True) == ['Focus terminal', 'Connect', 'Fork', 'Take over',
+                                           'Terminate'] + tail
+
+
+def test_tmux_pane_requires_pane_ancestor():
+    namespace = Live.load_codex.__globals__
+    parents = {30: 20, 20: 10, 10: 1}
+
+    class Result:
+        returncode = 0
+        stdout = '20\n'
+
+    with patch.dict(namespace, {
+            'process_environ': lambda pid: {'TMUX': '/tmp/sock,5,0', 'TMUX_PANE': '%3'},
+            'process_parent': parents.get}), \
+            patch.object(namespace['os'].path, 'exists', return_value=True), \
+            patch.object(namespace['subprocess'], 'run', return_value=Result()):
+        assert namespace['tmux_pane'](30) == ('/tmp/sock', '%3')
+        assert namespace['tmux_pane'](10) is None
