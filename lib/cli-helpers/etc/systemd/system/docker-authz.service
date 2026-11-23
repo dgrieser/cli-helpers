@@ -1,0 +1,21 @@
+[Unit]
+Description=Docker authorization plugin of cli-helpers (no privileged containers)
+Before=docker.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 -I /etc/cli-helpers/docker-authz
+Restart=always
+RestartSec=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+# the socket dir, writable despite ProtectSystem; kept on a stop as dockerd uses it too
+RuntimeDirectory=docker/plugins
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

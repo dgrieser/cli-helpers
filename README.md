@@ -25,7 +25,9 @@ of NetworkManager with its GNOME part and the configured profile for use by `wor
 `lib/cli-helpers/etc` into `/etc` (the NetworkManager dispatcher scripts: `tun-up` sends all DNS through the VPN while it
 is up, with the configured domains to search, and sets the Slack status, as the configured work Wi-Fi does. The MT7922 and Intel AX210 also get calmer
 roaming scans. The files turn wifi power save off and add a `systemd-resolved` stub on `docker0` with the DNS of Docker pointing at it, so containers resolve the
-internal names too. Setup installs the local NetworkManager settings as root-owned configuration and asks before overwriting an existing file), runs
+internal names too. `docker-authz.service` runs `/etc/cli-helpers/docker-authz`, the authorization plugin of Docker that refuses
+privileged containers (except the `moby/buildkit` builders of `docker buildx`) and `docker exec --privileged`, as systemd in a privileged
+container starts gettys on the ttys of the host and ends the desktop session; `docker.service` waits for it. Setup installs the local NetworkManager settings as root-owned configuration and asks before overwriting an existing file), runs
 `fix-mt7922-6ghz-roaming` to migrate the old udev rule and apply the 6 GHz fix on MediaTek MT7922 cards (setup waits for Wi-Fi after a possible driver reload).
 The Wi-Fi step also sets the configured Wi-Fi profile when its band is unrestricted to 5 GHz on Intel AX210 because that band restored internal HTTPS.
 Setup then installs `gh` and

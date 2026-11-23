@@ -1,0 +1,142 @@
+#!/usr/bin/python3 -I
+# Docker authorization plugin that refuses privileged containers.
+#
+# dockerd asks it about every API request (daemon.json "authorization-plugins":
+# ["cli-helpers-authz"]); it answers on /run/docker/plugins/cli-helpers-authz.sock.
+# It refuses:
+#   - creating a container with HostConfig.Privileged, except for the images of
+#     ALLOWED_PRIVILEGED_IMAGES (the builders of docker buildx need it)
+#   - docker exec --privileged
+#   - creating a container whose request body dockerd did not pass along
+#     (larger than 1 MiB or no JSON), as it cannot be checked
+# A privileged container gets the real /dev of the host: systemd in such a
+# container starts gettys on the host's ttys and hangs up the desktop session.
+# This is a guardrail against accidents, not a security boundary: whoever can
+# use docker is root anyway.
+#
+# Runs as docker-authz.service, before docker.service; dockerd does not start
+# without it.
+
+import base64
+import json
+import os
+import re
+import socket
+import socketserver
+import sys
+from http.server import BaseHTTPRequestHandler
+
+NAME = "cli-helpers-authz"
+SOCKET_DIR = "/run/docker/plugins"
+SOCKET_PATH = os.path.join(SOCKET_DIR, NAME + ".sock")
+# image references that may still run privileged, by name with any tag or digest
+ALLOWED_PRIVILEGED_IMAGES = [
+    re.compile(r"^(docker\.io/)?moby/buildkit([:@].*)?$"),
+]
+CREATE_URI = re.compile(r"^(/v[0-9.]+)?/containers/create(\?.*)?$")
+EXEC_URI = re.compile(r"^(/v[0-9.]+)?/containers/[^/?]+/exec(\?.*)?$")
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def request_body(request):
+    body = request.get("RequestBody")
+    if not body:
+        return None
+    try:
+        return json.loads(base64.b64decode(body))
+    except (ValueError, TypeError):
+        return None
+
+
+def image_allowed(image):
+    return any(pattern.match(image or "") for pattern in ALLOWED_PRIVILEGED_IMAGES)
+
+
+def check(request):
+    """Return None to allow the request, else the reason to refuse it."""
+    if request.get("RequestMethod") != "POST":
+        return None
+    uri = request.get("RequestUri", "")
+    if CREATE_URI.match(uri):
+        body = request_body(request)
+        if not isinstance(body, dict):
+            return "the container request could not be checked for --privileged"
+        host_config = body.get("HostConfig") or {}
+        if host_config.get("Privileged") and not image_allowed(body.get("Image")):
+            return "privileged containers are not allowed on this machine (image %s)" % body.get("Image")
+    elif EXEC_URI.match(uri):
+        body = request_body(request)
+        if not isinstance(body, dict):
+            return "the exec request could not be checked for --privileged"
+        if body.get("Privileged"):
+            return "docker exec --privileged is not allowed on this machine"
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, data):
+        payload = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.docker.plugins.v1.2+json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            request = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            request = {}
+        if self.path == "/Plugin.Activate":
+            self.reply({"Implements": ["authz"]})
+        elif self.path == "/AuthZPlugin.AuthZReq":
+            reason = check(request)
+            if reason:
+                log("refused %s %s: %s" % (request.get("RequestMethod"), request.get("RequestUri"), reason))
+                self.reply({"Allow": False, "Msg": reason})
+            else:
+                self.reply({"Allow": True})
+        elif self.path == "/AuthZPlugin.AuthZRes":
+            self.reply({"Allow": True})
+        else:
+            self.send_error(404)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def notify_ready():
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.sendto(b"READY=1", address)
+
+
+def main():
+    os.makedirs(SOCKET_DIR, mode=0o755, exist_ok=True)
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    old_umask = os.umask(0o077)
+    try:
+        server = Server(SOCKET_PATH, Handler)
+    finally:
+        os.umask(old_umask)
+    notify_ready()
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

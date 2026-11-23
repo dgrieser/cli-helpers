@@ -8,5 +8,8 @@
       "defaultMaxUsedSpace": "30GB",
       "defaultMinFreeSpace": "50GB"
     }
-  }
+  },
+  "authorization-plugins": [
+    "cli-helpers-authz"
+  ]
 }
