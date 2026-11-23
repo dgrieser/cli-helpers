@@ -2410,9 +2410,9 @@ Store the OpenVPN profile through `keyring-cli nm-store "Work VPN"`. For Slack, 
 
 ### `work-link`
 
-Keeps an internal HTTPS endpoint reachable through NetworkManager. Leave Wi-Fi selection in GNOME. The service keeps any active or connecting Wi-Fi profile, including a new network, and tries available preferred profiles if Wi-Fi disconnects. It respects the Wi-Fi radio switch and lets GNOME handle captive portal login. GNOME displays the existing Wi-Fi and VPN indicators.
+Keeps an internal HTTPS endpoint reachable through NetworkManager. Leave Wi-Fi selection in GNOME. The service keeps any active or connecting Wi-Fi profile, including a new network, and tries available preferred profiles if Wi-Fi disconnects. While Wi-Fi is the uplink, every two minutes the service checks the scan results of NetworkManager for a profile listed before the current one. It switches when such a profile has at least 50% signal, and waits ten minutes before it tries a failed profile again. It requests a scan only if NetworkManager has not scanned for two minutes. It respects the Wi-Fi radio switch and lets GNOME handle captive portal login. GNOME displays the existing Wi-Fi and VPN indicators.
 
-The VPN starts when the verified HTTPS probe fails on a connected uplink. Local failures before dialling, such as an unavailable credential provider, retry with a backoff of up to two minutes. Each VPN activation that could have submitted credentials uses one of two persistent attempt slots. Ambiguous failures also count. A successful VPN activation clears the counter. After two failures, check access before running `work-link reset-auth`. The service and CLI share the counter. Manual VPN attempts from other applications have their own lifecycle.
+The VPN starts when the verified HTTPS probe fails on a connected uplink. Local failures before dialling, such as an unavailable credential provider, retry with a backoff of up to two minutes. Each VPN activation that could have submitted credentials uses one of two persistent attempt slots, including the restart of a stale VPN. Ambiguous failures also count. A successful VPN activation clears the counter. After two failures, check access before running `work-link reset-auth`. The service and CLI share the counter. Manual VPN attempts from other applications have their own lifecycle.
 
 Install `python3-gi`, `gir1.2-nm-1.0`, `curl` and the NetworkManager OpenVPN plugin. Use a saved OpenVPN password profile with password storage set to **Ask every time**, and VPN persistence disabled. Create `${XDG_CONFIG_HOME:-$HOME/.config}/work-link/config.toml`:
 
@@ -2435,7 +2435,7 @@ systemctl --user enable --now work-link.service
 
 `work-link` checks access and makes one connection attempt if needed. `work-link connect --wifi "Phone hotspot" --ask` explicitly switches Wi-Fi and prompts for the VPN password and one-time code. `work-link status` checks current access. Use `status --quiet` (or `-q`) for an exit-code-only check, or `status --follow` (or `-f`) to stream background progress.
 
-The background service sends a GNOME notification if access remains unavailable for about a minute, or immediately when the VPN attempt limit is reached. Notifications use `notify-send` from `libnotify-bin`. Stop automatic connection with `systemctl --user disable --now work-link.service`.
+The service detects a rejected VPN login from the OpenVPN plugin and waits for a new one-time code before the next attempt. If the VPN stays active but internal HTTPS fails for a minute, the service restarts the VPN once. The background service sends a transient GNOME notification if access remains unavailable for three minutes, at most once every 30 minutes, and none for a missing network, which GNOME already shows. It notifies immediately when the VPN attempt limit is reached, and says so when the VPN rejected the login. Notifications use `notify-send` from `libnotify-bin`. Stop automatic connection with `systemctl --user disable --now work-link.service`.
 
 Run the connection and config tests with `/usr/bin/python3 -m unittest discover -s tests`.
 

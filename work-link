@@ -24,8 +24,15 @@ from gi.repository import Gio, GLib, NM
 NAME = "work-link"
 UNIT = f"{NAME}.service"
 AUTH_LIMIT = 2
-ALERT_DELAY = 60
+ALERT_DELAY = 180
+ALERT_COOLDOWN = 1800
+STALE_VPN_DELAY = 60
+OTP_WINDOW = 35
+UPGRADE_INTERVAL = 120
+UPGRADE_BACKOFF = 600
+UPGRADE_SIGNAL = 50
 OPENVPN = "org.freedesktop.NetworkManager.openvpn"
+VPN_PLUGIN = "org.freedesktop.NetworkManager.VPN.Plugin"
 WIFI = "802-11-wireless"
 
 
@@ -117,10 +124,12 @@ class Reporter:
             self.last = label, message
 
 
-def notify_failure(message):
+def notify_failure(message, urgent=False):
+    # Outage alerts are transient so they do not pile up in the GNOME message list.
+    options = ["--urgency=normal"] if urgent else ["--urgency=low", "--transient"]
     try:
         subprocess.run(
-            ["notify-send", f"--app-name={NAME}", "--icon=network-error", "--",
+            ["notify-send", f"--app-name={NAME}", "--icon=network-error", *options, "--",
              "Work connection unavailable", message],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
         )
@@ -279,6 +288,58 @@ class Network:
                         return base
         return None
 
+    def better_wifi(self, config, skip=()):
+        """Return a visible Wi-Fi profile ranked above the current Wi-Fi uplink.
+
+        Uses NetworkManager's cached scan results and requests a new scan only
+        when the last one is older than UPGRADE_INTERVAL.
+        """
+        client = self.client()
+        primary = self.uplink(client)
+        if not primary or primary.get_connection_type() != WIFI:
+            return None  # Wired or no uplink: nothing to improve.
+        current = primary.get_connection()
+        ranks = [i for i, name in enumerate(config.wifi_profiles) if current and matches(current, name)]
+        rank = ranks[0] if ranks else len(config.wifi_profiles)
+        wireless = current.get_setting_wireless() if current else None
+        current_ssid = wireless.get_ssid().get_data() if wireless and wireless.get_ssid() else None
+        devices = [d for d in primary.get_devices() if d.get_device_type() == NM.DeviceType.WIFI]
+        if not devices or rank == 0:
+            return None
+        device = devices[0]
+        # Available connections fit this device (interface, MAC) and a visible network.
+        profiles = device.get_available_connections()
+        for name in config.wifi_profiles[:rank]:
+            for profile in profiles:
+                if (not matches(profile, name) or profile.get_connection_type() != WIFI
+                        or profile.get_uuid() in skip):
+                    continue
+                ssid = profile.get_setting_wireless().get_ssid()
+                if ssid and ssid.get_data() == current_ssid:
+                    continue  # Same network under another profile name.
+                if any(ap.get_strength() >= UPGRADE_SIGNAL and ap.connection_valid(profile)
+                       for ap in device.get_access_points()):
+                    return profile.get_uuid(), device.get_iface(), profile.get_id()
+        self.request_scan(device)
+        return None
+
+    def request_scan(self, device):
+        last = device.get_last_scan()  # Milliseconds of CLOCK_BOOTTIME, -1 if never.
+        now = time.clock_gettime(time.CLOCK_BOOTTIME) * 1000
+        if last >= 0 and now - last < UPGRADE_INTERVAL * 1000:
+            return
+
+        def done(source, result):
+            try:
+                source.request_scan_finish(result)
+            except GLib.Error:
+                pass  # NetworkManager refuses scans while busy. The next round retries.
+            self.scanning = None
+
+        # Keep the device (and its client) alive until the reply arrives in wait().
+        self.scanning = device
+        device.request_scan_async(None, done)
+
     def wifi_up(self, uuid, iface=None):
         cmd = ["nmcli", "--wait", "12", "connection", "up", "uuid", uuid]
         if iface:
@@ -335,6 +396,16 @@ class Network:
             agent.password = None
             agent.destroy()
 
+    def vpn_down(self, profile_name):
+        for connection in self.client().get_active_connections():
+            if connection.get_vpn() and matches(connection, profile_name):
+                cmd = ["nmcli", "--wait", "10", "connection", "down", "apath", connection.get_path()]
+                try:
+                    return subprocess.run(cmd, capture_output=True, timeout=12).returncode == 0
+                except subprocess.TimeoutExpired:
+                    return False
+        return True
+
     @staticmethod
     def activate_vpn(client, profile, uplink):
         loop = GLib.MainLoop()
@@ -342,13 +413,30 @@ class Network:
         active = None
         handler = None
         outcome = "activation timed out"
+        plugins = set()
+        login_failed = set()
+
+        # NetworkManager reports a rejected OpenVPN login with an unknown state
+        # reason. Only the plugin's Failure signal says LOGIN_FAILED. The plugin
+        # bus name is not exposed, so trust it only if no other VPN plugin spoke.
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+        def plugin_signal(_bus, sender, _path, _interface, signal, parameters, *_args):
+            plugins.add(sender)
+            if signal == "Failure" and parameters.unpack()[0] == NM.VpnPluginFailure.LOGIN_FAILED:
+                login_failed.add(sender)
+
+        subscription = bus.signal_subscribe(None, VPN_PLUGIN, None, None, None,
+                                            Gio.DBusSignalFlags.NONE, plugin_signal)
 
         def changed(connection, state, reason):
             nonlocal outcome
             if state == NM.VpnConnectionState.ACTIVATED:
                 outcome = "connected"
             elif state in (NM.VpnConnectionState.FAILED, NM.VpnConnectionState.DISCONNECTED):
-                outcome = ("authentication rejected" if reason == NM.VpnConnectionStateReason.LOGIN_FAILED
+                outcome = ("authentication rejected"
+                           if (login_failed and plugins == login_failed and len(plugins) == 1)
+                           or reason == NM.VpnConnectionStateReason.LOGIN_FAILED
                            else "activation failed")
             else:
                 return
@@ -376,6 +464,7 @@ class Network:
             loop.run()
         finally:
             GLib.source_remove(timeout)
+            bus.signal_unsubscribe(subscription)
             if active and handler:
                 active.disconnect(handler)
             if outcome == "activation timed out" and active:
@@ -427,27 +516,40 @@ class Keeper:
         self.background = background
         self.failed_check = False
         self.notify = notify
+        self.last_alert = None
+        self.rejected = False
+        self.auth_retry_at = 0
+        self.stale_since = None
+        self.upgrade_at = 0
+        self.upgrade_failed = {}
         self.clear_alert()
 
     def clear_alert(self):
         self.failure_since = None
         self.alert_sent = False
         self.lockout_alert_sent = False
+        self.vpn_restarted = False
 
-    def unavailable(self, message, *, locked=False):
+    def unavailable(self, message, *, locked=False, alert=True):
         if self.background:
             now = self.clock()
             if self.failure_since is None:
                 self.failure_since = now
             if locked and not self.lockout_alert_sent:
-                self.notify(message)
+                self.notify(message, urgent=True)
                 self.lockout_alert_sent = self.alert_sent = True
-            elif not self.alert_sent and now - self.failure_since >= ALERT_DELAY:
+            elif (alert and not self.alert_sent and now - self.failure_since >= ALERT_DELAY
+                  and (self.last_alert is None or now - self.last_alert >= ALERT_COOLDOWN)):
                 self.notify(message)
                 self.alert_sent = True
+                self.last_alert = now
         return False
 
     def blocked(self):
+        if self.rejected:
+            self.report("Blocked", "VPN login rejected. Fix the credentials, then run work-link reset-auth.")
+            return self.unavailable("The VPN rejected the login. Fix the credentials and run work-link reset-auth.",
+                                    locked=True)
         self.report("Blocked", "VPN paused after two attempts. Check credentials, then run work-link reset-auth.")
         return self.unavailable("VPN paused after two attempts. Check credentials and run work-link reset-auth.",
                                 locked=True)
@@ -465,14 +567,29 @@ class Keeper:
                 if current.wifi or choice not in current.choices:
                     break
                 uuid, iface, name = choice
+                if self.clock() < self.upgrade_failed.get(uuid, 0):
+                    continue  # A failed switch to it left this Wi-Fi. Try the fallbacks first.
                 self.report("Wi-Fi", f"Connecting to {name}…")
                 if self.network.wifi_up(uuid, iface):
                     break
             self.wifi_retry_at = self.clock() + 30
             snapshot = self.network.snapshot(self.config)
+        elif snapshot.wifi and self.background and self.clock() >= self.upgrade_at:
+            self.upgrade_at = self.clock() + UPGRADE_INTERVAL
+            backed_off = {uuid for uuid, until in self.upgrade_failed.items() if self.clock() < until}
+            choice = self.network.better_wifi(self.config, backed_off)
+            if choice:
+                uuid, iface, name = choice
+                self.report("Wi-Fi", f"{name} is in range. Switching from {snapshot.wifi}…")
+                if not self.network.wifi_up(uuid, iface):
+                    self.upgrade_failed[uuid] = self.clock() + UPGRADE_BACKOFF
+                    # NetworkManager may have left the old network after a failed switch.
+                    self.wifi_retry_at = 0
+                snapshot = self.network.snapshot(self.config)
 
         if snapshot.uplink != self.uplink:
             self.uplink = snapshot.uplink
+            self.stale_since = None
             self.retry_at = 0
             self.delay = 15
             self.failed_check = False
@@ -481,21 +598,39 @@ class Keeper:
             if snapshot.offline_by_choice:
                 self.clear_alert()
                 return False
-            return self.unavailable("No usable network connection. Trying to reconnect.")
+            # GNOME already shows a missing network.
+            return self.unavailable("No usable network connection. Trying to reconnect.", alert=False)
         if snapshot.vpn == "activated" and self.budget.used():
             self.budget.write(0)
+            self.rejected = False
         if self.clock() < self.retry_at and not ask:
             return False
+        if snapshot.vpn != "activated":
+            self.stale_since = None
         if self.network.probe(self.config.probe_url):
             self.delay = 15
             self.failed_check = False
+            self.stale_since = None
             self.clear_alert()
             self.report("Ready", f"{snapshot.wifi or 'Network'} · internal HTTPS"
                         + (" through VPN" if snapshot.vpn == "activated" else " reachable"))
             return True
         if snapshot.vpn:
             self.report("Waiting", "VPN is active or starting. Internal HTTPS is unavailable.")
-            return self.unavailable("The VPN is active or starting, but internal HTTPS is unavailable.")
+            self.unavailable("The VPN is active or starting, but internal HTTPS is unavailable.")
+            if snapshot.vpn == "activated" and self.stale_since is None:
+                self.stale_since = self.clock()
+            if (self.background and snapshot.vpn == "activated" and not self.vpn_restarted
+                    and self.clock() - self.stale_since >= STALE_VPN_DELAY):
+                # A VPN over a silently dropped TCP session stays "activated"
+                # until TCP gives up, often 15 minutes later. Redial once.
+                self.vpn_restarted = True
+                self.report("VPN", "Internal HTTPS stays unavailable. Restarting the VPN.")
+                self.network.vpn_down(self.config.vpn_profile)
+                self.stale_since = None
+                self.failed_check = True
+                self.retry_at = 0
+            return False
         if snapshot.portal:
             self.report("Waiting", "Sign in to the Wi-Fi portal in GNOME.")
             self.clear_alert()
@@ -510,6 +645,10 @@ class Keeper:
         used = self.budget.used()
         if used >= AUTH_LIMIT:
             return self.blocked()
+        if self.clock() < self.auth_retry_at and not ask:
+            # Survives uplink changes: a retry with the same one-time code would be rejected again.
+            self.report("Waiting", "VPN login rejected. Waiting for a new one-time code.")
+            return self.unavailable("The VPN rejected the login. Retrying with a new one-time code.")
         self.report("VPN", "Getting credentials…")
         password = self.credential_source(self.config, ask)
         if not password:
@@ -524,6 +663,7 @@ class Keeper:
         outcome = self.network.vpn_up(self.config.vpn_profile, snapshot.uplink, password, reserve)
         if outcome == "connected":
             self.budget.write(0)
+            self.rejected = False
             self.delay = 15
             if self.network.probe(self.config.probe_url):
                 self.clear_alert()
@@ -533,6 +673,10 @@ class Keeper:
             return self.unavailable("The VPN is connected, but internal HTTPS is unavailable.")
         self.report("VPN", outcome.capitalize() + ".")
         self.defer()
+        if outcome == "authentication rejected":
+            self.rejected = True
+            self.auth_retry_at = self.clock() + OTP_WINDOW
+            self.retry_at = max(self.retry_at, self.auth_retry_at)
         if self.budget.used() >= AUTH_LIMIT:
             return self.blocked()
         return self.unavailable("VPN activation did not complete. Trying to reconnect.")

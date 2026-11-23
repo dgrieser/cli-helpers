@@ -27,6 +27,7 @@ class ConnectionPolicyTest(unittest.TestCase):
         self.network.snapshot.return_value = work_link.Snapshot(uplink="/uplink/1", wifi="Guest")
         self.network.probe.return_value = False
         self.network.vpn_up.side_effect = self.rejected
+        self.network.better_wifi.return_value = None
         self.credential = Mock(return_value="fake credential")
         self.now = 1000
         self.restart()
@@ -82,6 +83,8 @@ class ConnectionPolicyTest(unittest.TestCase):
         self.assertEqual(self.credential.call_count, 2)
 
     def test_ambiguous_timeout_is_also_capped(self):
+        self.keeper.background = True
+        self.keeper.notify = Mock()
         def timed_out(profile, uplink, password, reserve):
             reserve()
             return "activation timed out"
@@ -91,6 +94,7 @@ class ConnectionPolicyTest(unittest.TestCase):
             self.assertFalse(self.step())
             self.now += 120
         self.assertEqual(self.network.vpn_up.call_count, 2)
+        self.assertIn("paused after two attempts", self.keeper.notify.call_args.args[0])
 
     def test_credential_failures_back_off_without_spending_attempts(self):
         self.credential.return_value = None
@@ -111,27 +115,125 @@ class ConnectionPolicyTest(unittest.TestCase):
         self.assertTrue(self.step())
         self.credential.assert_not_called()
 
-    def test_background_notifies_once_per_sustained_outage(self):
+    def test_background_notifies_once_per_sustained_outage_with_cooldown(self):
         self.keeper.background = True
         self.keeper.notify = Mock()
-        self.network.snapshot.return_value = work_link.Snapshot()
+        self.credential.return_value = None
         self.assertFalse(self.step())
         self.now += work_link.ALERT_DELAY - 1
         self.assertFalse(self.step())
         self.keeper.notify.assert_not_called()
         self.now += 1
         self.assertFalse(self.step())
+        self.now += 120
         self.assertFalse(self.step())
         self.keeper.notify.assert_called_once()
 
-        self.network.snapshot.return_value = work_link.Snapshot(uplink="/uplink/2")
-        self.network.probe.return_value = True
-        self.assertTrue(self.step())
+        def outage():
+            self.now += 120  # Past the credential backoff.
+            self.network.probe.return_value = True
+            self.assertTrue(self.step())
+            self.network.probe.return_value = False
+            self.assertFalse(self.step())
+            self.now += work_link.ALERT_DELAY
+            self.assertFalse(self.step())
+
+        outage()  # Within the cooldown of the first alert.
+        self.keeper.notify.assert_called_once()
+        self.now += work_link.ALERT_COOLDOWN
+        outage()
+        self.assertEqual(self.keeper.notify.call_count, 2)
+
+    def test_missing_uplink_does_not_notify(self):
+        self.keeper.background = True
+        self.keeper.notify = Mock()
         self.network.snapshot.return_value = work_link.Snapshot()
         self.assertFalse(self.step())
-        self.now += work_link.ALERT_DELAY
+        self.now += work_link.ALERT_DELAY * 10
         self.assertFalse(self.step())
-        self.assertEqual(self.keeper.notify.call_count, 2)
+        self.keeper.notify.assert_not_called()
+
+    def test_stale_vpn_is_restarted_once_per_outage(self):
+        self.keeper.background = True
+        self.keeper.notify = Mock()
+        self.network.snapshot.return_value = work_link.Snapshot(uplink="/uplink/1", wifi="Guest", vpn="activated")
+        self.assertFalse(self.step())
+        self.now += work_link.STALE_VPN_DELAY - 1
+        self.assertFalse(self.step())
+        self.network.vpn_down.assert_not_called()
+        self.now += 1
+        self.assertFalse(self.step())
+        self.network.vpn_down.assert_called_once_with("VPN")
+        self.now += work_link.STALE_VPN_DELAY
+        self.assertFalse(self.step())
+        self.network.vpn_down.assert_called_once()
+        self.network.vpn_up.assert_not_called()
+
+    def test_new_vpn_gets_full_grace_period_after_long_outage(self):
+        self.keeper.background = True
+        self.keeper.notify = Mock()
+        self.network.snapshot.return_value = work_link.Snapshot()
+        self.assertFalse(self.step())
+        self.now += 600
+        self.network.snapshot.return_value = work_link.Snapshot(uplink="/uplink/1", wifi="Guest", vpn="activated")
+        self.assertFalse(self.step())
+        self.network.vpn_down.assert_not_called()
+        self.now += work_link.STALE_VPN_DELAY
+        self.assertFalse(self.step())
+        self.network.vpn_down.assert_called_once()
+
+    def test_preferred_wifi_in_range_is_switched_to_at_most_every_interval(self):
+        self.keeper.background = True
+        self.network.probe.return_value = True
+        self.network.better_wifi.return_value = ("work", "wlan0", "Work")
+        self.network.wifi_up.return_value = False
+        self.assertTrue(self.step())
+        self.network.wifi_up.assert_called_once_with("work", "wlan0")
+        self.now += work_link.UPGRADE_INTERVAL - 1
+        self.assertTrue(self.step())
+        self.network.better_wifi.assert_called_once()
+        self.now += 1
+        self.network.better_wifi.return_value = None
+        self.assertTrue(self.step())  # The failed profile backs off.
+        self.assertEqual(self.network.better_wifi.call_args.args[1], {"work"})
+        self.network.wifi_up.assert_called_once()
+        self.network.better_wifi.return_value = ("work", "wlan0", "Work")
+        self.now += work_link.UPGRADE_BACKOFF
+        self.assertTrue(self.step())
+        self.assertEqual(self.network.better_wifi.call_args.args[1], set())
+        self.assertEqual(self.network.wifi_up.call_count, 2)
+
+    def test_failed_switch_skips_that_profile_during_recovery(self):
+        self.keeper.background = True
+        self.network.probe.return_value = True
+        self.network.better_wifi.return_value = ("work", "wlan0", "Work")
+        choices = (("work", "wlan0", "Work"), ("home", "wlan0", "Home"))
+        disconnected = work_link.Snapshot(choices=choices)
+        connected = work_link.Snapshot(uplink="/uplink/2", wifi="Home")
+        self.network.snapshot.side_effect = [connected, disconnected] + [disconnected] * 3 + [connected]
+        self.network.wifi_up.side_effect = [False, True]
+        self.assertFalse(self.step())  # Switch fails and leaves Wi-Fi disconnected.
+        self.assertTrue(self.step())
+        self.assertEqual([call.args for call in self.network.wifi_up.call_args_list],
+                         [("work", "wlan0"), ("home", "wlan0")])
+
+    def test_foreground_connect_never_switches_wifi(self):
+        self.network.probe.return_value = True
+        self.network.better_wifi.return_value = ("work", "wlan0", "Work")
+        self.assertTrue(self.step())
+        self.network.better_wifi.assert_not_called()
+        self.network.wifi_up.assert_not_called()
+
+    def test_uplink_change_keeps_one_time_code_cooldown(self):
+        self.assertFalse(self.step())
+        self.assertEqual(self.network.vpn_up.call_count, 1)
+        self.network.snapshot.return_value = work_link.Snapshot(uplink="/uplink/2", wifi="Home")
+        self.now += 1
+        self.assertFalse(self.step())
+        self.assertEqual(self.network.vpn_up.call_count, 1)
+        self.now += work_link.OTP_WINDOW
+        self.assertFalse(self.step())
+        self.assertEqual(self.network.vpn_up.call_count, 2)
 
     def test_vpn_lockout_notifies_immediately_and_only_once(self):
         self.keeper.background = True
@@ -140,10 +242,14 @@ class ConnectionPolicyTest(unittest.TestCase):
         self.now += 4
         self.assertFalse(self.step())
         self.keeper.notify.assert_not_called()
-        self.now += 15
+        self.now += work_link.OTP_WINDOW - 1
+        self.assertFalse(self.step())
+        self.assertEqual(self.network.vpn_up.call_count, 1)  # Waits for a new one-time code.
+        self.now += 1
         self.assertFalse(self.step())
         self.keeper.notify.assert_called_once()
-        self.assertIn("paused after two attempts", self.keeper.notify.call_args.args[0])
+        self.assertIn("rejected the login", self.keeper.notify.call_args.args[0])
+        self.assertTrue(self.keeper.notify.call_args.kwargs["urgent"])
         self.now += 120
         self.assertFalse(self.step())
         self.keeper.notify.assert_called_once()
@@ -250,6 +356,37 @@ class NetworkAdapterTest(unittest.TestCase):
         agent.do_get_secrets(connection, "/", "vpn", [], request, callback, None)
         self.assertIsNone(callback.call_args.args[2])
         self.assertIsNotNone(callback.call_args.args[3])
+
+    def activate_with_plugin_signals(self, senders):
+        NM = work_link.NM
+        bus = Mock()
+        client = Mock()
+        active = Mock()
+
+        def activate(profile, specific, uplink, cancellable, callback):
+            callback(client, None)
+            handler = bus.signal_subscribe.call_args.args[6]
+            for sender in senders:
+                handler(bus, sender, "/", work_link.VPN_PLUGIN, "StateChanged", work_link.GLib.Variant("(u)", (3,)))
+            handler(bus, senders[0], "/", work_link.VPN_PLUGIN, "Failure",
+                    work_link.GLib.Variant("(u)", (int(NM.VpnPluginFailure.LOGIN_FAILED),)))
+            changed = active.connect.call_args.args[1]
+            changed(active, int(NM.VpnConnectionState.FAILED), int(NM.VpnConnectionStateReason.UNKNOWN))
+
+        client.activate_connection_async.side_effect = activate
+        client.activate_connection_finish.return_value = active
+        active.get_vpn_state.return_value = NM.VpnConnectionState.PREPARE
+        with (patch.object(work_link.Gio, "bus_get_sync", return_value=bus),
+              patch.object(work_link.GLib, "MainLoop")):
+            outcome = work_link.Network.activate_vpn(client, Mock(), "/uplink/1")
+        bus.signal_unsubscribe.assert_called_once()
+        return outcome
+
+    def test_plugin_login_failure_is_reported_as_rejection(self):
+        self.assertEqual(self.activate_with_plugin_signals([":1.2"]), "authentication rejected")
+
+    def test_login_failure_with_concurrent_vpn_plugin_is_ambiguous(self):
+        self.assertEqual(self.activate_with_plugin_signals([":1.2", ":1.3"]), "activation failed")
 
     def test_probe_requires_valid_tls_and_uses_https_only(self):
         with patch.object(work_link.subprocess, "run") as run:
