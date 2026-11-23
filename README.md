@@ -157,9 +157,11 @@ audio-levels alsa_input.pci-0000_00_1f.3.analog-stereo
 ```
 
 ### `audio-mic-toggle`
-Mutes or unmutes the default microphone (`wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle`) and lights the mic key of every Keychron keyboard connected over USB: red at full brightness while the microphone is muted, green at full brightness while it is not. It is the action of the `mic-toggle` app shortcut (`<Shift><Control>a`). The mic key is the key that sends Ctrl+Shift+A, looked up in the keymap of the keyboard itself, the default layer (Mac or Windows) first, so it works on any Keychron keyboard without configuration; `--key ROW,COL` (or `AUDIO_MIC_TOGGLE_KEY`) names the matrix position instead.
+Mutes or unmutes the default microphone (`wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle`) and lights the mic key of every Keychron keyboard connected over USB: red at full brightness while the microphone is muted, green at full brightness while it is not. It is the action of the `mic-toggle` app shortcut (`<Shift><Control>a`). The mic key is the key that sends Ctrl+Shift+A, as a keycode with modifiers or as a VIA macro, looked up in the keymap of the keyboard itself, the default layer (Mac or Windows) first, so it works on any Keychron keyboard without configuration; `--key ROW,COL` (or `AUDIO_MIC_TOGGLE_KEY`) names the matrix position instead.
 
 The color goes through the raw HID interface of the Keychron firmware, the one Keychron Launcher uses: it sets the per-key color of that key, which shows in the per-key RGB lighting mode, so the keyboard has to be in that mode, with firmware that has it (Keychron Launcher updates it). The color is not saved on the keyboard, which keeps its flash from wearing; a replugged keyboard shows its saved colors until the next toggle or `--sync`. The overall brightness of the keyboard caps the one of the key. `/dev/hidraw*` of the keyboard needs the udev rule of `setup.sh etc` (`/etc/udev/rules.d/70-keychron-hidraw.rules`, `uaccess` for the user at the seat). No Keychron keyboard connected is no error; one that cannot be reached, has no per-key RGB or no mic key is reported on stderr (exit code 1), and the microphone is toggled anyway.
+
+`lib/cli-helpers/keychron/k8-pro-home.json` is the backup of the K8 Pro at home before the firmware update (keymap, macros and lighting, read over VIA): the layers and macros in the save format of VIA, the mic key is `MACRO00` (Ctrl+Shift+A) of the Mac layer 0, top row, column 15.
 
 **Usage:** `audio-mic-toggle [-s|--sync] [-k|--key ROW,COL]`
 
