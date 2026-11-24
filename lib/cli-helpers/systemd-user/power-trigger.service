@@ -4,7 +4,7 @@ Description=Power Trigger
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/power-trigger
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]

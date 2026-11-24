@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -u
-from pydbus import SessionBus, SystemBus
-from gi.repository import GLib
+import pydbus
+from pydbus import SystemBus
+from gi.repository import Gio, GLib
 import os
 import subprocess
 import threading
@@ -14,6 +15,11 @@ SECONDS_DELAY_NETWORK_WAKE_CHECK=15
 NM_STATE_ASLEEP=10
 # let the lock screen draw before the screens go off, so turning them on shows no desktop
 SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK=2
+# Mutter 50.1 aborted twice when PowerSaveMode was set ~3 s after an undock
+# (meta_kms_impl_device_unhold_fd assertion, 2026-11-20 and 2026-11-24).
+# Wait until the monitor configuration did not change for this long.
+SECONDS_MONITORS_SETTLE=10
+SECONDS_DELAY_SESSION_BUS_RECONNECT=5
 MUTTER_POWER_SAVE_ON=0
 MUTTER_POWER_SAVE_OFF=3
 
@@ -51,7 +57,7 @@ def on_lid_closed_event(on_battery):
     is_lid_open=False
     print(f'Detected lid close')
     lock_screen()
-    GLib.timeout_add_seconds(SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK, turn_screens_off_if_lid_closed)
+    schedule_screens_off(SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK)
 
 def on_lid_closed_for_a_while_event(on_battery):
     print(f'Detected lid closed for {SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER} seconds while on {"battery" if on_battery else "AC"}')
@@ -120,10 +126,64 @@ def notify(summary, body, urgency='normal'):
     except OSError as e:
         print(f'Could not send notification: {e}')
 
+# The shared session bus of GLib (pydbus.SessionBus) raises SIGTERM when it closes.
+# A GNOME Shell crash restarts the session bus (gnome-session-restart-dbus.service),
+# and that stopped this service for good (2026-11-24). A private connection does not
+# exit on close; connect again when it was closed.
+session_bus = None
+session_bus_reconnect_pending = False
+
+def get_session_bus():
+    global session_bus
+    if session_bus is None or session_bus.con.is_closed():
+        address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        session_bus = pydbus.connect(address)
+        session_bus.con.connect('closed', on_session_bus_closed)
+        session_bus.subscribe(
+            iface='org.gnome.Mutter.DisplayConfig',
+            signal='MonitorsChanged',
+            object='/org/gnome/Mutter/DisplayConfig',
+            signal_fired=lambda *args: on_monitors_changed()
+        )
+        # a new session bus means a new GNOME Shell, its monitors are not settled yet
+        on_monitors_changed()
+    return session_bus
+
+def on_session_bus_closed(*args):
+    print('Session bus closed, connecting again')
+    schedule_session_bus_reconnect()
+
+def schedule_session_bus_reconnect():
+    global session_bus_reconnect_pending
+    if not session_bus_reconnect_pending:
+        session_bus_reconnect_pending = True
+        GLib.timeout_add_seconds(SECONDS_DELAY_SESSION_BUS_RECONNECT, reconnect_session_bus)
+
+# keep the MonitorsChanged subscription alive across session bus restarts
+def reconnect_session_bus():
+    global session_bus_reconnect_pending
+    session_bus_reconnect_pending = False
+    try:
+        get_session_bus()
+    except Exception as e:
+        print(f'Could not connect to the session bus: {e}')
+        schedule_session_bus_reconnect()
+    return False  # a GLib timeout callback, do not repeat
+
+def on_monitors_changed():
+    global last_monitors_change
+    last_monitors_change = time.monotonic()
+
+def schedule_screens_off(delay):
+    global screens_off_source
+    if screens_off_source is not None:
+        GLib.source_remove(screens_off_source)
+    screens_off_source = GLib.timeout_add(max(1, int(delay * 1000)), turn_screens_off_if_lid_closed)
+
 # all screens through Mutter, the external ones too; any input turns them on again
 def set_screens_on(on):
     try:
-        display = SessionBus().get('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig')
+        display = get_session_bus().get('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig')
         mode = MUTTER_POWER_SAVE_ON if on else MUTTER_POWER_SAVE_OFF
         if display.PowerSaveMode != mode:
             print(f'Turning screens {"on" if on else "off"}')
@@ -132,8 +192,23 @@ def set_screens_on(on):
         print(f'Could not turn screens {"on" if on else "off"}: {e}')
 
 def turn_screens_off_if_lid_closed():
-    if not is_lid_open:
-        set_screens_on(False)
+    global screens_off_source
+    screens_off_source = None
+    if is_lid_open:
+        return False
+    # connect first: a new connection resets the settle time for a restarted GNOME Shell
+    try:
+        get_session_bus()
+    except Exception as e:
+        print(f'Could not turn screens off: {e}')
+        return False
+    since_change = time.monotonic() - last_monitors_change
+    if since_change < SECONDS_MONITORS_SETTLE:
+        wait = SECONDS_MONITORS_SETTLE - since_change
+        print(f'Monitors changed {since_change:.1f} seconds ago, turning screens off in {wait:.1f} seconds')
+        schedule_screens_off(wait)
+        return False
+    set_screens_on(False)
     return False  # a GLib timeout callback, do not repeat
 
 def lock_screen():
@@ -205,6 +280,8 @@ is_lid_open = True
 is_on_battery = get_on_battery()
 last_suspend_timestamp = 0
 lid_closed_timer = None
+screens_off_source = None
+last_monitors_change = 0.0
 bus = SystemBus()
 
 upower = bus.get('org.freedesktop.UPower', '/org/freedesktop/UPower')
@@ -227,5 +304,6 @@ bus.subscribe(
 
 print('Starting power trigger...')
 print(f'Currently running on {"battery" if is_on_battery else "AC"} power')
+reconnect_session_bus()
 loop = GLib.MainLoop()
 loop.run()
