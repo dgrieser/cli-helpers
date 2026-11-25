@@ -1,7 +1,7 @@
 {
   "segments": [
     "ssh",
-    "cwd",
+    "~/.config/powerline-shell/segments/cwd_git.py",
     {
       "type": "mycmd",
       "command": ["kube-current", "-s"],

@@ -3560,6 +3560,46 @@ software-582-python-dev-tools@dev() {
 software-583-pip-libs@base() {
     pip_update pip-libs elevenlabs perplexityai pyht slack-bolt keyboard playsound pytapo environs
 }
+# powerline_drop_cwd CONFIG: removes the stock "cwd" segment from the user's prompt
+# config. The shipped segments/cwd_git.py replaced it (the repository name inside
+# a git repository, the path elsewhere), but config-merge only adds list entries,
+# so an older config would show both. Plain "cwd" and {"type": "cwd"} alike
+powerline_drop_cwd() {
+    local config="${1}"
+    local merged
+    # --no-config: config_update did not ship the replacement either
+    [ "${no_config}" -eq 1 ] && return 0
+    [ -f "${config}" ] || return 0
+    merged="$(python3 - "${config}" <<'EOF'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    config = json.load(handle)
+segments = config.get("segments", [])
+
+
+def segment_type(segment):
+    return segment.get("type") if isinstance(segment, dict) else segment
+
+
+types = [segment_type(segment) for segment in segments]
+# only once the replacement is in, so the prompt never loses its directory
+if "cwd" not in types or not any(isinstance(t, str) and t.endswith("/cwd_git.py") for t in types):
+    sys.exit(0)
+config["segments"] = [segment for segment in segments if segment_type(segment) != "cwd"]
+print(json.dumps(config, indent=2))
+EOF
+)" || return 1
+    [ -n "${merged}" ] || return 0
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "${APP_NAME}: would remove the cwd segment from ${config}" 1>&2
+        return 0
+    fi
+    verbose "remove the cwd segment from ${config}"
+    printf '%s\n' "${merged}" | ${SUDO_USER} tee "${config}" > /dev/null
+}
+
 software-584-pip-tools@base() {
     # the own fork, with the mycmd segment the prompt config uses; rsstail is the
     # python one rsstail-jw-music needs (--format, -e), apt's rsstail is another
@@ -3569,6 +3609,7 @@ software-584-pip-tools@base() {
     # the prompt config, with the fork's mycmd and virtual_env segments, and
     # prompt.bash, the prompt functions ~/.bashrc sources
     config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell" || return 1
+    powerline_drop_cwd "${CURRENT_USER_HOME}/.config/powerline-shell/config.json" || return 1
     # the look of streamdown
     config_update streamdown "${CURRENT_USER_HOME}/.config/streamdown"
 }
