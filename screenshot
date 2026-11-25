@@ -166,7 +166,7 @@ if [ ! -d "${document_dir}" ]; then
         --object-path /org/freedesktop/portal/documents \
         --method org.freedesktop.portal.Documents.GetMountPoint >/dev/null 2>&1
     if [ ! -d "${document_dir}" ]; then
-        message="Flatpak document mount unavailable at ${document_dir}. Try: systemctl --user restart xdg-document-portal.service"
+        message="Flatpak document mount unavailable at ${document_dir}. Try: fix-screenshot"
         if command -v notify-send >/dev/null 2>&1; then
             notify-send "Screenshot unavailable" "${message}" >/dev/null 2>&1
         fi

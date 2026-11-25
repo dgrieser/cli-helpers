@@ -20,7 +20,7 @@
 # setup.sh --list lists its steps, setup.sh STEP... runs only those. On a headless
 # system (see headless) it leaves out what only a desktop needs: the steps of
 # GUI_STEPS unless they are named, the gui software of updater, the GNOME
-# extension, the desktop entries and the GNOME part of the VPN plugin.
+# extensions, the desktop entries and the GNOME part of the VPN plugin.
 
 # the step functions are called by their name in STEPS
 # shellcheck disable=SC2329
@@ -407,8 +407,10 @@ install_cli_helpers() {
                 || fail "Failed to install the per-user assets"
         fi
         if command -v gnome-shell > /dev/null 2>&1 && command -v gnome-extensions > /dev/null 2>&1; then
-            run gnome-extensions enable cli-helpers-window-bridge@dgrieser.de \
-                || warning "Could not enable the GNOME extension; log out and back in, then enable it"
+            for uuid in cli-helpers-window-bridge@dgrieser.de cli-helpers-overview-titles@dgrieser.de; do
+                run gnome-extensions enable "${uuid}" \
+                    || warning "Could not enable the GNOME extension ${uuid}; log out and back in, then enable it"
+            done
         fi
     else
         run make -C "${REPO_DIR}" "${target}" "${make_args[@]}" || fail "Failed to run make ${target}"

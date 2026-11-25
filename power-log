@@ -35,4 +35,4 @@ done
 match='Detected lid (open|close)$'
 [ "${all}" -eq 1 ] && match='.'
 
-journalctl --user -u power-trigger.service --no-hostname --since -72h | grep -E "${match}" | sed -E 's/^(.+)power-trigger[^:]+: (.+)$/\1\2/g' | less +G
+journalctl --user -u power-trigger.service --no-hostname --since -7d | grep -E "${match}" | sed -E 's/^(.+)power-trigger[^:]+: (.+)$/\1\2/g' | less +G

@@ -69,13 +69,13 @@ their logins, caches and installed programs, and what only the git repos of `~/w
 `/media/$USER`, `/run/media/$USER` or `/mnt`) to store it on. Before the copy it offers to store the current SSH
 config and the API key of Codeium (of `~/.codeium/config.json` of its Vim plugin, else of `~/.codeium/sublime/codeium-api-key.txt` of its Sublime Text plugin) in the keyring. Ctrl-C in any prompt aborts `setup.sh` and `setup-backup` as a whole.
 
-The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extension used by the window tools on Wayland. Commands that double as importable Python modules (`toage`, `prompt`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
+The repo ships a `Makefile` that installs every executable into `$(PREFIX)/bin` (default `/usr/local/bin`) and shared helpers into `$(PREFIX)/lib/cli-helpers`, and packages/enables the bundled GNOME Shell extensions: `cli-helpers-window-bridge@dgrieser.de`, used by the window and clipboard tools on Wayland, and `cli-helpers-overview-titles@dgrieser.de`, which shows a large title on every window of the overview. Commands that double as importable Python modules (`toage`, `prompt`) are installed a second time as `<name>.py` into `$(PREFIX)/lib/python3/dist-packages`, which `make install` / `make install-links` put on `sys.path` for every `python3` process with `/usr/lib/python3/dist-packages/usr-local-python3.pth` (also under `sudo`, cron and systemd, unlike `PYTHONPATH`), so other tools can import them instead of piping through them.
 
 ```bash
 make list                     # show targets and the full command list
 make update                   # update installed software (use UPDATE_ARGS='--dry-run apt')
 sudo make install-links       # install as symlinks back to this repo (no copy)
-sudo make install             # copy commands + shared helpers + GNOME extension
+sudo make install             # copy commands + shared helpers + GNOME extensions
 sudo make uninstall           # remove installed files
 make list-install             # show install destinations
 ```
@@ -90,6 +90,16 @@ Override paths with `PREFIX=...`, `BINDIR=...`, `LIBDIR=...`, `PYTHONDIR=...`.
 The GNOME extension steps (packaging, installing, enabling) are skipped automatically when no GNOME Shell is
 detected, so the install works unchanged on non-GNOME systems; set `ENABLE_GNOME_EXTENSION=0` to skip them on a
 GNOME system too, or `ENABLE_GNOME_EXTENSION=1` to force them.
+
+The overview titles extension puts the title of each window, centered and large, on its preview in the overview
+(Super), so windows are told apart without hovering them. The first line is the app name; the second line is the
+window title without that app name and without leading status symbols such as the spinner of Claude Code. For a
+terminal (Ptyxis, GNOME Terminal, Console, Ghostty, Terminator), the first line is the running command and the second
+line the title in front of it; without a running command, the first line is the title alone. The title replaces the
+small caption that GNOME shows on hover. Its settings (Extensions app, or
+`gnome-extensions prefs cli-helpers-overview-titles@dgrieser.de`) set the font, the sizes of both lines, the text and
+background colors, the corner radius and the position on the preview (top, center, bottom); changes apply at once.
+GNOME on Wayland loads extension code only at login, so log out and in again after installing or updating it.
 
 `make install` and `make install-links` also install the systemd user timer that keeps the index of
 [`agent-session`](#agent-session) current (`make install-agent-session-timer` on its own): the units
@@ -2620,6 +2630,24 @@ Brings back an I2C-HID touchpad (e.g. of a Framework laptop) that stopped workin
 
 **Usage:** `fix-touchpad`
 
+### `fix-screenshot`
+Brings back the Flatpak document portal that [`screenshot`](#screenshot) (the Print Screen keybinding) needs when it fails with "Flatpak document mount unavailable", without logging out. It closes a running Gradia (its sandbox keeps the old mount), restarts `xdg-document-portal.service`, unmounts a stale FUSE mount of `$XDG_RUNTIME_DIR/doc` left by a crashed portal, and checks that the document mount of Gradia is there again. Does nothing if the mount is already healthy.
+
+**Usage:** `fix-screenshot [OPTIONS]`
+
+| Argument / Flag | Description |
+|---|---|
+| `-f, --force` | Restart the portal even if the mount looks healthy. |
+| `-h, --help` | Show the help message and exit. |
+
+Environment: `SCREENSHOT_APP_ID` (Flatpak app ID, defaults to `be.alexandervanhee.gradia`).
+
+**Examples:**
+```bash
+fix-screenshot
+fix-screenshot --force
+```
+
 ### `bluetooth-trigger`
 Listens on the system D-Bus for BlueZ Bluetooth device add/remove events and prints the device object path as each device appears or disappears (with commented-out scaffolding for triggering actions on a specific MAC address).
 
@@ -3329,7 +3357,7 @@ Takes an interactive screenshot with the Gradia Flatpak editor and starts a watc
 
 Environment: `SCREENSHOT_APP_ID` (Flatpak app ID, defaults to `be.alexandervanhee.gradia`), `SCREENSHOT_IDLE`, `SCREENSHOT_POLL` and `SCREENSHOT_STARTUP` set the same values as the corresponding flags.
 
-If the Flatpak document mount is unavailable, the launcher reports the error and shows a desktop notification when `notify-send` is installed. Restart the user document portal with `systemctl --user restart xdg-document-portal.service`, then try Print Screen again.
+If the Flatpak document mount is unavailable, the launcher reports the error and shows a desktop notification when `notify-send` is installed. Run [`fix-screenshot`](#fix-screenshot) to bring the portal back, then try Print Screen again.
 
 **Examples:**
 ```bash

@@ -1,0 +1,10 @@
+/* colors, fonts and corner radius come from the settings, as inline styles */
+.cli-helpers-overview-title {
+  padding: 10px 22px;
+  spacing: 2px;
+}
+
+.cli-helpers-overview-title-heading,
+.cli-helpers-overview-title-body {
+  text-align: center;
+}

@@ -31,9 +31,12 @@ ENABLE_GNOME_EXTENSION ?= $(HAVE_GNOME)
 INSTALL_USER_ASSETS ?= 1
 UPDATE_ARGS ?=
 
-EXTENSION_UUID := cli-helpers-window-bridge@dgrieser.de
-EXTENSION_DIR := gnome-shell-extension/$(EXTENSION_UUID)
-EXTENSION_ZIP ?= /tmp/$(EXTENSION_UUID).shell-extension.zip
+# the GNOME extensions, one folder each under $(EXTENSION_SRCDIR): the window
+# bridge of the window and clipboard tools, and the titles of the overview
+EXTENSION_SRCDIR := gnome-shell-extension
+EXTENSION_UUIDS := cli-helpers-window-bridge@dgrieser.de cli-helpers-overview-titles@dgrieser.de
+# the folder the extension zips are packaged into, one <uuid>.shell-extension.zip each
+EXTENSION_ZIPDIR ?= /tmp
 SHAREDDIR := lib/cli-helpers
 SHARED := lib-desktop lib-clipboard gnome-clipboard-bridge gnome-display-config gnome-window-bridge gnome-window-place config-merge local-config pip-packages chrome-profile browser-audio-record.js \
 	terminal-cell-size ptyxis-window
@@ -151,10 +154,12 @@ install: check-dirs
 	done
 	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
 		if command -v gnome-extensions >/dev/null 2>&1; then \
-			gnome-extensions enable "$(EXTENSION_UUID)" || \
-				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
+			for uuid in $(EXTENSION_UUIDS); do \
+				gnome-extensions enable "$$uuid" || \
+					echo "WARNING: Could not enable $$uuid. You may need to restart GNOME Shell or run: gnome-extensions enable $$uuid" 1>&2; \
+			done; \
 		else \
-			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUID) manually after install." 1>&2; \
+			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUIDS) manually after install." 1>&2; \
 		fi; \
 	else \
 		echo "Skipping GNOME extension enable step."; \
@@ -193,19 +198,32 @@ install-links: check-dirs
 	done
 	if [ "$(INSTALL_USER_ASSETS)" != "0" ] && [ -z "$(DESTDIR)" ] && [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
 		if command -v gnome-extensions >/dev/null 2>&1; then \
-			gnome-extensions enable "$(EXTENSION_UUID)" || \
-				echo "WARNING: Could not enable $(EXTENSION_UUID). You may need to restart GNOME Shell or run: gnome-extensions enable $(EXTENSION_UUID)" 1>&2; \
+			for uuid in $(EXTENSION_UUIDS); do \
+				gnome-extensions enable "$$uuid" || \
+					echo "WARNING: Could not enable $$uuid. You may need to restart GNOME Shell or run: gnome-extensions enable $$uuid" 1>&2; \
+			done; \
 		else \
-			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUID) manually after install." 1>&2; \
+			echo "WARNING: gnome-extensions not found; enable $(EXTENSION_UUIDS) manually after install." 1>&2; \
 		fi; \
 	else \
 		echo "Skipping GNOME extension enable step."; \
 	fi
 	$(MAKE) --no-print-directory default-browser-hint
 
+# an extension with settings ships its compiled schemas; they are compiled in a
+# copy of its folder, so the repo holds no build output
 extension-zip:
-	rm -f "$(EXTENSION_ZIP)"
-	cd "$(EXTENSION_DIR)" && zip -r "$(EXTENSION_ZIP)" .
+	for uuid in $(EXTENSION_UUIDS); do \
+		zip="$(EXTENSION_ZIPDIR)/$$uuid.shell-extension.zip"; \
+		rm -f "$$zip"; \
+		stage="$$(mktemp -d)" || exit 1; \
+		cp -r "$(EXTENSION_SRCDIR)/$$uuid/." "$$stage" && \
+			{ [ ! -d "$$stage/schemas" ] || glib-compile-schemas --strict "$$stage/schemas"; } && \
+			(cd "$$stage" && zip -r "$$zip" .); \
+		status=$$?; \
+		rm -rf "$$stage"; \
+		[ "$$status" -eq 0 ] || exit 1; \
+	done
 
 # the zip is only built when the extension is actually going to be installed,
 # so non-GNOME systems need neither gnome-extensions nor zip
@@ -213,9 +231,12 @@ install-gnome-extension: $(if $(filter 0,$(ENABLE_GNOME_EXTENSION)),,extension-z
 	if [ "$(ENABLE_GNOME_EXTENSION)" = "0" ]; then \
 		echo "Skipping GNOME extension install."; \
 	else \
-		gnome-extensions install --force "$(EXTENSION_ZIP)"; \
-		status=$$?; \
-		rm -f "$(EXTENSION_ZIP)"; \
+		status=0; \
+		for uuid in $(EXTENSION_UUIDS); do \
+			zip="$(EXTENSION_ZIPDIR)/$$uuid.shell-extension.zip"; \
+			gnome-extensions install --force "$$zip" || status=1; \
+			rm -f "$$zip"; \
+		done; \
 		exit $$status; \
 	fi
 
@@ -387,7 +408,9 @@ uninstall: uninstall-agent-session-timer
 		update-desktop-database "$(DESKTOPDIR)" || true; \
 	fi
 	if [ "$(ENABLE_GNOME_EXTENSION)" != "0" ]; then \
-		gnome-extensions uninstall "$(EXTENSION_UUID)" || true; \
+		for uuid in $(EXTENSION_UUIDS); do \
+			gnome-extensions uninstall "$$uuid" || true; \
+		done; \
 	fi
 
 list-install:
@@ -398,9 +421,10 @@ list-install:
 	@printf 'Python modules -> %s (on sys.path via %s)\n' "$(DESTDIR)$(PYTHONDIR)" "$(DESTDIR)$(PTHFILE)"
 	@printf '%s\n' $(MODULES) | sed 's#^#  #;s#$$#.py#'
 ifeq ($(ENABLE_GNOME_EXTENSION),0)
-	@printf 'GNOME extension -> skipped\n'
+	@printf 'GNOME extensions -> skipped\n'
 else
-	@printf 'GNOME extension -> gnome-extensions install --force %s\n' "$(EXTENSION_ZIP)"
+	@printf 'GNOME extensions -> gnome-extensions install --force\n'
+	@printf '%s\n' $(EXTENSION_UUIDS) | sed 's#^#  $(EXTENSION_SRCDIR)/#'
 endif
 	@printf 'Bash completion -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
 	@printf '  %s (one symlink per command)\n' "$(COMPLETION)"

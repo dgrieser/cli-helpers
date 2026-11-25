@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.cli-helpers-overview-titles"
+          path="/org/gnome/shell/extensions/cli-helpers-overview-titles/">
+    <key name="font-family" type="s">
+      <default>'monospace'</default>
+      <summary>Font family of the title</summary>
+    </key>
+    <key name="heading-font-size" type="i">
+      <range min="6" max="96"/>
+      <default>26</default>
+      <summary>Font size of the first line, in pixels</summary>
+    </key>
+    <key name="body-font-size" type="i">
+      <range min="6" max="96"/>
+      <default>20</default>
+      <summary>Font size of the second line, in pixels</summary>
+    </key>
+    <key name="text-color" type="s">
+      <default>'rgba(255,255,255,1)'</default>
+      <summary>Text color, as a CSS color</summary>
+    </key>
+    <key name="background-color" type="s">
+      <default>'rgba(0,0,0,0.82)'</default>
+      <summary>Background color of the box, as a CSS color</summary>
+    </key>
+    <key name="corner-radius" type="i">
+      <range min="0" max="64"/>
+      <default>16</default>
+      <summary>Corner radius of the box, in pixels</summary>
+    </key>
+    <key name="position" type="s">
+      <choices>
+        <choice value="top"/>
+        <choice value="center"/>
+        <choice value="bottom"/>
+      </choices>
+      <default>'center'</default>
+      <summary>Vertical position of the title on the window preview</summary>
+    </key>
+  </schema>
+</schemalist>

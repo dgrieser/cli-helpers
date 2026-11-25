@@ -1,0 +1,135 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+APP_ID="${SCREENSHOT_APP_ID:-be.alexandervanhee.gradia}"
+UNIT="xdg-document-portal.service"
+DOC_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}/doc"
+force=0
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Bring back the Flatpak document portal that screenshot (the Print Screen
+keybinding) needs, without logging out: close a running Gradia, restart
+${UNIT} (unmounting a stale ${DOC_DIR} first), and check that
+the document mount of Gradia is there again.
+
+Options:
+  -f, --force           Restart the portal even if the mount looks healthy
+  -h, --help            Show this help message and exit
+
+Environment:
+  SCREENSHOT_APP_ID     Flatpak app ID (default: be.alexandervanhee.gradia)
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# ask the portal for its mount point, which activates it over D-Bus if needed
+activate_portal() {
+    gdbus call --session --timeout 5 --dest org.freedesktop.portal.Documents \
+        --object-path /org/freedesktop/portal/documents \
+        --method org.freedesktop.portal.Documents.GetMountPoint >/dev/null 2>&1
+}
+
+app_mount_ok() {
+    [ -d "${DOC_DIR}/by-app/${APP_ID}" ]
+}
+
+doc_mounted() {
+    findmnt --mountpoint "${DOC_DIR}" >/dev/null 2>&1
+}
+
+unmount_doc() {
+    local cmd
+    for cmd in fusermount3 fusermount; do
+        if command -v "${cmd}" >/dev/null 2>&1; then
+            "${cmd}" -uz "${DOC_DIR}" 2>/dev/null && return 0
+        fi
+    done
+    return 1
+}
+
+app_running() {
+    flatpak ps --columns=application 2>/dev/null | grep -qx "${APP_ID}"
+}
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        --bash-completion)
+            echo "--force"
+            echo "--help"
+            exit 0
+            ;;
+        -f|--force)
+            force=1
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+
+for cmd in flatpak gdbus systemctl findmnt; do
+    command -v "${cmd}" >/dev/null 2>&1 || fail "'${cmd}' not found."
+done
+flatpak info "${APP_ID}" >/dev/null 2>&1 || fail "Flatpak app '${APP_ID}' is not installed."
+
+if [ "${force}" -eq 0 ]; then
+    activate_portal
+    if app_mount_ok; then
+        echo "Document mount of ${APP_ID} is healthy, nothing to do (use --force to restart anyway)"
+        exit 0
+    fi
+fi
+
+# a running sandbox keeps the old mount, so Gradia has to start again
+if app_running; then
+    echo "Closing ${APP_ID}"
+    if command -v screenshot >/dev/null 2>&1; then
+        SCREENSHOT_APP_ID="${APP_ID}" screenshot --close
+    else
+        flatpak kill "${APP_ID}" >/dev/null 2>&1
+    fi
+fi
+systemctl --user stop screenshot-autoclose.service >/dev/null 2>&1
+
+echo "Restarting ${UNIT}"
+systemctl --user stop "${UNIT}" || fail "Cannot stop ${UNIT}"
+# a portal that died leaves its FUSE mount behind ("Transport endpoint is not
+# connected"), and the new one cannot mount over it
+if doc_mounted; then
+    unmount_doc || error "Cannot unmount ${DOC_DIR}"
+fi
+systemctl --user reset-failed "${UNIT}" >/dev/null 2>&1
+systemctl --user start "${UNIT}" || fail "Cannot start ${UNIT}"
+activate_portal
+
+# the by-app folder of an app appears on its first lookup
+waited=0
+until app_mount_ok; do
+    [ "${waited}" -ge 5 ] && fail "Document mount of ${APP_ID} still missing at ${DOC_DIR}/by-app/${APP_ID}. Log out and back in."
+    sleep 1
+    waited=$((waited + 1))
+done
+
+echo "Done, Print Screen works again"

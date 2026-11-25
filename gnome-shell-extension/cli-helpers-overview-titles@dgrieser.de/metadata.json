@@ -1,0 +1,11 @@
+{
+  "uuid": "cli-helpers-overview-titles@dgrieser.de",
+  "name": "CLI Helpers Overview Titles",
+  "description": "Shows a large, always visible title on every window preview of the overview.",
+  "shell-version": [
+    "48",
+    "49",
+    "50"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.cli-helpers-overview-titles"
+}
