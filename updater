@@ -3547,19 +3547,6 @@ software-565-rustup@dev() {
     curl -fsSL "https://sh.rustup.rs" | ${SUDO_USER} sh -s -- -y --no-modify-path
 }
 software-570-gitlab-timelogs@dev() { cargo_install_update gitlab-timelogs; }
-software-580-python-libs@base() {
-    apt_upgrade python3-anthropic python3-openai python3-pandas python3-pyautogui python3-sounddevice \
-        python3-soundfile python3-piexif python3-croniter python3-parse python3-sh
-}
-software-581-python-tools@base() { apt_upgrade glances weasyprint python3-msoffcrypto-tool python3-shtab; }
-software-582-python-dev-tools@dev() {
-    apt_upgrade python3-pytest python3-pytest-asyncio python3-pyinstrument python3-icalendar \
-        python3-recurring-ical-events mkdocs-material
-}
-# the libraries of the own scripts
-software-583-pip-libs@base() {
-    pip_update pip-libs elevenlabs perplexityai pyht slack-bolt keyboard playsound pytapo environs
-}
 # powerline_drop_cwd CONFIG: removes the stock "cwd" segment from the user's prompt
 # config. The shipped segments/cwd_git.py replaced it (the repository name inside
 # a git repository, the path elsewhere), but config-merge only adds list entries,
@@ -3600,16 +3587,39 @@ EOF
     printf '%s\n' "${merged}" | ${SUDO_USER} tee "${config}" > /dev/null
 }
 
-software-584-pip-tools@base() {
-    # the own fork, with the mycmd segment the prompt config uses; rsstail is the
-    # python one rsstail-jw-music needs (--format, -e), apt's rsstail is another
-    # program with another CLI
-    pip_update pip-tools streamdown "powerline-shell @ git+https://github.com/dgrieser/powerline-shell.git" \
-        csv2md markdown-to-mrkdwn oletools rsstail || return 1
-    # the prompt config, with the fork's mycmd and virtual_env segments, and
-    # prompt.bash, the prompt functions ~/.bashrc sources
+# the prompt; numbered before pip-libs and pip-tools, so on the first run its own
+# manifest is in before pip-tools drops powerline-shell from its one, and the
+# pip-packages folder never loses it
+# the own fork, with the mycmd segment the prompt config uses
+POWERLINE_SHELL_PIP="powerline-shell @ git+https://github.com/dgrieser/powerline-shell.git"
+software-579-powerline-shell@base() {
+    pip_update powerline-shell "${POWERLINE_SHELL_PIP}" || return 1
+    # the prompt config, with the fork's mycmd and virtual_env segments and the
+    # own cwd_git segment, and prompt.bash, the prompt functions ~/.bashrc sources
     config_update powerline-shell "${CURRENT_USER_HOME}/.config/powerline-shell" || return 1
-    powerline_drop_cwd "${CURRENT_USER_HOME}/.config/powerline-shell/config.json" || return 1
+    powerline_drop_cwd "${CURRENT_USER_HOME}/.config/powerline-shell/config.json"
+}
+software-580-python-libs@base() {
+    apt_upgrade python3-anthropic python3-openai python3-pandas python3-pyautogui python3-sounddevice \
+        python3-soundfile python3-piexif python3-croniter python3-parse python3-sh
+}
+software-581-python-tools@base() { apt_upgrade glances weasyprint python3-msoffcrypto-tool python3-shtab; }
+software-582-python-dev-tools@dev() {
+    apt_upgrade python3-pytest python3-pytest-asyncio python3-pyinstrument python3-icalendar \
+        python3-recurring-ical-events mkdocs-material
+}
+# the libraries of the own scripts
+software-583-pip-libs@base() {
+    pip_update pip-libs elevenlabs perplexityai pyht slack-bolt keyboard playsound pytapo environs
+}
+software-584-pip-tools@base() {
+    # rsstail is the python one rsstail-jw-music needs (--format, -e), apt's
+    # rsstail is another program with another CLI
+    local -a packages=(streamdown csv2md markdown-to-mrkdwn oletools rsstail)
+    # powerline-shell moved to its own step; kept here until that step wrote its
+    # manifest, so a run of pip-tools alone does not uninstall the prompt
+    [ -f /usr/local/lib/python3/pip-packages.d/powerline-shell.txt ] || packages+=("${POWERLINE_SHELL_PIP}")
+    pip_update pip-tools "${packages[@]}" || return 1
     # the look of streamdown
     config_update streamdown "${CURRENT_USER_HOME}/.config/streamdown"
 }

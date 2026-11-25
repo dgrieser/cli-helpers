@@ -1,6 +1,6 @@
 # The cwd segment of the prompt, but inside a git repository it shows only the
-# name of the repository instead of the path. Outside one it is the stock cwd
-# segment, with its settings ("cwd" in config.json).
+# name of the repository, after a git logo, instead of the path. Outside one it
+# is the stock cwd segment, with its settings ("cwd" in config.json).
 # The repository name comes from the common git dir, so a linked worktree (e.g.
 # ~/workspace.worktree/<repo path>/<branch>) shows the name of its main tree, not
 # its branch folder; a submodule, whose git dir lives in the parent's
@@ -12,6 +12,9 @@ import subprocess
 
 from powerline_shell.segments.cwd import add_cwd_segment
 from powerline_shell.utils import ThreadedSegment
+
+# nf-fa-git
+GIT_ICON = u""
 
 
 def git_repo_name(cwd):
@@ -41,4 +44,7 @@ class Segment(ThreadedSegment):
             add_cwd_segment(self.powerline)
             return
         theme = self.powerline.theme
+        # the git logo (Font Awesome, needs a Nerd Font) in the colors of the
+        # home part "~" the path starts with outside a repository
+        self.powerline.append(" %s " % GIT_ICON, theme.HOME_FG, theme.HOME_BG)
         self.powerline.append(" %s " % self.repo, theme.CWD_FG, theme.PATH_BG)

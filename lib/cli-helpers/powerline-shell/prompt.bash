@@ -1,5 +1,5 @@
 # The bash prompt of powerline-shell, sourced by ~/.bashrc; installed by updater
-# (software pip-tools) together with config.json. launcher-terminal replaces
+# (software powerline-shell) together with config.json. launcher-terminal replaces
 # _powerline_ps1 with its short prompt (launcher/bash/bashrc).
 
 ### PS1 settings
