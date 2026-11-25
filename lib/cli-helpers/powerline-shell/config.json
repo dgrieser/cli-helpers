@@ -25,7 +25,8 @@
       "fg_color": "$POWERLINE_VENV_FG",
       "bg_color": "$POWERLINE_VENV_BG"
     },
-    "root"
+    "root",
+    "~/.config/powerline-shell/segments/title.py"
   ],
   "mode": "patched",
   "vcs": {

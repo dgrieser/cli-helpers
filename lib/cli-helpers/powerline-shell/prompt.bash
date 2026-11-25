@@ -27,16 +27,8 @@ function _powerline_ps1()
     # checked here, not when sourced: ~/.bashrc puts ~/.local/bin on PATH later;
     # without powerline-shell (not installed yet) the prompt stays as it is
     command -v powerline-shell > /dev/null || return
+    # the window title comes with it (segments/title.py)
     PS1=$(powerline-shell $status)
-    new_title="$(dirs)"
-    kctx="$(kube-current -s -n)"
-    [ -n "${kctx}" ] && new_title="${new_title} [${kctx}]"
-    title "${new_title}"
-}
-
-function title()
-{
-   echo -en "\e]2;$1\a"
 }
 
 
