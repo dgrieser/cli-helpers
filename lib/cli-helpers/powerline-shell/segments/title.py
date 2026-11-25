@@ -1,8 +1,8 @@
 # The window title, set by the prompt itself: powerline-shell puts the escape
 # sequence into PS1, so the shell runs no command of its own for it. The title
-# is what the cwd_git segment shows (the repository name inside a git
-# repository, the path with ~ for the home elsewhere), followed by the kube
-# context in brackets when the prompt shows one.
+# is what the cwd_git segment shows (inside a git repository its name, with the
+# branch in parentheses; elsewhere the path with ~ for the home), followed by
+# the kube context in brackets when the prompt shows one.
 # Nothing is looked up twice: this segment goes last in config.json, so the
 # others are done and it reads their results; the title goes first into the
 # prompt, where it takes no colors and leaves the separators alone.
@@ -58,7 +58,12 @@ class Segment(BasicSegment):
         if shell not in TITLE_TEMPLATES or os.getenv("TERM") == "linux":
             return
         # set by cwd_git; None outside a repository, missing without cwd_git
-        title = getattr(powerline, "git_repo", None) or replace_home_dir(powerline.cwd)
+        repo = getattr(powerline, "git_repo", None)
+        branch = getattr(powerline, "git_branch", None)
+        if repo:
+            title = "%s (%s)" % (repo, branch) if branch else repo
+        else:
+            title = replace_home_dir(powerline.cwd)
         kube = kube_context(powerline)
         if kube:
             title = "%s [%s]" % (title, kube)

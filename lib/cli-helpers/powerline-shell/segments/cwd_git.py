@@ -1,5 +1,5 @@
 # The cwd segment of the prompt, but inside a git repository it shows only the
-# name of the repository, after a ">_" icon, instead of the path. Outside one it
+# name of the repository, after the git logo, instead of the path. Outside one it
 # is the stock cwd segment, with its settings ("cwd" in config.json).
 # The repository name comes from the common git dir, so a linked worktree (e.g.
 # ~/workspace.worktree/<repo path>/<branch>) shows the name of its main tree, not
@@ -14,10 +14,17 @@ import subprocess
 from powerline_shell.segments.cwd import add_cwd_segment
 from powerline_shell.utils import ThreadedSegment
 
-# a shell prompt for a repository, in plain characters, no font needed
-REPO_ICON = ">_"
-# turquoise (#00afaf), one of the 256 terminal colors powerline-shell takes
-REPO_BG = 37
+# the git logo, nf-fa-git (Font Awesome, needs a Nerd Font)
+REPO_ICON = u"\uf1d3"
+# the logo's cells (space, logo, space) fade from a light to a dark git orange,
+# one background each, in 24-bit color
+REPO_FADE = ((0xF5, 0x73, 0x4F), (0xC8, 0x38, 0x1E))
+# the closest of the 256 terminal colors (#d75f5f), all powerline-shell takes:
+# the whole segment's background where the terminal has no 24-bit color, and
+# the one a segment before it (ssh) draws its separator on
+REPO_BG = 167
+# the terminals that say they show 24-bit color
+TRUECOLOR = ("truecolor", "24bit")
 
 
 def escape_bash(text):
@@ -29,31 +36,68 @@ def escape_bash(text):
     return re.sub(r"[\\`$]", lambda m: "\\\\" + ("\\\\" if m.group() == "\\" else m.group()), text)
 
 
-def git_repo_name(cwd):
+def fade_cells(powerline, cells, fg):
+    """The cells, each on its own background, stepping from the first color of
+    REPO_FADE to the second; the foreground stays on the last color after them,
+    so the separator that follows takes it."""
+    (r1, g1, b1), (r2, g2, b2) = REPO_FADE
+    steps = max(len(cells) - 1, 1)
+    out = [powerline.fgcolor(fg)]
+    for i, cell in enumerate(cells):
+        rgb = (r1 + (r2 - r1) * i // steps, g1 + (g2 - g1) * i // steps, b1 + (b2 - b1) * i // steps)
+        out.append(powerline.color_template % ("[48;2;%d;%d;%dm" % rgb))
+        out.append(cell)
+    out.append(powerline.color_template % ("[38;2;%d;%d;%dm" % (r2, g2, b2)))
+    return "".join(out)
+
+
+def git_branch(git_dir):
+    """The branch HEAD is on, read from the HEAD file, so it costs no second git
+    run; the short commit when detached, None when unreadable."""
+    try:
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as handle:
+            head = handle.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if head.startswith("ref: "):
+        ref = head[len("ref: "):]
+        return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    return head[:7] or None
+
+
+def git_repo(cwd):
+    """The name of the repository and its branch, (None, None) outside one."""
     try:
         out = subprocess.check_output(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel",
+             "--git-dir"],
             cwd=cwd, stderr=subprocess.DEVNULL).decode("utf-8")
     except (subprocess.CalledProcessError, OSError, UnicodeDecodeError):
         # not in a repository, inside .git (no toplevel) or no git at all
-        return None
+        return None, None
     lines = out.splitlines()
-    if len(lines) != 2:
-        return None
-    common_dir, toplevel = lines
+    if len(lines) != 3:
+        return None, None
+    common_dir, toplevel, git_dir = lines
     if os.path.basename(common_dir) == ".git":
-        return os.path.basename(os.path.dirname(common_dir))
-    return os.path.basename(toplevel) or None
+        name = os.path.basename(os.path.dirname(common_dir))
+    else:
+        name = os.path.basename(toplevel)
+    if not name:
+        return None, None
+    # a linked worktree has its own HEAD in its own git dir
+    return name, git_branch(git_dir)
 
 
 class Segment(ThreadedSegment):
     def run(self):
-        self.repo = git_repo_name(self.powerline.cwd)
+        self.repo, self.branch = git_repo(self.powerline.cwd)
 
     def add_to_powerline(self):
         self.join()
         # for the title segment, which goes after this one
         self.powerline.git_repo = self.repo
+        self.powerline.git_branch = self.branch
         if not self.repo:
             add_cwd_segment(self.powerline)
             return
@@ -62,5 +106,11 @@ class Segment(ThreadedSegment):
         if self.powerline.args.shell == "bash":
             repo = escape_bash(repo)
         # the icon where the path outside a repository starts with its home part "~"
-        self.powerline.append(" %s " % REPO_ICON, theme.HOME_FG, REPO_BG, sanitize=False)
+        if os.getenv("COLORTERM") in TRUECOLOR:
+            # the cells bring their own colors; no separator color, so the arrow
+            # keeps the foreground the fade ends on
+            content = fade_cells(self.powerline, [" ", REPO_ICON, " "], theme.HOME_FG)
+            self.powerline.segments.append((content, None, REPO_BG, self.powerline.separator, None))
+        else:
+            self.powerline.append(" %s " % REPO_ICON, theme.HOME_FG, REPO_BG, sanitize=False)
         self.powerline.append(" %s " % repo, theme.CWD_FG, theme.PATH_BG, sanitize=False)
