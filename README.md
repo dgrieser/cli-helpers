@@ -34,7 +34,8 @@ Setup then installs `gh` and
 `glab` and asks you to log in with them (before the `glab` login to the configured GitLab host it asks you to dial the VPN
 when the host is not reachable, using `work-link` if configured, and then offers the `glab` login to gitlab.com), sets up
 `glab` as the Docker credential helper of the registries of the hosts it is logged in to (`updater glab-docker`: `glab
-auth configure-docker`, without the configured private registries, so `docker login` and `docker logout` work for them), stores the
+auth configure-docker`, without the configured private registries, so `docker login` and `docker logout` work for them), sets up
+`go-auth-glab` as the `GOAUTH` of Go, so private Go modules on those hosts resolve with the token of `glab` (`updater go-auth-glab`, which installs Go first when it is missing), stores the
 host key of the configured SSH host in `~/.ssh/known_hosts` (through the VPN when needed; that host can use `sshpass`,
 which fails silently on an unknown host key), restores the session of Sublime Text (its open windows
 and tabs with their unsaved text, asking you to close Sublime Text first when it runs), restores the profile of Google Chrome
@@ -1685,6 +1686,22 @@ Takes no arguments.
 go-run
 ```
 
+### `go-auth-glab`
+A `GOAUTH` command of Go: authenticates go-import lookups and module downloads against the GitLab hosts `glab` is logged in to, with the token `glab` keeps in its config or the keyring (`glab auth git-credential`). GitLab answers an anonymous go-import lookup of a module in a nested group with a cut-off repository path, so such modules need credentials; this way they come from `glab` instead of a token in `~/.netrc`. Go runs it once without a URL before its first HTTPS fetch, and it prints an `Authorization` header for every host `glab` has a token for. After a 4xx response Go runs it again with the URL and the response on stdin, and it prints the header of that host only. A host without a token, or a missing `glab`, gives no credentials and no failure, so Go still fetches everything else. `updater go-auth-glab` sets it up, with `netrc` after it for the other hosts.
+
+**Usage:** `go-auth-glab [URL]`
+
+| Argument / Flag | Description |
+|---|---|
+| `URL` | The URL of a failed fetch; only its host gets credentials. |
+| `-h, --help` | Show usage and exit. |
+
+**Examples:**
+```bash
+go env -w GOAUTH="$(command -v go-auth-glab);netrc"
+GOAUTH="$(command -v go-auth-glab);netrc" go mod download
+```
+
 ### `bump-version`
 Increments the lowest meaningful numeric component of a version string, preferring the build segment, then the prerelease segment, then a plain integer version, and otherwise bumping the semver patch level; the new version is printed to stdout.
 
@@ -2575,6 +2592,8 @@ A repo that breaks `apt-get update` does not fail every apt install after it: wh
 Secrets stay in the GNOME keyring, never in the repo: `updater opencode` writes the API keys stored with `secret-tool store --label="opencode PROVIDER" service opencode provider PROVIDER` into `~/.local/share/opencode/auth.json` (mode `600`), and keeps the other entries there, e.g. logins. `updater aws` does the same for S3 access keys: each item stored as `service aws profile PROFILE endpoint URL`, whose secret is the `credential_process` JSON (`{"Version": 1, "AccessKeyId": "...", "SecretAccessKey": "..."}`), becomes a profile of `~/.aws/config` with `credential_process = secret-tool lookup service aws profile PROFILE` and `endpoint_url`, so the keys are read from the keyring on each call and never written to a file. `setup-backup` copies them with the keyring files, so `setup.sh` hands them over to a new machine before the updater runs.
 
 `updater hardware` blacklists the driver of a built-in device that is never used (the WWAN modem's `iosm`) only on a machine that has such a device, and keeps WirePlumber away from the audio of the USB-C dock and the webcam, and from an AMD GPU's HDMI audio where there is one.
+
+`updater go-auth-glab` (in the groups `dev` and `mw`) sets `go-auth-glab;netrc` as the `GOAUTH` of Go (`go env -w`), so private Go modules on the GitLab hosts of `glab` resolve with the token `glab` keeps in the keyring, without a token in `~/.netrc`. Go takes the credentials of a host from the first command that has them, so `~/.netrc` still serves the other hosts. A `GOAUTH` of your own other than the default `netrc` is kept.
 
 A software whose tools are missing installs them first, once per run: e.g. `updater atoss-cli` on a new machine installs the base packages and `glab` before it, `npm` software gets `nodejs`, `go install` tools get `go`. Releases from GitHub need a `gh auth login`, those from private GitLab hosts a `glab auth login`; `updater` stops with that hint when the login is missing.
 

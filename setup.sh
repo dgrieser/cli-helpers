@@ -5,7 +5,7 @@
 # with its DNS (the files of lib/cli-helpers/etc in /etc, also the DNS, build cache limit and the plugin refusing privileged containers of docker,
 # wifi power save off and access to Keychron keyboards), the 6 GHz fix for the MediaTek MT7922,
 # the base software, gh and glab with their logins (glab to the configured GitLab host and,
-# if you like, gitlab.com), the configured SSH host key, the keys of
+# if you like, gitlab.com, and for the registries of docker and the private modules of Go), the configured SSH host key, the keys of
 # ~/.ssh/authorized_keys that may log in over SSH, the dotfiles of
 # bash_aliases.d (asking for missing SSH keys and history backups), the reminders
 # of reminder, the lists of the configured Kubernetes directory, the Downloads folder, the session of Sublime Text, the profile of
@@ -88,7 +88,7 @@ STEPS=(
     # after etc, so the reconnect applies its power save setting, and before the
     # VPN is dialed for the glab login, as the driver reload drops the wifi
     "wifi          fix_wifi              -      migrate the old Wi-Fi rule, fix MT7922 6 GHz, and apply the configured AX210 5 GHz profile"
-    "gh-glab       install_gh_glab       -      gh and glab with their logins"
+    "gh-glab       install_gh_glab       -      gh and glab with their logins, glab for the registries of docker and the private modules of Go"
     "ssh-host      store_work_ssh_key     -      the configured work SSH host key"
     "ssh           restore_ssh           backup the keys of ~/.ssh/authorized_keys, which may log in to this machine over SSH"
     "sublime       restore_sublime       backup the session of Sublime Text"
@@ -806,6 +806,9 @@ install_gh_glab() {
     command -v glab > /dev/null 2>&1 && login_gitlab gitlab.com optional
     # after the logins, as glab auth configure-docker only sets up their hosts
     command -v glab > /dev/null 2>&1 && run_updater glab-docker
+    # go-auth-glab as the GOAUTH of Go, so private Go modules on the GitLab
+    # hosts of glab resolve with its token; installs Go first when it is missing
+    command -v glab > /dev/null 2>&1 && run_updater go-auth-glab
 }
 
 # Ensure the configured SSH host key is available for noninteractive logins.

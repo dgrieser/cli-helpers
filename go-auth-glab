@@ -1,0 +1,106 @@
+#!/bin/bash
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [URL]
+
+A GOAUTH command of Go that authenticates go-import and module downloads
+against the GitLab hosts glab is logged in to, with the token glab keeps in
+its config or the keyring (glab auth git-credential). So private modules of
+nested GitLab groups resolve without a token in ~/.netrc.
+
+Set it up with: go env -w GOAUTH="\$(command -v ${APP_NAME});netrc"
+Go takes the credentials of a host from the first GOAUTH command that has
+them, so ~/.netrc still serves the hosts glab does not know.
+
+Go runs it once with no URL before its first HTTPS fetch: it prints the
+credentials of every host glab has a token for. After a 4xx response Go runs
+it again with the URL and the response on stdin: it prints the credentials
+of the host of that URL only. A host without a token, or glab missing, gives
+no credentials and no failure, so Go still fetches everything else.
+
+Options:
+  -h, --help    Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+# glab_hosts: the hosts of the glab config, one per line
+glab_hosts() {
+    local config_dir="${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/glab-cli}"
+    awk '/^hosts:/ { in_hosts = 1; indent = ""; next }
+        !in_hosts || /^[ \t]*(#|$)/ { next }
+        /^[^ \t]/ { in_hosts = 0; next }
+        { match($0, /^[ \t]+/); this = substr($0, 1, RLENGTH) }
+        indent == "" { indent = this }
+        this == indent { sub(/^[ \t]+/, ""); sub(/:[ \t]*$/, ""); gsub(/["\047]/, ""); print }' \
+        "${config_dir}/config.yml" 2>/dev/null
+}
+
+# print_credentials HOST: prints the credential set of HOST for Go, nothing
+# when glab has no token for it
+print_credentials() {
+    local host="${1}" line username="" password=""
+    while IFS= read -r line; do
+        case "${line}" in
+            username=*) username="${line#username=}" ;;
+            password=*) password="${line#password=}" ;;
+        esac
+    done < <(printf 'protocol=https\nhost=%s\n\n' "${host}" | glab auth git-credential get 2>/dev/null)
+    [ -n "${username}" ] && [ -n "${password}" ] || return 0
+    printf 'https://%s/\n\nAuthorization: Basic %s\n\n' "${host}" \
+        "$(printf '%s:%s' "${username}" "${password}" | base64 -w 0)"
+}
+
+url=""
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            [ -n "${url}" ] && { error "Unexpected argument: ${1}"; usage; }
+            url="${1}"
+            ;;
+    esac
+    shift
+done
+
+host=""
+if [ -n "${url}" ]; then
+    [[ "${url}" == https://* ]] || fail "Not an HTTPS URL: ${url}"
+    host="${url#https://}"
+    host="${host%%/*}"
+    host="${host##*@}"
+    # Go writes the failed response to stdin; read it so Go never sees a broken pipe
+    [ -t 0 ] || cat > /dev/null
+fi
+
+if ! command -v glab > /dev/null 2>&1; then
+    warning "glab is not installed, no GitLab credentials for Go"
+    exit 0
+fi
+
+while IFS= read -r known; do
+    [ -n "${known}" ] || continue
+    [ -z "${host}" ] || [ "${known}" = "${host}" ] || continue
+    print_credentials "${known}"
+done < <(glab_hosts)

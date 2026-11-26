@@ -3502,6 +3502,41 @@ software-550-go@dev() {
     done
     ${SUDO_USER} "${go_root}/bin/go" version 1>&2 || return 1
 }
+# go-auth-glab as the first GOAUTH of Go, so go-import and module downloads from
+# the GitLab hosts glab is logged in to use its token from the keyring. netrc
+# stays second: Go takes the credentials of a host from the first command that
+# has them, so ~/.netrc still serves the other hosts. A GOAUTH of your own
+# other than the default netrc is kept
+software-551-go-auth-glab@dev@mw() {
+    local go_cmd="${CURRENT_USER_HOME}/.local/go/bin/go"
+    needs go "${go_cmd}" || return $(( $? == 3 ? 0 : 1 ))
+    needs glab || return $(( $? == 3 ? 0 : 1 ))
+    if [ "${no_config}" -eq 1 ]; then
+        echo "${APP_NAME}: not configuring the GOAUTH of Go (--no-config)" 1>&2
+        return 0
+    fi
+    local helper current wanted
+    if ! helper="$(${SUDO_USER} which go-auth-glab 2>/dev/null)"; then
+        error "go-auth-glab of cli-helpers is not in the PATH of ${CURRENT_USER_NAME}"
+        return 1
+    fi
+    wanted="${helper};netrc"
+    current="$(${SUDO_USER} "${go_cmd}" env GOAUTH)" || return 1
+    if [ "${current}" = "${wanted}" ]; then
+        echo "${APP_NAME}: GOAUTH of Go is ${wanted}" 1>&2
+        return 0
+    fi
+    if [ -n "${current}" ] && [ "${current}" != "netrc" ]; then
+        warning "Keeping the GOAUTH of Go: ${current}"
+        return 0
+    fi
+    if [ "${dry_run}" -eq 1 ]; then
+        echo "Would run go env -w GOAUTH=${wanted}" 1>&2
+        return 0
+    fi
+    verbose "${SUDO_USER:+${SUDO_USER} }go env -w GOAUTH=${wanted}"
+    ${SUDO_USER} "${go_cmd}" env -w "GOAUTH=${wanted}"
+}
 software-560-go-tools@dev() {
     go_install_update \
         golang.org/x/tools/gopls \
