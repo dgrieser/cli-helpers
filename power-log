@@ -9,13 +9,15 @@ usage: ${APP} [OPTIONS]
 Print log entries from power-trigger service.
 
 Options:
-    -h, --help   Print this help and exit.
-    -a, --all    Print all log entries, not just opening and closing the lid.
+    -h, --help        Print this help and exit.
+    -a, --all         Print all log entries, not just opening and closing the lid.
+    -d, --days DAYS   Show the last DAYS days (positive integer, default: 7).
 EOF
     exit 1
 }
 
 all=0
+days=7
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -25,6 +27,14 @@ while [ "${#}" -gt 0 ]; do
         -a|--all)
             all=1
             ;;
+        -d|--days)
+            days="${2:-}"
+            if ! [[ "${days}" =~ ^0*[1-9][0-9]*$ ]]; then
+                printf '%s\n' 'ERROR: --days requires a positive integer.' >&2
+                usage
+            fi
+            shift
+            ;;
         *)
             usage
             ;;
@@ -32,7 +42,64 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
-match='Detected lid (open|close)$'
-[ "${all}" -eq 1 ] && match='.'
+terminal=0
+color=0
+if [ -t 1 ]; then
+    terminal=1
+    if [ -z "${NO_COLOR+x}" ] && [ -n "${TERM:-}" ] && [ "${TERM}" != dumb ]; then
+        color=1
+    fi
+fi
 
-journalctl --user -u power-trigger.service --no-hostname --since -7d | grep -E "${match}" | sed -E 's/^(.+)power-trigger[^:]+: (.+)$/\1\2/g' | less +G
+print_log() {
+    SYSTEMD_COLORS=0 journalctl --user -u power-trigger.service --no-hostname --no-pager --since "-${days}d" --output=short-iso |
+    awk -v all="${all}" -v terminal="${terminal}" -v color="${color}" '
+        BEGIN {
+            palette = 0
+            date_color[0] = "\033[1;38;5;231;48;5;24m"
+            date_color[1] = "\033[1;38;5;231;48;5;54m"
+            open_color = "\033[1;32m"
+            close_color = "\033[1;35m"
+            reset = "\033[0m"
+        }
+        {
+            is_open = /Detected lid open$/
+            is_close = /Detected lid close$/
+            if (!all && !is_open && !is_close) {
+                next
+            }
+            if ($0 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
+                print
+                next
+            }
+
+            day = substr($0, 1, 10)
+            if (day != previous_day) {
+                if (previous_day != "") {
+                    if (terminal) {
+                        print ""
+                    }
+                    palette = 1 - palette
+                }
+                previous_day = day
+            }
+
+            message = substr($0, length($1) + 1)
+            sub(/^ power-trigger[^[:space:]:]*: /, " ", message)
+            entry = " " substr($1, 12) message
+            if (color) {
+                day = date_color[palette] day reset
+                if (is_open || is_close) {
+                    entry = (is_open ? open_color : close_color) entry reset
+                }
+            }
+            print day entry
+        }
+    '
+}
+
+if [ "${terminal}" -eq 1 ]; then
+    print_log | less -R +G
+else
+    print_log
+fi

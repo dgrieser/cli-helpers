@@ -2661,7 +2661,7 @@ bluetooth-trigger
 ```
 
 ### `power-log`
-Prints log entries from the `power-trigger.service` user systemd unit for the last 72 hours, piped into `less`, defaulting to just lid open/close events.
+Shows the last seven days of `power-trigger.service` logs, defaulting to lid open and close events. In a terminal, `less` opens at the newest entry. Dates alternate between blue and purple, with a blank line between days. Lid open entries are green and lid close entries are magenta. Set `NO_COLOR` to disable colors.
 
 **Usage:** `power-log [OPTIONS]`
 
@@ -2669,11 +2669,12 @@ Prints log entries from the `power-trigger.service` user systemd unit for the la
 |---|---|
 | `-h, --help` | Print the help message and exit. |
 | `-a, --all` | Print all log entries, not just lid open/close events. |
+| `-d, --days DAYS` | Show the last `DAYS` days (positive integer, default 7). |
 
 **Examples:**
 ```bash
 power-log
-power-log --all
+power-log --all --days 3
 ```
 
 ### `power-trigger`
