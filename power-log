@@ -53,47 +53,177 @@ fi
 
 print_log() {
     SYSTEMD_COLORS=0 journalctl --user -u power-trigger.service --no-hostname --no-pager --since "-${days}d" --output=short-iso |
-    awk -v all="${all}" -v terminal="${terminal}" -v color="${color}" '
+    LC_ALL=C TZ=UTC awk -v all="${all}" -v terminal="${terminal}" -v color="${color}" '
+        function clock_seconds(timestamp, offset, direction) {
+            # Compare times within one date using their recorded UTC offsets.
+            direction = (substr(timestamp, 9, 1) == "-" ? -1 : 1)
+            offset = substr(timestamp, 10)
+            gsub(/:/, "", offset)
+            return substr(timestamp, 1, 2) * 3600 + substr(timestamp, 4, 2) * 60 + substr(timestamp, 7, 2) \
+                - direction * (substr(offset, 1, 2) * 3600 + substr(offset, 3, 2) * 60)
+        }
+
+        function format_time(timestamp, event, muted, time_color, separator_color, active_palette) {
+            active_palette = pair_palette
+            if (muted) {
+                if (!pair_open) {
+                    return gray timestamp reset
+                }
+                time_color = muted_pair_color[pair_palette]
+            } else if (event == "open" || (event == "close" && pair_open)) {
+                time_color = pair_color[pair_palette]
+                if (event == "close") {
+                    pair_open = 0
+                    pair_palette = 1 - pair_palette
+                } else {
+                    pair_open = 1
+                }
+            } else {
+                return bold substr(timestamp, 1, 5) gray substr(timestamp, 6) reset
+            }
+            separator_color = muted ? muted_pair_separator[active_palette] : pair_separator[active_palette]
+            return time_color substr(timestamp, 1, 2) separator_color ":" time_color substr(timestamp, 4, 2) \
+                pair_colon_color[active_palette] ":" \
+                reset gray substr(timestamp, 7) reset
+        }
+
+        function format_entry(date, timestamp, message, event, muted, word_color) {
+            if (color) {
+                timestamp = format_time(timestamp, event, muted)
+                if (event != "") {
+                    word_color = muted ? muted_event_color[event] : event_color[event]
+                    sub(/(open|close)$/, word_color bold "&", message)
+                    message = gray message reset
+                }
+            }
+            return date " " timestamp message
+        }
+
+        function next_second(stamp, civil) {
+            # Step the wall clock by one second and keep the recorded UTC offset.
+            civil = substr(stamp, 1, 19)
+            gsub(/[-T:]/, " ", civil)
+            return strftime("%Y-%m-%dT%H:%M:%S", mktime(civil) + 1) substr(stamp, 20)
+        }
+
+        function flush_close(event, stamp, i, muted, inferred_stamp, next_open) {
+            if (close_row == "") {
+                return 0
+            }
+            if (event == "close") {
+                inferred_stamp = next_second(close_stamp)
+                next_open = inferred_stamp
+            } else if (event == "open") {
+                next_open = stamp
+            }
+            muted = render(close_row, "close", 0, next_open)
+            if (inferred_stamp != "") {
+                render(inferred_stamp " Inferred lid open", "open", muted)
+            }
+            for (i = 1; i <= queued_count; i++) {
+                render(queued_rows[i], "", 0)
+                delete queued_rows[i]
+            }
+            close_row = ""
+            queued_count = 0
+            return muted
+        }
+
         BEGIN {
             palette = 0
-            date_color[0] = "\033[1;38;5;231;48;5;24m"
-            date_color[1] = "\033[1;38;5;231;48;5;54m"
-            open_color = "\033[1;32m"
-            close_color = "\033[1;35m"
+            pair_palette = 0
+            # cli-kit notice Pastel palette.
+            date_color[0] = "\033[1;38;2;13;38;56;48;2;180;216;240m"
+            date_color[1] = "\033[1;38;2;74;26;106;48;2;187;168;240m"
+            pair_color[0] = "\033[1;38;2;58;42;5;48;2;246;213;142m"
+            pair_color[1] = "\033[1;38;2;13;46;42;48;2;185;226;218m"
+            muted_pair_color[0] = "\033[38;2;153;145;125;48;2;246;213;142m"
+            muted_pair_color[1] = "\033[38;2;132;150;143;48;2;185;226;218m"
+            pair_separator[0] = "\033[22;38;2;102;88;60m"
+            pair_separator[1] = "\033[22;38;2;59;99;89m"
+            muted_pair_separator[0] = "\033[22;38;2;170;160;132m"
+            muted_pair_separator[1] = "\033[22;38;2;149;168;161m"
+            pair_colon_color[0] = "\033[22;38;2;226;195;130m"
+            pair_colon_color[1] = "\033[22;38;2;169;207;199m"
+            event_color["open"] = "\033[38;2;184;230;194m"
+            event_color["close"] = "\033[38;2;231;163;203m"
+            muted_event_color["open"] = "\033[38;2;144;156;147m"
+            muted_event_color["close"] = "\033[38;2;156;141;150m"
+            gray = "\033[22;38;2;115;120;130m"
+            bold = "\033[1m"
             reset = "\033[0m"
         }
-        {
-            is_open = /Detected lid open$/
-            is_close = /Detected lid close$/
-            if (!all && !is_open && !is_close) {
-                next
-            }
-            if ($0 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
-                print
-                next
+        function render(row, event, muted, next_open, day, timestamp, date_display, message, gap) {
+            if (row !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
+                print row
+                return 0
             }
 
-            day = substr($0, 1, 10)
+            day = substr(row, 1, 10)
             if (day != previous_day) {
                 if (previous_day != "") {
-                    if (terminal) {
-                        print ""
-                    }
+                    day_break_pending = terminal
                     palette = 1 - palette
                 }
                 previous_day = day
+                split(day, date_parts, "-")
+                noon = mktime(date_parts[1] " " date_parts[2] " " date_parts[3] " 12 00 00")
+                date_label = strftime("%a", noon) " " day
+            }
+            if (day_break_pending && !lid_open) {
+                print ""
+                day_break_pending = 0
+                pair_open = 0
+                pair_palette = 0
             }
 
-            message = substr($0, length($1) + 1)
+            match(row, /[[:space:]]/)
+            timestamp = substr(row, 12, RSTART - 12)
+            message = substr(row, RSTART)
             sub(/^ power-trigger[^[:space:]:]*: /, " ", message)
-            entry = " " substr($1, 12) message
+            date_display = date_label
             if (color) {
-                day = date_color[palette] day reset
-                if (is_open || is_close) {
-                    entry = (is_open ? open_color : close_color) entry reset
+                date_display = date_color[palette] " " date_label " " reset
+                if (next_open != "" && !day_break_pending && day == substr(next_open, 1, 10)) {
+                    gap = clock_seconds(substr(next_open, 12)) - clock_seconds(timestamp)
+                    muted = gap >= 0 && gap < 600
                 }
             }
-            print day entry
+            print format_entry(date_display, timestamp, message, event, muted)
+            if (event != "") {
+                lid_open = event == "open"
+            }
+            return muted
+        }
+
+        {
+            event = ""
+            if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
+                if (/Detected lid open$/) {
+                    event = "open"
+                } else if (/Detected lid close$/) {
+                    event = "close"
+                }
+            }
+            if (event != "") {
+                muted = flush_close(event, $1)
+                if (event == "close") {
+                    # Wait for the next lid event to tell whether an open is missing.
+                    close_row = $0
+                    close_stamp = $1
+                } else {
+                    render($0, event, muted)
+                }
+            } else if (all) {
+                if (close_row != "") {
+                    queued_rows[++queued_count] = $0
+                } else {
+                    render($0, "", 0)
+                }
+            }
+        }
+        END {
+            flush_close("", "")
         }
     '
 }

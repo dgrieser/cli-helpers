@@ -2661,7 +2661,9 @@ bluetooth-trigger
 ```
 
 ### `power-log`
-Shows the last seven days of `power-trigger.service` logs, defaulting to lid open and close events. In a terminal, `less` opens at the newest entry. Dates alternate between blue and purple, with a blank line between days. Lid open entries are green and lid close entries are magenta. Set `NO_COLOR` to disable colors.
+Shows the last seven days of `power-trigger.service` logs, defaulting to lid open and close events. In a terminal, `less` opens at the newest entry. Date badges alternate between pastel blue and lavender. Blank lines mark day changes and fall after the close when the lid stays open overnight. The words `open` and `close` appear in mint and pink. When the lid closes and reopens in under ten minutes in the same block, both timestamps use muted text. Open and close pairs share a timestamp background that alternates between sand and aqua within each block, including on muted timestamps inside the pair. Set `NO_COLOR` to disable colors.
+
+Between consecutive closes, `Inferred lid open` marks a missing open at the next whole second after the first close.
 
 **Usage:** `power-log [OPTIONS]`
 
