@@ -16,8 +16,10 @@ Without a target, the review is chosen from the repository state:
   - on any other branch: the changes against the default branch
 
 In a terminal, the response is shown and a menu then offers to copy it, send
-a prompt to the same Codex session, draft inline comments for an existing
-PR/MR, or choose a new review. Posting requires approval of the preview.
+a prompt to the same Codex session, or choose a new review. When the current
+branch has an open PR/MR (looked up with gh or glab after the review), the menu
+also offers to draft inline comments for it or to approve it. Posting requires
+approval of the preview, approving a confirmation.
 Otherwise, or with --print, only the response goes to stdout.
 
 Targets:
@@ -193,14 +195,43 @@ run_codex() {
     mv -f "${new_answer_file}" "${answer_file}"
 }
 
+# Whether the index and working tree match HEAD (untracked files aside).
+clean_tree() {
+    git diff --quiet HEAD -- 2>/dev/null
+}
+
+# After a successful review, ${reviewed_head} is the HEAD commit it covered and
+# ${reviewed_base} the commit its diff starts from ("full" for the whole
+# repository); both are empty unless the review covered committed changes (base
+# or full) with no tracked changes in the working tree, before and after, as
+# only then can approval apply. A failed review clears them.
 run_review() {
-    local deep="${1}" reviewing=Reviewing
+    local deep="${1}" reviewing=Reviewing head="" base=""
     shift
     if [ "${deep}" = on ]; then
         reviewing="Deep reviewing"
     fi
     printf '%s %s (%s)\n' "${reviewing}" "${description}" "${selection}" >&2
-    run_codex "${deep}" review "${@}" </dev/null && cp "${answer_file}" "${work_dir}/review.md"
+    if clean_tree; then
+        case "${mode}" in
+            full)
+                head="$(git rev-parse --verify --quiet HEAD)" && base=full
+                ;;
+            base)
+                # codex diffs against the merge base, as a PR/MR does
+                head="$(git rev-parse --verify --quiet HEAD)" &&
+                    base="$(git merge-base "${2}" HEAD 2>/dev/null)" || head=""
+                ;;
+        esac
+    fi
+    reviewed_head=""
+    reviewed_base=""
+    run_codex "${deep}" review "${@}" </dev/null && cp "${answer_file}" "${work_dir}/review.md" || return
+    if [ -n "${head}" ] && [ -n "${base}" ] && clean_tree &&
+        [ "$(git rev-parse --verify --quiet HEAD)" = "${head}" ]; then
+        reviewed_head="${head}"
+        reviewed_base="${base}"
+    fi
 }
 
 # The prompt goes through stdin, so text starting with "-" is no option.
@@ -244,13 +275,193 @@ ask_repeat() {
 }
 
 ask_next() {
-    local label=Prompt
-    prompt-select --prompt "Next:" --no-abort-message \
-        "copy=Copy response" \
-        "followup=${label}" \
-        "comments=Draft PR/MR comments" \
-        "review=Repeat" \
-        "quit=Quit" </dev/tty
+    local -a choices=("copy=Copy response" "followup=Prompt")
+    if [ -n "${pr_url}" ]; then
+        choices+=("comments=Draft ${pr_ref} comments")
+        if [ -n "${reviewed_head}" ] && [ "${pr_approved}" -eq 0 ]; then
+            choices+=("approve=Approve ${pr_ref}")
+        fi
+    fi
+    choices+=("review=Repeat" "quit=Quit")
+    prompt-select --prompt "Next:" --no-abort-message "${choices[@]}" </dev/tty
+}
+
+# The host and path of a remote URL (git@host:path, ssh://user@host:port/path,
+# https://host:port/path), without a trailing .git. An HTTP(S) host keeps its
+# port, which the web and API endpoints share; an SSH port is left out.
+remote_host() {
+    if [[ "${1}" =~ ^https?:// ]]; then
+        sed -E 's#^https?://##; s#^[^@/]*@##; s#/.*##' <<< "${1}"
+    else
+        sed -E 's#^[a-z+]+://##; s#^[^@/]*@##; s#[:/].*##' <<< "${1}"
+    fi
+}
+
+remote_path() {
+    sed -E 's#^[a-z+]+://##; s#^[^@/]*@##; s#^[^:/]*(:[0-9]+/|[:/])##; s#\.git/?$##; s#/$##' <<< "${1}"
+}
+
+# Looks up the open PR/MR whose source is the current branch, pushed to the
+# repository of its upstream remote (else origin), and sets ${pr_provider},
+# ${pr_host}, ${pr_path}, ${pr_number}, ${pr_url}, ${pr_repo} and ${pr_ref};
+# leaves ${pr_url} empty when there is none or gh/glab cannot tell.
+find_pull_request() {
+    local branch remote url host path json upstream default
+
+    pr_provider="" pr_host="" pr_path="" pr_number="" pr_url="" pr_repo="" pr_ref="" pr_approved=0
+    branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || return 0
+    remote="$(git config --get "branch.${branch}.remote")"
+    if [ -z "${remote}" ] || [ "${remote}" = . ]; then
+        remote=origin
+    fi
+    # The upstream branch names the PR/MR source, unless it is the default
+    # branch, which a feature branch may track as its base.
+    upstream="$(git config --get "branch.${branch}.merge")"
+    upstream="${upstream#refs/heads/}"
+    default="$(git-default 2>/dev/null)"
+    if [ -n "${upstream}" ] && [ "${upstream}" != "${default}" ]; then
+        branch="${upstream}"
+    fi
+    url="$(git remote get-url "${remote}" 2>/dev/null)" || return 0
+    host="$(remote_host "${url}")"
+    path="$(remote_path "${url}")"
+    [ -n "${host}" ] && [ -n "${path}" ] || return 0
+
+    pr_host="${host}"
+    pr_path="${path}"
+    # GitHub Enterprise hosts need not say github; gh knows them once logged in.
+    if [[ "${host}" == *github* ]] || [ -n "$(git config --get "remote.${remote}.gh-resolved")" ] ||
+        { command -v gh >/dev/null 2>&1 && gh auth token --hostname "${host}" >/dev/null 2>&1; }; then
+        command -v gh >/dev/null 2>&1 || return 0
+        pr_repo="${host}/${path}"
+        json="$(gh pr list --repo "${pr_repo}" --head "${branch}" --state open \
+            --json number,url,headRefName,isCrossRepository 2>/dev/null)" || return 0
+        # Only a request from this repository itself, not from a fork with a
+        # branch of the same name; more than one is ambiguous.
+        json="$(jq -c --arg branch "${branch}" \
+            '[.[] | select(.headRefName == $branch and .isCrossRepository == false)]
+             | if length == 1 then .[0] else empty end' <<< "${json}" 2>/dev/null)"
+        [ -n "${json}" ] || return 0
+        pr_provider=github
+        pr_number="$(jq -r '.number' <<< "${json}")"
+        pr_url="$(jq -r '.url' <<< "${json}")"
+        pr_ref="PR #${pr_number}"
+    else
+        command -v glab >/dev/null 2>&1 || return 0
+        pr_repo="https://${host}/${path}"
+        [[ "${url}" == http://* ]] && pr_repo="http://${host}/${path}"
+        json="$(glab mr list --repo "${pr_repo}" --source-branch "${branch}" --output json 2>/dev/null)" || return 0
+        json="$(jq -c --arg branch "${branch}" \
+            '[.[] | select(.state == "opened" and .source_branch == $branch and
+                           .source_project_id == .target_project_id)]
+             | if length == 1 then .[0] else empty end' <<< "${json}" 2>/dev/null)"
+        [ -n "${json}" ] || return 0
+        pr_provider=gitlab
+        pr_number="$(jq -r '.iid' <<< "${json}")"
+        pr_url="$(jq -r '.web_url' <<< "${json}")"
+        pr_ref="MR !${pr_number}"
+    fi
+    if [ -z "${pr_number}" ] || [ "${pr_number}" = null ] || [ -z "${pr_url}" ] || [ "${pr_url}" = null ]; then
+        pr_url=""
+    fi
+}
+
+# The current head commit of the PR/MR and, on GitHub, the tip of its base
+# branch, on GitLab the merge base, separated by a space.
+pull_request_refs() {
+    if [ "${pr_provider}" = github ]; then
+        gh pr view "${pr_url}" --json headRefOid,baseRefOid \
+            --jq '"\(.headRefOid) \(.baseRefOid)"' 2>/dev/null
+    else
+        glab mr view "${pr_number}" --repo "${pr_repo}" --output json 2>/dev/null |
+            jq -r '"\(.sha // "") \(.diff_refs.base_sha // "")"'
+    fi
+}
+
+pull_request_head() {
+    local refs
+    refs="$(pull_request_refs)" && printf '%s\n' "${refs%% *}"
+}
+
+# Whether the last review covered exactly the PR/MR diff: the PR/MR head is the
+# reviewed HEAD, and the reviewed diff starts at the PR/MR's merge base (an
+# earlier start could hide a change the PR/MR reverts).
+review_covers() {
+    local head="${1}" base="${2}"
+
+    if [ "${head}" != "${reviewed_head}" ]; then
+        error "${pr_ref} is at ${head:0:12}, the review ran on ${reviewed_head:0:12}; push or review again first"
+        return 1
+    fi
+    [ "${reviewed_base}" = full ] && return 0
+    if [ "${pr_provider}" = github ]; then
+        if ! git cat-file -e "${base}^{commit}" 2>/dev/null ||
+            ! base="$(git merge-base "${base}" "${head}")"; then
+            error "The base of ${pr_ref} (${base:0:12}) is not available locally; fetch first"
+            return 1
+        fi
+    fi
+    if [ "${base}" != "${reviewed_base}" ]; then
+        error "The review did not cover the changes of ${pr_ref}; review against its target branch first"
+        return 1
+    fi
+}
+
+# GitHub binds a review to a commit but approves the PR whatever its head is by
+# then, so a push between the last check and the approval gets the approval
+# dismissed again.
+approve_github() {
+    local head="${1}" id
+    if ! id="$(gh api --hostname "${pr_host}" --method POST \
+        "repos/${pr_path}/pulls/${pr_number}/reviews" \
+        -f commit_id="${head}" -f event=APPROVE --jq .id 2>&1)"; then
+        printf '%s\n' "${id}" >&2
+        return 1
+    fi
+    if [ "$(pull_request_head)" = "${head}" ]; then
+        return 0
+    fi
+    error "${pr_ref} changed during the approval"
+    if gh api --hostname "${pr_host}" --method PUT --silent \
+        "repos/${pr_path}/pulls/${pr_number}/reviews/${id}/dismissals" \
+        -f event=DISMISS -f message="Approved ${head} while the head changed" >/dev/null 2>&1; then
+        error "Dismissed the approval again; review again first"
+    else
+        error "Could not dismiss the approval; dismiss it in ${pr_url}"
+    fi
+    return 1
+}
+
+# Reads the PR/MR refs and checks that the last review covered its diff.
+check_coverage() {
+    local refs head
+    refs="$(pull_request_refs)"
+    head="${refs%% *}"
+    if [ -z "${head}" ] || [ "${head}" = "${refs}" ]; then
+        error "Could not read the head commit of ${pr_ref}"
+        return 1
+    fi
+    review_covers "${head}" "${refs#* }"
+}
+
+# Approves only the reviewed commit, and only after a review that covered the
+# PR/MR diff, checked again after the confirmation (a retarget can change the
+# diff); GitLab refuses the approval itself once the head moved.
+approve_pull_request() {
+    local head="${reviewed_head}" out
+
+    check_coverage || return 1
+    prompt-no-yes "Approve ${pr_ref} at ${head:0:12} (${pr_url})?" </dev/tty || return 0
+    check_coverage || return 1
+    if [ "${pr_provider}" = github ]; then
+        approve_github "${head}" || { error "Could not approve ${pr_ref}"; return 1; }
+    elif ! out="$(glab mr approve "${pr_number}" --repo "${pr_repo}" --sha "${head}" 2>&1)"; then
+        [ -z "${out}" ] || printf '%s\n' "${out}" >&2
+        error "Could not approve ${pr_ref}"
+        return 1
+    fi
+    echo "Approved ${pr_ref}." >&2
+    pr_approved=1
 }
 
 ask_followup() {
@@ -304,7 +515,7 @@ Resolve the current repository, branch, host and existing open PR/MR from Git
 metadata and the host. Prefer connected tools, with gh/glab as fallback. Do not
 assume GitHub, origin, or a default base branch. If the target is ambiguous or
 unavailable, return a null target, no comments, and explain in English notes.
-Use a PR/MR URL supplied in a revision to disambiguate after verifying it.
+Use a PR/MR URL supplied below or in a revision to disambiguate after verifying it.
 Read the current remote diff, head and base/diff references, relevant code, and
 existing threads. Verify session findings against the remote diff. Exclude
 unpublished working-tree changes, speculative issues, style nits, resolved
@@ -324,6 +535,7 @@ Omit findings without a complete applicable fix and explain why in notes.
 When revising, preserve unrequested parts of the current draft that still apply.
 Keep suggestion code in replacement only. Return only the schema-defined JSON.
 EOF
+    printf '\nThe open PR/MR found for the current branch: %s\n' "${pr_url}"
     printf '\nReview response follows:\n'
     cat "${work_dir}/review.md"
     if [ -n "${1}" ]; then
@@ -505,6 +717,7 @@ review_again() {
     case "${action}" in
         auto) ;;
         same)
+            mode="${initial_mode}"
             description="${initial_description}"
             selection="same settings"
             review_args=("${initial_args[@]}")
@@ -528,7 +741,7 @@ review_again() {
 
     run_review "${deep}" "${review_args[@]}"
     case $? in
-        0) show_answer ;;
+        0) show_answer; find_pull_request ;;
         130) ;;
         *) error "Review failed" ;;
     esac
@@ -557,6 +770,9 @@ interactive_loop() {
                 ;;
             comments)
                 draft_comments
+                ;;
+            approve)
+                approve_pull_request
                 ;;
             review)
                 review_again
@@ -679,6 +895,7 @@ fi
 if [ "${print}" -eq 0 ]; then
     command -v prompt-select >/dev/null 2>&1 || fail "prompt-select not found"
     command -v prompt >/dev/null 2>&1 || fail "prompt not found"
+    command -v prompt-no-yes >/dev/null 2>&1 || fail "prompt-no-yes not found"
     command -v clip >/dev/null 2>&1 || fail "clip not found"
 fi
 
@@ -694,6 +911,16 @@ work_dir="$(mktemp -d)" || fail "Could not create temporary directory"
 trap 'rm -rf "${work_dir}"' EXIT
 answer_file="${work_dir}/answer.md"
 session_id=""
+reviewed_head=""
+reviewed_base=""
+pr_provider=""
+pr_host=""
+pr_path=""
+pr_number=""
+pr_url=""
+pr_repo=""
+pr_ref=""
+pr_approved=0
 
 run_review "${initial_deep}" "${review_args[@]}" || exit $?
 
@@ -703,4 +930,5 @@ if [ "${print}" -eq 1 ]; then
 fi
 
 show_answer
+find_pull_request
 interactive_loop

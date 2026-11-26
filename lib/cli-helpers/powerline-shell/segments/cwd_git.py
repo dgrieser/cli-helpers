@@ -5,6 +5,8 @@
 # ~/workspace.worktree/<repo path>/<branch>) shows the name of its main tree, not
 # its branch folder; a submodule, whose git dir lives in the parent's
 # .git/modules, shows its own folder name.
+# A linked worktree gets WORKTREE_MARK after the logo and a violet fade instead
+# of the orange one, so it stands apart from the main tree of the same name.
 # powerline-shell loads this file by its path (config.json), not as a module of
 # its package, so imports must be absolute.
 import os
@@ -16,6 +18,8 @@ from powerline_shell.utils import ThreadedSegment
 
 # the git logo, nf-fa-git (Font Awesome, needs a Nerd Font)
 REPO_ICON = u"\uf1d3"
+# after the logo in a linked worktree
+WORKTREE_MARK = "*"
 # the logo's cells (space, logo, space) fade from a light to a dark git orange,
 # one background each, in 24-bit color
 REPO_FADE = ((0xF5, 0x73, 0x4F), (0xC8, 0x38, 0x1E))
@@ -23,6 +27,9 @@ REPO_FADE = ((0xF5, 0x73, 0x4F), (0xC8, 0x38, 0x1E))
 # the whole segment's background where the terminal has no 24-bit color, and
 # the one a segment before it (ssh) draws its separator on
 REPO_BG = 167
+# the same for a linked worktree: light to dark violet, closest #875fd7
+WORKTREE_FADE = ((0xA8, 0x7C, 0xF0), (0x6A, 0x3C, 0xC0))
+WORKTREE_BG = 98
 # the terminals that say they show 24-bit color
 TRUECOLOR = ("truecolor", "24bit")
 
@@ -36,11 +43,11 @@ def escape_bash(text):
     return re.sub(r"[\\`$]", lambda m: "\\\\" + ("\\\\" if m.group() == "\\" else m.group()), text)
 
 
-def fade_cells(powerline, cells, fg):
+def fade_cells(powerline, cells, fg, fade):
     """The cells, each on its own background, stepping from the first color of
-    REPO_FADE to the second; the foreground stays on the last color after them,
-    so the separator that follows takes it."""
-    (r1, g1, b1), (r2, g2, b2) = REPO_FADE
+    fade to the second; the foreground stays on the last color after them, so
+    the separator that follows takes it."""
+    (r1, g1, b1), (r2, g2, b2) = fade
     steps = max(len(cells) - 1, 1)
     out = [powerline.fgcolor(fg)]
     for i, cell in enumerate(cells):
@@ -66,7 +73,8 @@ def git_branch(git_dir):
 
 
 def git_repo(cwd):
-    """The name of the repository and its branch, (None, None) outside one."""
+    """The name of the repository, its branch and whether cwd is in a linked
+    worktree; (None, None, False) outside one."""
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel",
@@ -74,24 +82,26 @@ def git_repo(cwd):
             cwd=cwd, stderr=subprocess.DEVNULL).decode("utf-8")
     except (subprocess.CalledProcessError, OSError, UnicodeDecodeError):
         # not in a repository, inside .git (no toplevel) or no git at all
-        return None, None
+        return None, None, False
     lines = out.splitlines()
     if len(lines) != 3:
-        return None, None
+        return None, None, False
     common_dir, toplevel, git_dir = lines
     if os.path.basename(common_dir) == ".git":
         name = os.path.basename(os.path.dirname(common_dir))
     else:
         name = os.path.basename(toplevel)
     if not name:
-        return None, None
-    # a linked worktree has its own HEAD in its own git dir
-    return name, git_branch(git_dir)
+        return None, None, False
+    # a linked worktree has its own git dir (with its own HEAD) below
+    # worktrees/ of the common one; the main tree and a submodule share theirs
+    linked = os.path.normpath(git_dir) != os.path.normpath(common_dir)
+    return name, git_branch(git_dir), linked
 
 
 class Segment(ThreadedSegment):
     def run(self):
-        self.repo, self.branch = git_repo(self.powerline.cwd)
+        self.repo, self.branch, self.linked = git_repo(self.powerline.cwd)
 
     def add_to_powerline(self):
         self.join()
@@ -105,12 +115,16 @@ class Segment(ThreadedSegment):
         repo = self.repo
         if self.powerline.args.shell == "bash":
             repo = escape_bash(repo)
+        if self.linked:
+            icon, fade, bg = REPO_ICON + WORKTREE_MARK, WORKTREE_FADE, WORKTREE_BG
+        else:
+            icon, fade, bg = REPO_ICON, REPO_FADE, REPO_BG
         # the icon where the path outside a repository starts with its home part "~"
         if os.getenv("COLORTERM") in TRUECOLOR:
             # the cells bring their own colors; no separator color, so the arrow
             # keeps the foreground the fade ends on
-            content = fade_cells(self.powerline, [" ", REPO_ICON, " "], theme.HOME_FG)
-            self.powerline.segments.append((content, None, REPO_BG, self.powerline.separator, None))
+            content = fade_cells(self.powerline, [" ", icon, " "], theme.HOME_FG, fade)
+            self.powerline.segments.append((content, None, bg, self.powerline.separator, None))
         else:
-            self.powerline.append(" %s " % REPO_ICON, theme.HOME_FG, REPO_BG, sanitize=False)
+            self.powerline.append(" %s " % icon, theme.HOME_FG, bg, sanitize=False)
         self.powerline.append(" %s " % repo, theme.CWD_FG, theme.PATH_BG, sanitize=False)
