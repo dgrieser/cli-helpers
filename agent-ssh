@@ -1,0 +1,366 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+# not the ssh of this repository: that one writes every call to the shell history
+SSH="${AGENT_SSH_SSH:-/usr/bin/ssh}"
+SOCKET_DIR="${AGENT_SSH_DIR:-${HOME}/.ssh}"
+MAX_WAIT=300
+# seconds an attempt that asks for nothing may take
+BATCH_LIMIT=45
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [OPTIONS] [DESTINATION] [-- SSH OPTIONS | REMOTE COMMAND]
+
+Keeps one SSH connection to DESTINATION open for agents and scripts. You log
+in once, with whatever the host asks for (password, second factor); everything
+after that goes through the control socket of that connection and asks for
+nothing. An agent runs "${APP_NAME} exec DESTINATION COMMAND", or passes
+-o ControlPath="\$(${APP_NAME} path DESTINATION)" to ssh, scp or rsync.
+
+Commands:
+  open DESTINATION      Open the connection in the background
+  watch DESTINATION     Open the connection and stay: look at it every INTERVAL
+                        seconds and open it again when it is gone. Without a
+                        login that needs you this happens silently; with one,
+                        you get a desktop notification and the terminal asks.
+                        A host that cannot be reached is tried again, with
+                        growing pauses of up to ${MAX_WAIT} seconds
+  status [DESTINATION]  Say whether the connection is open (exit status 1 when
+                        not); without DESTINATION: every connection of ${APP_NAME}
+  exec DESTINATION [REMOTE COMMAND]
+                        Run REMOTE COMMAND through the open connection. Never
+                        opens one and never asks: exit status 255 when none is open
+  path DESTINATION      Print the control socket of the connection
+  close DESTINATION     Close the connection
+
+Options:
+  -n, --name NAME           Name of the control socket: ${SOCKET_DIR}/cm-NAME
+                            (default: DESTINATION)
+  -p, --persist TIME        open, watch: close the connection after this long
+                            without use (default: 8h; "yes" for never)
+  -i, --interval SECONDS    watch: seconds between two looks (default: 30)
+  -c, --count NUMBER        watch: stop after this many looks (default: never)
+      --no-notify           watch: no desktop notification
+  -h, --help                Show this help message and exit
+
+      --bash-completion     Print completion candidates and exit
+
+For open and watch, everything after "--" is passed to ssh (e.g. -- -p 2222
+-J jumphost). A connection that lost its network closes itself within a
+minute (ServerAliveInterval), so the watcher notices.
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+log() {
+    echo "$(date +%H:%M:%S) ${1}" 1>&2
+}
+
+# socket_path NAME: prints the control socket of NAME
+socket_path() {
+    echo "${SOCKET_DIR}/cm-${1}"
+}
+
+# is_open SOCKET DESTINATION: whether a connection answers on SOCKET
+is_open() {
+    "${SSH}" -O check -o ControlPath="${1}" "${2}" > /dev/null 2>&1
+}
+
+# open_connection SOCKET DESTINATION BATCH [SSH OPTIONS]: opens the connection
+# in the background. With BATCH=yes nothing is asked for and it fails instead.
+# BatchMode alone does not see to that: the ssh of a jump host (-J) is a process
+# of its own that takes neither it nor ConnectTimeout over. So that attempt
+# runs without a terminal to ask on (setsid) and with a limit on its time.
+open_connection() {
+    local socket="${1}" destination="${2}" batch="${3}"
+    local -a quiet=()
+    shift 3
+    if [ "${batch}" = "yes" ]; then
+        quiet=(env -u SSH_ASKPASS SSH_ASKPASS_REQUIRE=never setsid -w timeout "${BATCH_LIMIT}")
+    fi
+    "${quiet[@]}" "${SSH}" -f -N \
+        -o ControlMaster=yes -o ControlPath="${socket}" -o ControlPersist="${persist}" \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 \
+        -o BatchMode="${batch}" "${@}" "${destination}" < /dev/null
+}
+
+# clear_socket SOCKET DESTINATION: removes what a dead connection left behind,
+# so the next one can bind the socket
+clear_socket() {
+    is_open "${1}" "${2}" && return 0
+    [ ! -e "${1}" ] && [ ! -L "${1}" ] || rm -f -- "${1}"
+}
+
+notify() {
+    [ "${notify}" -eq 1 ] || return 0
+    command -v notify-send > /dev/null 2>&1 || return 0
+    notify-send --app-name "${APP_NAME}" "${APP_NAME}: ${1}" "${2}" > /dev/null 2>&1
+    return 0
+}
+
+# reopen SOCKET DESTINATION [SSH OPTIONS]: opens the connection again, first
+# without asking for anything. Only a host that refuses that login gets the
+# terminal: a host that cannot be reached must not leave a prompt behind.
+reopen() {
+    local socket="${1}" destination="${2}" output errors
+    shift 2
+    clear_socket "${socket}" "${destination}"
+    # A file, not a pipe: the connection in the background (and the ssh of a
+    # jump host) keeps what it got as stderr open, and reading a pipe to its end
+    # would wait for as long as the connection lives.
+    errors="$(mktemp)" || return 1
+    if open_connection "${socket}" "${destination}" yes "${@}" > /dev/null 2> "${errors}"; then
+        rm -f -- "${errors}"
+        return 0
+    fi
+    output="$(cat "${errors}")"
+    rm -f -- "${errors}"
+    if [[ "${output}" != *"Permission denied"* ]]; then
+        log "${destination} not reached: $(printf '%s\n' "${output}" | tail -n 1)"
+        return 1
+    fi
+    if [ ! -t 0 ]; then
+        log "${destination} asks for a login and this is no terminal"
+        return 1
+    fi
+    notify "${destination} needs your login" "The connection is gone. The terminal of the watcher is asking."
+    printf '\a' 1>&2
+    log "${destination} asks for a login"
+    open_connection "${socket}" "${destination}" no "${@}"
+}
+
+# print_status SOCKET DESTINATION: one line, returns whether it is open
+print_status() {
+    if is_open "${1}" "${2}"; then
+        echo "open    ${2}  ${1}"
+        return 0
+    fi
+    echo "closed  ${2}  ${1}"
+    return 1
+}
+
+# open_names: the names of all sockets with a connection behind them
+open_names() {
+    local socket name
+    for socket in "${SOCKET_DIR}"/cm-*; do
+        [ -S "${socket}" ] || continue
+        name="${socket##*/cm-}"
+        is_open "${socket}" "${name}" && echo "${name}"
+    done
+}
+
+completion() {
+    local previous="${1}" command="${2}"
+    case "${previous}" in
+        -n|--name|-p|--persist|-i|--interval|-c|--count) return ;;
+    esac
+    case "${command}" in
+        open|watch)
+            echo "-n --name -p --persist -i --interval -c --count --no-notify -h --help"
+            sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\+//p' "${HOME}/.ssh/config" 2>/dev/null \
+                | tr ' ' '\n' | grep -v '[*?!]'
+            ;;
+        status|exec|path|close)
+            echo "-n --name -h --help"
+            open_names
+            ;;
+        *)
+            echo "open watch status exec path close -h --help"
+            ;;
+    esac
+}
+
+command=""
+destination=""
+name=""
+persist="8h"
+interval=30
+count=0
+notify=1
+rest=()
+
+case "${1}" in
+    --bash-completion)
+        shift
+        completion "${@}"
+        exit 0
+        ;;
+    open|watch|status|exec|path|close)
+        command="${1}"
+        shift
+        ;;
+    -h|--help|"")
+        usage
+        ;;
+    *)
+        error "Unknown command: ${1}"
+        usage
+        ;;
+esac
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -n|--name)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" =~ ^[A-Za-z0-9@._-]+$ ]] || fail "Not a socket name: ${1}"
+            name="${1}"
+            ;;
+        -p|--persist)
+            shift
+            [ -z "${1}" ] && usage
+            [[ "${1}" =~ ^([0-9]+[smhdwSMHDW]?)+$|^yes$ ]] || fail "Not a time: ${1}"
+            persist="${1}"
+            ;;
+        -i|--interval)
+            shift
+            [[ "${1}" =~ ^[1-9][0-9]*$ ]] || fail "--interval takes a number of seconds"
+            interval="${1}"
+            ;;
+        -c|--count)
+            shift
+            [[ "${1}" =~ ^[1-9][0-9]*$ ]] || fail "--count takes a number"
+            count="${1}"
+            ;;
+        --no-notify)
+            notify=0
+            ;;
+        --)
+            shift
+            rest=("${@}")
+            break
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -n "${destination}" ]; then
+                # what follows the destination of exec is the remote command
+                [ "${command}" = "exec" ] || { error "Unexpected argument: ${1}"; usage; }
+                rest=("${@}")
+                break
+            fi
+            destination="${1}"
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${destination}" ]; then
+    [ "${command}" = "status" ] || { error "${command} needs a destination"; usage; }
+    [ -z "${name}" ] || fail "--name needs a destination"
+    found=0
+    for socket in "${SOCKET_DIR}"/cm-*; do
+        [ -S "${socket}" ] || continue
+        print_status "${socket}" "${socket##*/cm-}"
+        found=1
+    done
+    [ "${found}" -eq 1 ] || echo "No connection." 1>&2
+    exit 0
+fi
+
+[[ "${destination}" != -* ]] || fail "Not a destination: ${destination}"
+if [ -z "${name}" ]; then
+    name="${destination}"
+    [[ "${name}" =~ ^[A-Za-z0-9@._-]+$ ]] || fail "${destination} gives no socket name, pass --name"
+fi
+socket="$(socket_path "${name}")"
+# sun_path of a unix socket holds 108 bytes, ssh needs some of them for a temporary name
+[ "${#socket}" -le 80 ] || fail "Socket path too long, pass a shorter --name: ${socket}"
+
+case "${command}" in
+    path)
+        echo "${socket}"
+        ;;
+    status)
+        print_status "${socket}" "${destination}"
+        ;;
+    close)
+        if ! is_open "${socket}" "${destination}"; then
+            echo "No open connection to ${destination}." 1>&2
+            exit 0
+        fi
+        "${SSH}" -O exit -o ControlPath="${socket}" "${destination}" 2> /dev/null \
+            || fail "Could not close the connection to ${destination}"
+        ;;
+    exec)
+        if ! is_open "${socket}" "${destination}"; then
+            error "No open connection to ${destination}: run '${APP_NAME} watch ${destination}' in a terminal"
+            exit 255
+        fi
+        # ProxyCommand: the connection may go away between the look above and
+        # this call, and ssh would then quietly make one of its own. Through
+        # the socket no proxy is used; without it this one fails at once.
+        exec "${SSH}" -o ControlMaster=no -o ControlPath="${socket}" -o BatchMode=yes \
+            -o ProxyCommand=false "${destination}" "${rest[@]}"
+        ;;
+    open)
+        if is_open "${socket}" "${destination}"; then
+            echo "Already open." 1>&2
+            echo "${socket}"
+            exit 0
+        fi
+        clear_socket "${socket}" "${destination}"
+        open_connection "${socket}" "${destination}" no "${rest[@]}" || fail "Could not open a connection to ${destination}"
+        echo "${socket}"
+        ;;
+    watch)
+        trap 'echo 1>&2; log "watcher stopped, the connection stays as it is"; exit 130' INT TERM
+        looks=0
+        wait="${interval}"
+        state=""
+        while true; do
+            if is_open "${socket}" "${destination}"; then
+                [ "${state}" = "open" ] || log "${destination} open: ${socket}"
+                state="open"
+                wait="${interval}"
+            else
+                [ "${state}" != "open" ] || log "${destination} is gone, opening it again"
+                if [ -z "${state}" ]; then
+                    # the first time you are there: ask straight away
+                    clear_socket "${socket}" "${destination}"
+                    open_connection "${socket}" "${destination}" no "${rest[@]}"
+                else
+                    reopen "${socket}" "${destination}" "${rest[@]}"
+                fi
+                if is_open "${socket}" "${destination}"; then
+                    log "${destination} open: ${socket}"
+                    state="open"
+                    wait="${interval}"
+                else
+                    [ "${state}" = "closed" ] && wait=$(( wait * 2 ))
+                    [ "${wait}" -le "${MAX_WAIT}" ] || wait="${MAX_WAIT}"
+                    state="closed"
+                    log "next try in ${wait} seconds"
+                fi
+            fi
+            looks=$(( looks + 1 ))
+            [ "${count}" -eq 0 ] || [ "${looks}" -lt "${count}" ] || break
+            sleep "${wait}"
+        done
+        [ "${state}" = "open" ]
+        ;;
+esac

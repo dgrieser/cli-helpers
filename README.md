@@ -2361,6 +2361,35 @@ sshr --prompt user@host
 sshr
 ```
 
+### `agent-ssh`
+Keeps one SSH connection to a host open for agents and scripts. You log in once, with whatever the host asks for (password, second factor); everything after that goes through the control socket of that connection (`~/.ssh/cm-NAME`) and asks for nothing. `watch` stays in its terminal, looks at the connection every 30 seconds and opens it again when it is gone. It first tries without asking for anything, so a host that logs you in by key comes back silently and a host that cannot be reached leaves no prompt behind; it is tried again with growing pauses of up to 5 minutes. Only when the host refuses that login you get a desktop notification and the terminal asks. A connection that lost its network closes itself within a minute (`ServerAliveInterval`), so the watcher notices. `exec` never opens a connection and never asks: without an open one it fails with exit status 255. It calls `/usr/bin/ssh`, not the [`ssh`](#ssh) wrapper, so nothing lands in the shell history.
+
+**Usage:** `agent-ssh COMMAND [OPTIONS] [DESTINATION] [-- SSH OPTIONS | REMOTE COMMAND]`
+
+| Argument / Flag | Description |
+|---|---|
+| `open DESTINATION` | Open the connection in the background and print its control socket. |
+| `watch DESTINATION` | Open the connection and stay: open it again whenever it is gone. |
+| `status [DESTINATION]` | Say whether the connection is open (exit status 1 when not); without a destination list every connection. |
+| `exec DESTINATION [REMOTE COMMAND]` | Run the remote command through the open connection. |
+| `path DESTINATION` | Print the control socket, for `ssh`, `scp` or `rsync -e` with `-o ControlPath=`. |
+| `close DESTINATION` | Close the connection. |
+| `-n`, `--name NAME` | Name of the control socket (default: the destination). |
+| `-p`, `--persist TIME` | `open`, `watch`: close the connection after this long without use (default: `8h`; `yes` for never). |
+| `-i`, `--interval SECONDS` | `watch`: seconds between two looks (default: 30). |
+| `-c`, `--count NUMBER` | `watch`: stop after this many looks. |
+| `--no-notify` | `watch`: no desktop notification. |
+| `-- SSH OPTIONS` | `open`, `watch`: passed to `ssh`, e.g. `-- -p 2222 -J jumphost`. |
+
+**Examples:**
+```bash
+agent-ssh watch user@jump.example.com
+agent-ssh exec user@jump.example.com uptime
+scp -o ControlPath="$(agent-ssh path user@jump.example.com)" file user@jump.example.com:
+agent-ssh status
+agent-ssh close user@jump.example.com
+```
+
 ### `ssh-httpd-tunnel`
 Starts a local Python HTTP server on a generated port and opens a reverse SSH tunnel so the remote host can reach it on the same port.
 
