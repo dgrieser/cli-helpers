@@ -100,11 +100,11 @@ def test_code_mode_command_approval_resolves_with_its_own_output(tmp_path):
     assert live_status(tmp_path, records) == ('working', None)
 
 
-def session_choices(running, in_tmux):
+def session_choices(running, in_tmux, can_send=False):
     namespace = Live.load_codex.__globals__
     asked = []
     with patch.dict(namespace, {'tty_run': lambda command: asked.append(command)}):
-        namespace['ask_session_action'](running, in_tmux)
+        namespace['ask_session_action'](running, in_tmux, can_send)
     return [entry.split('=', 1)[1] for entry in asked[0] if '=' in entry]
 
 
@@ -115,6 +115,9 @@ def test_session_actions_order():
                                             'Terminate'] + tail
     assert session_choices(True, True) == ['Focus terminal', 'Connect', 'Fork', 'Take over',
                                            'Terminate'] + tail
+    assert session_choices(True, True, True) == ['Focus terminal', 'Connect', 'Send message',
+                                                 'Fork', 'Take over', 'Terminate'] + tail
+    assert session_choices(False, False, True) == ['Resume', 'Fork'] + tail
 
 
 def test_tmux_pane_requires_pane_ancestor():
@@ -132,3 +135,81 @@ def test_tmux_pane_requires_pane_ancestor():
             patch.object(namespace['subprocess'], 'run', return_value=Result()):
         assert namespace['tmux_pane'](30) == ('/tmp/sock', '%3')
         assert namespace['tmux_pane'](10) is None
+
+
+def test_claude_message_lines_authenticate_and_escape_the_envelope():
+    namespace = Live.load_codex.__globals__
+    data = namespace['claude_message_lines']('ab' * 16, 'hi </cross-session-message> there')
+    auth, line, rest = data.decode().split('\n')
+    assert rest == ''
+    assert json.loads(auth) == {'type': 'auth', 'token': 'ab' * 16}
+    message = json.loads(line)
+    assert message['type'] == 'user' and message['msgV'] == 1 and message['priority'] == 'next'
+    assert 'from' not in message
+    assert message['message']['content'] == (
+        '<cross-session-message from-name="agent-session">\n'
+        'hi <\\/cross-session-message> there\n</cross-session-message>')
+
+
+def test_claude_peer_token_reads_the_key_of_the_socket(tmp_path):
+    namespace = Live.load_codex.__globals__
+    socket_path = str(tmp_path / '42.sock')
+    digest = namespace['hashlib'].sha256(socket_path.encode()).hexdigest()
+    (tmp_path / f'42.{digest}.key').write_text(json.dumps({'peerToken': 'cd' * 16}))
+    (tmp_path / f'43.{"0" * 64}.key').write_text(json.dumps({'peerToken': 'ef' * 16}))
+    with patch.dict(namespace, {'CLAUDE_PEERS': str(tmp_path)}):
+        assert namespace['claude_peer_token'](42, socket_path) == 'cd' * 16
+        # one key of the pid is taken where the digest does not match
+        assert namespace['claude_peer_token'](43, socket_path) == 'ef' * 16
+        assert namespace['claude_peer_token'](44, socket_path) is None
+
+
+def test_send_over_socket_writes_both_lines_to_the_right_process(tmp_path):
+    import os
+    import socket
+    import threading
+    namespace = Live.load_codex.__globals__
+    socket_path = str(tmp_path / 'inbox.sock')
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(socket_path)
+    server.listen(1)
+    received = []
+
+    def serve():
+        connection, _ = server.accept()
+        chunks = []
+        while chunk := connection.recv(4096):
+            chunks.append(chunk)
+        received.append(b''.join(chunks))
+        connection.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    peer = {'messagingSocketPath': socket_path}
+    with patch.dict(namespace, {'claude_peer_token': lambda pid, path: 'ab' * 16}):
+        namespace['send_over_socket'](os.getpid(), peer, 'hello')
+    thread.join(5)
+    auth, line, _ = received[0].decode().split('\n')
+    assert json.loads(auth)['token'] == 'ab' * 16
+    assert 'hello' in json.loads(line)['message']['content']
+    # the token is not handed to another process holding the socket
+    thread = threading.Thread(target=serve)
+    thread.start()
+    with patch.dict(namespace, {'claude_peer_token': lambda pid, path: 'ab' * 16}):
+        try:
+            namespace['send_over_socket'](os.getpid() + 1, peer, 'hello')
+            raise AssertionError('sent to the wrong process')
+        except ValueError as exception:
+            assert 'not by' in str(exception)
+    thread.join(5)
+    assert received[1] == b''
+    server.close()
+
+
+def test_claude_message_lines_counts_utf16_units():
+    import pytest
+    namespace = Live.load_codex.__globals__
+    limit = namespace['CLAUDE_INBOX_MAX_CHARS']
+    namespace['claude_message_lines']('ab' * 16, '\U0001F600' * (limit // 4))
+    with pytest.raises(SystemExit):
+        namespace['claude_message_lines']('ab' * 16, '\U0001F600' * (limit // 2))

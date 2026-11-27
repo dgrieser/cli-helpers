@@ -3537,6 +3537,32 @@ software-551-go-auth-glab@dev@mw() {
     verbose "${SUDO_USER:+${SUDO_USER} }go env -w GOAUTH=${wanted}"
     ${SUDO_USER} "${go_cmd}" env -w "GOAUTH=${wanted}"
 }
+# netrchy serves ~/.netrc from a FUSE mount: the tokens glab keeps for its
+# GitLab hosts, then the static ~/.config/netrchy/netrc for the other hosts.
+# netrchy install sets up its systemd user service, moves an existing
+# ~/.netrc to the static file and links ~/.netrc to the mount; run on each
+# update, it restarts the service when the binary changed
+software-552-netrchy@dev@mw() {
+    apt_upgrade fuse3 || return 1
+    install_git_release "https://github.com/dgrieser/netrchy" || return $?
+    completion_update netrchy netrchy completion bash || return 1
+    needs glab || return $(( $? == 3 ? 0 : 1 ))
+    if [ "${no_config}" -eq 1 ]; then
+        echo "${APP_NAME}: not setting up the netrchy service (--no-config)" 1>&2
+        return 0
+    fi
+    # a dry run does not install netrchy
+    if [ "${dry_run}" -eq 1 ] && ! ${SUDO_USER} which netrchy > /dev/null 2>&1; then
+        echo "Would run netrchy install" 1>&2
+        return 0
+    fi
+    # systemctl --user talks to the user's session
+    local session_env=("env" "XDG_RUNTIME_DIR=/run/user/${CURRENT_USER_ID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${CURRENT_USER_ID}/bus")
+    local install_args=()
+    [ "${dry_run}" -eq 1 ] && install_args+=("--dry-run")
+    verbose "${SUDO_USER:+${SUDO_USER} }netrchy install ${install_args[*]}"
+    ${SUDO_USER} "${session_env[@]}" netrchy install "${install_args[@]}"
+}
 software-560-go-tools@dev() {
     go_install_update \
         golang.org/x/tools/gopls \

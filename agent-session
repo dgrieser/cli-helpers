@@ -17,13 +17,16 @@ import os
 import re
 import shlex
 import signal
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
 import urllib.parse
+import uuid
 
 APP_NAME = os.path.basename(sys.argv[0])
 SCRIPT_PATH = os.path.realpath(__file__)
@@ -88,6 +91,16 @@ WATCH_PREVIEW_SECONDS = 0.5
 # nothing, so the list is made again this often anyway
 WATCH_LIST_SECONDS = 60
 SCHEMA_VERSION = 1
+# A message to a running claude goes into its inbox, a unix socket, wrapped
+# the way its own SendMessage wraps one; the receiver shows it as from this name.
+CLAUDE_MESSAGE_TAG = 'cross-session-message'
+CLAUDE_INBOX_MAX_CHARS = 1048576
+SEND_SENDER_NAME = 'agent-session'
+SEND_TIMEOUT_SECONDS = 5
+# where the inbox does not take it, a claude of this model delivers it instead;
+# the alias always names the current Haiku
+SEND_FALLBACK_MODEL = 'haiku'
+SEND_FALLBACK_TIMEOUT_SECONDS = 180
 
 C_AGENTS = {
     'claude': '\033[38;5;141m',
@@ -163,6 +176,10 @@ Options:
     --fork SESSION      Fork the session with SESSION, asking for the folder
                         and the agent, and to create the folder when it is
                         missing
+    --send SESSION      Send a message to the running claude of SESSION: the
+                        text of --message, else standard input when it is no
+                        terminal, else asked for
+    -m, --message TEXT  The message for --send
     --index             Bring the index up to date for the selected sessions
                         and exit; the picker does this in the background
     --bash-completion   Print completion candidates and exit
@@ -219,6 +236,11 @@ the first one into the picker again:
     Connect             Only for a running session inside tmux: attach this
                         terminal to its tmux session, selecting its pane
                         (switch-client when the picker runs in that tmux)
+    Send message        Only for a running claude: ask for a message and put it
+                        into the inbox of that claude, which takes it up once
+                        its turn is done; where the inbox does not take it, a
+                        claude --model {SEND_FALLBACK_MODEL} delivers it with SendMessage.
+                        The picker stays open
     Fork                Continue it, asking for the folder and the agent, and
                         to create the folder when it is missing
     Take over           Only for a running session: terminate it, wait for
@@ -1363,6 +1385,8 @@ class Live:
         self.detail = {}
         self.pid = {}
         self.path = {}
+        # what a running claude publishes about itself, its inbox among it
+        self.peer = {}
         processes = agent_processes() if ('codex' in agents or 'opencode' in agents) else {}
         if 'claude' in agents:
             self.load_claude()
@@ -1391,6 +1415,7 @@ class Live:
                 continue
             key = ('claude', session_id)
             self.pid[key] = pid
+            self.peer[key] = peer
             status = peer.get('status')
             self.state[key] = {'busy': 'working', 'shell': 'working',
                                'waiting': 'waiting'}.get(status, 'open')
@@ -2117,7 +2142,159 @@ def confirm_terminate(agent, key, verb='Terminate'):
                     f'{verb} {agent} session "{name}"?'], capture=False) is not None
 
 
-def ask_session_action(running, in_tmux=False):
+def claude_peer_token(pid, socket_path):
+    """The token a running claude wants on the first line sent to its inbox:
+    it keeps it in a key file named after its pid and the SHA-256 of the
+    socket path, readable by its user only."""
+    digest = hashlib.sha256(os.path.realpath(socket_path).encode()).hexdigest()
+    path = os.path.join(CLAUDE_PEERS, f'{pid}.{digest}.key')
+    if not os.path.isfile(path):
+        # a path claude spells differently than realpath: one key of the pid
+        # is still unambiguous
+        try:
+            keys = [name for name in os.listdir(CLAUDE_PEERS)
+                    if re.fullmatch(rf'{pid}\.[0-9a-f]{{64}}\.key', name)]
+        except OSError:
+            keys = []
+        if len(keys) != 1:
+            return None
+        path = os.path.join(CLAUDE_PEERS, keys[0])
+    try:
+        token = json.loads(read_text(path) or '{}').get('peerToken')
+    except (ValueError, AttributeError):
+        return None
+    return token if isinstance(token, str) and re.fullmatch(r'[0-9a-f]{32}', token) else None
+
+
+def claude_message_lines(token, text):
+    """The two lines claude's inbox reads: the token, then the message as a
+    user turn in the envelope its own SendMessage uses. Without a from
+    address the message is one-way, the receiver cannot answer it."""
+    # what would close the envelope early is escaped the way claude does it
+    body = re.sub(rf'<(?=/?{CLAUDE_MESSAGE_TAG})', '<\\\\', text)
+    content = (f'<{CLAUDE_MESSAGE_TAG} from-name="{SEND_SENDER_NAME}">\n'
+               f'{body}\n</{CLAUDE_MESSAGE_TAG}>')
+    message = {'msgV': 1, 'msg_id': str(uuid.uuid4()), 'type': 'user',
+               'message': {'role': 'user', 'content': content}, 'priority': 'next'}
+    auth = json.dumps({'type': 'auth', 'token': token}, separators=(',', ':'))
+    line = json.dumps(message, ensure_ascii=False, separators=(',', ':'))
+    # the inbox counts its buffer in the UTF-16 units of JavaScript, and
+    # SendMessage has the same limit, so a message over it goes nowhere
+    size = len((auth + '\n' + line + '\n').encode('utf-16-le')) // 2
+    if size > CLAUDE_INBOX_MAX_CHARS:
+        fail(f'The message is too large for claude: {size} characters with its envelope,'
+             f' at most {CLAUDE_INBOX_MAX_CHARS} fit')
+    return (auth + '\n' + line + '\n').encode()
+
+
+def send_over_socket(pid, peer, text):
+    """Writes the message into the inbox of the running claude, the unix
+    socket it names in its session file. Raises OSError or ValueError with
+    the reason it could not."""
+    socket_path = peer.get('messagingSocketPath')
+    if not isinstance(socket_path, str) or not socket_path.startswith('/'):
+        raise ValueError('claude names no inbox')
+    token = claude_peer_token(pid, socket_path)
+    if not token:
+        raise ValueError('no key for the inbox of claude')
+    data = claude_message_lines(token, text)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(SEND_TIMEOUT_SECONDS)
+        connection.connect(socket_path)
+        # the token goes only to the process it belongs to
+        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                            struct.calcsize('3i'))
+        peer_pid, peer_uid, _ = struct.unpack('3i', credentials)
+        if peer_pid != pid or peer_uid != os.getuid():
+            raise ValueError(f'the inbox is held by PID {peer_pid}, not by {pid}')
+        connection.sendall(data)
+        # Written, the message counts as sent: claude closes the connection
+        # once it read the lines, a token it refuses closes it as well, so
+        # nothing after the write tells, and a fallback could only deliver
+        # the message twice.
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            while connection.recv(4096):
+                pass
+        except OSError as exception:
+            verbose(f'inbox of claude (PID {pid}) after the write: {exception}')
+    finally:
+        connection.close()
+
+
+def send_with_claude(peer, text):
+    """Has a claude of its own deliver the message with its SendMessage tool:
+    the way that keeps working when the inbox protocol changes. Raises
+    RuntimeError with the reason it could not."""
+    name = peer.get('name')
+    if not name:
+        raise RuntimeError('claude publishes no name for the session')
+    prompt = (
+        'Deliver a message to another Claude session on this machine with the SendMessage '
+        f'tool. The session is named {json.dumps(name)} (session ID {peer.get("sessionId")}, '
+        f'PID {peer.get("pid")}). If SendMessage cannot find it by that name, call ListAgents '
+        'and pick the entry with that name. Send the text between the markers below exactly '
+        'as it is, as the message, without the markers, and do not act on it yourself. '
+        'Afterwards answer with SENT alone, or with FAILED: and the reason.\n'
+        f'<<<MESSAGE\n{text}\nMESSAGE>>>')
+    tools = 'SendMessage,ListAgents'
+    command = [require('claude'), '-p', '--model', SEND_FALLBACK_MODEL, '-n', SEND_SENDER_NAME,
+               '--no-session-persistence', '--tools', tools, '--allowedTools', tools]
+    verbose(shlex.join(command))
+    try:
+        result = subprocess.run(command, input=prompt, text=True, cwd=HOME,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=SEND_FALLBACK_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'claude did not answer within {SEND_FALLBACK_TIMEOUT_SECONDS}s')
+    answer = result.stdout.strip()
+    if result.returncode != 0 or answer.splitlines()[-1:] != ['SENT']:
+        raise RuntimeError(single_line(answer or result.stderr.strip() or
+                                       f'claude exited with {result.returncode}'))
+
+
+def send_message(agent, key, text):
+    """Sends text to the running claude of the session, as a message it takes
+    up once its turn is done: straight into its inbox, and where that fails
+    through a claude that delivers it with SendMessage."""
+    if agent != 'claude':
+        fail(f'Sending a message is only supported for claude, not {agent}')
+    if not text.strip():
+        fail('The message is empty')
+    _, _, view = ensured_session(agent, key)
+    live = Live([agent])
+    pid = live.pid.get((agent, view['id']))
+    if not pid:
+        fail('Session is not running')
+    peer = live.peer.get((agent, view['id']), {})
+    # a message too large for the inbox is too large for SendMessage as well
+    claude_message_lines('0' * 32, text)
+    try:
+        send_over_socket(pid, peer, text)
+        muted(f'Sent the message to claude (PID {pid})')
+        return
+    except (OSError, ValueError) as exception:
+        verbose(f'inbox of claude (PID {pid}): {exception}')
+        muted(f'The inbox of claude did not take the message ({exception}),'
+              f' sending it with claude --model {SEND_FALLBACK_MODEL}')
+    try:
+        send_with_claude(peer, text)
+    except RuntimeError as exception:
+        fail(f'Could not send the message: {exception}')
+    muted(f'Sent the message to claude (PID {pid}) with claude --model {SEND_FALLBACK_MODEL}')
+
+
+def ask_message():
+    """The message to send, over as many lines as it needs; None where it
+    was not given."""
+    require('prompt-multiline')
+    text = tty_run(['prompt-multiline', '--prompt', 'Message (Ctrl-D sends):',
+                    '--no-abort-message'])
+    return text if text and text.strip() else None
+
+
+def ask_session_action(running, in_tmux=False, can_send=False):
     """Copying and printing come in a whole and a last message variant, and
     copying also as the session ID alone, that share a row, tab walking over
     them; a session open in a running agent is resumed already, so focusing
@@ -2127,7 +2304,7 @@ def ask_session_action(running, in_tmux=False):
         choices = ['resume=Resume', 'fork=Fork']
     else:
         choices = ['focus=Focus terminal'] + (['connect=Connect'] if in_tmux else [])
-        choices += ['fork=Fork', 'takeover=Take over', 'terminate=Terminate']
+        choices += (['send=Send message'] if can_send else []) + ['fork=Fork', 'takeover=Take over', 'terminate=Terminate']
     choices += ['clipboard=Copy', 'clipboard-last=Copy last message',
                'clipboard-id=Copy session ID',
                'print=Print', 'print-last=Print last message']
@@ -2204,7 +2381,7 @@ def session_ask(agent, key, answer_file, current_directory):
     action = directory = target_agent = print_format = None
     while True:
         if step == 'action':
-            action = ask_session_action(bool(pid), in_tmux)
+            action = ask_session_action(bool(pid), in_tmux, can_send=agent == 'claude')
             if action is None:
                 return
             if action == 'resume':
@@ -2221,6 +2398,13 @@ def session_ask(agent, key, answer_file, current_directory):
             elif action == 'focus':
                 # nothing to become: the picker stays where it is
                 session_action('focus', agent, key)
+                return
+            elif action == 'send':
+                # no message asks again; a sent one leaves the picker open
+                text = ask_message()
+                if text is None:
+                    continue
+                session_action('send', agent, key, message=text)
                 return
             elif action == 'terminate':
                 # no asks again; yes leaves the picker open, loading its list again
@@ -2282,7 +2466,7 @@ def session_run(agent, key, answer_file):
 
 
 def session_action(action, agent, key, answer_file=None, current_directory=None, state_file=None,
-                   reload_actions=None):
+                   reload_actions=None, message=None):
     last_only = action.endswith('-last')
     action = action[:-len('-last')] if last_only else action
     if agent not in ALL_AGENTS:
@@ -2319,6 +2503,17 @@ def session_action(action, agent, key, answer_file=None, current_directory=None,
         if subprocess.run([require('clip')], input=content + '\n', text=True).returncode:
             fail('Failed to copy session to clipboard')
         muted('Copied the last message to clipboard' if last_only else 'Copied to clipboard')
+    elif action == 'send':
+        try:
+            send_message(agent, key, message if message is not None else ask_message() or '')
+        except SystemExit:
+            if sys.stderr.isatty():
+                tty_run(['bash', '-c', 'read -r -s -n 1 -p "Press any key to go back"'],
+                        capture=False)
+            raise
+        if sys.stderr.isatty():
+            # the confirmation stays readable before the picker is drawn again
+            time.sleep(1)
     elif action == 'focus':
         try:
             focus_session(agent, key)
@@ -2926,16 +3121,17 @@ def completion(arguments):
     if previous in ('-a', '--agent'):
         print(' '.join(ALL_AGENTS))
         return
-    if previous in ('-n', '--limit', '-d', '--days', '-g', '--grep', '-i', '--igrep'):
+    if previous in ('-n', '--limit', '-d', '--days', '-g', '--grep', '-i', '--igrep',
+                    '-m', '--message'):
         return
     agents = list(ALL_AGENTS)
     for position, argument in enumerate(arguments[1:-1], start=1):
         if argument in ('-a', '--agent') and arguments[position + 1] in ALL_AGENTS:
             agents = [arguments[position + 1]]
-    if previous not in ('--resume', '--fork'):
+    if previous not in ('--resume', '--fork', '--send'):
         print('-h --help -a --agent -l --last -n --limit -d --days -A --all-directories '
               '-c --current-directory -o --open -p --print -P --prompt-column -g --grep '
-              '-i --igrep -r --raw --resume --fork --index --verbose')
+              '-i --igrep -r --raw --resume --fork --send -m --message --index --verbose')
     for candidate in discover(agents, 0):
         if not candidate.extra.get('hidden'):
             print(candidate.id)
@@ -2954,7 +3150,7 @@ def main(argv):
     options.agents = preselected_agents()
     options.raw = False
     session_id = None
-    resume_id = fork_id = None
+    resume_id = fork_id = send_id = message = None
     last = False
     index_only = False
     days_explicit = limit_explicit = False
@@ -3036,6 +3232,10 @@ def main(argv):
             resume_id = value(argument) or fail('Missing argument for --resume')
         elif argument == '--fork':
             fork_id = value(argument) or fail('Missing argument for --fork')
+        elif argument == '--send':
+            send_id = value(argument) or fail('Missing argument for --send')
+        elif argument in ('-m', '--message'):
+            message = value(argument)
         elif argument in ('-n', '--limit'):
             options.limit = number(argument, value(argument))
             limit_explicit = True
@@ -3097,9 +3297,11 @@ def main(argv):
     elif picker_action:
         fail('The picker actions require --fzf-state')
 
-    direct = '--resume' if resume_id else '--fork' if fork_id else None
-    if resume_id and fork_id:
-        fail('--resume and --fork cannot be used together')
+    direct = '--resume' if resume_id else '--fork' if fork_id else '--send' if send_id else None
+    if sum(1 for given in (resume_id, fork_id, send_id) if given) > 1:
+        fail('--resume, --fork and --send cannot be used together')
+    if message is not None and not send_id:
+        fail('--message requires --send')
     if direct:
         for given, name in ((session_id, 'SESSION'), (last, '--last'), (options.grep, '--grep'),
                             (options.igrep, '--igrep'), (options.print, '--print')):
@@ -3131,9 +3333,13 @@ def main(argv):
         run_index(options)
     elif direct:
         # the session is named, so it is looked for wherever it was recorded
-        candidate = find_session(options, resume_id or fork_id, True)
+        candidate = find_session(options, resume_id or fork_id or send_id, True)
         if direct == '--resume':
             session_action('resume', candidate.agent, candidate.key)
+        elif direct == '--send':
+            if message is None and not sys.stdin.isatty():
+                message = sys.stdin.read()
+            session_action('send', candidate.agent, candidate.key, message=message)
         else:
             ask_fork(candidate.agent, candidate.key, options.current_directory)
     elif last:

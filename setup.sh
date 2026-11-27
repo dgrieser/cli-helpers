@@ -809,6 +809,8 @@ install_gh_glab() {
     # go-auth-glab as the GOAUTH of Go, so private Go modules on the GitLab
     # hosts of glab resolve with its token; installs Go first when it is missing
     command -v glab > /dev/null 2>&1 && run_updater go-auth-glab
+    # netrchy serves ~/.netrc from the tokens of glab, after the logins
+    command -v glab > /dev/null 2>&1 && run_updater netrchy
 }
 
 # Ensure the configured SSH host key is available for noninteractive logins.
