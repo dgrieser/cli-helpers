@@ -8,7 +8,15 @@ import threading
 import time
 from pathlib import Path
 
-SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER=600 #1800
+# On battery with the lid closed: power saver after 10 minutes. Suspend only when the
+# battery is low: under 30 % once the lid is closed for 30 minutes, under 10 % once it
+# is closed for 5 minutes. At 30 % or more the laptop keeps running.
+SECONDS_UNTIL_POWER_SAVER=600
+BATTERY_PERCENT_LOW=30
+SECONDS_LID_CLOSED_BEFORE_SUSPEND_LOW=1800
+BATTERY_PERCENT_CRITICAL=10
+SECONDS_LID_CLOSED_BEFORE_SUSPEND_CRITICAL=300
+POWER_PROFILE_POWER_SAVER='power-saver'
 SECONDS_DELAY_BETWEEN_SUSPENDS=60
 # give logind time to send PrepareForSleep(false) itself before NetworkManager is checked
 SECONDS_DELAY_NETWORK_WAKE_CHECK=15
@@ -59,15 +67,17 @@ def on_lid_closed_event(on_battery):
     lock_screen()
     schedule_screens_off(SECONDS_DELAY_SCREEN_OFF_AFTER_LOCK)
 
-def on_lid_closed_for_a_while_event(on_battery):
-    print(f'Detected lid closed for {SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER} seconds while on {"battery" if on_battery else "AC"}')
+def on_lid_closed_power_saver_event(on_battery):
+    print(f'Detected lid closed for {SECONDS_UNTIL_POWER_SAVER} seconds while on {"battery" if on_battery else "AC"}')
     if on_battery:
-        suspend_laptop()
+        set_power_saver()
 
 def on_battery_event(on_battery):
     print(f'Detected change to {"battery" if on_battery else "AC"} power')
+    if not on_battery:
+        restore_power_profile()
     if on_battery and not is_lid_open:
-        print('Now on battery and lid closed, starting lid closed timer')
+        print('Now on battery and lid closed, starting lid closed timers')
         start_lid_closed_timer()
 
 def on_prepare_for_sleep(suspending):
@@ -83,8 +93,10 @@ def on_resume():
     print(f'Detected system resume with lid {"open" if is_lid_open else "closed"}')
     schedule_network_wake_check()
     if not is_lid_open and is_on_battery:
-        print('Lid still closed and on battery, suspending again')
-        suspend_laptop()
+        print('Lid still closed and on battery, checking the battery')
+        # the power saver timer does not count the time asleep
+        reschedule_power_saver()
+        check_suspend()
 
 # A resume can kill systemd-logind (systemd watchdog, 2026-11-15) before it sends
 # PrepareForSleep(false). NetworkManager then stays asleep and the wifi stays off.
@@ -211,39 +223,187 @@ def turn_screens_off_if_lid_closed():
     set_screens_on(False)
     return False  # a GLib timeout callback, do not repeat
 
+# power-profiles-daemon, the legacy name before version 0.20 as a fallback
+def get_power_profiles():
+    try:
+        return bus.get('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles')
+    except Exception:
+        return bus.get('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles')
+
+# remembers the profile before, restore_power_profile switches back to it
+def set_power_saver():
+    global power_profile_before
+    try:
+        power_profiles = get_power_profiles()
+        current = power_profiles.ActiveProfile
+        if current == POWER_PROFILE_POWER_SAVER:
+            return
+        print(f'Switching power profile from {current} to {POWER_PROFILE_POWER_SAVER}')
+        power_profiles.ActiveProfile = POWER_PROFILE_POWER_SAVER
+        power_profile_before = current
+    except Exception as e:
+        print(f'Could not switch to power profile {POWER_PROFILE_POWER_SAVER}: {e}')
+
+# any other profile in between, even power-saver chosen again later, belongs to the user
+def on_power_profiles_properties_changed(params):
+    global power_profile_before
+    changed = params[1]
+    if power_profile_before is None or 'ActiveProfile' not in changed:
+        return
+    if changed['ActiveProfile'] != POWER_PROFILE_POWER_SAVER:
+        print(f'Power profile changed to {changed["ActiveProfile"]}, not restoring {power_profile_before} anymore')
+        power_profile_before = None
+
+# leaves a profile alone that was changed after set_power_saver
+def restore_power_profile():
+    global power_profile_before
+    if power_profile_before is None:
+        return
+    previous = power_profile_before
+    try:
+        power_profiles = get_power_profiles()
+        current = power_profiles.ActiveProfile
+        if current != POWER_PROFILE_POWER_SAVER:
+            print(f'Power profile changed to {current} meanwhile, not restoring {previous}')
+        else:
+            print(f'Restoring power profile {previous}')
+            power_profiles.ActiveProfile = previous
+        power_profile_before = None
+    except Exception as e:
+        # keep it, the next lid open or AC plug-in tries again
+        print(f'Could not restore power profile {previous}: {e}')
+
 def lock_screen():
     print('Locking screen')
     subprocess.run(['loginctl', 'lock-session'])
 
 def suspend_laptop():
-    global last_suspend_timestamp
+    global last_suspend_timestamp, suspend_pending
     now = time.time()
+    if suspend_pending:
+        # the pending one may be dropped for a lid or power change, so check again
+        print(f'Suspend already pending, checking again in {SECONDS_DELAY_BETWEEN_SUSPENDS} seconds')
+        schedule_suspend_check(SECONDS_DELAY_BETWEEN_SUSPENDS)
+        return
     if now - last_suspend_timestamp < SECONDS_DELAY_BETWEEN_SUSPENDS:
-        print(f'Last suspend call was less than {SECONDS_DELAY_BETWEEN_SUSPENDS} seconds ago, starting lid closed timer instead')
-        start_lid_closed_timer()
+        print(f'Last suspend call was less than {SECONDS_DELAY_BETWEEN_SUSPENDS} seconds ago, checking again later')
+        schedule_suspend_check(SECONDS_DELAY_BETWEEN_SUSPENDS)
         return
     last_suspend_timestamp = now
-    print('Unmounting cifs')
-    umount_cifs(force=True)
-    print('Suspending laptop')
-    subprocess.run(['systemctl', 'suspend'])
+    suspend_pending = True
+    # a stalled CIFS unmount must not block the main loop and its lid and power events
+    threading.Thread(target=unmount_and_suspend, args=(power_state_generation,), daemon=True).start()
 
-def on_lid_closed_timer_trigger():
-    cancel_lid_closed_timer()
-    on_lid_closed_for_a_while_event(is_on_battery)
+def unmount_and_suspend(generation):
+    global suspend_pending
+    try:
+        print('Unmounting cifs')
+        umount_cifs(force=True)
+        # the lid or the power source may change while the unmount runs, even back again
+        if generation != power_state_generation:
+            print('Lid or power source changed while unmounting, not suspending')
+            return
+        print('Suspending laptop')
+        subprocess.run(['systemctl', 'suspend'])
+    finally:
+        suspend_pending = False
 
+# the time the lid is closed for, suspends included; None while the lid is open or on AC
+def seconds_lid_closed():
+    if lid_closed_since is None:
+        return None
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - lid_closed_since
+
+def get_battery_percent():
+    try:
+        return float(battery.Percentage)
+    except Exception as e:
+        print(f'Could not read the battery level: {e}')
+        return None
+
+# how long the lid must be closed before a suspend at this battery level, None for never
+def seconds_lid_closed_before_suspend(percent):
+    if percent is None:
+        # unknown level: suspend like a low battery rather than let it run empty
+        return SECONDS_LID_CLOSED_BEFORE_SUSPEND_LOW
+    if percent < BATTERY_PERCENT_CRITICAL:
+        return SECONDS_LID_CLOSED_BEFORE_SUSPEND_CRITICAL
+    if percent < BATTERY_PERCENT_LOW:
+        return SECONDS_LID_CLOSED_BEFORE_SUSPEND_LOW
+    return None
+
+# called by the lid closed timers, on battery level changes and on resume
+def check_suspend():
+    if is_lid_open or not is_on_battery:
+        return
+    closed = seconds_lid_closed()
+    if closed is None:
+        return
+    percent = get_battery_percent()
+    required = seconds_lid_closed_before_suspend(percent)
+    if required is None:
+        return
+    level = 'unknown' if percent is None else f'{percent:.0f} %'
+    if closed < required:
+        print(f'Battery at {level}, suspending once the lid is closed for {required} seconds')
+        schedule_suspend_check(required - closed)
+        return
+    print(f'Battery at {level} and lid closed for {closed:.0f} seconds, suspending')
+    suspend_laptop()
+
+def schedule_suspend_check(delay):
+    global suspend_check_timer
+    if suspend_check_timer is not None:
+        GLib.source_remove(suspend_check_timer)
+    suspend_check_timer = GLib.timeout_add(max(1, int(delay * 1000) + 1), on_suspend_check_timer_trigger)
+
+def on_suspend_check_timer_trigger():
+    global suspend_check_timer
+    suspend_check_timer = None
+    check_suspend()
+    return False  # a GLib timeout callback, do not repeat
+
+def schedule_power_saver(delay):
+    global power_saver_timer
+    if power_saver_timer is not None:
+        GLib.source_remove(power_saver_timer)
+    power_saver_timer = GLib.timeout_add(max(1, int(delay * 1000) + 1), on_power_saver_timer_trigger)
+
+# GLib timers do not count the time asleep, the lid closed time does
+def reschedule_power_saver():
+    closed = seconds_lid_closed()
+    if power_saver_timer is not None and closed is not None:
+        schedule_power_saver(SECONDS_UNTIL_POWER_SAVER - closed)
+
+def on_power_saver_timer_trigger():
+    global power_saver_timer
+    power_saver_timer = None
+    on_lid_closed_power_saver_event(is_on_battery)
+    return False  # a GLib timeout callback, do not repeat
+
+# GLib timers: the callbacks run in the main loop, like the D-Bus signal handlers.
+# The suspend check runs first at the shortest time a suspend can happen at.
 def start_lid_closed_timer():
     cancel_lid_closed_timer()
-    global lid_closed_timer
-    if SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER > 0:
-        lid_closed_timer = threading.Timer(SECONDS_UNTIL_LID_CLOSED_TIMER_TRIGGER, on_lid_closed_timer_trigger)
-        lid_closed_timer.start()
+    global lid_closed_since, power_saver_timer
+    lid_closed_since = time.clock_gettime(time.CLOCK_BOOTTIME)
+    if SECONDS_UNTIL_POWER_SAVER > 0:
+        schedule_power_saver(SECONDS_UNTIL_POWER_SAVER)
+    schedule_suspend_check(min(SECONDS_LID_CLOSED_BEFORE_SUSPEND_CRITICAL, SECONDS_LID_CLOSED_BEFORE_SUSPEND_LOW))
 
 def cancel_lid_closed_timer():
-    global lid_closed_timer
-    if lid_closed_timer is not None:
-        lid_closed_timer.cancel()
-        lid_closed_timer = None
+    global lid_closed_since, power_saver_timer, suspend_check_timer
+    lid_closed_since = None
+    if power_saver_timer is not None:
+        GLib.source_remove(power_saver_timer)
+        power_saver_timer = None
+    if suspend_check_timer is not None:
+        GLib.source_remove(suspend_check_timer)
+        suspend_check_timer = None
+
+def on_battery_properties_changed(*args):
+    if 'Percentage' in args[1] and not is_lid_open and is_on_battery:
+        check_suspend()
 
 def on_battery(on_battery):
     global is_on_battery
@@ -252,7 +412,10 @@ def on_battery(on_battery):
 
 def on_upower_properties_changed(*args):
     properties = args[1]
-    
+    global power_state_generation
+    if 'LidIsClosed' in properties or 'OnBattery' in properties:
+        power_state_generation += 1
+
     if 'LidIsClosed' in properties:
         if properties['LidIsClosed']:
             on_lid_closed_event(is_on_battery)
@@ -260,8 +423,11 @@ def on_upower_properties_changed(*args):
         else:
             on_lid_opened_event(is_on_battery)
             cancel_lid_closed_timer()
+            restore_power_profile()
     
     if 'OnBattery' in properties:
+        if not properties['OnBattery']:
+            cancel_lid_closed_timer()
         on_battery(properties['OnBattery'])
 
 def get_on_battery():
@@ -279,13 +445,22 @@ def get_on_battery():
 is_lid_open = True
 is_on_battery = get_on_battery()
 last_suspend_timestamp = 0
-lid_closed_timer = None
+lid_closed_since = None
+suspend_check_timer = None
+suspend_pending = False
+power_saver_timer = None
+power_profile_before = None
+# counts lid and power source changes, a pending suspend is dropped when it changed
+power_state_generation = 0
 screens_off_source = None
 last_monitors_change = 0.0
 bus = SystemBus()
 
 upower = bus.get('org.freedesktop.UPower', '/org/freedesktop/UPower')
 upower.PropertiesChanged.connect(on_upower_properties_changed)
+# the combined level of all batteries, as GNOME shows it
+battery = bus.get('org.freedesktop.UPower', '/org/freedesktop/UPower/devices/DisplayDevice')
+battery.PropertiesChanged.connect(on_battery_properties_changed)
 bus.subscribe(
     iface='org.freedesktop.login1.Manager',
     signal='PrepareForSleep',
@@ -301,9 +476,16 @@ bus.subscribe(
     signal_fired=lambda sender, object, iface, signal, params: on_logind_owner_changed(*params)
 )
 
+for power_profiles_object in ('/org/freedesktop/UPower/PowerProfiles', '/net/hadess/PowerProfiles'):
+    bus.subscribe(
+        iface='org.freedesktop.DBus.Properties',
+        signal='PropertiesChanged',
+        object=power_profiles_object,
+        signal_fired=lambda sender, object, iface, signal, params: on_power_profiles_properties_changed(params)
+    )
 
 print('Starting power trigger...')
-print(f'Currently running on {"battery" if is_on_battery else "AC"} power')
+print(f'Currently running on {"battery" if is_on_battery else "AC"} power, battery at {get_battery_percent()} %')
 reconnect_session_bus()
 loop = GLib.MainLoop()
 loop.run()

@@ -2743,7 +2743,7 @@ power-log --all --days 3
 ```
 
 ### `power-trigger`
-A long-running D-Bus service daemon that watches UPower lid and battery state plus logind sleep signals, and automatically locks the screen on lid close and suspends the laptop (after unmounting CIFS shares) when the lid stays closed on battery; meant to be run as a systemd user service.
+A long-running D-Bus service daemon that watches UPower lid and battery state plus logind sleep signals, and automatically locks the screen on lid close. When the lid stays closed on battery, it switches the power profile to `power-saver` after 10 minutes. It suspends the laptop (after unmounting CIFS shares) only on a low battery: under 30 % once the lid is closed for 30 minutes, under 10 % once it is closed for 5 minutes; at 30 % or more the laptop keeps running. The battery level is checked again whenever it changes, and after a resume with the lid still closed. Opening the lid or plugging in AC power restores the power profile from before, unless it was changed in the meantime. Meant to be run as a systemd user service.
 
 `updater power-trigger` installs and enables the user service, and writes the logind drop-in `/etc/systemd/logind.conf.d/50-power-trigger.conf`: logind ignores the lid (on battery, on AC and docked), so closing it locks instead of suspending, the power button suspends and a long press powers off.
 
