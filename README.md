@@ -2367,8 +2367,9 @@ Gives an agent an SSH connection to a host that needs your login, without the ag
 - `ask` writes down what is asked for, sends a desktop notification and waits. A connection to the same destination (with the same SSH options) that is already open gives its ticket at once, and two asks for one host are one ask. An ask that is not granted in time stays, so the next `ask` finds the connection you opened meanwhile.
 - `grant` shows every ask with the directory it came from and the SSH options it wants, and asks: yes, not now (the ask stays), or deny (the waiting agent is told). With a destination it opens a connection to it, asked for or not, and prints the ticket to hand to the agent. Then it always stays, until you end it with Ctrl-C: it takes the asks as they come (with a bell) and looks at every connection each 30 seconds (`--interval`). A connection that is gone is opened again under the same ticket. It first tries without asking for anything, so a host that logs you in by key comes back silently and a host that cannot be reached leaves no question behind; that one is tried again with growing pauses of up to 5 minutes. Only when the host refuses that login you get a desktop notification and the question on the terminal of `grant`. Ending `grant` leaves the connections as they are.
 - `grant` only runs on a terminal: it is where the host asks for your login. That keeps an agent from granting by mistake; what really keeps it out is the login only you can give, so a host that lets your keys in without one is not protected by this tool.
-- `open` runs a remote command through the connection of a ticket. It never opens a connection and never asks: when the connection is gone it fails with exit status 255. While a `grant` is running the ticket stays and `ask` waits until the connection is back; without one the ticket is gone and `ask` is a new ask. A connection that lost its network closes itself within a minute (`ServerAliveInterval`).
-- `open --tmux` runs the remote command in a window of a tmux session on the host (made when it is not there, used again when it is), so it goes on when the connection or the call ends, and you can attach and watch. Its output (stdout and stderr together) is printed as it comes and its exit status is returned; stdin is not passed on. Without a remote command it attaches you to the session. A result that did not arrive (exit status 255) stays on the host, in the directory below `~/.cache/agent-ssh` that is named on stderr when the command starts, with the files `output` and `status`.
+- `open` runs a remote command through the connection of a ticket, in a window of a tmux session on the host (screen where there is no tmux, directly where there is neither). The session is made when it is not there and used again when it is, so the command goes on when the connection or the call ends, and you can attach and watch. Its output (stdout and stderr together) is printed as it comes and its exit status is returned; stdin is not passed on. Without a remote command it attaches you to the session. A result that did not arrive (exit status 255) stays on the host, in the directory below `~/.cache/agent-ssh` that is named on stderr when the command starts, with the files `output` and `status`.
+- `open --direct` runs the remote command as `ssh` does: stdin is passed on, stdout and stderr stay apart, and the command ends with the connection.
+- `open` never opens a connection and never asks: without one it fails with exit status 255. While a `grant` is running the ticket of a connection that is gone stays, and `open` and `ask` wait until it is back (`--wait`); without one the ticket is gone and `ask` is a new ask. A connection that lost its network closes itself within a minute (`ServerAliveInterval`).
 
 It calls `/usr/bin/ssh`, not the [`ssh`](#ssh) wrapper, so nothing lands in the shell history.
 
@@ -2377,25 +2378,26 @@ It calls `/usr/bin/ssh`, not the [`ssh`](#ssh) wrapper, so nothing lands in the 
 | Argument / Flag | Description |
 |---|---|
 | `ask DESTINATION [-- SSH OPTIONS]` | Agent: ask for a connection, wait until there is one and print its ticket. |
-| `open TICKET [REMOTE COMMAND]` | Agent: run the remote command through the connection of the ticket. |
+| `open TICKET [REMOTE COMMAND]` | Agent: run the remote command through the connection of the ticket, in a tmux or screen session on the host. |
 | `path TICKET` | Agent: print the control socket, for `ssh`, `scp` or `rsync -e` with `-o ControlPath=`. |
 | `grant [DESTINATION] [-- SSH OPTIONS]` | You: go through the asks, or open a connection to the destination; prints the tickets, then stays and keeps the connections open. |
 | `status` | List the asks and the open connections. |
 | `close TICKET` | Close the connection, or take back an ask. |
-| `-w`, `--wait SECONDS` | `ask`: give up waiting after this long (default: 300; `0` waits for as long as it takes). |
+| `-w`, `--wait SECONDS` | `ask`: give up waiting after this long (default: 300; `0` waits for as long as it takes). `open`: how long to wait for a connection that is being opened again (default: 60). |
 | `--no-notify` | `ask`, `grant`: no desktop notification. |
 | `-y`, `--yes` | `grant`: grant every ask without a question. |
 | `-i`, `--interval SECONDS` | `grant`: seconds between two looks at the connections (default: 30). |
 | `-p`, `--persist TIME` | `grant`: close the connection after this long without use (default: `8h`; `yes` for never). Only matters once no `grant` is running. |
-| `-t`, `--tmux` | `open`: run the remote command in a tmux session on the host, or attach when there is none. |
-| `-s`, `--session NAME` | `open`: name of that tmux session (default: `agent-ssh`). |
+| `-d`, `--direct` | `open`: run the remote command as `ssh` does, not in a tmux or screen session. |
+| `-s`, `--session NAME` | `open`: name of the tmux or screen session (default: `agent-ssh`). |
 
 **Examples:**
 ```bash
 ticket="$(agent-ssh ask user@jump.example.com)"   # the agent, waits
 agent-ssh grant                                    # you, in a terminal; stays and watches
-agent-ssh open "${ticket}" uptime
-agent-ssh open --tmux "${ticket}" ./long-running-job --all
+agent-ssh open "${ticket}" ./long-running-job --all
+agent-ssh open --direct "${ticket}" 'sh -s' < script.sh
+agent-ssh open "${ticket}"                         # you: attach to the session
 scp -o ControlPath="$(agent-ssh path "${ticket}")" file user@jump.example.com:
 agent-ssh grant user@jump.example.com -- -p 2222   # you, without an ask: prints the ticket
 agent-ssh status

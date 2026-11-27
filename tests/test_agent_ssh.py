@@ -439,8 +439,8 @@ class SessionTest(Base):
         self.assertEqual((done.returncode, done.stdout, done.stderr), (3, "in\n", "err\n"))
 
     def test_host_without_tmux_and_screen_runs_the_command_directly(self):
-        path = path_without(self.dir / "bin", "tmux", "screen")
-        done = self.run_tool("open", self.ticket, "echo out; exit 3", PATH=path, **self.host)
+        path = path_without(self.dir / "bin-plain", "tmux", "screen")
+        done = self.run_tool("open", self.ticket, "echo out; exit 3", **dict(self.host, PATH=path))
         self.assertEqual((done.returncode, done.stdout), (3, "out\n"), done.stderr)
         self.assertIn("neither tmux nor screen", done.stderr)
         self.assertEqual(self.results(), [])

@@ -574,15 +574,26 @@ case "${kind}" in
             screen -ls 2> /dev/null | grep -q "^[[:space:]]*[0-9][0-9]*\.${session}[[:space:]]"
         }
         # screen makes a second session of the same name without a word: one
-        # call at a time looks and makes it
+        # call at a time looks and makes it. The lock is a file the shell itself
+        # creates (set -C: only if it is not there); mkdir is not safe for this
+        # everywhere, the one of uutils lets several calls win.
         tries=0
-        until mkdir "${cache}/session.lock" 2> /dev/null; do
+        until ( set -C; : > "${cache}/session.lock" ) 2> /dev/null; do
             tries=$(( tries + 1 ))
             [ "${tries}" -lt 50 ] || break
             pause
         done
-        has_screen || screen -dmS "${session}"
-        rmdir "${cache}/session.lock" 2> /dev/null
+        if ! has_screen; then
+            screen -dmS "${session}"
+            # it comes back before the session is there: the next call must see it
+            tries=0
+            until has_screen; do
+                tries=$(( tries + 1 ))
+                [ "${tries}" -lt 25 ] || break
+                pause
+            done
+        fi
+        rm -f -- "${cache}/session.lock"
         # a session that was just made needs a moment before it takes commands
         tries=0
         until screen -S "${session}" -X screen -t agent-ssh sh "${dir}/run" "${dir}" > /dev/null 2>&1; do
