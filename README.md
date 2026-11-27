@@ -836,11 +836,12 @@ Without a target, the review is chosen from the state of the repository:
 2. On the default branch, as detected by `git-default` from dev-helpers: review the whole repository.
 3. On any other branch: review the changes against the default branch.
 
-Reviews and follow-ups show Codex commands, intermediate status messages, and available reasoning summaries on stderr. In a terminal, responses and comment previews use Markdown rendering with `glow` when installed. Afterwards, a menu offers:
+Reviews and follow-ups show Codex commands, intermediate status messages, and available reasoning summaries on stderr. In a terminal, responses and comment previews use Markdown rendering with `glow` when installed. Afterwards, a menu offers the entries below. The PR/MR entries appear only when `gh` (GitHub) or `glab` (GitLab) finds an open pull or merge request for the current branch, looked up after each review on the branch's upstream remote (else `origin`).
 
 - **Copy response**: copies the last response to the clipboard with `clip` and returns to the menu.
 - **Prompt** sends a follow-up to the current Codex session (`codex exec resume`) using the initial run's deep setting. It appears as **Deep prompt** when deep mode is on.
-- **Draft PR/MR comments** asks the same session to verify findings against the existing open pull or merge request. The preview shows the target, reviewed commit, exact line ranges, short German comments, and full replacement code in fenced blocks. Choose **Prompt Codex to revise** or **Edit comment text** to revise the draft, then review it again. **Post as is** publishes the approved comments inline with applicable code suggestions after Codex rechecks the remote diff.
+- **Draft PR #N comments** / **Draft MR !N comments** asks the same session to verify findings against the open pull or merge request of the current branch. The preview shows the target, reviewed commit, exact line ranges, short German comments, and full replacement code in fenced blocks. Choose **Prompt Codex to revise** or **Edit comment text** to revise the draft, then review it again. **Post as is** publishes the approved comments inline with applicable code suggestions after Codex rechecks the remote diff.
+- **Approve PR #N** / **Approve MR !N** approves the open pull or merge request after a confirmation (GitHub API through `gh api`, `glab mr approve --sha`). It appears only after a successful `base` or `full` review of a working tree without tracked changes, and refuses unless the request's head is the reviewed `HEAD` and, for `base`, the reviewed diff starts at the request's merge base. The approval is bound to the reviewed commit; on GitHub, an approval that races a push is dismissed again.
 - **Repeat** opens a menu with the review detected from the current repository state, the initial review target, and the remaining modes. Each review starts a new Codex session. Follow-up prompts go to the new session.
 - **Quit** (or Esc).
 
