@@ -2364,6 +2364,8 @@ sshr
 ### `agent-ssh`
 Keeps one SSH connection to a host open for agents and scripts. You log in once, with whatever the host asks for (password, second factor); everything after that goes through the control socket of that connection (`~/.ssh/cm-NAME`) and asks for nothing. `watch` stays in its terminal, looks at the connection every 30 seconds and opens it again when it is gone. It first tries without asking for anything, so a host that logs you in by key comes back silently and a host that cannot be reached leaves no prompt behind; it is tried again with growing pauses of up to 5 minutes. Only when the host refuses that login you get a desktop notification and the terminal asks. A connection that lost its network closes itself within a minute (`ServerAliveInterval`), so the watcher notices. `exec` never opens a connection and never asks: without an open one it fails with exit status 255. It calls `/usr/bin/ssh`, not the [`ssh`](#ssh) wrapper, so nothing lands in the shell history.
 
+With `--tmux` a tmux session on the host is used: made when it is not there, used again when it is. `exec --tmux` runs the remote command in a window of its own in that session, so it goes on when the connection or the call ends, and you can attach and watch. Its output (stdout and stderr together) is printed as it comes and its exit status is returned; stdin is not passed on. Without a remote command, `exec --tmux` attaches you to the session. A result that did not arrive (exit status 255: connection lost) stays on the host, in the directory below `~/.cache/agent-ssh` that is named on stderr when the command starts, with the files `output` and `status`. `close` leaves the tmux session alone.
+
 **Usage:** `agent-ssh COMMAND [OPTIONS] [DESTINATION] [-- SSH OPTIONS | REMOTE COMMAND]`
 
 | Argument / Flag | Description |
@@ -2379,6 +2381,8 @@ Keeps one SSH connection to a host open for agents and scripts. You log in once,
 | `-i`, `--interval SECONDS` | `watch`: seconds between two looks (default: 30). |
 | `-c`, `--count NUMBER` | `watch`: stop after this many looks. |
 | `--no-notify` | `watch`: no desktop notification. |
+| `-t`, `--tmux` | Use a tmux session on the host. `exec`: run the remote command in it, or attach when there is none. `open`, `watch`: make the session with the connection. |
+| `-s`, `--session NAME` | Name of that tmux session (default: `agent-ssh`). |
 | `-- SSH OPTIONS` | `open`, `watch`: passed to `ssh`, e.g. `-- -p 2222 -J jumphost`. |
 
 **Examples:**
@@ -2386,6 +2390,8 @@ Keeps one SSH connection to a host open for agents and scripts. You log in once,
 agent-ssh watch user@jump.example.com
 agent-ssh exec user@jump.example.com uptime
 scp -o ControlPath="$(agent-ssh path user@jump.example.com)" file user@jump.example.com:
+agent-ssh exec --tmux user@jump.example.com ./long-running-job --all
+agent-ssh exec --tmux user@jump.example.com
 agent-ssh status
 agent-ssh close user@jump.example.com
 ```

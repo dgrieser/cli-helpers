@@ -30,7 +30,8 @@ Commands:
                         not); without DESTINATION: every connection of ${APP_NAME}
   exec DESTINATION [REMOTE COMMAND]
                         Run REMOTE COMMAND through the open connection. Never
-                        opens one and never asks: exit status 255 when none is open
+                        opens one and never asks: exit status 255 when none is
+                        open. With --tmux it runs in a tmux session on the host
   path DESTINATION      Print the control socket of the connection
   close DESTINATION     Close the connection
 
@@ -42,9 +43,24 @@ Options:
   -i, --interval SECONDS    watch: seconds between two looks (default: 30)
   -c, --count NUMBER        watch: stop after this many looks (default: never)
       --no-notify           watch: no desktop notification
+  -t, --tmux                Use a tmux session on the host: made when it is not
+                            there, used again when it is.
+                            exec: REMOTE COMMAND runs in a window of its own in
+                            that session and goes on when the connection or this
+                            call ends. Its output (stdout and stderr together)
+                            is printed as it comes and its exit status is
+                            returned; stdin is not passed on. Without REMOTE
+                            COMMAND you are attached to the session.
+                            open, watch: the session is made with the connection
+  -s, --session NAME        Name of that tmux session (default: ${APP_NAME})
   -h, --help                Show this help message and exit
 
       --bash-completion     Print completion candidates and exit
+
+A command of exec --tmux whose result did not arrive (connection lost, call
+interrupted) leaves output and exit status on the host, in the directory
+below ~/.cache/agent-ssh that is named on stderr at its start. close leaves
+the tmux session alone.
 
 For open and watch, everything after "--" is passed to ssh (e.g. -- -p 2222
 -J jumphost). A connection that lost its network closes itself within a
@@ -158,6 +174,97 @@ print_status() {
     return 1
 }
 
+# through_socket SOCKET DESTINATION [REMOTE COMMAND]: ssh through the open
+# connection and nothing else; SSH_OPTIONS holds further options of that call.
+# With REPLACE set ssh takes the place of this process, so a signal sent to it
+# ends ssh and with it the remote command.
+# ProxyCommand: the connection may go away between the look at it and this
+# call, and ssh would then quietly make one of its own. Through the socket no
+# proxy is used; without it this one fails at once.
+through_socket() {
+    local socket="${1}" destination="${2}"
+    shift 2
+    ${REPLACE:+exec} "${SSH}" -o ControlMaster=no -o ControlPath="${socket}" -o BatchMode=yes \
+        -o ProxyCommand=false "${SSH_OPTIONS[@]}" "${destination}" "${@}"
+}
+
+# tmux_ensure SOCKET DESTINATION: makes the tmux session on the host when it is
+# not there
+tmux_ensure() {
+    through_socket "${1}" "${2}" \
+        "tmux has-session -t '=${session}' 2>/dev/null || tmux new-session -d -s '${session}' 2>/dev/null || tmux has-session -t '=${session}'" < /dev/null \
+        || warning "No tmux session ${session} on ${2}"
+}
+
+# tmux_script ID COMMAND: prints the sh script the host runs for exec --tmux.
+# The command runs in a window of the session, through the login shell as with
+# plain ssh. The script only waits for it and passes its output on, so losing
+# the connection ends the wait and not the command. Output and exit status stay
+# in ~/.cache/agent-ssh/ID of the host: only the caller knows whether they
+# arrived, so it is the caller who removes them (tmux_forget).
+tmux_script() {
+    local id="${1}" remote_command="${2}" mark="AGENT_SSH_COMMAND_END"
+    while [[ "${remote_command}" == *"${mark}"* ]]; do
+        mark="${mark}_${RANDOM}"
+    done
+    printf "session='%s'\nid='%s'\n" "${session}" "${id}"
+    printf "print_command() {\ncat <<'%s'\n%s\n%s\n}\n" "${mark}" "${remote_command}" "${mark}"
+    cat <<'EOF'
+command -v tmux > /dev/null 2>&1 || { echo "ERROR: tmux is not installed on $(hostname)" 1>&2; exit 255; }
+# a call at the same moment may make the session first: then it is there
+tmux has-session -t "=${session}" 2> /dev/null || tmux new-session -d -s "${session}" 2> /dev/null \
+    || tmux has-session -t "=${session}" || exit 255
+umask 077
+dir="${HOME}/.cache/agent-ssh/${id}"
+case "${dir}" in
+    *"'"*) echo "ERROR: cannot work in ${dir}" 1>&2; exit 255 ;;
+esac
+mkdir -p "${HOME}/.cache/agent-ssh" && mkdir "${dir}" || exit 255
+print_command > "${dir}/command"
+: > "${dir}/output"
+# the exit status appears only after tee wrote the last of the output
+cat > "${dir}/run" <<'RUN'
+dir=$1
+{ "${SHELL:-/bin/sh}" -c "$(cat "${dir}/command")" 2>&1; echo "$?" > "${dir}/status.new"; } | tee -a "${dir}/output"
+mv "${dir}/status.new" "${dir}/status"
+RUN
+window=$(tmux new-window -d -P -F '#{window_id}' -t "=${session}:" -n agent-ssh "sh '${dir}/run' '${dir}'") \
+    || { rm -rf -- "${dir}"; exit 255; }
+echo "agent-ssh: tmux session ${session}, window ${window}, result in ${dir}" 1>&2
+
+offset=0
+emit() {
+    size=$(wc -c < "${dir}/output")
+    [ "${size}" -gt "${offset}" ] || return 0
+    tail -c "+$(( offset + 1 ))" "${dir}/output" | head -c "$(( size - offset ))"
+    offset=${size}
+}
+looks=0
+while [ ! -f "${dir}/status" ]; do
+    emit
+    looks=$(( looks + 1 ))
+    if [ "$(( looks % 10 ))" -eq 0 ] \
+        && ! tmux list-windows -t "=${session}" -F '#{window_id}' 2> /dev/null | grep -qx "${window}"; then
+        # the command may have ended between the look at the status and this one
+        [ ! -f "${dir}/status" ] || break
+        emit
+        echo "ERROR: the window of the command is gone and it left no exit status" 1>&2
+        exit 255
+    fi
+    sleep 0.2 2> /dev/null || sleep 1
+done
+emit
+status=$(cat "${dir}/status")
+exit "${status:-255}"
+EOF
+}
+
+# tmux_forget SOCKET DESTINATION ID: removes output and exit status of a
+# command from the host
+tmux_forget() {
+    through_socket "${1}" "${2}" "rm -rf \"\${HOME}/.cache/agent-ssh/${3}\"" < /dev/null > /dev/null 2>&1
+}
+
 # open_names: the names of all sockets with a connection behind them
 open_names() {
     local socket name
@@ -171,15 +278,19 @@ open_names() {
 completion() {
     local previous="${1}" command="${2}"
     case "${previous}" in
-        -n|--name|-p|--persist|-i|--interval|-c|--count) return ;;
+        -n|--name|-p|--persist|-i|--interval|-c|--count|-s|--session) return ;;
     esac
     case "${command}" in
         open|watch)
-            echo "-n --name -p --persist -i --interval -c --count --no-notify -h --help"
+            echo "-n --name -p --persist -i --interval -c --count --no-notify -t --tmux -s --session -h --help"
             sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\+//p' "${HOME}/.ssh/config" 2>/dev/null \
                 | tr ' ' '\n' | grep -v '[*?!]'
             ;;
-        status|exec|path|close)
+        exec)
+            echo "-n --name -t --tmux -s --session -h --help"
+            open_names
+            ;;
+        status|path|close)
             echo "-n --name -h --help"
             open_names
             ;;
@@ -196,7 +307,11 @@ persist="8h"
 interval=30
 count=0
 notify=1
+tmux=0
+session="${APP_NAME}"
 rest=()
+SSH_OPTIONS=()
+REPLACE=""
 
 case "${1}" in
     --bash-completion)
@@ -246,6 +361,16 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --no-notify)
             notify=0
+            ;;
+        -t|--tmux)
+            tmux=1
+            ;;
+        -s|--session)
+            shift
+            [ -z "${1}" ] && usage
+            # tmux gives "." and ":" a meaning of their own in the name of a session
+            [[ "${1}" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Not a tmux session name: ${1}"
+            session="${1}"
             ;;
         --)
             shift
@@ -311,20 +436,36 @@ case "${command}" in
             error "No open connection to ${destination}: run '${APP_NAME} watch ${destination}' in a terminal"
             exit 255
         fi
-        # ProxyCommand: the connection may go away between the look above and
-        # this call, and ssh would then quietly make one of its own. Through
-        # the socket no proxy is used; without it this one fails at once.
-        exec "${SSH}" -o ControlMaster=no -o ControlPath="${socket}" -o BatchMode=yes \
-            -o ProxyCommand=false "${destination}" "${rest[@]}"
+        if [ "${tmux}" -eq 0 ]; then
+            REPLACE=1
+            through_socket "${socket}" "${destination}" "${rest[@]}"
+        elif [ "${#rest[@]}" -eq 0 ]; then
+            [ -t 0 ] || fail "Attaching to the tmux session needs a terminal"
+            SSH_OPTIONS=(-t)
+            REPLACE=1
+            through_socket "${socket}" "${destination}" "tmux new-session -A -s '${session}'"
+        else
+            # as ssh does it: the words joined by spaces, taken apart by the shell of the host
+            id="$(date +%Y%m%d-%H%M%S)-${$}-${RANDOM}"
+            tmux_script "${id}" "${rest[*]}" | through_socket "${socket}" "${destination}" "sh -s"
+            status="${?}"
+            # 255 is ssh saying that the connection went away (or the script that
+            # tmux did not work): then nothing proves that the result arrived
+            [ "${status}" -eq 255 ] || tmux_forget "${socket}" "${destination}" "${id}"
+            exit "${status}"
+        fi
+        exit "${?}"
         ;;
     open)
         if is_open "${socket}" "${destination}"; then
             echo "Already open." 1>&2
+            [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
             echo "${socket}"
             exit 0
         fi
         clear_socket "${socket}" "${destination}"
         open_connection "${socket}" "${destination}" no "${rest[@]}" || fail "Could not open a connection to ${destination}"
+        [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
         echo "${socket}"
         ;;
     watch)
@@ -334,7 +475,10 @@ case "${command}" in
         state=""
         while true; do
             if is_open "${socket}" "${destination}"; then
-                [ "${state}" = "open" ] || log "${destination} open: ${socket}"
+                if [ "${state}" != "open" ]; then
+                    log "${destination} open: ${socket}"
+                    [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
+                fi
                 state="open"
                 wait="${interval}"
             else
@@ -348,6 +492,7 @@ case "${command}" in
                 fi
                 if is_open "${socket}" "${destination}"; then
                     log "${destination} open: ${socket}"
+                    [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
                     state="open"
                     wait="${interval}"
                 else
