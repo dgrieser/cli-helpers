@@ -29,6 +29,17 @@ Options:
 
 - Always respond in english, even when working on german repos, or repos with german labels.
 
+# Remote hosts (agent-ssh)
+
+Hosts that need my login (password, second factor) are reached through a connection I grant: `agent-ssh` from my cli-helpers repo (`~/workspace/dgrieser/cli-helpers`). `agent-ssh --help` has the details.
+
+- Get a ticket: `agent-ssh ask DESTINATION [-- SSH OPTIONS]`. It prints the ticket of an open connection at once; otherwise it waits (300 seconds, `--wait`) until I granted it with `agent-ssh grant` in a terminal of mine. Not granted in time: tell me and ask again later, the ask stays. Never try to log in yourself, and never run `grant`: it is mine. `agent-ssh status` lists asks and open connections.
+- Run commands: `agent-ssh open TICKET COMMAND`. By default the command runs in a tmux session on the host (screen without tmux, directly without both): it goes on when the connection is lost, stdout and stderr come together, stdin is not passed on. For stdin or separate streams (`sh -s < script`, pipes): `agent-ssh open --direct TICKET COMMAND`.
+- Exit status 255 means no connection, not a failed command. My `grant` keeps running, watches the connections and opens a lost one again under the same ticket; `open` waits 60 seconds for that (`--wait`), `ask` waits longer. When no `grant` runs the ticket is gone: `ask` again and use the new ticket.
+- A result that did not arrive (255 in the middle of a command) stays on the host in `~/.cache/agent-ssh/<id>` (`output`, `status`; the path is printed on stderr when the command starts). Read it from there before you run the command again.
+- Other tools (`scp`, `rsync -e`, scripts that call `ssh`): `-o ControlPath="$(agent-ssh path TICKET)"`.
+- Do not `close` a connection unless I ask for it.
+
 # Git worktrees
 
 I manage worktrees with `git-worktree` from my dev-helpers repo (`~/workspace/dgrieser/dev-helpers`, installed to `/usr/local/bin`). Use it instead of raw `git worktree add`/`remove` so worktrees land where I expect them.
