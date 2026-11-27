@@ -29,6 +29,15 @@ Options:
 
 - Always respond in english, even when working on german repos, or repos with german labels.
 
+# Remote hosts (agent-ssh)
+
+Hosts that need my login (password, second factor) are reached through a connection I grant: `agent-ssh` from my cli-helpers repo (`~/workspace/dgrieser/cli-helpers`). `agent-ssh --help` has the details.
+
+- Get a ticket: `agent-ssh ask DESTINATION`. It waits until I ran `agent-ssh grant` in a terminal and prints the ticket; an open connection gives it at once. Not granted in time: tell me, ask again later. Never try to log in yourself, and never run `grant`: it is mine.
+- Run commands: `agent-ssh open TICKET COMMAND`. Exit status 255 means the connection is gone: ask again (my `grant` keeps running and opens it again under the same ticket, `ask` waits for that).
+- Long-running commands: `agent-ssh open --tmux TICKET COMMAND`. They survive a lost connection; on 255 the result stays on the host in `~/.cache/agent-ssh/<id>` (`output`, `status`; the path is printed on stderr).
+- Other tools (`scp`, `rsync -e`, scripts that call `ssh`): `-o ControlPath="$(agent-ssh path TICKET)"`.
+
 # Git worktrees
 
 I manage worktrees with `git-worktree` from my dev-helpers repo (`~/workspace/dgrieser/dev-helpers`, installed to `/usr/local/bin`). Use it instead of raw `git worktree add`/`remove` so worktrees land where I expect them.

@@ -3,68 +3,94 @@
 APP_NAME="$(basename "${0}")"
 # not the ssh of this repository: that one writes every call to the shell history
 SSH="${AGENT_SSH_SSH:-/usr/bin/ssh}"
-SOCKET_DIR="${AGENT_SSH_DIR:-${HOME}/.ssh}"
+# asks, tickets and control sockets; gone with the session, like the connections
+STATE_DIR="${AGENT_SSH_DIR:-${XDG_RUNTIME_DIR:-${HOME}/.cache}/agent-ssh}"
+# longest pause between two tries to reach a host, in seconds
 MAX_WAIT=300
-# seconds an attempt that asks for nothing may take
+# seconds a try that asks for nothing may take
 BATCH_LIMIT=45
 
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} COMMAND [OPTIONS] [DESTINATION] [-- SSH OPTIONS | REMOTE COMMAND]
+usage: ${APP_NAME} COMMAND [OPTIONS] [ARGUMENTS]
 
-Keeps one SSH connection to DESTINATION open for agents and scripts. You log
-in once, with whatever the host asks for (password, second factor); everything
-after that goes through the control socket of that connection and asks for
-nothing. An agent runs "${APP_NAME} exec DESTINATION COMMAND", or passes
--o ControlPath="\$(${APP_NAME} path DESTINATION)" to ssh, scp or rsync.
+Gives an agent an SSH connection to a host that needs your login, without the
+agent ever seeing that login. The agent asks, you grant in a terminal of your
+own (password, second factor), and the agent uses the connection through the
+ticket it got.
 
-Commands:
-  open DESTINATION      Open the connection in the background
-  watch DESTINATION     Open the connection and stay: look at it every INTERVAL
-                        seconds and open it again when it is gone. Without a
-                        login that needs you this happens silently; with one,
-                        you get a desktop notification and the terminal asks.
-                        A host that cannot be reached is tried again, with
-                        growing pauses of up to ${MAX_WAIT} seconds
-  status [DESTINATION]  Say whether the connection is open (exit status 1 when
-                        not); without DESTINATION: every connection of ${APP_NAME}
-  exec DESTINATION [REMOTE COMMAND]
-                        Run REMOTE COMMAND through the open connection. Never
-                        opens one and never asks: exit status 255 when none is
-                        open. With --tmux it runs in a tmux session on the host
-  path DESTINATION      Print the control socket of the connection
-  close DESTINATION     Close the connection
+Commands for the agent:
+  ask DESTINATION [-- SSH OPTIONS]
+                        Ask for a connection to DESTINATION and wait until
+                        there is one, then print its ticket. A connection to
+                        DESTINATION that is already open gives its ticket at
+                        once, one that a running grant is opening again is
+                        waited for. An ask that was not granted in time
+                        stays: ask again later
+  open TICKET [REMOTE COMMAND]
+                        Run REMOTE COMMAND through the connection of TICKET,
+                        in a window of a tmux session on the host (screen
+                        where there is no tmux, directly where there is
+                        neither). The session is made when it is not there and
+                        used again when it is. The command goes on when the
+                        connection or this call ends; its output (stdout and
+                        stderr together) is printed as it comes and its exit
+                        status is returned; stdin is not passed on. Without
+                        REMOTE COMMAND you are attached to the session.
+                        Never opens a connection and never asks: exit status
+                        255 when there is none. One that a running grant is
+                        opening again is waited for
+  path TICKET           Print the control socket of the connection, for ssh,
+                        scp or rsync with -o ControlPath=
+
+Commands for you:
+  grant [DESTINATION] [-- SSH OPTIONS]
+                        Without DESTINATION: show what was asked for, open the
+                        connections you grant and print their tickets. With
+                        DESTINATION: open a connection to it, asked for or
+                        not, and print its ticket. Then it stays, until you
+                        end it: it takes the asks as they come and looks at
+                        every connection each INTERVAL seconds. One that is
+                        gone is opened again under its ticket - silently
+                        where the host lets you in without a question, else
+                        with a desktop notification and the question on this
+                        terminal. A host that cannot be reached is tried
+                        again, with growing pauses of up to 300 seconds.
+                        Needs a terminal: it is where the host asks for your
+                        login. What keeps an agent out is that login, not
+                        this command
+  status                List the asks and the open connections
+  close TICKET          Close the connection, or take back an ask
 
 Options:
-  -n, --name NAME           Name of the control socket: ${SOCKET_DIR}/cm-NAME
-                            (default: DESTINATION)
-  -p, --persist TIME        open, watch: close the connection after this long
-                            without use (default: 8h; "yes" for never)
-  -i, --interval SECONDS    watch: seconds between two looks (default: 30)
-  -c, --count NUMBER        watch: stop after this many looks (default: never)
-      --no-notify           watch: no desktop notification
-  -t, --tmux                Use a tmux session on the host: made when it is not
-                            there, used again when it is.
-                            exec: REMOTE COMMAND runs in a window of its own in
-                            that session and goes on when the connection or this
-                            call ends. Its output (stdout and stderr together)
-                            is printed as it comes and its exit status is
-                            returned; stdin is not passed on. Without REMOTE
-                            COMMAND you are attached to the session.
-                            open, watch: the session is made with the connection
-  -s, --session NAME        Name of that tmux session (default: ${APP_NAME})
+  -w, --wait SECONDS        ask: give up waiting after this long (default: 300;
+                            0 waits for as long as it takes)
+                            open: how long to wait for a connection that is
+                            being opened again (default: 60)
+      --no-notify           ask, grant: no desktop notification
+  -y, --yes                 grant: grant every ask without a question
+  -i, --interval SECONDS    grant: seconds between two looks at the connections
+                            (default: 30)
+  -p, --persist TIME        grant: close the connection after this long without
+                            use (default: 8h; "yes" for never). Only matters
+                            once no grant is running: a running one opens it again
+  -d, --direct              open: run REMOTE COMMAND as ssh does, not in a tmux
+                            or screen session: stdin is passed on, stdout and
+                            stderr stay apart, and the command ends with the
+                            connection. Without REMOTE COMMAND: a shell
+  -s, --session NAME        open: name of the tmux or screen session
+                            (default: ${APP_NAME})
   -h, --help                Show this help message and exit
 
       --bash-completion     Print completion candidates and exit
 
-A command of exec --tmux whose result did not arrive (connection lost, call
-interrupted) leaves output and exit status on the host, in the directory
-below ~/.cache/agent-ssh that is named on stderr at its start. close leaves
-the tmux session alone.
+A command whose result did not arrive (connection lost, call interrupted)
+leaves output and exit status on the host, in the directory below
+~/.cache/agent-ssh that is named on stderr at its start.
 
-For open and watch, everything after "--" is passed to ssh (e.g. -- -p 2222
+SSH OPTIONS are passed to ssh when the connection is opened (e.g. -- -p 2222
 -J jumphost). A connection that lost its network closes itself within a
-minute (ServerAliveInterval), so the watcher notices.
+minute (ServerAliveInterval).
 EOF
     exit 1
 }
@@ -87,43 +113,194 @@ abort() {
     exit 1
 }
 
-log() {
-    echo "$(date +%H:%M:%S) ${1}" 1>&2
+# A record is the file of an ask (ID.ask) or of an open connection (ID.ticket):
+# the destination, the time of the ask, the directory it came from, then the
+# ssh options, one per line.
+
+# record_field FILE LINE
+record_field() {
+    sed -n "${2}p" "${1}" 2> /dev/null
 }
 
-# socket_path NAME: prints the control socket of NAME
-socket_path() {
-    echo "${SOCKET_DIR}/cm-${1}"
+# record_key FILE: what makes two records the same connection: the
+# destination and, when there are ssh options, those and the directory they
+# were given in (-i ./key means another file elsewhere)
+record_key() {
+    awk 'NR == 1 { print } NR == 3 { directory = $0 } NR == 4 { print directory } NR >= 4 { print }' \
+        "${1}" 2> /dev/null
 }
 
-# is_open SOCKET DESTINATION: whether a connection answers on SOCKET
-is_open() {
-    "${SSH}" -O check -o ControlPath="${1}" "${2}" > /dev/null 2>&1
-}
-
-# open_connection SOCKET DESTINATION BATCH [SSH OPTIONS]: opens the connection
-# in the background. With BATCH=yes nothing is asked for and it fails instead.
-# BatchMode alone does not see to that: the ssh of a jump host (-J) is a process
-# of its own that takes neither it nor ConnectTimeout over. So that attempt
-# runs without a terminal to ask on (setsid) and with a limit on its time.
-open_connection() {
-    local socket="${1}" destination="${2}" batch="${3}"
-    local -a quiet=()
-    shift 3
-    if [ "${batch}" = "yes" ]; then
-        quiet=(env -u SSH_ASKPASS SSH_ASKPASS_REQUIRE=never setsid -w timeout "${BATCH_LIMIT}")
+# make_key DESTINATION [SSH OPTIONS]: the key of a record written here and now
+make_key() {
+    if [ "${#}" -gt 1 ]; then
+        printf '%s\n' "${1}" "${PWD}" "${@:2}"
+    else
+        printf '%s\n' "${1}"
     fi
-    "${quiet[@]}" "${SSH}" -f -N \
-        -o ControlMaster=yes -o ControlPath="${socket}" -o ControlPersist="${persist}" \
-        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 \
-        -o BatchMode="${batch}" "${@}" "${destination}" < /dev/null
 }
 
-# clear_socket SOCKET DESTINATION: removes what a dead connection left behind,
-# so the next one can bind the socket
-clear_socket() {
-    is_open "${1}" "${2}" && return 0
-    [ ! -e "${1}" ] && [ ! -L "${1}" ] || rm -f -- "${1}"
+# record_options FILE: fills OPTIONS with the ssh options of the record
+record_options() {
+    mapfile -t OPTIONS < <(sed -n '4,$p' "${1}" 2> /dev/null)
+}
+
+socket_of() {
+    echo "${STATE_DIR}/${1}.sock"
+}
+
+# destination_of ID: the destination of the ticket or the ask ID
+destination_of() {
+    local destination
+    destination="$(record_field "${STATE_DIR}/${1}.ticket" 1)"
+    [ -n "${destination}" ] || destination="$(record_field "${STATE_DIR}/${1}.ask" 1)"
+    # ssh wants a host name even for a call that only talks to the socket, and
+    # may look it up (CanonicalizeHostname): it gets the one the socket is for
+    echo "${destination:-${1}}"
+}
+
+# control ID COMMAND: sends COMMAND (check, exit) to the connection of ID
+control() {
+    "${SSH}" -O "${2}" -o ControlPath="$(socket_of "${1}")" "$(destination_of "${1}")" > /dev/null 2>&1
+}
+
+# is_open ID: whether a connection answers on the socket of ID
+is_open() {
+    control "${1}" check
+}
+
+# forget ID: removes what is left of a connection that is gone
+forget() {
+    rm -f -- "${STATE_DIR}/${1}.ticket" "${STATE_DIR}/${1}.grant" "$(socket_of "${1}")"
+}
+
+# watching: whether a grant is running. It holds a shared lock on watch.lock
+# for as long as it lives (descriptor 7), so nothing is left behind by one
+# that was killed.
+watching() {
+    ! ( flock -n 6 ) 6> "${STATE_DIR}/watch.lock"
+}
+
+# sweep: forgets every ticket whose connection is gone - unless a grant is
+# running: that one opens the connection again, under the same ticket
+sweep() {
+    local file id
+    ! watching || return 0
+    for file in "${STATE_DIR}"/*.ticket; do
+        [ -f "${file}" ] || continue
+        id="$(basename "${file}" .ticket)"
+        is_open "${id}" || forget "${id}"
+    done
+}
+
+# find_record KIND KEY: prints the id of the record of KIND (ask, ticket)
+# with that key
+find_record() {
+    local file
+    for file in "${STATE_DIR}"/*."${1}"; do
+        [ -f "${file}" ] || continue
+        if [ "$(record_key "${file}")" = "${2}" ]; then
+            basename "${file}" ".${1}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+new_id() {
+    local id
+    while true; do
+        id="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
+        [ -e "${STATE_DIR}/${id}.ask" ] || [ -e "${STATE_DIR}/${id}.ticket" ] || break
+    done
+    echo "${id}"
+}
+
+# write_ask ID DESTINATION [SSH OPTIONS]
+write_ask() {
+    local id="${1}" destination="${2}"
+    shift 2
+    printf '%s\n' "${destination}" "$(date +%s)" "${PWD}" "${@}" > "${STATE_DIR}/${id}.ask.new" \
+        && mv -- "${STATE_DIR}/${id}.ask.new" "${STATE_DIR}/${id}.ask"
+}
+
+# locked COMMAND...: one look-then-write at a time, so two asks for the same
+# host at the same moment become one
+locked() {
+    (
+        flock 9 || exit 1
+        "${@}"
+    ) 9> "${STATE_DIR}/lock"
+}
+
+# remove_ask ID
+remove_ask() {
+    rm -f -- "${STATE_DIR}/${1}.ask" "${STATE_DIR}/${1}.asked"
+    # with the ask gone no grant is left to lock it, unless it became a ticket
+    [ -e "${STATE_DIR}/${1}.ticket" ] || rm -f -- "${STATE_DIR}/${1}.grant"
+}
+
+# ask_id WHO DESTINATION [SSH OPTIONS]: prints "open ID" for a connection that
+# is there, "ask ID" for the ask that is now waiting for a grant. WHO is agent
+# or user: an ask an agent made or joined is marked (ID.asked), so a grant that
+# only made it for itself knows whether it may take it away again.
+ask_id() {
+    local who="${1}" key id
+    shift
+    key="$(make_key "${@}")"
+    sweep
+    if id="$(find_record ticket "${key}")"; then
+        # gone, and still there: a running grant is opening it again
+        if is_open "${id}"; then
+            echo "open ${id}"
+        else
+            echo "gone ${id}"
+        fi
+        return 0
+    fi
+    if ! id="$(find_record ask "${key}")"; then
+        id="$(new_id)"
+        write_ask "${id}" "${@}" || return 1
+    fi
+    [ "${who}" != "agent" ] || : > "${STATE_DIR}/${id}.asked"
+    echo "ask ${id}"
+}
+
+# take_back ID: removes the ask ID, returns 1 when there is none (any more)
+take_back() {
+    [ -f "${STATE_DIR}/${1}.ask" ] || return 1
+    remove_ask "${1}"
+}
+
+# drop_unasked ID: removes an ask no agent waits for
+drop_unasked() {
+    [ -e "${STATE_DIR}/${1}.asked" ] || remove_ask "${1}"
+}
+
+# age FILE LINE: the time in that line of the record, as "5m" or "2h"
+age() {
+    local then seconds
+    then="$(record_field "${1}" "${2}")"
+    [[ "${then}" =~ ^[0-9]+$ ]] || { echo "?"; return; }
+    seconds=$(( $(date +%s) - then ))
+    if [ "${seconds}" -lt 60 ]; then
+        echo "${seconds}s"
+    elif [ "${seconds}" -lt 3600 ]; then
+        echo "$(( seconds / 60 ))m"
+    else
+        echo "$(( seconds / 3600 ))h"
+    fi
+}
+
+# print_record KIND ID: one line of status
+print_record() {
+    local file="${STATE_DIR}/${2}.${1}" state="open" options
+    if [ "${1}" != "ticket" ]; then
+        state="ask "
+    elif ! is_open "${2}"; then
+        state="gone"
+    fi
+    options="$(sed -n '4,$p' "${file}" | tr '\n' ' ')"
+    echo "${state}  ${2}  $(record_field "${file}" 1)  $(age "${file}" 2)  ${options:+[${options% }]  }from $(record_field "${file}" 3)"
 }
 
 notify() {
@@ -133,48 +310,197 @@ notify() {
     return 0
 }
 
-# reopen SOCKET DESTINATION [SSH OPTIONS]: opens the connection again, first
-# without asking for anything. Only a host that refuses that login gets the
-# terminal: a host that cannot be reached must not leave a prompt behind.
+# promote ID: turns the ask ID into a ticket. Under the lock, like taking an
+# ask back: one of the two happens, never half of each.
+promote() {
+    local id="${1}" file="${STATE_DIR}/${1}.ask"
+    [ -f "${file}" ] || return 1
+    { sed -n '1p' "${file}"; date +%s; sed -n '3,$p' "${file}"; } > "${STATE_DIR}/${id}.ticket.new" \
+        && mv -- "${STATE_DIR}/${id}.ticket.new" "${STATE_DIR}/${id}.ticket" \
+        && remove_ask "${id}"
+}
+
+log() {
+    echo "$(date +%H:%M:%S) ${1}" 1>&2
+}
+
+# connect ID FILE BATCH: opens the connection of the record FILE in the
+# background, on the socket of ID. With BATCH=no the host asks for the login on
+# this terminal, whatever the ssh config says. With BATCH=yes nothing is asked
+# for and it fails instead; BatchMode alone does not see to that, as the ssh of
+# a jump host (-J) is a process of its own that takes neither it nor
+# ConnectTimeout over: that try runs without a terminal to ask on (setsid) and
+# with a limit on its time.
+connect() {
+    local id="${1}" file="${2}" batch="${3}" destination directory
+    local -a quiet=()
+    destination="$(record_field "${file}" 1)"
+    directory="$(record_field "${file}" 3)"
+    record_options "${file}"
+    is_open "${id}" || rm -f -- "$(socket_of "${id}")"
+    if [ "${batch}" = "yes" ]; then
+        quiet=(env -u SSH_ASKPASS SSH_ASKPASS_REQUIRE=never setsid -w timeout "${BATCH_LIMIT}")
+    fi
+    (
+        # ssh options may name files (-i ./key, -F ./config): they mean the
+        # directory they were asked in, not the one of this terminal
+        if [ "${#OPTIONS[@]}" -gt 0 ]; then
+            cd -- "${directory}" 2> /dev/null || { error "No directory ${directory} to open the connection in"; exit 1; }
+        fi
+        # 7 and 8: the locks of a running grant and of once, which the
+        # connection in the background must not keep
+        "${quiet[@]}" "${SSH}" -f -N \
+            -o ControlMaster=yes -o ControlPath="$(socket_of "${id}")" -o ControlPersist="${persist}" \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o BatchMode="${batch}" \
+            "${OPTIONS[@]}" "${destination}" < /dev/null 7>&- 8>&-
+    ) || return 1
+    is_open "${id}"
+}
+
+# disconnect ID DESTINATION: closes a connection that got no ticket
+disconnect() {
+    "${SSH}" -O exit -o ControlPath="$(socket_of "${1}")" "${2}" > /dev/null 2>&1
+    rm -f -- "${STATE_DIR}/${1}.ticket.new" "$(socket_of "${1}")"
+}
+
+# open_connection ID: opens the connection of the ask ID and turns the ask
+# into a ticket
+open_connection() {
+    local id="${1}" file="${STATE_DIR}/${1}.ask" destination
+    # the other grant may be through already
+    if [ -f "${STATE_DIR}/${id}.ticket" ] && is_open "${id}"; then
+        return 0
+    fi
+    destination="$(record_field "${file}" 1)"
+    connect "${id}" "${file}" no || return 1
+    # The ask may have been taken back during the login: a connection without a
+    # ticket would stay open with nothing that lists or closes it.
+    locked promote "${id}" && return 0
+    disconnect "${id}" "${destination}"
+    return 1
+}
+
+# has_ticket ID
+has_ticket() {
+    [ -f "${STATE_DIR}/${1}.ticket" ]
+}
+
+# reopen ID: opens the connection of the ticket ID again, first without asking
+# for anything. Only a host that refuses that login gets the terminal: one
+# that cannot be reached must not leave a question behind.
 reopen() {
-    local socket="${1}" destination="${2}" output errors
-    shift 2
-    clear_socket "${socket}" "${destination}"
+    local id="${1}" file="${STATE_DIR}/${1}.ticket" destination errors output
+    is_open "${id}" && return 0
+    destination="$(record_field "${file}" 1)"
+    [ -n "${destination}" ] || return 1
     # A file, not a pipe: the connection in the background (and the ssh of a
     # jump host) keeps what it got as stderr open, and reading a pipe to its end
     # would wait for as long as the connection lives.
     errors="$(mktemp)" || return 1
-    if open_connection "${socket}" "${destination}" yes "${@}" > /dev/null 2> "${errors}"; then
+    if ! connect "${id}" "${file}" yes > /dev/null 2> "${errors}"; then
+        output="$(cat "${errors}")"
         rm -f -- "${errors}"
-        return 0
+        if [[ "${output}" != *"Permission denied"* ]]; then
+            log "${destination} (${id}) not reached: $(printf '%s\n' "${output}" | tail -n 1)"
+            return 1
+        fi
+        notify "${destination} needs your login" "The connection is gone. The terminal of ${APP_NAME} grant is asking."
+        printf '\a' 1>&2
+        log "${destination} (${id}) asks for a login"
+        connect "${id}" "${file}" no || return 1
     fi
-    output="$(cat "${errors}")"
     rm -f -- "${errors}"
-    if [[ "${output}" != *"Permission denied"* ]]; then
-        log "${destination} not reached: $(printf '%s\n' "${output}" | tail -n 1)"
-        return 1
-    fi
-    if [ ! -t 0 ]; then
-        log "${destination} asks for a login and this is no terminal"
-        return 1
-    fi
-    notify "${destination} needs your login" "The connection is gone. The terminal of the watcher is asking."
-    printf '\a' 1>&2
-    log "${destination} asks for a login"
-    open_connection "${socket}" "${destination}" no "${@}"
-}
-
-# print_status SOCKET DESTINATION: one line, returns whether it is open
-print_status() {
-    if is_open "${1}" "${2}"; then
-        echo "open    ${2}  ${1}"
-        return 0
-    fi
-    echo "closed  ${2}  ${1}"
+    # closed while the login went on: then nobody wants it any more
+    locked has_ticket "${id}" && return 0
+    disconnect "${id}" "${destination}"
     return 1
 }
 
-# through_socket SOCKET DESTINATION [REMOTE COMMAND]: ssh through the open
+# once ID COMMAND...: COMMAND by one grant at a time. Two that take the same
+# ask, or open the same connection again, would log in twice, and the second
+# would close what the first opened. Returns 3 when another one is at it.
+once() {
+    local id="${1}"
+    shift
+    (
+        flock -n 8 || exit 3
+        "${@}"
+    ) 8> "${STATE_DIR}/${id}.grant"
+    # The lock file stays for as long as the ask or its ticket: taken away
+    # after a failed try, the next two grants could each lock a file of their own.
+}
+
+# watch_connections: one look at every ticket; what is gone is opened again.
+# SEEN, PAUSE and NEXT_TRY keep, per ticket, what the last look found, how long
+# the pause after a failed try is and when the next one is due.
+watch_connections() {
+    local id destination now
+    for id in $(ids ticket); do
+        destination="$(destination_of "${id}")"
+        if is_open "${id}"; then
+            [ "${SEEN[${id}]}" = "open" ] || log "${destination} (${id}) open"
+            SEEN[${id}]="open"
+            PAUSE[${id}]="${interval}"
+            continue
+        fi
+        now="$(date +%s)"
+        [ "${now}" -ge "${NEXT_TRY[${id}]:-0}" ] || continue
+        [ "${SEEN[${id}]}" != "open" ] || log "${destination} (${id}) is gone, opening it again"
+        once "${id}" reopen "${id}"
+        if is_open "${id}"; then
+            log "${destination} (${id}) open"
+            SEEN[${id}]="open"
+            PAUSE[${id}]="${interval}"
+        elif ! has_ticket "${id}"; then
+            # closed meanwhile
+            rm -f -- "${STATE_DIR}/${id}.grant"
+        else
+            [ "${SEEN[${id}]}" != "closed" ] || PAUSE[${id}]=$(( ${PAUSE[${id}]:-${interval}} * 2 ))
+            [ "${PAUSE[${id}]:-${interval}}" -le "${MAX_WAIT}" ] || PAUSE[${id}]="${MAX_WAIT}"
+            SEEN[${id}]="closed"
+            NEXT_TRY[${id}]=$(( now + ${PAUSE[${id}]:-${interval}} ))
+            log "${destination} (${id}): next try in ${PAUSE[${id}]:-${interval}} seconds"
+        fi
+    done
+}
+
+# grant_ask ID: asks you about the ask ID, opens its connection and prints the
+# ticket. Returns 1 for an ask that stays as it is, 3 for one another grant is
+# opening the connection of.
+grant_ask() {
+    local id="${1}" file="${STATE_DIR}/${1}.ask" destination answer
+    destination="$(record_field "${file}" 1)"
+    [ -n "${destination}" ] || return 1
+    print_record ask "${id}" 1>&2
+    if [ "${yes}" -eq 0 ]; then
+        read -r -p "Grant? [Y]es / [n]ot now / [d]eny: " answer || { echo 1>&2; return 1; }
+        case "${answer}" in
+            ""|y|Y|yes) ;;
+            d|D|deny)
+                locked remove_ask "${id}"
+                echo "Denied." 1>&2
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
+    fi
+    once "${id}" open_connection "${id}"
+    case "${?}" in
+        0) ;;
+        3)
+            echo "Another ${APP_NAME} grant is opening this connection." 1>&2
+            return 3
+            ;;
+        *)
+            error "No connection to ${destination}, the ask stays"
+            return 1
+            ;;
+    esac
+    echo "Ticket of ${destination}:" 1>&2
+    echo "${id}"
+}
+
+# through_socket ID DESTINATION [REMOTE COMMAND]: ssh through the open
 # connection and nothing else; SSH_OPTIONS holds further options of that call.
 # With REPLACE set ssh takes the place of this process, so a signal sent to it
 # ends ssh and with it the remote command.
@@ -182,27 +508,20 @@ print_status() {
 # call, and ssh would then quietly make one of its own. Through the socket no
 # proxy is used; without it this one fails at once.
 through_socket() {
-    local socket="${1}" destination="${2}"
+    local id="${1}" destination="${2}"
     shift 2
-    ${REPLACE:+exec} "${SSH}" -o ControlMaster=no -o ControlPath="${socket}" -o BatchMode=yes \
+    ${REPLACE:+exec} "${SSH}" -o ControlMaster=no -o ControlPath="$(socket_of "${id}")" -o BatchMode=yes \
         -o ProxyCommand=false "${SSH_OPTIONS[@]}" "${destination}" "${@}"
 }
 
-# tmux_ensure SOCKET DESTINATION: makes the tmux session on the host when it is
-# not there
-tmux_ensure() {
-    through_socket "${1}" "${2}" \
-        "tmux has-session -t '=${session}' 2>/dev/null || tmux new-session -d -s '${session}' 2>/dev/null || tmux has-session -t '=${session}'" < /dev/null \
-        || warning "No tmux session ${session} on ${2}"
-}
-
-# tmux_script ID COMMAND: prints the sh script the host runs for exec --tmux.
-# The command runs in a window of the session, through the login shell as with
-# plain ssh. The script only waits for it and passes its output on, so losing
-# the connection ends the wait and not the command. Output and exit status stay
-# in ~/.cache/agent-ssh/ID of the host: only the caller knows whether they
-# arrived, so it is the caller who removes them (tmux_forget).
-tmux_script() {
+# session_script ID COMMAND: prints the sh script the host runs for open.
+# The command runs in a window of the tmux or screen session, through the
+# login shell as with plain ssh. The script only waits for it and passes its
+# output on, so losing the connection ends the wait and not the command.
+# Output and exit status stay in ~/.cache/agent-ssh/ID of the host: only the
+# caller knows whether they arrived, so it is the caller who removes them
+# (session_forget).
+session_script() {
     local id="${1}" remote_command="${2}" mark="AGENT_SSH_COMMAND_END"
     while [[ "${remote_command}" == *"${mark}"* ]]; do
         mark="${mark}_${RANDOM}"
@@ -210,27 +529,70 @@ tmux_script() {
     printf "session='%s'\nid='%s'\n" "${session}" "${id}"
     printf "print_command() {\ncat <<'%s'\n%s\n%s\n}\n" "${mark}" "${remote_command}" "${mark}"
     cat <<'EOF'
-command -v tmux > /dev/null 2>&1 || { echo "ERROR: tmux is not installed on $(hostname)" 1>&2; exit 255; }
-# a call at the same moment may make the session first: then it is there
-tmux has-session -t "=${session}" 2> /dev/null || tmux new-session -d -s "${session}" 2> /dev/null \
-    || tmux has-session -t "=${session}" || exit 255
+give_up() {
+    echo "ERROR: ${1}" 1>&2
+    exit 255
+}
+pause() {
+    sleep 0.2 2> /dev/null || sleep 1
+}
+if command -v tmux > /dev/null 2>&1; then
+    kind=tmux
+elif command -v screen > /dev/null 2>&1; then
+    kind=screen
+else
+    echo "agent-ssh: neither tmux nor screen on $(hostname), the command runs directly" 1>&2
+    "${SHELL:-/bin/sh}" -c "$(print_command)" < /dev/null
+    exit "$?"
+fi
 umask 077
-dir="${HOME}/.cache/agent-ssh/${id}"
+cache="${HOME}/.cache/agent-ssh"
+dir="${cache}/${id}"
 case "${dir}" in
-    *"'"*) echo "ERROR: cannot work in ${dir}" 1>&2; exit 255 ;;
+    *"'"*) give_up "cannot work in ${dir}" ;;
 esac
-mkdir -p "${HOME}/.cache/agent-ssh" && mkdir "${dir}" || exit 255
+mkdir -p "${cache}" && mkdir "${dir}" || exit 255
 print_command > "${dir}/command"
 : > "${dir}/output"
 # the exit status appears only after tee wrote the last of the output
 cat > "${dir}/run" <<'RUN'
 dir=$1
+echo "$$" > "${dir}/pid"
 { "${SHELL:-/bin/sh}" -c "$(cat "${dir}/command")" 2>&1; echo "$?" > "${dir}/status.new"; } | tee -a "${dir}/output"
 mv "${dir}/status.new" "${dir}/status"
 RUN
-window=$(tmux new-window -d -P -F '#{window_id}' -t "=${session}:" -n agent-ssh "sh '${dir}/run' '${dir}'") \
-    || { rm -rf -- "${dir}"; exit 255; }
-echo "agent-ssh: tmux session ${session}, window ${window}, result in ${dir}" 1>&2
+case "${kind}" in
+    tmux)
+        # a call at the same moment may make the session first: then it is there
+        tmux has-session -t "=${session}" 2> /dev/null || tmux new-session -d -s "${session}" 2> /dev/null \
+            || tmux has-session -t "=${session}" || { rm -rf -- "${dir}"; give_up "no tmux session ${session}"; }
+        tmux new-window -d -t "=${session}:" -n agent-ssh "sh '${dir}/run' '${dir}'" \
+            || { rm -rf -- "${dir}"; give_up "no window in the tmux session ${session}"; }
+        ;;
+    screen)
+        has_screen() {
+            screen -ls 2> /dev/null | grep -q "^[[:space:]]*[0-9][0-9]*\.${session}[[:space:]]"
+        }
+        # screen makes a second session of the same name without a word: one
+        # call at a time looks and makes it
+        tries=0
+        until mkdir "${cache}/session.lock" 2> /dev/null; do
+            tries=$(( tries + 1 ))
+            [ "${tries}" -lt 50 ] || break
+            pause
+        done
+        has_screen || screen -dmS "${session}"
+        rmdir "${cache}/session.lock" 2> /dev/null
+        # a session that was just made needs a moment before it takes commands
+        tries=0
+        until screen -S "${session}" -X screen -t agent-ssh sh "${dir}/run" "${dir}" > /dev/null 2>&1; do
+            tries=$(( tries + 1 ))
+            [ "${tries}" -lt 25 ] || { rm -rf -- "${dir}"; give_up "no window in the screen session ${session}"; }
+            pause
+        done
+        ;;
+esac
+echo "agent-ssh: ${kind} session ${session}, result in ${dir}" 1>&2
 
 offset=0
 emit() {
@@ -243,15 +605,17 @@ looks=0
 while [ ! -f "${dir}/status" ]; do
     emit
     looks=$(( looks + 1 ))
-    if [ "$(( looks % 10 ))" -eq 0 ] \
-        && ! tmux list-windows -t "=${session}" -F '#{window_id}' 2> /dev/null | grep -qx "${window}"; then
-        # the command may have ended between the look at the status and this one
-        [ ! -f "${dir}/status" ] || break
-        emit
-        echo "ERROR: the window of the command is gone and it left no exit status" 1>&2
-        exit 255
+    if [ "$(( looks % 10 ))" -eq 0 ]; then
+        if [ ! -f "${dir}/pid" ]; then
+            [ "${looks}" -lt 50 ] || give_up "the command did not start in the ${kind} session ${session}"
+        elif ! kill -0 "$(cat "${dir}/pid")" 2> /dev/null; then
+            # the command may have ended between the look at the status and this one
+            [ ! -f "${dir}/status" ] || break
+            emit
+            give_up "the command is gone and left no exit status (was its window closed?)"
+        fi
     fi
-    sleep 0.2 2> /dev/null || sleep 1
+    pause
 done
 emit
 status=$(cat "${dir}/status")
@@ -259,57 +623,77 @@ exit "${status:-255}"
 EOF
 }
 
-# tmux_forget SOCKET DESTINATION ID: removes output and exit status of a
+# attach_command: prints what the host runs to attach you to the session
+attach_command() {
+    # the name of a session holds nothing a shell takes apart
+    cat <<EOF
+sh -c 'if command -v tmux > /dev/null 2>&1; then exec tmux new-session -A -s ${session}; elif command -v screen > /dev/null 2>&1; then exec screen -xRR -S ${session}; else echo "ERROR: neither tmux nor screen on this host" 1>&2; exit 255; fi'
+EOF
+}
+
+# session_forget ID DESTINATION RESULT: removes output and exit status of a
 # command from the host
-tmux_forget() {
+session_forget() {
     through_socket "${1}" "${2}" "rm -rf \"\${HOME}/.cache/agent-ssh/${3}\"" < /dev/null > /dev/null 2>&1
 }
 
-# open_names: the names of all sockets with a connection behind them
-open_names() {
-    local socket name
-    for socket in "${SOCKET_DIR}"/cm-*; do
-        [ -S "${socket}" ] || continue
-        name="${socket##*/cm-}"
-        is_open "${socket}" "${name}" && echo "${name}"
+# ids KIND: the ids of all records of KIND
+ids() {
+    local file
+    for file in "${STATE_DIR}"/*."${1}"; do
+        [ -f "${file}" ] && basename "${file}" ".${1}"
     done
 }
 
 completion() {
     local previous="${1}" command="${2}"
     case "${previous}" in
-        -n|--name|-p|--persist|-i|--interval|-c|--count|-s|--session) return ;;
+        -w|--wait|-p|--persist|-s|--session|-i|--interval) return ;;
     esac
     case "${command}" in
-        open|watch)
-            echo "-n --name -p --persist -i --interval -c --count --no-notify -t --tmux -s --session -h --help"
-            sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\+//p' "${HOME}/.ssh/config" 2>/dev/null \
-                | tr ' ' '\n' | grep -v '[*?!]'
+        ask)
+            echo "-w --wait --no-notify -h --help"
             ;;
-        exec)
-            echo "-n --name -t --tmux -s --session -h --help"
-            open_names
+        grant)
+            echo "-y --yes -i --interval -p --persist --no-notify -h --help"
             ;;
-        status|path|close)
-            echo "-n --name -h --help"
-            open_names
+        open)
+            echo "-d --direct -s --session -w --wait -h --help"
+            ids ticket
+            return
+            ;;
+        path)
+            ids ticket
+            return
+            ;;
+        close)
+            ids ticket
+            ids ask
+            return
+            ;;
+        status)
+            return
             ;;
         *)
-            echo "open watch status exec path close -h --help"
+            echo "ask open path grant status close -h --help"
+            return
             ;;
     esac
+    sed -n 's/^[[:space:]]*[Hh]ost[[:space:]]\+//p' "${HOME}/.ssh/config" 2> /dev/null \
+        | tr ' ' '\n' | grep -v '[*?!]'
 }
 
 command=""
-destination=""
-name=""
-persist="8h"
-interval=30
-count=0
+target=""
+wait_limit=""
 notify=1
-tmux=0
+yes=0
+interval=30
+persist="8h"
+direct=0
 session="${APP_NAME}"
 rest=()
+OPTIONS=()
 SSH_OPTIONS=()
 REPLACE=""
 
@@ -319,7 +703,7 @@ case "${1}" in
         completion "${@}"
         exit 0
         ;;
-    open|watch|status|exec|path|close)
+    ask|open|path|grant|status|close)
         command="${1}"
         shift
         ;;
@@ -337,11 +721,21 @@ while [ "${#}" -gt 0 ]; do
         -h|--help)
             usage
             ;;
-        -n|--name)
+        -w|--wait)
             shift
-            [ -z "${1}" ] && usage
-            [[ "${1}" =~ ^[A-Za-z0-9@._-]+$ ]] || fail "Not a socket name: ${1}"
-            name="${1}"
+            [[ "${1}" =~ ^[0-9]+$ ]] || fail "--wait takes a number of seconds"
+            wait_limit="${1}"
+            ;;
+        --no-notify)
+            notify=0
+            ;;
+        -y|--yes)
+            yes=1
+            ;;
+        -i|--interval)
+            shift
+            [[ "${1}" =~ ^[1-9][0-9]*$ ]] || fail "--interval takes a number of seconds"
+            interval="${1}"
             ;;
         -p|--persist)
             shift
@@ -349,27 +743,14 @@ while [ "${#}" -gt 0 ]; do
             [[ "${1}" =~ ^([0-9]+[smhdwSMHDW]?)+$|^yes$ ]] || fail "Not a time: ${1}"
             persist="${1}"
             ;;
-        -i|--interval)
-            shift
-            [[ "${1}" =~ ^[1-9][0-9]*$ ]] || fail "--interval takes a number of seconds"
-            interval="${1}"
-            ;;
-        -c|--count)
-            shift
-            [[ "${1}" =~ ^[1-9][0-9]*$ ]] || fail "--count takes a number"
-            count="${1}"
-            ;;
-        --no-notify)
-            notify=0
-            ;;
-        -t|--tmux)
-            tmux=1
+        -d|--direct)
+            direct=1
             ;;
         -s|--session)
             shift
             [ -z "${1}" ] && usage
             # tmux gives "." and ":" a meaning of their own in the name of a session
-            [[ "${1}" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Not a tmux session name: ${1}"
+            [[ "${1}" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Not a session name: ${1}"
             session="${1}"
             ;;
         --)
@@ -382,130 +763,220 @@ while [ "${#}" -gt 0 ]; do
             usage
             ;;
         *)
-            if [ -n "${destination}" ]; then
-                # what follows the destination of exec is the remote command
-                [ "${command}" = "exec" ] || { error "Unexpected argument: ${1}"; usage; }
+            if [ -n "${target}" ]; then
+                # what follows the ticket of open is the remote command
+                [ "${command}" = "open" ] || { error "Unexpected argument: ${1}"; usage; }
                 rest=("${@}")
                 break
             fi
-            destination="${1}"
+            target="${1}"
             ;;
     esac
     shift
 done
 
-if [ -z "${destination}" ]; then
-    [ "${command}" = "status" ] || { error "${command} needs a destination"; usage; }
-    [ -z "${name}" ] || fail "--name needs a destination"
-    found=0
-    for socket in "${SOCKET_DIR}"/cm-*; do
-        [ -S "${socket}" ] || continue
-        print_status "${socket}" "${socket##*/cm-}"
-        found=1
-    done
-    [ "${found}" -eq 1 ] || echo "No connection." 1>&2
-    exit 0
+if [ -z "${wait_limit}" ]; then
+    wait_limit=300
+    [ "${command}" != "open" ] || wait_limit=60
 fi
-
-[[ "${destination}" != -* ]] || fail "Not a destination: ${destination}"
-if [ -z "${name}" ]; then
-    name="${destination}"
-    [[ "${name}" =~ ^[A-Za-z0-9@._-]+$ ]] || fail "${destination} gives no socket name, pass --name"
-fi
-socket="$(socket_path "${name}")"
-# sun_path of a unix socket holds 108 bytes, ssh needs some of them for a temporary name
-[ "${#socket}" -le 80 ] || fail "Socket path too long, pass a shorter --name: ${socket}"
-
 case "${command}" in
-    path)
-        echo "${socket}"
+    ask)
+        [ -n "${target}" ] || { error "${command} needs a destination"; usage; }
+        ;;
+    open|path|close)
+        [ -n "${target}" ] || { error "${command} needs a ticket"; usage; }
+        [[ "${target}" =~ ^[a-z0-9]{6}$ ]] || fail "Not a ticket: ${target}"
         ;;
     status)
-        print_status "${socket}" "${destination}"
+        [ -z "${target}" ] || { error "Unexpected argument: ${target}"; usage; }
+        ;;
+esac
+if [ "${command}" = "ask" ] || { [ "${command}" = "grant" ] && [ -n "${target}" ]; }; then
+    # user@host, or ssh://user@[::1]:22
+    destination_form='^[]A-Za-z0-9@._:/%[-]+$'
+    [[ "${target}" =~ ${destination_form} ]] && [[ "${target}" != -* ]] || fail "Not a destination: ${target}"
+    for option in "${rest[@]}"; do
+        [[ "${option}" != *$'\n'* ]] || fail "An ssh option must not hold a line break"
+    done
+fi
+
+( umask 077; mkdir -p "${STATE_DIR}" ) || fail "Cannot create ${STATE_DIR}"
+# sun_path of a unix socket holds 108 bytes, ssh needs some of them for a temporary name
+[ "${#STATE_DIR}" -le 60 ] || fail "Too long for the control sockets: ${STATE_DIR}"
+
+case "${command}" in
+    status)
+        sweep
+        for id in $(ids ask); do
+            print_record ask "${id}"
+        done
+        for id in $(ids ticket); do
+            print_record ticket "${id}"
+        done
+        ;;
+    path)
+        [ -f "${STATE_DIR}/${target}.ticket" ] || fail "No ticket ${target}"
+        socket_of "${target}"
         ;;
     close)
-        if ! is_open "${socket}" "${destination}"; then
-            echo "No open connection to ${destination}." 1>&2
+        if locked take_back "${target}"; then
             exit 0
         fi
-        "${SSH}" -O exit -o ControlPath="${socket}" "${destination}" 2> /dev/null \
-            || fail "Could not close the connection to ${destination}"
+        [ -f "${STATE_DIR}/${target}.ticket" ] || fail "No ticket ${target}"
+        # The ticket goes first: a running grant that opens the connection
+        # again at this moment then finds none and closes what it opened.
+        destination="$(destination_of "${target}")"
+        locked rm -f -- "${STATE_DIR}/${target}.ticket"
+        "${SSH}" -O exit -o ControlPath="$(socket_of "${target}")" "${destination}" > /dev/null 2>&1
+        forget "${target}"
         ;;
-    exec)
-        if ! is_open "${socket}" "${destination}"; then
-            error "No open connection to ${destination}: run '${APP_NAME} watch ${destination}' in a terminal"
+    ask)
+        found="$(locked ask_id agent "${target}" "${rest[@]}")" || fail "Could not write the ask"
+        id="${found#* }"
+        if [ "${found%% *}" = "open" ]; then
+            echo "${id}"
+            exit 0
+        fi
+        if [ "${found%% *}" = "gone" ]; then
+            echo "The connection to ${target} (${id}) is gone: waiting for the ${APP_NAME} grant of the user to open it again." 1>&2
+        else
+            echo "Asked for ${target} (${id}): waiting for '${APP_NAME} grant' in a terminal of the user." 1>&2
+            notify "connection to ${target} asked for" "Run '${APP_NAME} grant' in a terminal."
+        fi
+        waited=0
+        while true; do
+            if [ -f "${STATE_DIR}/${id}.ticket" ] && is_open "${id}"; then
+                echo "${id}"
+                exit 0
+            fi
+            if [ ! -f "${STATE_DIR}/${id}.ask" ] && [ ! -f "${STATE_DIR}/${id}.ticket" ]; then
+                fail "The ask for ${target} was denied, or its connection closed"
+            fi
+            if [ "${wait_limit}" -gt 0 ] && [ "${waited}" -ge "${wait_limit}" ]; then
+                fail "No connection within ${wait_limit} seconds. The ask stays: run '${APP_NAME} ask' again later"
+            fi
+            sleep 1
+            waited=$(( waited + 1 ))
+        done
+        ;;
+    open)
+        file="${STATE_DIR}/${target}.ticket"
+        if [ ! -f "${file}" ]; then
+            error "No ticket ${target}: get one with '${APP_NAME} ask DESTINATION'"
             exit 255
         fi
-        if [ "${tmux}" -eq 0 ]; then
+        destination="$(record_field "${file}" 1)"
+        if ! is_open "${target}"; then
+            if ! watching; then
+                # the ask that leads to the same connection: with its ssh
+                # options, in the directory they were given in
+                record_options "${file}"
+                again="${APP_NAME} ask ${destination}"
+                where=""
+                if [ "${#OPTIONS[@]}" -gt 0 ]; then
+                    again="${again} -- ${OPTIONS[*]}"
+                    where=" in $(record_field "${file}" 3)"
+                fi
+                forget "${target}"
+                error "The connection of ticket ${target} is gone: run '${again}'${where} for a new one"
+                exit 255
+            fi
+            echo "The connection of ticket ${target} is gone: waiting for the ${APP_NAME} grant of the user to open it again." 1>&2
+            waited=0
+            until is_open "${target}"; do
+                [ -f "${file}" ] || { error "Ticket ${target} was closed"; exit 255; }
+                if [ "${waited}" -ge "${wait_limit}" ]; then
+                    error "The connection of ticket ${target} is not back within ${wait_limit} seconds: try again later"
+                    exit 255
+                fi
+                sleep 1
+                waited=$(( waited + 1 ))
+            done
+        fi
+        if [ "${direct}" -eq 1 ]; then
             REPLACE=1
-            through_socket "${socket}" "${destination}" "${rest[@]}"
+            through_socket "${target}" "${destination}" "${rest[@]}"
         elif [ "${#rest[@]}" -eq 0 ]; then
-            [ -t 0 ] || fail "Attaching to the tmux session needs a terminal"
+            [ -t 0 ] || fail "Attaching to the session needs a terminal"
             SSH_OPTIONS=(-t)
             REPLACE=1
-            through_socket "${socket}" "${destination}" "tmux new-session -A -s '${session}'"
+            through_socket "${target}" "${destination}" "$(attach_command)"
         else
             # as ssh does it: the words joined by spaces, taken apart by the shell of the host
-            id="$(date +%Y%m%d-%H%M%S)-${$}-${RANDOM}"
-            tmux_script "${id}" "${rest[*]}" | through_socket "${socket}" "${destination}" "sh -s"
+            result="$(date +%Y%m%d-%H%M%S)-${$}-${RANDOM}"
+            session_script "${result}" "${rest[*]}" | through_socket "${target}" "${destination}" "sh -s"
             status="${?}"
             # 255 is ssh saying that the connection went away (or the script that
-            # tmux did not work): then nothing proves that the result arrived
-            [ "${status}" -eq 255 ] || tmux_forget "${socket}" "${destination}" "${id}"
+            # the session did not work): then nothing proves that the result arrived
+            [ "${status}" -eq 255 ] || session_forget "${target}" "${destination}" "${result}"
             exit "${status}"
         fi
         exit "${?}"
         ;;
-    open)
-        if is_open "${socket}" "${destination}"; then
-            echo "Already open." 1>&2
-            [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
-            echo "${socket}"
-            exit 0
+    grant)
+        # A person decides, and the host needs somewhere to ask for the login.
+        # A guard against a grant by mistake, not a wall: what an agent cannot
+        # get around is the login itself.
+        [ -t 0 ] || fail "${APP_NAME} grant needs a terminal: it is for the user, not for an agent"
+        [ -n "${target}" ] || [ "${#rest[@]}" -eq 0 ] || fail "SSH options need a destination"
+        # what went away while no grant was running is not opened again
+        sweep
+        exec 7> "${STATE_DIR}/watch.lock" && flock -s 7 || fail "Cannot lock ${STATE_DIR}/watch.lock"
+        declare -A SEEN PAUSE NEXT_TRY
+        if [ -n "${target}" ]; then
+            found="$(locked ask_id user "${target}" "${rest[@]}")" || fail "Could not write the ask"
+            id="${found#* }"
+            case "${found%% *}" in
+                open)
+                    echo "Already open, ticket of ${target}:" 1>&2
+                    echo "${id}"
+                    ;;
+                gone)
+                    once "${id}" reopen "${id}" || fail "No connection to ${target}"
+                    echo "Open again, ticket of ${target}:" 1>&2
+                    echo "${id}"
+                    ;;
+                *)
+                    # naming the destination is the decision
+                    asked_yes="${yes}"
+                    yes=1
+                    grant_ask "${id}"
+                    status="${?}"
+                    yes="${asked_yes}"
+                    # An ask of an agent stays for the next try, one made here does
+                    # not - unless another grant is logging in for it right now.
+                    [ "${status}" -eq 0 ] || [ "${status}" -eq 3 ] || locked drop_unasked "${id}"
+                    [ "${status}" -eq 0 ] || exit 1
+                    ;;
+            esac
+            SEEN[${id}]="open"
         fi
-        clear_socket "${socket}" "${destination}"
-        open_connection "${socket}" "${destination}" no "${rest[@]}" || fail "Could not open a connection to ${destination}"
-        [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
-        echo "${socket}"
-        ;;
-    watch)
-        trap 'echo 1>&2; log "watcher stopped, the connection stays as it is"; exit 130' INT TERM
-        looks=0
-        wait="${interval}"
-        state=""
+        trap 'echo 1>&2; log "ended, the connections stay as they are"; exit 130' INT TERM
+        skipped=" "
+        told=0
+        looked=0
         while true; do
-            if is_open "${socket}" "${destination}"; then
-                if [ "${state}" != "open" ]; then
-                    log "${destination} open: ${socket}"
-                    [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
-                fi
-                state="open"
-                wait="${interval}"
-            else
-                [ "${state}" != "open" ] || log "${destination} is gone, opening it again"
-                if [ -z "${state}" ]; then
-                    # the first time you are there: ask straight away
-                    clear_socket "${socket}" "${destination}"
-                    open_connection "${socket}" "${destination}" no "${rest[@]}"
+            for id in $(ids ask); do
+                # an ask you said "not now" to comes up again with the next grant
+                [[ "${skipped}" != *" ${id} "* ]] || continue
+                printf '\a' 1>&2
+                if grant_ask "${id}"; then
+                    SEEN[${id}]="open"
                 else
-                    reopen "${socket}" "${destination}" "${rest[@]}"
+                    skipped="${skipped}${id} "
                 fi
-                if is_open "${socket}" "${destination}"; then
-                    log "${destination} open: ${socket}"
-                    [ "${tmux}" -eq 0 ] || tmux_ensure "${socket}" "${destination}"
-                    state="open"
-                    wait="${interval}"
-                else
-                    [ "${state}" = "closed" ] && wait=$(( wait * 2 ))
-                    [ "${wait}" -le "${MAX_WAIT}" ] || wait="${MAX_WAIT}"
-                    state="closed"
-                    log "next try in ${wait} seconds"
-                fi
+                told=0
+            done
+            now="$(date +%s)"
+            if [ "$(( now - looked ))" -ge "${interval}" ]; then
+                watch_connections
+                looked="${now}"
             fi
-            looks=$(( looks + 1 ))
-            [ "${count}" -eq 0 ] || [ "${looks}" -lt "${count}" ] || break
-            sleep "${wait}"
+            if [ "${told}" -eq 0 ]; then
+                log "watching $(ids ticket | wc -l) connection(s), waiting for asks (Ctrl-C to end)"
+                told=1
+            fi
+            sleep 2
         done
-        [ "${state}" = "open" ]
         ;;
 esac
